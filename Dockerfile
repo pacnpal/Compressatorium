@@ -5,7 +5,7 @@
 # reproducible. apt-get update inside the stages still pulls security patches;
 # bump these digests periodically (docker buildx imagetools inspect <img>).
 #   debian:trixie-slim and node:lts-slim digests captured 2026-06-02.
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8 AS builder
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS builder
 
 # Install build dependencies
 #
@@ -45,7 +45,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
 # reproducibility.
 # DL3008 ignored for the same reason as the z3ds builder (generic build deps).
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8 AS maxcso-builder
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS maxcso-builder
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinned to an immutable maxcso commit so release images are reproducible
 # (the build workflow passes only APP_VERSION). This is master @ 2024-01-26,
@@ -88,7 +88,7 @@ RUN make && \
 # PARAM.SFO readback, so extractps3iso (round-trip) isn't needed.
 # DL3008 ignored for the same reason as the other builders (generic build deps).
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8 AS makeps3iso-builder
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS makeps3iso-builder
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinned to an immutable commit so release images are reproducible. master @
 # 2022-03-09 (latest upstream; last tagged release predates it). Override with
@@ -130,7 +130,7 @@ ARG APP_VERSION=dev
 ENV VITE_APP_VERSION=${APP_VERSION}
 RUN npm run build
 
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 # ---------------------------------------------------------------------------
 # Immutable pin: mame-tools 0.285+dfsg1-1 from snapshot.debian.org
