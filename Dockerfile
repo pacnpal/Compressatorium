@@ -120,7 +120,7 @@ RUN make -C makeps3iso && \
 # node:lts-slim ships linux/amd64 and linux/arm64 manifests, and the SPA
 # has no native dependencies so QEMU emulation under buildx works.
 # ---------------------------------------------------------------------------
-FROM node:lts-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203 AS frontend-builder
+FROM node:lts-slim@sha256:b31e7a42fdf8b8aa5f5ed477c72d694301273f1069c5a2f71d53c6482e99a2fc AS frontend-builder
 WORKDIR /build
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
