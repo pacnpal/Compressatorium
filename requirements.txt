@@ -8,7 +8,7 @@ rarfile>=4.2
 defusedxml>=0.7.1
 python-multipart>=0.0.32
 SQLAlchemy>=2.0.51,<3.0
-alembic>=1.18.4
+alembic>=1.18.5
 # nsz: Nintendo Switch NSP/XCI <-> NSZ/XCZ (de)compressor. Pulls zstandard +
 # pycryptodome itself. Ships NO keys; the operator supplies their own prod.keys.
 nsz>=4.6.1
