@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 from config import settings
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from models import (
     BulkDeleteRequest,
@@ -25,6 +25,7 @@ from utils.junk import is_junk_entry
 from utils.path_utils import (
     ensure_path_within_volumes,
     get_volume_name_for_path,
+    is_configured_volume_root,
     is_within_configured_volumes,
 )
 
@@ -34,6 +35,8 @@ logger = get_logger("files")
 # Upper bound on archives summarized in one /archive-summary request. The browser
 # hydrates the visible page, so this is a safety ceiling, not the normal size.
 MAX_ARCHIVE_SUMMARY_PATHS = 1000
+ACTION_CONFIRM_HEADER = "x-chd-action-confirm"
+CONFIRM_RECURSIVE_DELETE = "recursive-delete"
 
 
 # A makeps3iso ``-s`` split set: ``Game.iso.0``, ``Game.iso.1``, … The numeric
@@ -820,6 +823,7 @@ async def rename_file(
 
 @router.delete("/files/delete")
 async def delete_file(
+    request: Request,
     path: str = Query(..., description="Path to file or directory to delete"),
     recursive: bool = Query(
         False,
@@ -839,6 +843,11 @@ async def delete_file(
         raise HTTPException(status_code=404, detail="File or directory not found")
 
     is_dir = await run_in_threadpool(os.path.isdir, path)
+    if is_dir and await run_in_threadpool(
+        is_configured_volume_root, path, treat_archives=False,
+    ):
+        raise HTTPException(status_code=400, detail="Cannot delete a configured volume root")
+
     # For a recursive directory delete this also rejects the request if any
     # active job's path lives under the directory (see _assert_path_not_in_use).
     await _assert_path_not_in_use(path, is_dir=is_dir)
@@ -854,6 +863,12 @@ async def delete_file(
                     detail="Directory is not empty; confirm recursive delete to remove it",
                 )
             if contents:
+                confirmation = request.headers.get(ACTION_CONFIRM_HEADER, "")
+                if confirmation != CONFIRM_RECURSIVE_DELETE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Missing confirmation header for recursive delete",
+                    )
                 await run_in_threadpool(shutil.rmtree, path)
             else:
                 await run_in_threadpool(os.rmdir, path)
