@@ -22,7 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import subprocess
+import subprocess  # nosec B404 -- fixed argv lists, shell=False; see build_command
 import sys
 from pathlib import Path
 
@@ -70,7 +70,8 @@ def main() -> int:
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         print(f"[{index}/{len(shots)}] {output}", flush=True)
         try:
-            result = subprocess.run(build_command(shot, args.timeout), check=False)
+            # argv is a fixed list from shots.yml, never shell-interpreted
+            result = subprocess.run(build_command(shot, args.timeout), check=False)  # nosec B603
         except FileNotFoundError:
             print(
                 "error: 'shot-scraper' not found on PATH. Install it with "
