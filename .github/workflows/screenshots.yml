@@ -81,7 +81,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt shot-scraper
-          shot-scraper install chromium
+          shot-scraper install
 
       - name: Start the app
         env:

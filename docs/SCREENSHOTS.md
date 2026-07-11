@@ -38,7 +38,7 @@ npm run build
 
 # 2. Install the screenshot tooling
 pip install -r requirements.txt shot-scraper
-shot-scraper install chromium
+shot-scraper install
 
 # 3. Start the app against a fixture library
 scripts/make_screenshot_fixture.sh /tmp/shot-fixture
