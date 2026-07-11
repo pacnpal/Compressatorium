@@ -7,6 +7,11 @@ and #179, part of the #177 tech-debt epic).
 
 ### Changed
 
+- **Automatic volume discovery ignores symlink children.** When
+  `COMPRESSATORIUM_VOLUMES` is unset, startup discovery now only trusts direct,
+  non-symlink subdirectories of `COMPRESSATORIUM_MOUNT_ROOT`, preventing a
+  symlink under the mount root from being registered as a volume outside the
+  intended library tree.
 - **Deterministic ordering across the registry, search, and runner (issue
   #183).** The `ToolRegistry` extension-union helpers (`convertible_extensions`,
   `archive_input_extensions`, `verify_extensions`, `output_extensions`,

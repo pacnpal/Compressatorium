@@ -402,7 +402,7 @@ class Settings(BaseSettings):
         """Return configured data volumes discovered from data_mount_root.
 
         Discovery strategy:
-        1. Scan direct subdirectories under `data_mount_root`.
+        1. Scan direct non-symlink subdirectories under `data_mount_root`.
         2. If one or more entries are mount points, use only mount points.
         3. Otherwise use all direct subdirectories.
         4. If no subdirectories exist, allow `data_mount_root` itself when present.
@@ -419,7 +419,7 @@ class Settings(BaseSettings):
         children: list[Path] = []
         try:
             children = sorted(
-                [p for p in resolved_root.iterdir() if p.is_dir()],
+                [p for p in resolved_root.iterdir() if not p.is_symlink() and p.is_dir()],
                 key=lambda p: p.name.lower(),
             )
         except OSError:
