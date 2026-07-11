@@ -357,6 +357,13 @@ flags. One-shot subprocess work (info / header / embedded-hash extraction)
 shares `run_capture()` rather than re-implementing the spawn / cancel / timeout /
 terminate dance per tool.
 
+Directory-input tools that hand a source tree to a native recursive reader must
+validate both at planning time and again in `JobManager._process_job` after the
+source subtree lock is acquired, immediately before invoking the tool. The PS3
+`folder_to_iso` path uses `is_safe_directory_tree` for both checks so a queued
+job cannot be made unsafe by adding a symlink, special file, or volume-escaping
+entry after planning but before `makeps3iso` starts.
+
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
 `ArchiveService.enforce_archive_limits(members)` is the shared seam any

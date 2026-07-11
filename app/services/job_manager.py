@@ -25,7 +25,11 @@ from services.makeps3iso import makeps3iso_service
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan
-from utils.path_utils import is_within_configured_volumes, strip_archive_path
+from utils.path_utils import (
+    is_safe_directory_tree,
+    is_within_configured_volumes,
+    strip_archive_path,
+)
 
 logger = get_logger("job_manager")
 
@@ -1789,6 +1793,29 @@ class JobManager:
             await self._clear_existing_output(job)
 
             _convert_service = registry.for_mode(job.mode.value)
+            if job.input_kind == InputKind.DIRECTORY:
+                # Re-check directory-input safety after acquiring the source
+                # subtree lock and immediately before invoking the native
+                # recursive packer. A queued PS3 folder job may have been
+                # valid when planned but mutated before it starts; this guards
+                # the exact tree makeps3iso is about to read.
+                if not await run_in_threadpool(is_safe_directory_tree, input_path):
+                    job.status = JobStatus.FAILED
+                    job.error_message = (
+                        "PS3 folder contains symlinks, special files, "
+                        "or paths outside configured volumes"
+                    )
+                    job.completed_at = datetime.now(timezone.utc)
+                    await self._notify_subscribers(
+                        job_id,
+                        {
+                            "type": "error",
+                            "job_id": job_id,
+                            "error": job.error_message,
+                        },
+                    )
+                    return
+
             async for update in _convert_service.convert(
                 input_path,
                 job.output_path,

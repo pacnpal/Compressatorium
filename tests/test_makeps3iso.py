@@ -820,6 +820,75 @@ async def test_process_job_rejects_existing_split_set_without_overwrite(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_process_job_revalidates_ps3_tree_after_dir_lock(tmp_path, monkeypatch):
+    # A queued folder_to_iso job can be planned while safe, then have a symlink
+    # inserted before it reaches the worker. The worker must revalidate after
+    # acquiring the directory subtree lock and before makeps3iso runs.
+    from app.services import job_manager as job_manager_module
+    from app.services.job_manager import job_manager
+    from services.concurrency_manager import concurrency_manager
+    from services.lock_manager import lock_manager
+
+    folder_path = _make_ps3_folder(tmp_path / "volume" / "MyGame")
+    out = str(tmp_path / "volume" / "MyGame.iso")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (folder_path / "PS3_GAME" / "LEAK.TXT").symlink_to(outside)
+
+    # is_safe_directory_tree consults its own imported settings singleton; patch
+    # that exact global so the temporary tree is treated as the configured volume.
+    monkeypatch.setattr(
+        job_manager_module.is_safe_directory_tree.__globals__["settings"],
+        "chd_volumes",
+        str(tmp_path / "volume"),
+    )
+    monkeypatch.setattr(
+        job_manager_module.is_safe_directory_tree.__globals__["settings"],
+        "data_mount_root",
+        str(tmp_path / "volume"),
+    )
+
+    called = False
+
+    async def fake_convert(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        yield {"progress": 100, "message": "should not run"}
+
+    monkeypatch.setattr(
+        job_manager_module.registry.for_mode("folder_to_iso"), "convert", fake_convert,
+    )
+
+    job = ConversionJob(
+        id="ps3unsafe1",
+        file_path=str(folder_path),
+        filename="MyGame",
+        mode=ConversionMode.FOLDER_TO_ISO,
+        status=JobStatus.QUEUED,
+        created_at=datetime.now(timezone.utc),
+        output_path=out,
+        input_kind=InputKind.DIRECTORY,
+        allow_overwrite=False,
+    )
+    job_manager.jobs[job.id] = job
+    try:
+        await job_manager._process_job(job.id)
+        assert job.status == JobStatus.FAILED
+        assert "PS3 folder contains symlinks" in (job.error_message or "")
+        assert called is False
+        _, output_locked = lock_manager.check_file_status(out)
+        assert output_locked is False
+        assert lock_manager.dir_lock_would_conflict(str(folder_path)) is False
+    finally:
+        lock_manager.release_lock(out)
+        lock_manager.release_dir_lock(str(folder_path))
+        concurrency_manager.release(job.id)
+        job_manager.jobs.pop(job.id, None)
+        job_manager._cancel_events.pop(job.id, None)
+        job_manager._cancelled.discard(job.id)
+
+
+@pytest.mark.asyncio
 async def test_process_job_rejects_directory_output(tmp_path):
     # A directory shadowing the output path (MyGame.iso/) is never a valid
     # makeps3iso target. acquire_lock already rejects it (its ``not isfile``
