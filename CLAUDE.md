@@ -37,3 +37,11 @@ infrastructure: `docs/DESIGN_tool_plugin_architecture.md`.
   proper doc under `docs/` — the plugin contract / shared infrastructure in
   `docs/DESIGN_tool_plugin_architecture.md`, and user-facing changes in
   `docs/RELEASE_NOTES.md`.
+- **Keep the screenshots current.** The Web UI screenshots in `docs/screenshots/`
+  (embedded in `README.md`) are generated from `shots.yml` by shot-scraper, not
+  captured by hand. When a UI change alters an existing surface, refresh them —
+  push (the **Take screenshots** workflow, `.github/workflows/screenshots.yml`,
+  regenerates and commits them) or run it locally per `docs/SCREENSHOTS.md`. When
+  you add or meaningfully change a surface, update the list itself: add or edit
+  the matching entry in `shots.yml` (and reference the new image from the README /
+  docs) so the automation captures it. See `docs/SCREENSHOTS.md` for the setup.
