@@ -11,7 +11,7 @@ infrastructure: `docs/DESIGN_tool_plugin_architecture.md`.
 - Build SPA: `npm run build` (Vite → `static/`, served by FastAPI at `/static`)
 - Run (prod-style): `./run_dev.sh` (bootstraps `.venv`, uvicorn on `:8080`)
 - Dev HMR: `npm run dev` (Vite on `:5173`, proxies `/api` + `/health` to `:8080`)
-- Tests: `PYTHONPATH=app python -m pytest -q`
+- Tests: `PYTHONPATH=app python -m pytest -q tests`
 - Lint (Python): `ruff check .` (max line length 100, matching `.pylintrc` / Codacy)
 - Lint (JS/Svelte): `npm run lint` (eslint)
 - Version lives in `package.json`; releases also update `docs/RELEASE_NOTES.md`.
