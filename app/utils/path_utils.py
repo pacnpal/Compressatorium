@@ -84,17 +84,16 @@ def is_safe_directory_tree(path: str) -> bool:
     the confined root's real subtree is the only thing the native reader sees.
     """
     # Reject a symlinked source root before resolving it. A trailing separator
+    # or "." component (".../LinkGame/", ".../LinkGame/.", ".../LinkGame/./")
     # makes ``os.path.islink``/``os.lstat`` follow the link to its target, so a
     # request like ``/volume/LinkGame/`` would otherwise resolve the symlink
     # away and hand the native packer a root pointing outside the configured
-    # volume. Strip trailing separators and ``lstat`` the original path itself.
-    # Preserve any drive prefix: on Windows ``"C:\\".rstrip(sep)`` collapses to
-    # ``"C:"``, which ``lstat`` resolves to the *current directory* on that
-    # drive rather than the drive root, so strip only the remainder.
-    seps = os.sep + (os.altsep or "")
-    drive, rest = os.path.splitdrive(path)
-    stripped_rest = rest.rstrip(seps)
-    raw_root = drive + stripped_rest if stripped_rest else path
+    # volume. ``os.path.normpath`` collapses those trailing components (and any
+    # duplicate separators) purely lexically — without following symlinks — so
+    # the ``lstat`` sees the submitted root itself. It also preserves a drive
+    # root (``"C:\\"`` stays ``"C:\\"`` and never collapses to ``"C:"``, which
+    # would target the current directory on that drive).
+    raw_root = os.path.normpath(path) if path else path
     try:
         raw_lstat = os.lstat(raw_root)
     except OSError:

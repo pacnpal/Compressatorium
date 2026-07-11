@@ -195,6 +195,33 @@ async def test_plan_job_rejects_symlinked_ps3_root_with_trailing_slash(tmp_path,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", [os.sep + ".", os.sep + "." + os.sep])
+async def test_plan_job_rejects_symlinked_ps3_root_with_dot_component(
+    tmp_path, monkeypatch, suffix,
+):
+    # A symlinked source root must be rejected even when hidden behind a trailing
+    # "." or "./" component: those make os.lstat follow the link, so
+    # is_safe_directory_tree must normalize them away before the pre-resolve lstat
+    # to keep "/vol/link/." from handing makeps3iso a symlinked root.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_folder = _make_ps3_folder(volume / "MyGame")
+    link_root = volume / "LinkGame"
+    link_root.symlink_to(real_folder, target_is_directory=True)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(link_root) + suffix,
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.asyncio
 async def test_plan_job_rejects_ps3_dir_with_symlinked_directory(tmp_path, monkeypatch):
     _confine_to_volume(monkeypatch, tmp_path / "volume")
     volume = tmp_path / "volume"

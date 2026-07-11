@@ -12,7 +12,8 @@ and #179, part of the #177 tech-debt epic).
   and the queued worker repeats the same safety walk after acquiring the source
   directory lock and before clearing any existing output, immediately before
   invoking `makeps3iso`. A symlinked source root is rejected even when submitted
-  with a trailing slash. This prevents a crafted or mutated PS3 folder from
+  with a trailing separator or `.`/`./` component. This prevents a crafted or
+  mutated PS3 folder from
   causing the native packer to read and embed files outside the configured
   volume boundary, and keeps a safety rejection on an overwrite job from
   deleting the user's prior output.
