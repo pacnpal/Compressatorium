@@ -920,6 +920,14 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
 
         try:
             if is_dir:
+                if await run_in_threadpool(
+                    is_configured_volume_root, path, treat_archives=False,
+                ):
+                    return {
+                        "path": path,
+                        "success": False,
+                        "error": "Cannot delete a configured volume root",
+                    }
                 # Only delete empty directories for safety
                 # os.listdir can be blocking
                 contents = await run_in_threadpool(os.listdir, path)
