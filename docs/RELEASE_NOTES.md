@@ -5,6 +5,13 @@
 Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
 and #179, part of the #177 tech-debt epic).
 
+### Security
+
+- **CHD disc-ID probing now has resource bounds.** The direct CHD sector reader
+  rejects oversized or invalid hunk geometry, caps compressed hunk expansion and
+  LZMA dictionary sizes, and `chdman dumpmeta` now has a timeout and output-size
+  limit so crafted CHDs cannot exhaust memory or hang metadata/API requests.
+
 ### Changed
 
 - **Deterministic ordering across the registry, search, and runner (issue
