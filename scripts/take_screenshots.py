@@ -69,7 +69,15 @@ def main() -> int:
         output = shot.get("output", "?")
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         print(f"[{index}/{len(shots)}] {output}", flush=True)
-        result = subprocess.run(build_command(shot, args.timeout), check=False)
+        try:
+            result = subprocess.run(build_command(shot, args.timeout), check=False)
+        except FileNotFoundError:
+            print(
+                "error: 'shot-scraper' not found on PATH. Install it with "
+                "'pip install shot-scraper' and run 'shot-scraper install'.",
+                file=sys.stderr,
+            )
+            return 127
         if result.returncode != 0:
             failures.append(output)
             print(f"  !! failed ({result.returncode}): {output}", file=sys.stderr, flush=True)

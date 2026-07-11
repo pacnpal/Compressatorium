@@ -24,17 +24,21 @@ mkdir -p \
   "$root/GameCube" \
   "$root/Nintendo 3DS"
 
+# Placeholder file sizes are in KiB. `dd` is used rather than `head -c` because
+# the latter's byte count is a GNU extension the BSD `head` on macOS lacks.
+placeholder() { dd if=/dev/zero of="$1" bs=1024 count="$2" 2>/dev/null; }
+
 # CHDMAN: a .cue sheet referencing a .bin data track.
 printf 'FILE "game.bin" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n' \
   > "$root/Arcade CHD/street-fighter.cue"
-head -c 2359296 /dev/zero > "$root/Arcade CHD/game.bin"
+placeholder "$root/Arcade CHD/game.bin" 2304
 
 # Dolphin: a GameCube/Wii disc image plus an already-compressed RVZ.
-head -c 4194304 /dev/zero > "$root/GameCube/mario-kart.iso"
-head -c 1048576 /dev/zero > "$root/GameCube/zelda-wind-waker.rvz"
+placeholder "$root/GameCube/mario-kart.iso" 4096
+placeholder "$root/GameCube/zelda-wind-waker.rvz" 1024
 
 # 3DS: a couple of ROMs.
-head -c 2097152 /dev/zero > "$root/Nintendo 3DS/pokemon-x.3ds"
-head -c 2097152 /dev/zero > "$root/Nintendo 3DS/mario-3d-land.cci"
+placeholder "$root/Nintendo 3DS/pokemon-x.3ds" 2048
+placeholder "$root/Nintendo 3DS/mario-3d-land.cci" 2048
 
 echo "Fixture volume created under: $root"
