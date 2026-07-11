@@ -169,6 +169,21 @@ def is_safe_directory_tree(path: str) -> bool:
     return not walk_errors
 
 
+def is_configured_volume_root(path: str, *, treat_archives: bool = True) -> bool:
+    """Check whether the given path is exactly one of the configured volume roots."""
+    base_path = strip_archive_path(path) if treat_archives else path
+    real_path = _resolve_path(base_path, strict=False)
+    if real_path is None:
+        return False
+
+    for volume in settings.volumes:
+        real_volume = _resolve_volume(volume)
+        if real_volume is not None and real_path == real_volume:
+            return True
+
+    return False
+
+
 def ensure_path_within_volumes(path: str, *, treat_archives: bool = True) -> Path:
     """Return the resolved path if it is within configured volumes, else raise ValueError."""
     if not is_within_configured_volumes(path, treat_archives=treat_archives):
