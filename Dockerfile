@@ -267,10 +267,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD if [ "${CHD_MODE:-webui}" = "cli" ]; then \
             exit 0; \
         fi; \
-        if [ "$(id -u)" = "0" ]; then \
-            gosu converter python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
+        if [ "$(/usr/bin/id -u)" = "0" ]; then \
+            /usr/sbin/gosu converter /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
         else \
-            python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
+            /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
         fi
 
 # Create runtime user/group (pinned to 999:999) and prepare ownership for entrypoint privilege drop

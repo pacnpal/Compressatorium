@@ -5,6 +5,10 @@
 Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
 and #179, part of the #177 tech-debt epic).
 
+### Fixed
+
+- **Container root startup and healthcheck command lookup is hardened.** Root-mode UID/GID remapping and healthchecks now call system utilities by absolute path instead of resolving them through the converter-writable virtualenv path, preserving PUID/PGID support while preventing app-user PATH shadowing from escalating to root.
+
 ### Changed
 
 - **Deterministic ordering across the registry, search, and runner (issue
