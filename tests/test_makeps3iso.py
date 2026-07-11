@@ -244,6 +244,34 @@ def test_strip_trailing_dot_and_seps(raw, expected):
 
 
 @pytest.mark.asyncio
+async def test_plan_job_canonicalizes_symlinked_ancestor(tmp_path, monkeypatch):
+    # A source reached through a symlinked ANCESTOR (link -> real) is accepted,
+    # but the plan must pack the resolved real path — not the mutable symlinked
+    # spelling — so a concurrent swap of the ancestor link can't retarget
+    # makeps3iso to an unchecked tree after validation.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_parent = volume / "real"
+    real_parent.mkdir(parents=True)
+    folder = _make_ps3_folder(real_parent / "MyGame")
+    (volume / "link").symlink_to(real_parent, target_is_directory=True)
+
+    submitted = str(volume / "link" / "MyGame")  # traverses the symlinked ancestor
+    plan = await convert_routes.plan_job(
+        submitted,
+        spec=registry.spec("folder_to_iso"),
+        mode="folder_to_iso",
+        output_dir=None,
+        duplicate_action=convert_routes.DuplicateAction.SKIP,
+        delete_on_verify=False,
+    )
+    # Packed path is the real, symlink-free location.
+    assert plan.file_path == os.path.realpath(submitted)
+    assert plan.file_path == str(folder)
+    assert f"{os.sep}link{os.sep}" not in plan.file_path
+
+
+@pytest.mark.asyncio
 async def test_plan_job_rejects_symlinked_root_behind_dotdot_cancelled_ancestor(
     tmp_path, monkeypatch,
 ):

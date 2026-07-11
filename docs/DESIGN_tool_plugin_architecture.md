@@ -520,7 +520,12 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
   `os.walk(followlinks=False)` never descends through a link, the surviving
   entries are all genuine children of the confined root — no per-entry resolve
   is needed — so makeps3iso cannot dereference a link and embed files outside
-  the volume boundary.
+  the volume boundary. The directory job is also **canonicalized to the resolved
+  real source path** (`os.path.realpath`) before being queued, so makeps3iso is
+  handed a symlink-free path: a concurrent swap of a symlinked *ancestor*
+  component after validation cannot retarget the native reader to an unchecked
+  tree. (A symlinked *root* is still rejected outright, since the safety walk
+  runs on the original submitted path.)
 - **Job model.** `ConversionJob.input_kind: InputKind` is threaded end-to-end
   (derived from the mode spec at queue time, serialized to a string only at the
   API/persistence edge). The generic `_process_job` flow already handles a

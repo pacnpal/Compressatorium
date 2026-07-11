@@ -460,7 +460,17 @@ async def _plan_directory_job(
     if not accepts:
         raise SkipFile(SkipReason.PS3_FOLDER_INVALID)
 
-    normalized = os.path.normpath(file_path)
+    # Canonicalize the source to its real, symlink-free path before deriving the
+    # job, and pack *that* path. makeps3iso reads the source tree as a native
+    # subprocess, so a submitted path with a symlink in an ancestor component
+    # (e.g. "/vol/link/MyGame" with "link" -> "/vol/real") would otherwise let a
+    # concurrent swap of that link retarget the native reader to an unchecked
+    # tree after validation. Resolving to the real path removes that mutable
+    # window; a symlinked *root* is still rejected outright by
+    # `is_safe_directory_tree` below (which runs on the original submitted path).
+    source_real = await run_in_threadpool(os.path.realpath, file_path)
+
+    normalized = os.path.normpath(source_real)
     display_filename = os.path.basename(normalized)
     output_path = await run_in_threadpool(
         _get_output_path, mode, normalized, output_dir,
@@ -475,7 +485,6 @@ async def _plan_directory_job(
     # guards against *other* jobs, not a job's own output.) Resolve symlinks
     # first so a symlinked output dir into the tree can't slip past this.
     output_real = await run_in_threadpool(os.path.realpath, output_path)
-    source_real = await run_in_threadpool(os.path.realpath, file_path)
     if output_real == source_real or output_real.startswith(source_real + os.sep):
         raise SkipFile(SkipReason.PS3_OUTPUT_INSIDE_SOURCE)
 
@@ -521,7 +530,7 @@ async def _plan_directory_job(
         duplicate_action == DuplicateAction.OVERWRITE and output_exists
     )
     return JobPlan(
-        file_path=file_path,
+        file_path=source_real,
         output_path=output_path,
         base_output_path=base_output_path,
         allow_overwrite=allow_overwrite,
