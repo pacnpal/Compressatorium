@@ -88,8 +88,13 @@ def is_safe_directory_tree(path: str) -> bool:
     # request like ``/volume/LinkGame/`` would otherwise resolve the symlink
     # away and hand the native packer a root pointing outside the configured
     # volume. Strip trailing separators and ``lstat`` the original path itself.
+    # Preserve any drive prefix: on Windows ``"C:\\".rstrip(sep)`` collapses to
+    # ``"C:"``, which ``lstat`` resolves to the *current directory* on that
+    # drive rather than the drive root, so strip only the remainder.
     seps = os.sep + (os.altsep or "")
-    raw_root = path.rstrip(seps) or path
+    drive, rest = os.path.splitdrive(path)
+    stripped_rest = rest.rstrip(seps)
+    raw_root = drive + stripped_rest if stripped_rest else path
     try:
         raw_lstat = os.lstat(raw_root)
     except OSError:
