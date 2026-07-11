@@ -83,19 +83,27 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be a semantic version, optionally prefixed with v: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "Version from release tag: ${VERSION}"
 
       - name: Sync version to package.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_COMMITISH: ${{ github.event.release.target_commitish }}
+          VERSION_SYNC_TOKEN: ${{ secrets.VERSION_SYNC_TOKEN }}
         run: |
-          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json package-lock.json
           if ! git diff --cached --quiet; then
-            git commit -m "chore: sync package.json to v${{ steps.version.outputs.version }} [skip ci]"
-            git remote set-url origin https://x-access-token:${{ secrets.VERSION_SYNC_TOKEN }}@github.com/${{ github.repository }}.git
-            git push origin HEAD:${{ github.event.release.target_commitish }}
+            git commit -m "chore: sync package.json to v${VERSION} [skip ci]"
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: bearer ${VERSION_SYNC_TOKEN}" \
+              push origin "HEAD:${TARGET_COMMITISH}"
           fi
 
       - name: Extract Docker metadata
