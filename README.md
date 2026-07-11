@@ -328,9 +328,9 @@ docker run -d \
   pacnpal/compressatorium
 ```
 
-Then open **http://localhost:8080** in your browser.
+Then open **http://localhost:8080** in your browser. The Web UI prompts for HTTP Basic auth. The username defaults to `admin`; set `COMPRESSATORIUM_AUTH_TOKEN` for the password, or read the generated token from `/config/auth_token` after first startup.
 
-> **Required:** The `/config` volume must be mounted for persistent data storage.  
+> **Required:** The `/config` volume must be mounted for persistent data storage and the generated auth token.  
 > **Volume discovery:** If `COMPRESSATORIUM_VOLUMES` is unset, the app scans `/data/*` at startup and auto-registers mounted game volumes (restart after mount changes).  
 > **Ownership (optional):** Set `PUID`/`PGID` to match your host user/group (for example Unraid `99:100`). If unset, defaults remain `999:999`.  
 > **Default temp location:** `/config/temp`. To use a different location, set `CHD_TEMP_DIR` and mount it.
@@ -1062,6 +1062,9 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `PUID` | `999` | Optional runtime UID remap for `converter` before app startup (useful on Unraid/home servers) |
 | `PGID` | `999` | Optional runtime GID remap for `converter`; if that GID already exists, `converter` is reassigned to the existing group |
 | `CHD_DATA_DIR` | `/config` | Directory for persistent application data |
+| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password. Send as HTTP Basic password for user `admin`, as `Authorization: Bearer`, as `X-Compressatorium-Token`, or as `access_token` for SSE clients. |
+| `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI. |
+| `COMPRESSATORIUM_DISABLE_AUTH` | `false` | Explicitly disables Web UI/API authentication. Only use behind another access-control layer. |
 | `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Web UI: when true, `Search All` conversions return to the previous file-list view after queueing |
 | `CHD_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Legacy alias for `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` |
 | `CHD_TEMP_DIR` | `/config/temp` | Temporary working directory for archive extraction (auto-created) |

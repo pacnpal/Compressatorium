@@ -131,6 +131,9 @@ Volume behavior:
 | `PUID` | `999` | Optional runtime UID remap for `converter` (commonly set on Unraid) |
 | `PGID` | `999` | Optional runtime GID remap for `converter`; reuses an existing group when that GID is already present |
 | `CHD_DATA_DIR` | `/config` | Persistent data directory |
+| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password. Use it via HTTP Basic, bearer token, `X-Compressatorium-Token`, or `access_token` for SSE clients. |
+| `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI. |
+| `COMPRESSATORIUM_DISABLE_AUTH` | `false` | Disable built-in auth only when another access-control layer protects the service. |
 | `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Web UI: when true, `Search All` conversions return to the previous file-list view after queueing |
 | `CHD_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Legacy alias for `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` |
 | `CHD_TEMP_DIR` | `/config/temp` | Temporary working directory for archive extraction (auto-created) |
@@ -237,6 +240,6 @@ For production guidance, security notes, and checklists, see **[DEPLOYMENT.md](D
 Key recommendations:
 - Enable resource limits
 - Set up HTTPS if exposing externally
-- Consider adding authentication
+- Keep built-in auth enabled, and optionally add proxy authentication
 - Monitor disk space and resource usage
 - Regular backups of converted files

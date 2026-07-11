@@ -5,6 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from auth import ensure_auth_token, require_auth_middleware
 from config import settings
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -236,6 +237,11 @@ async def lifespan(app: FastAPI):
     explicit_volumes = [v.strip() for v in str(settings.chd_volumes).split(",") if v.strip()]
     discovered_volumes = [] if explicit_volumes else settings.scan_data_mounts_on_startup()
     logger.info(f"Compressatorium v{get_version()} starting...")
+    auth_token = ensure_auth_token()
+    if settings.disable_auth:
+        logger.warning("Web UI authentication is disabled by configuration")
+    elif auth_token:
+        logger.info("Web UI authentication enabled for user %s", settings.auth_username)
     logger.info(
         "Runtime limits pid=%s max_concurrent_jobs=%s max_job_history=%s lock_dir=%s",
         os.getpid(),
@@ -317,6 +323,11 @@ app = FastAPI(
     version=get_version(),
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def require_auth(request, call_next):
+    return await require_auth_middleware(request, call_next)
+
 
 # Include routers
 app.include_router(files.router, prefix="/api", tags=["files"])
