@@ -511,9 +511,11 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
   advisory check — `supports_delete_on_verify=False`, so a curated source folder
   is never auto-deleted. Before queuing the native packer, `plan_job` also walks
   the whole source tree with `utils.path_utils.is_safe_directory_tree`: the root
-  is `lstat`ed (after `os.path.normpath` collapses trailing separators and `.`
-  components, so a symlinked root cannot hide behind a trailing `/`, `/.`, or
-  `/./`) and confined to a configured volume, then every
+  is `lstat`ed after stripping only trailing separators and `.` components
+  (interior `..`/symlinked ancestors are left intact, so the kernel resolves
+  them and `lstat` reports the true final entry — a symlinked root cannot hide
+  behind a trailing `/`, `/.`, `/./`, or a `..`-cancelled symlinked ancestor)
+  and confined to a configured volume, then every
   entry is `lstat`ed and any symlink or non-regular entry is rejected. Because
   `os.walk(followlinks=False)` never descends through a link, the surviving
   entries are all genuine children of the confined root — no per-entry resolve

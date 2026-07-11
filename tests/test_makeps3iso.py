@@ -221,6 +221,62 @@ async def test_plan_job_rejects_symlinked_ps3_root_with_dot_component(
     assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("/vol/link", "/vol/link"),
+        ("/vol/link/", "/vol/link"),
+        ("/vol/link/.", "/vol/link"),
+        ("/vol/link/./", "/vol/link"),
+        ("/vol/link///", "/vol/link"),
+        ("/", "/"),
+        (".", "."),
+        # Interior ".." and symlinked ancestors must survive untouched so lstat
+        # resolves them the way the kernel does.
+        ("/vol/anchor/../link", "/vol/anchor/../link"),
+        ("/vol/game/subdir/..", "/vol/game/subdir/.."),
+    ],
+)
+def test_strip_trailing_dot_and_seps(raw, expected):
+    from app.utils.path_utils import _strip_trailing_dot_and_seps
+
+    assert _strip_trailing_dot_and_seps(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_plan_job_rejects_symlinked_root_behind_dotdot_cancelled_ancestor(
+    tmp_path, monkeypatch,
+):
+    # A symlinked root reached through a ".."-cancelled symlinked ancestor must
+    # still be rejected. Submitting "<volume>/anchor/../LinkGame" (anchor is a
+    # symlink) lexically normalizes to "<volume>/LinkGame" — a benign decoy dir —
+    # but the kernel resolves ".." *after* following anchor, so the real final
+    # component is a symlink. The pre-resolve lstat must probe the un-normalized
+    # path so S_ISLNK catches it, rather than lstat'ing the lexical decoy.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_folder = _make_ps3_folder(volume / "RealGame")
+    outside = tmp_path / "outside"
+    (outside / "x").mkdir(parents=True)
+    (volume / "anchor").symlink_to(outside / "x", target_is_directory=True)
+    (outside / "LinkGame").symlink_to(real_folder, target_is_directory=True)
+    # Decoy: the path that lexical normalization ("anchor/.." cancels) would hit,
+    # existing as a plain directory so an lstat on it would wrongly pass.
+    (volume / "LinkGame").mkdir()
+
+    submitted = str(volume / "anchor") + os.sep + ".." + os.sep + "LinkGame"
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            submitted,
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
 @pytest.mark.asyncio
 async def test_plan_job_rejects_ps3_dir_with_symlinked_directory(tmp_path, monkeypatch):
     _confine_to_volume(monkeypatch, tmp_path / "volume")

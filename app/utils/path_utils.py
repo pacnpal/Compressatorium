@@ -76,6 +76,33 @@ def is_within_configured_volumes(path: str, *, treat_archives: bool = True) -> b
     return False
 
 
+def _strip_trailing_dot_and_seps(path: str) -> str:
+    """Strip only *trailing* separators and ``.`` components from ``path``.
+
+    Used to find the submitted root entry to ``lstat`` before resolution. Unlike
+    :func:`os.path.normpath`, interior ``..`` and symlinked components are left
+    intact: normalizing ``/vol/anchor/../LinkGame`` to ``/vol/LinkGame`` would
+    lexically cancel a symlinked ``anchor`` against the following ``..``, so a
+    pre-resolve ``lstat`` would probe a benign lexical path instead of the real
+    final component the kernel reaches (``/outside/LinkGame``). Keeping the
+    interior intact lets ``lstat`` resolve the ancestors exactly as the kernel
+    does and report the true final entry (catching a symlinked root), while the
+    trailing ``/`` / ``/.`` / ``/./`` are removed so the probe lands on that
+    entry itself rather than following it.
+    """
+    seps = os.sep + (os.altsep or "")
+    drive, tail = os.path.splitdrive(path)
+    prev = None
+    while tail != prev:
+        prev = tail
+        tail = tail.rstrip(seps)
+        # Drop a standalone trailing "." component (".", ".../.") — but never the
+        # "." inside a ".." component, which stays meaningful.
+        if tail.endswith(".") and (len(tail) == 1 or tail[-2] in seps):
+            tail = tail[:-1]
+    return (drive + tail) or path
+
+
 def is_safe_directory_tree(path: str) -> bool:
     """Return whether a directory tree is safe for native recursive readers.
 
@@ -88,12 +115,11 @@ def is_safe_directory_tree(path: str) -> bool:
     # makes ``os.path.islink``/``os.lstat`` follow the link to its target, so a
     # request like ``/volume/LinkGame/`` would otherwise resolve the symlink
     # away and hand the native packer a root pointing outside the configured
-    # volume. ``os.path.normpath`` collapses those trailing components (and any
-    # duplicate separators) purely lexically — without following symlinks — so
-    # the ``lstat`` sees the submitted root itself. It also preserves a drive
-    # root (``"C:\\"`` stays ``"C:\\"`` and never collapses to ``"C:"``, which
-    # would target the current directory on that drive).
-    raw_root = os.path.normpath(path) if path else path
+    # volume. Strip only those trailing components (see the helper) and ``lstat``
+    # the resulting root: the kernel resolves any symlinked ancestors while
+    # ``lstat`` reports the final entry without following it, so a symlinked
+    # root is caught even behind a "." or a ".."-cancelled symlinked ancestor.
+    raw_root = _strip_trailing_dot_and_seps(path)
     try:
         raw_lstat = os.lstat(raw_root)
     except OSError:
