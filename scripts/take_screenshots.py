@@ -49,6 +49,7 @@ def build_command(shot: dict, timeout: int) -> list[str]:
 
 
 def main() -> int:
+    """Parse arguments, capture every shot in ``config``, and return an exit code."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, help="Path to shots.yml")
     parser.add_argument(
@@ -70,8 +71,11 @@ def main() -> int:
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         print(f"[{index}/{len(shots)}] {output}", flush=True)
         try:
-            # argv is a fixed list from shots.yml, never shell-interpreted
-            result = subprocess.run(build_command(shot, args.timeout), check=False)  # nosec B603
+            # argv is a fixed list built from the trusted shots.yml, shell=False;
+            # not attacker-controlled. Silence the subprocess SAST false positives.
+            result = subprocess.run(  # nosec B603  # nosemgrep
+                build_command(shot, args.timeout), check=False
+            )
         except FileNotFoundError:
             print(
                 "error: 'shot-scraper' not found on PATH. Install it with "
@@ -79,6 +83,10 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 127
+        except ValueError as exc:
+            failures.append(output)
+            print(f"  !! invalid shot: {exc}", file=sys.stderr, flush=True)
+            continue
         if result.returncode != 0:
             failures.append(output)
             print(f"  !! failed ({result.returncode}): {output}", file=sys.stderr, flush=True)

@@ -10,19 +10,25 @@
 # Theme control: the UI stores its light/dark preference in the
 # `theme-preference` localStorage key (mode-watcher). Setting the key and
 # dispatching a `storage` event flips the theme reactively before capture, so
-# each surface is shot as a light / dark pair. See _dark / _light snippets below.
+# each surface is shot as a light / dark pair. Theme-only shots share the JS via
+# the &js_theme_light / &js_theme_dark YAML anchors defined below (anchors expand
+# at parse time, so both PyYAML and `shot-scraper multi` see the full script);
+# the batch / Dolphin / 3DS shots keep inline JS because they append interaction
+# steps after the theme flip.
 #
-# The server is expected on http://127.0.0.1:8099 (see the workflow). Views are
-# addressed through the app's hash router: #/workspace/<tool>, #/dashboard,
-# #/dat, #/help.
+# Each URL carries a unique `?s=` query so every shot is a full page load rather
+# than a same-document hash change (the app is a hash-router SPA). The server is
+# expected on http://127.0.0.1:8099 (see the workflow). Views are addressed
+# through the hash router: #/workspace/<tool>, #/dashboard, #/dat, #/help.
 
 # --- Workspace: CHDMAN (default tool, Arcade CHD volume) -------------------
+# These two shots also define the shared theme-flip anchors.
 - url: http://127.0.0.1:8099/?s=workspace-chdman-light#/workspace/chdman
   output: docs/screenshots/workspace-chdman-light.png
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
+  javascript: &js_theme_light |
     (async () => {
       localStorage.setItem('theme-preference', 'light');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
@@ -33,7 +39,7 @@
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
+  javascript: &js_theme_dark |
     (async () => {
       localStorage.setItem('theme-preference', 'dark');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
@@ -136,23 +142,13 @@
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=dashboard-dark#/dashboard
   output: docs/screenshots/dashboard-dark.png
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'dark');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_dark
 
 # --- DAT Library ----------------------------------------------------------
 - url: http://127.0.0.1:8099/?s=dat-light#/dat
@@ -160,23 +156,13 @@
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=dat-dark#/dat
   output: docs/screenshots/dat-dark.png
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'dark');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_dark
 
 # --- Help -----------------------------------------------------------------
 - url: http://127.0.0.1:8099/?s=help-light#/help
@@ -184,23 +170,13 @@
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=help-dark#/help
   output: docs/screenshots/help-dark.png
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'dark');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_dark
 
 # --- Responsive layouts (workspace at desktop / tablet / mobile widths) ----
 - url: http://127.0.0.1:8099/?s=docs-desktop-view#/workspace/chdman
@@ -208,31 +184,16 @@
   width: 1280
   height: 900
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=docs-tablet-view#/workspace/chdman
   output: docs/screenshots/docs-tablet-view.png
   width: 768
   height: 1024
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=docs-mobile-view#/workspace/chdman
   output: docs/screenshots/docs-mobile-view.png
   width: 375
   height: 812
   wait: 1800
-  javascript: |
-    (async () => {
-      localStorage.setItem('theme-preference', 'light');
-      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
-      await new Promise(r => setTimeout(r, 500));
-    })()
+  javascript: *js_theme_light
