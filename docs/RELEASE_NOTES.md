@@ -5,6 +5,14 @@
 Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
 and #179, part of the #177 tech-debt epic).
 
+### Fixed
+
+- **PS3 ISO duplicate preflight no longer scans the whole output directory per
+  candidate.** Split-output detection now probes the contiguous `.iso.0`,
+  `.iso.1`, … sequence directly instead of enumerating every sibling, so
+  `/api/jobs/check-duplicates` stays lightweight for nonexistent folder-to-ISO
+  candidates while preserving split-set collision checks.
+
 ### Changed
 
 - **Deterministic ordering across the registry, search, and runner (issue

@@ -263,8 +263,9 @@ class BaseTool:
         return None
 
     # Default: suffix-swap off output_path for each ModeSpec.companion_exts
-    # (extractcd .cue -> .bin). makeps3iso overrides with its disk-probed split
-    # parts; modes with no companion_exts return [].
+    # (extractcd .cue -> .bin). makeps3iso overrides with its disk-probed
+    # contiguous split parts using direct .0/.1/... probes rather than sibling
+    # directory scans; modes with no companion_exts return [].
     def companion_outputs(self, output_path, mode) -> list[str]:
         return [str(Path(output_path).with_suffix(e)) for e in self.spec(mode).companion_exts]
 
