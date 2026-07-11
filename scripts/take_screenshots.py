@@ -71,11 +71,10 @@ def main() -> int:
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         print(f"[{index}/{len(shots)}] {output}", flush=True)
         try:
-            # argv is a fixed list built from the trusted shots.yml, shell=False;
-            # not attacker-controlled. Silence the subprocess SAST false positives.
-            result = subprocess.run(  # nosec B603  # nosemgrep
-                build_command(shot, args.timeout), check=False
-            )
+            # cmd is a fixed argv list built from the trusted shots.yml and run with
+            # shell=False, so the subprocess SAST warnings are false positives.
+            cmd = build_command(shot, args.timeout)
+            result = subprocess.run(cmd, check=False)  # nosec B603  # nosemgrep
         except FileNotFoundError:
             print(
                 "error: 'shot-scraper' not found on PATH. Install it with "
