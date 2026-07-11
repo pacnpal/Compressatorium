@@ -316,9 +316,12 @@ async def test_plan_job_rejects_non_ps3_dir(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_plan_job_rejects_output_inside_source(tmp_path):
+async def test_plan_job_rejects_output_inside_source(tmp_path, monkeypatch):
     # An output_dir inside the source folder would make makeps3iso pack its own
-    # in-progress ISO and corrupt the image — must be rejected.
+    # in-progress ISO and corrupt the image — must be rejected. Confine the
+    # source to a configured volume so the (safe) tree passes is_safe_directory_tree
+    # and the output-inside-source guard is the one that fires.
+    _confine_to_volume(monkeypatch, tmp_path)
     folder = _make_ps3_folder(tmp_path / "MyGame")
     with pytest.raises(convert_routes.SkipFile) as exc:
         await convert_routes.plan_job(
@@ -330,6 +333,40 @@ async def test_plan_job_rejects_output_inside_source(tmp_path):
             delete_on_verify=False,
         )
     assert exc.value.reason is convert_routes.SkipReason.PS3_OUTPUT_INSIDE_SOURCE
+
+
+@pytest.mark.asyncio
+async def test_plan_job_skip_conflict_short_circuits_before_safety_walk(
+    tmp_path, monkeypatch,
+):
+    # A SKIP request whose output already exists must short-circuit with
+    # OUTPUT_EXISTS *without* running the recursive PS3 safety walk — otherwise a
+    # batch skip over a large already-converted library stats every tree for
+    # nothing. The worker still revalidates the tree for jobs that actually run.
+    _confine_to_volume(monkeypatch, tmp_path)
+    folder = _make_ps3_folder(tmp_path / "MyGame")
+    (tmp_path / "MyGame.iso").write_bytes(b"iso")  # existing sibling output
+
+    walked = False
+
+    def _tracking_walk(path):
+        nonlocal walked
+        walked = True
+        return True
+
+    monkeypatch.setattr(convert_routes, "is_safe_directory_tree", _tracking_walk)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(folder),
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.OUTPUT_EXISTS
+    assert walked is False
 
 
 @pytest.mark.asyncio

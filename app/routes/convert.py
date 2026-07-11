@@ -459,8 +459,6 @@ async def _plan_directory_job(
     )
     if not accepts:
         raise SkipFile(SkipReason.PS3_FOLDER_INVALID)
-    if not await run_in_threadpool(is_safe_directory_tree, file_path):
-        raise SkipFile(SkipReason.PS3_FOLDER_UNSAFE)
 
     normalized = os.path.normpath(file_path)
     display_filename = os.path.basename(normalized)
@@ -509,6 +507,15 @@ async def _plan_directory_job(
             output_path = await run_in_threadpool(
                 get_unique_output_path, output_path, mode,
             )
+
+    # Recursive PS3 safety walk, deferred until the job is known to actually run.
+    # Skip/locked collisions above short-circuit first, so a batch SKIP over an
+    # already-converted large PS3 library isn't forced to stat every entry only
+    # to skip with OUTPUT_EXISTS. Jobs that will queue are still validated here,
+    # and `_process_job` revalidates the exact tree again after acquiring the
+    # directory lock, immediately before makeps3iso runs.
+    if not await run_in_threadpool(is_safe_directory_tree, file_path):
+        raise SkipFile(SkipReason.PS3_FOLDER_UNSAFE)
 
     allow_overwrite = (
         duplicate_action == DuplicateAction.OVERWRITE and output_exists
