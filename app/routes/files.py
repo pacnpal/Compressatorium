@@ -36,6 +36,8 @@ logger = get_logger("files")
 # hydrates the visible page, so this is a safety ceiling, not the normal size.
 MAX_ARCHIVE_SUMMARY_PATHS = 1000
 ACTION_CONFIRM_HEADER = "x-chd-action-confirm"
+CONFIRM_RENAME_FILE = "rename-file"
+CONFIRM_DELETE_FILE = "delete-file"
 CONFIRM_RECURSIVE_DELETE = "recursive-delete"
 
 
@@ -742,12 +744,24 @@ async def list_archive(
     }
 
 
+def _require_action_confirmation(request: Request, expected: str, action: str) -> None:
+    confirmation = request.headers.get(ACTION_CONFIRM_HEADER, "")
+    if confirmation != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing confirmation header for {action}",
+        )
+
+
 @router.post("/files/rename")
 async def rename_file(
+    request: Request,
     path: str = Query(..., description="Path to file or directory to rename"),
     new_name: str = Query(..., description="New name for the file or directory"),
 ) -> dict:
     """Rename a file or directory."""
+    _require_action_confirmation(request, CONFIRM_RENAME_FILE, "rename action")
+
     # is_within_configured_volumes uses os.path.realpath which hits disk
     if not await run_in_threadpool(is_within_configured_volumes, path, treat_archives=False):
         raise HTTPException(
@@ -834,6 +848,11 @@ async def delete_file(
     ),
 ) -> dict:
     """Delete a file, an empty directory, or (with ``recursive``) a non-empty one."""
+    if recursive:
+        _require_action_confirmation(request, CONFIRM_RECURSIVE_DELETE, "recursive delete")
+    else:
+        _require_action_confirmation(request, CONFIRM_DELETE_FILE, "delete action")
+
     if not await run_in_threadpool(is_within_configured_volumes, path, treat_archives=False):
         raise HTTPException(
             status_code=403, detail="Access denied: path outside configured volumes",
@@ -863,12 +882,6 @@ async def delete_file(
                     detail="Directory is not empty; confirm recursive delete to remove it",
                 )
             if contents:
-                confirmation = request.headers.get(ACTION_CONFIRM_HEADER, "")
-                if confirmation != CONFIRM_RECURSIVE_DELETE:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Missing confirmation header for recursive delete",
-                    )
                 await run_in_threadpool(shutil.rmtree, path)
             else:
                 await run_in_threadpool(os.rmdir, path)
