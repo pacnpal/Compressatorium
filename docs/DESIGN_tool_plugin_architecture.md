@@ -362,7 +362,10 @@ validate both at planning time and again in `JobManager._process_job` after the
 source subtree lock is acquired, immediately before invoking the tool. The PS3
 `folder_to_iso` path uses `is_safe_directory_tree` for both checks so a queued
 job cannot be made unsafe by adding a symlink, special file, or volume-escaping
-entry after planning but before `makeps3iso` starts.
+entry after planning but before `makeps3iso` starts. The worker runs the
+re-check *before* `_clear_existing_output`, so a safety rejection on an
+overwrite job is non-destructive — the prior output is only cleared once the
+source is confirmed still safe.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
@@ -507,10 +510,14 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
   built ISO (reusing the shared `disc_id.read_iso_file` ISO 9660 reader) as an
   advisory check — `supports_delete_on_verify=False`, so a curated source folder
   is never auto-deleted. Before queuing the native packer, `plan_job` also walks
-  the whole source tree with `utils.path_utils.is_safe_directory_tree`: symlinks
-  and non-regular entries are rejected, and every resolved entry must remain
-  under both the selected source root and a configured volume, so makeps3iso
-  cannot dereference a link and embed files outside the volume boundary.
+  the whole source tree with `utils.path_utils.is_safe_directory_tree`: the root
+  is `lstat`ed (with trailing separators stripped, so a symlinked root cannot
+  hide behind a trailing slash) and confined to a configured volume, then every
+  entry is `lstat`ed and any symlink or non-regular entry is rejected. Because
+  `os.walk(followlinks=False)` never descends through a link, the surviving
+  entries are all genuine children of the confined root — no per-entry resolve
+  is needed — so makeps3iso cannot dereference a link and embed files outside
+  the volume boundary.
 - **Job model.** `ConversionJob.input_kind: InputKind` is threaded end-to-end
   (derived from the mode spec at queue time, serialized to a string only at the
   API/persistence edge). The generic `_process_job` flow already handles a

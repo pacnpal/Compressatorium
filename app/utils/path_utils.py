@@ -80,22 +80,25 @@ def is_safe_directory_tree(path: str) -> bool:
     """Return whether a directory tree is safe for native recursive readers.
 
     Native tools such as makeps3iso recursively read the source tree outside of
-    Python's path guards.  Reject symlinks and non-regular filesystem entries,
-    and require every visited entry to remain within both the source root and a
-    configured volume after resolution.
+    Python's path guards.  Reject symlinks and non-regular filesystem entries so
+    the confined root's real subtree is the only thing the native reader sees.
     """
-    if os.path.islink(path):
+    # Reject a symlinked source root before resolving it. A trailing separator
+    # makes ``os.path.islink``/``os.lstat`` follow the link to its target, so a
+    # request like ``/volume/LinkGame/`` would otherwise resolve the symlink
+    # away and hand the native packer a root pointing outside the configured
+    # volume. Strip trailing separators and ``lstat`` the original path itself.
+    seps = os.sep + (os.altsep or "")
+    raw_root = path.rstrip(seps) or path
+    try:
+        raw_lstat = os.lstat(raw_root)
+    except OSError:
+        return False
+    if stat.S_ISLNK(raw_lstat.st_mode):
         return False
 
     root = _resolve_path(path, strict=True)
     if root is None or not root.is_dir():
-        return False
-
-    try:
-        root_lstat = os.lstat(root)
-    except OSError:
-        return False
-    if stat.S_ISLNK(root_lstat.st_mode):
         return False
 
     root_str = str(root)
@@ -125,16 +128,13 @@ def is_safe_directory_tree(path: str) -> bool:
                 return False
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 return False
-
-            entry_real = _resolve_path(entry, strict=True)
-            if entry_real is None:
-                return False
-            try:
-                entry_real.relative_to(root)
-            except ValueError:
-                return False
-            if not is_within_configured_volumes(str(entry_real), treat_archives=False):
-                return False
+            # No per-entry resolve/volume re-check: ``os.walk(followlinks=False)``
+            # never descends through a symlink, and every symlink or special
+            # entry is rejected above, so each visited entry is a genuine child
+            # of the already volume-confined ``root``. Resolving and
+            # re-verifying containment for every file would add tens of
+            # thousands of redundant syscalls on a large PS3 tree while proving
+            # something the traversal already guarantees.
 
     return not walk_errors
 
