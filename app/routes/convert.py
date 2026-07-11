@@ -162,6 +162,24 @@ def _is_same_path(path_a: str, path_b: str) -> bool:
         return False
 
 
+def _numbered_output_siblings(output_path: str) -> list[str]:
+    """Existing ``output_path.<digits>`` siblings that a split build may occupy."""
+    siblings: list[str] = []
+    directory = os.path.dirname(output_path) or "."
+    basename = os.path.basename(output_path)
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if (
+                    entry.is_file()
+                    and re.fullmatch(re.escape(basename) + r"\.\d+", entry.name)
+                ):
+                    siblings.append(entry.path)
+    except OSError:
+        pass
+    return siblings
+
+
 def get_disallowed_archive_paths(file_paths: list[str]) -> set[str]:
     """Get archive paths that should not allow delete-on-verify due to multiple selections."""
     archive_counts = {}
@@ -214,6 +232,11 @@ def check_output_conflicts(mode: str, output_path: str) -> tuple:
         c_exists, c_locked = lock_manager.check_file_status(companion)
         exists = exists or c_exists or c_locked
         locked = locked or c_locked
+    if mode == "folder_to_iso":
+        for sibling in _numbered_output_siblings(output_path):
+            s_exists, s_locked = lock_manager.check_file_status(sibling)
+            exists = exists or s_exists or s_locked
+            locked = locked or s_locked
     return exists, locked
 
 

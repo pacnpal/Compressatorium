@@ -564,6 +564,28 @@ async def test_plan_job_rejects_existing_split_set(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plan_job_rejects_existing_numbered_split_sibling(
+    tmp_path, monkeypatch,
+):
+    _confine_to_volume(monkeypatch, tmp_path)
+    _make_ps3_folder(tmp_path / "MyGame")
+    # A numbered sibling can become part of a future contiguous split set after
+    # makeps3iso creates the preceding parts, so it must block the output name
+    # even when .0 does not exist yet.
+    (tmp_path / "MyGame.iso.1").write_bytes(b"unrelated")
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(tmp_path / "MyGame"),
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.OUTPUT_EXISTS
+
+
+@pytest.mark.asyncio
 async def test_plan_job_rename_steps_past_split_set(tmp_path, monkeypatch):
     _confine_to_volume(monkeypatch, tmp_path)
     _make_ps3_folder(tmp_path / "MyGame")
@@ -577,6 +599,25 @@ async def test_plan_job_rename_steps_past_split_set(tmp_path, monkeypatch):
         delete_on_verify=False,
     )
     # RENAME bumps past the occupied split set to a free name.
+    assert plan.output_path == str(tmp_path / "MyGame_1.iso")
+
+
+@pytest.mark.asyncio
+async def test_plan_job_rename_steps_past_numbered_split_sibling(
+    tmp_path, monkeypatch,
+):
+    _confine_to_volume(monkeypatch, tmp_path)
+    _make_ps3_folder(tmp_path / "MyGame")
+    (tmp_path / "MyGame.iso.1").write_bytes(b"unrelated")
+    plan = await convert_routes.plan_job(
+        str(tmp_path / "MyGame"),
+        spec=registry.spec("folder_to_iso"),
+        mode="folder_to_iso",
+        output_dir=None,
+        duplicate_action=convert_routes.DuplicateAction.RENAME,
+        delete_on_verify=False,
+    )
+    # RENAME must avoid any numbered sibling, not just a contiguous set from .0.
     assert plan.output_path == str(tmp_path / "MyGame_1.iso")
 
 
@@ -823,6 +864,16 @@ def test_check_output_conflicts_split_aware(tmp_path):
     exists, _ = convert_routes.check_output_conflicts("folder_to_iso", out)
     assert exists is True
     # A non-directory mode ignores the .0 probe (no plain file present).
+    exists_other, _ = convert_routes.check_output_conflicts("createcd", out)
+    assert exists_other is False
+
+
+def test_check_output_conflicts_detects_any_numbered_split_sibling(tmp_path):
+    out = str(tmp_path / "Game.iso")
+    Path(out + ".2").write_bytes(b"unrelated")
+    exists, _ = convert_routes.check_output_conflicts("folder_to_iso", out)
+    assert exists is True
+
     exists_other, _ = convert_routes.check_output_conflicts("createcd", out)
     assert exists_other is False
 
