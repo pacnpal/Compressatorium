@@ -7,6 +7,7 @@ search directory annotation, the service convert (mocked subprocess), and the
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -160,6 +161,113 @@ async def test_plan_job_rejects_ps3_dir_with_symlinked_file(tmp_path, monkeypatc
     with pytest.raises(convert_routes.SkipFile) as exc:
         await convert_routes.plan_job(
             str(folder),
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.asyncio
+async def test_plan_job_rejects_symlinked_ps3_root_with_trailing_slash(tmp_path, monkeypatch):
+    # A symlinked source root must be rejected even with a trailing separator: a
+    # trailing slash makes os.path.islink/os.lstat follow the link, so
+    # is_safe_directory_tree must lstat the trailing-slash-stripped path to keep
+    # a request like "/volume/LinkGame/" from handing makeps3iso a symlinked root.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_folder = _make_ps3_folder(volume / "MyGame")
+    link_root = volume / "LinkGame"
+    link_root.symlink_to(real_folder, target_is_directory=True)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(link_root) + os.sep,
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", [os.sep + ".", os.sep + "." + os.sep])
+async def test_plan_job_rejects_symlinked_ps3_root_with_dot_component(
+    tmp_path, monkeypatch, suffix,
+):
+    # A symlinked source root must be rejected even when hidden behind a trailing
+    # "." or "./" component: those make os.lstat follow the link, so
+    # is_safe_directory_tree must normalize them away before the pre-resolve lstat
+    # to keep "/vol/link/." from handing makeps3iso a symlinked root.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_folder = _make_ps3_folder(volume / "MyGame")
+    link_root = volume / "LinkGame"
+    link_root.symlink_to(real_folder, target_is_directory=True)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(link_root) + suffix,
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("/vol/link", "/vol/link"),
+        ("/vol/link/", "/vol/link"),
+        ("/vol/link/.", "/vol/link"),
+        ("/vol/link/./", "/vol/link"),
+        ("/vol/link///", "/vol/link"),
+        ("/", "/"),
+        (".", "."),
+        # Interior ".." and symlinked ancestors must survive untouched so lstat
+        # resolves them the way the kernel does.
+        ("/vol/anchor/../link", "/vol/anchor/../link"),
+        ("/vol/game/subdir/..", "/vol/game/subdir/.."),
+    ],
+)
+def test_strip_trailing_dot_and_seps(raw, expected):
+    from app.utils.path_utils import _strip_trailing_dot_and_seps
+
+    assert _strip_trailing_dot_and_seps(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_plan_job_rejects_symlinked_root_behind_dotdot_cancelled_ancestor(
+    tmp_path, monkeypatch,
+):
+    # A symlinked root reached through a ".."-cancelled symlinked ancestor must
+    # still be rejected. Submitting "<volume>/anchor/../LinkGame" (anchor is a
+    # symlink) lexically normalizes to "<volume>/LinkGame" — a benign decoy dir —
+    # but the kernel resolves ".." *after* following anchor, so the real final
+    # component is a symlink. The pre-resolve lstat must probe the un-normalized
+    # path so S_ISLNK catches it, rather than lstat'ing the lexical decoy.
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    real_folder = _make_ps3_folder(volume / "RealGame")
+    outside = tmp_path / "outside"
+    (outside / "x").mkdir(parents=True)
+    (volume / "anchor").symlink_to(outside / "x", target_is_directory=True)
+    (outside / "LinkGame").symlink_to(real_folder, target_is_directory=True)
+    # Decoy: the path that lexical normalization ("anchor/.." cancels) would hit,
+    # existing as a plain directory so an lstat on it would wrongly pass.
+    (volume / "LinkGame").mkdir()
+
+    submitted = str(volume / "anchor") + os.sep + ".." + os.sep + "LinkGame"
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            submitted,
             spec=registry.spec("folder_to_iso"),
             mode="folder_to_iso",
             output_dir=None,
@@ -879,6 +987,77 @@ async def test_process_job_revalidates_ps3_tree_after_dir_lock(tmp_path, monkeyp
         _, output_locked = lock_manager.check_file_status(out)
         assert output_locked is False
         assert lock_manager.dir_lock_would_conflict(str(folder_path)) is False
+    finally:
+        lock_manager.release_lock(out)
+        lock_manager.release_dir_lock(str(folder_path))
+        concurrency_manager.release(job.id)
+        job_manager.jobs.pop(job.id, None)
+        job_manager._cancel_events.pop(job.id, None)
+        job_manager._cancelled.discard(job.id)
+
+
+@pytest.mark.asyncio
+async def test_process_job_revalidation_is_non_destructive_on_overwrite(tmp_path, monkeypatch):
+    # An overwrite folder_to_iso job whose source turned unsafe after planning
+    # must fail *without* deleting the user's prior output: the revalidation
+    # runs before _clear_existing_output, so the existing ISO is preserved.
+    from app.services import job_manager as job_manager_module
+    from app.services.job_manager import job_manager
+    from services.concurrency_manager import concurrency_manager
+    from services.lock_manager import lock_manager
+
+    folder_path = _make_ps3_folder(tmp_path / "volume" / "MyGame")
+    out = str(tmp_path / "volume" / "MyGame.iso")
+    # A prior output already exists — an overwrite job would normally clear it.
+    with open(out, "wb") as prior:
+        prior.write(b"previous-iso-contents")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (folder_path / "PS3_GAME" / "LEAK.TXT").symlink_to(outside)
+
+    monkeypatch.setattr(
+        job_manager_module.is_safe_directory_tree.__globals__["settings"],
+        "chd_volumes",
+        str(tmp_path / "volume"),
+    )
+    monkeypatch.setattr(
+        job_manager_module.is_safe_directory_tree.__globals__["settings"],
+        "data_mount_root",
+        str(tmp_path / "volume"),
+    )
+
+    called = False
+
+    async def fake_convert(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        yield {"progress": 100, "message": "should not run"}
+
+    monkeypatch.setattr(
+        job_manager_module.registry.for_mode("folder_to_iso"), "convert", fake_convert,
+    )
+
+    job = ConversionJob(
+        id="ps3unsafe2",
+        file_path=str(folder_path),
+        filename="MyGame",
+        mode=ConversionMode.FOLDER_TO_ISO,
+        status=JobStatus.QUEUED,
+        created_at=datetime.now(timezone.utc),
+        output_path=out,
+        input_kind=InputKind.DIRECTORY,
+        allow_overwrite=True,
+    )
+    job_manager.jobs[job.id] = job
+    try:
+        await job_manager._process_job(job.id)
+        assert job.status == JobStatus.FAILED
+        assert "PS3 folder contains symlinks" in (job.error_message or "")
+        assert called is False
+        # The prior output must be untouched — rejection is non-destructive.
+        assert os.path.exists(out)
+        with open(out, "rb") as saved:
+            assert saved.read() == b"previous-iso-contents"
     finally:
         lock_manager.release_lock(out)
         lock_manager.release_dir_lock(str(folder_path))

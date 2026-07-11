@@ -76,26 +76,59 @@ def is_within_configured_volumes(path: str, *, treat_archives: bool = True) -> b
     return False
 
 
+def _strip_trailing_dot_and_seps(path: str) -> str:
+    """Strip only *trailing* separators and ``.`` components from ``path``.
+
+    Used to find the submitted root entry to ``lstat`` before resolution. Unlike
+    :func:`os.path.normpath`, interior ``..`` and symlinked components are left
+    intact: normalizing ``/vol/anchor/../LinkGame`` to ``/vol/LinkGame`` would
+    lexically cancel a symlinked ``anchor`` against the following ``..``, so a
+    pre-resolve ``lstat`` would probe a benign lexical path instead of the real
+    final component the kernel reaches (``/outside/LinkGame``). Keeping the
+    interior intact lets ``lstat`` resolve the ancestors exactly as the kernel
+    does and report the true final entry (catching a symlinked root), while the
+    trailing ``/`` / ``/.`` / ``/./`` are removed so the probe lands on that
+    entry itself rather than following it.
+    """
+    seps = os.sep + (os.altsep or "")
+    drive, tail = os.path.splitdrive(path)
+    prev = None
+    while tail != prev:
+        prev = tail
+        tail = tail.rstrip(seps)
+        # Drop a standalone trailing "." component (".", ".../.") — but never the
+        # "." inside a ".." component, which stays meaningful.
+        if tail.endswith(".") and (len(tail) == 1 or tail[-2] in seps):
+            tail = tail[:-1]
+    return (drive + tail) or path
+
+
 def is_safe_directory_tree(path: str) -> bool:
     """Return whether a directory tree is safe for native recursive readers.
 
     Native tools such as makeps3iso recursively read the source tree outside of
-    Python's path guards.  Reject symlinks and non-regular filesystem entries,
-    and require every visited entry to remain within both the source root and a
-    configured volume after resolution.
+    Python's path guards.  Reject symlinks and non-regular filesystem entries so
+    the confined root's real subtree is the only thing the native reader sees.
     """
-    if os.path.islink(path):
+    # Reject a symlinked source root before resolving it. A trailing separator
+    # or "." component (".../LinkGame/", ".../LinkGame/.", ".../LinkGame/./")
+    # makes ``os.path.islink``/``os.lstat`` follow the link to its target, so a
+    # request like ``/volume/LinkGame/`` would otherwise resolve the symlink
+    # away and hand the native packer a root pointing outside the configured
+    # volume. Strip only those trailing components (see the helper) and ``lstat``
+    # the resulting root: the kernel resolves any symlinked ancestors while
+    # ``lstat`` reports the final entry without following it, so a symlinked
+    # root is caught even behind a "." or a ".."-cancelled symlinked ancestor.
+    raw_root = _strip_trailing_dot_and_seps(path)
+    try:
+        raw_lstat = os.lstat(raw_root)
+    except OSError:
+        return False
+    if stat.S_ISLNK(raw_lstat.st_mode):
         return False
 
     root = _resolve_path(path, strict=True)
     if root is None or not root.is_dir():
-        return False
-
-    try:
-        root_lstat = os.lstat(root)
-    except OSError:
-        return False
-    if stat.S_ISLNK(root_lstat.st_mode):
         return False
 
     root_str = str(root)
@@ -125,16 +158,13 @@ def is_safe_directory_tree(path: str) -> bool:
                 return False
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 return False
-
-            entry_real = _resolve_path(entry, strict=True)
-            if entry_real is None:
-                return False
-            try:
-                entry_real.relative_to(root)
-            except ValueError:
-                return False
-            if not is_within_configured_volumes(str(entry_real), treat_archives=False):
-                return False
+            # No per-entry resolve/volume re-check: ``os.walk(followlinks=False)``
+            # never descends through a symlink, and every symlink or special
+            # entry is rejected above, so each visited entry is a genuine child
+            # of the already volume-confined ``root``. Resolving and
+            # re-verifying containment for every file would add tens of
+            # thousands of redundant syscalls on a large PS3 tree while proving
+            # something the traversal already guarantees.
 
     return not walk_errors
 
