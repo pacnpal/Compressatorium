@@ -18,6 +18,7 @@ export const CONFIRM = Object.freeze({
   CANCEL_ALL_JOBS: 'cancel-all-jobs',
   CLEAR_COMPLETED_JOBS: 'clear-completed-jobs',
   DELETE_ON_VERIFY: 'delete-on-verify',
+  RECURSIVE_DELETE: 'recursive-delete',
 });
 
 /**

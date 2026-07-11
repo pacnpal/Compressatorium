@@ -148,9 +148,10 @@ export const api = {
   deleteFile(path, { recursive = false } = {}) {
     const params = new URLSearchParams({ path });
     if (recursive) params.set('recursive', 'true');
+    const headers = recursive ? { 'X-CHD-Action-Confirm': CONFIRM.RECURSIVE_DELETE } : {};
     return fetchJson(
       buildApiUrl('/files/delete', params),
-      { method: 'DELETE' },
+      { method: 'DELETE', headers },
       'Failed to delete',
     );
   },

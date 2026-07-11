@@ -5,7 +5,7 @@
 # reproducible. apt-get update inside the stages still pulls security patches;
 # bump these digests periodically (docker buildx imagetools inspect <img>).
 #   debian:trixie-slim and node:lts-slim digests captured 2026-06-02.
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS builder
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS builder
 
 # Install build dependencies
 #
@@ -45,7 +45,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
 # reproducibility.
 # DL3008 ignored for the same reason as the z3ds builder (generic build deps).
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS maxcso-builder
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS maxcso-builder
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinned to an immutable maxcso commit so release images are reproducible
 # (the build workflow passes only APP_VERSION). This is master @ 2024-01-26,
@@ -88,7 +88,7 @@ RUN make && \
 # PARAM.SFO readback, so extractps3iso (round-trip) isn't needed.
 # DL3008 ignored for the same reason as the other builders (generic build deps).
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS makeps3iso-builder
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS makeps3iso-builder
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinned to an immutable commit so release images are reproducible. master @
 # 2022-03-09 (latest upstream; last tagged release predates it). Override with
@@ -120,7 +120,7 @@ RUN make -C makeps3iso && \
 # node:lts-slim ships linux/amd64 and linux/arm64 manifests, and the SPA
 # has no native dependencies so QEMU emulation under buildx works.
 # ---------------------------------------------------------------------------
-FROM node:lts-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203 AS frontend-builder
+FROM node:lts-slim@sha256:b31e7a42fdf8b8aa5f5ed477c72d694301273f1069c5a2f71d53c6482e99a2fc AS frontend-builder
 WORKDIR /build
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -130,7 +130,7 @@ ARG APP_VERSION=dev
 ENV VITE_APP_VERSION=${APP_VERSION}
 RUN npm run build
 
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
 
 # ---------------------------------------------------------------------------
 # Immutable pin: mame-tools 0.285+dfsg1-1 from snapshot.debian.org

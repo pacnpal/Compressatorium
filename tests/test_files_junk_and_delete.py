@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import Headers
 
 from app.routes import files as files_routes
 from app.utils.junk import is_junk_entry, is_junk_path
+
+
+def _request(headers: dict[str, str] | None = None):
+    return SimpleNamespace(headers=Headers(headers or {}))
 
 
 @pytest.fixture(name="vol")
@@ -68,21 +74,66 @@ async def test_delete_nonempty_dir_requires_recursive(vol: Path):
     # recursive=False is what HTTP resolves when the param is absent; pass it
     # explicitly here since a direct call leaves Query(...) defaults unresolved.
     with pytest.raises(HTTPException) as exc:
-        await files_routes.delete_file(path=str(d), recursive=False)
+        await files_routes.delete_file(_request(), path=str(d), recursive=False)
     assert exc.value.status_code == 409
     assert "not empty" in exc.value.detail.lower()
     assert d.exists()  # nothing deleted on the refusal
 
-    result = await files_routes.delete_file(path=str(d), recursive=True)
+    with pytest.raises(HTTPException) as exc:
+        await files_routes.delete_file(_request(), path=str(d), recursive=True)
+    assert exc.value.status_code == 400
+    assert "confirmation header" in exc.value.detail.lower()
+    assert d.exists()
+
+    result = await files_routes.delete_file(
+        _request({"x-chd-action-confirm": "recursive-delete"}),
+        path=str(d),
+        recursive=True,
+    )
     assert result["success"] is True
     assert not d.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_configured_volume_root_is_blocked(vol: Path):
+    (vol / "a.txt").write_bytes(b"x")
+
+    with pytest.raises(HTTPException) as exc:
+        await files_routes.delete_file(
+            _request({"x-chd-action-confirm": "recursive-delete"}),
+            path=str(vol),
+            recursive=True,
+        )
+    assert exc.value.status_code == 400
+    assert "volume root" in exc.value.detail.lower()
+    assert vol.exists()
+    assert (vol / "a.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_batch_blocks_configured_volume_root(vol: Path):
+    # An empty configured volume root must not be removable through the batch
+    # endpoint, which deletes empty directories with os.rmdir.
+    for child in vol.iterdir():
+        child.unlink()
+    assert not any(vol.iterdir())
+
+    response = await files_routes.delete_files_batch(
+        files_routes.BulkDeleteRequest(paths=[str(vol)]),
+    )
+    assert response["success"] == 0
+    assert response["failed"] == 1
+    result = response["results"][0]
+    assert result["success"] is False
+    assert "volume root" in result["error"].lower()
+    assert vol.exists()
 
 
 @pytest.mark.asyncio
 async def test_delete_empty_dir_needs_no_recursive(vol: Path):
     d = vol / "empty"
     d.mkdir()
-    result = await files_routes.delete_file(path=str(d), recursive=False)
+    result = await files_routes.delete_file(_request(), path=str(d), recursive=False)
     assert result["success"] is True
     assert not d.exists()
 
@@ -91,6 +142,6 @@ async def test_delete_empty_dir_needs_no_recursive(vol: Path):
 async def test_delete_file(vol: Path):
     f = vol / "x.bin"
     f.write_bytes(b"x")
-    result = await files_routes.delete_file(path=str(f), recursive=False)
+    result = await files_routes.delete_file(_request(), path=str(f), recursive=False)
     assert result["success"] is True
     assert not f.exists()
