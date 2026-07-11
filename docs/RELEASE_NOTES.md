@@ -5,6 +5,19 @@
 Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
 and #179, part of the #177 tech-debt epic).
 
+### Added
+
+- **Automated Web UI screenshots.** The screenshots embedded in the README are
+  now generated with [shot-scraper](https://shot-scraper.datasette.io/) instead
+  of captured by hand. A new **Take screenshots** GitHub Actions workflow builds
+  the UI, boots it against a throwaway fixture library, captures every surface in
+  light and dark (definitions in `shots.yml`), optimises the PNGs with Oxipng,
+  and commits them back to `docs/screenshots/`. It can also be run locally. See
+  [`docs/SCREENSHOTS.md`](SCREENSHOTS.md) for the full setup. The stale,
+  unreferenced `ui.png` / `mobile-*` / `tablet-*` captures were removed in favour
+  of the regenerated `docs-desktop-view` / `docs-tablet-view` / `docs-mobile-view`
+  set.
+
 ### Changed
 
 - **Deterministic ordering across the registry, search, and runner (issue

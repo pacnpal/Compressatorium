@@ -357,6 +357,8 @@ In the Web UI, you can specify a custom output directory for converted CHD, Dolp
 
 The Web UI ships with light and dark themes and is fully responsive from desktop down to phones. Each surface below is shown as a light / dark pair.
 
+> These screenshots are generated automatically. The [Take screenshots](.github/workflows/screenshots.yml) GitHub Actions workflow builds the UI, runs it against a throwaway fixture library, captures each surface with [shot-scraper](https://shot-scraper.datasette.io/) (definitions in [`shots.yml`](shots.yml)), optimises the PNGs with [Oxipng](https://github.com/shssoichiro/oxipng), and commits the results back to `docs/screenshots/`. To refresh them, trigger that workflow (or run it locally — see [`docs/SCREENSHOTS.md`](docs/SCREENSHOTS.md)).
+
 #### Workspace
 
 A three-pane layout: navigation and tool picker on the left, the volume and file browser in the middle, and a live convert panel with the job queue on the right. Selecting a tool refilters the file list and the convert options to match.
