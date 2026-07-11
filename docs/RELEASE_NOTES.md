@@ -20,6 +20,12 @@ and #179, part of the #177 tech-debt epic).
 
 ### Changed
 
+- **Docker Compose Web UI examples now bind to loopback by default.** The
+  published Web UI port is `127.0.0.1:8080:8080` in the single-volume and
+  multi-volume Compose examples, reducing the chance of exposing the
+  unauthenticated local UI on every host network interface. Use a trusted
+  reverse proxy, VPN, or authentication layer before publishing it externally.
+
 - **Deterministic ordering across the registry, search, and runner (issue
   #183).** The `ToolRegistry` extension-union helpers (`convertible_extensions`,
   `archive_input_extensions`, `verify_extensions`, `output_extensions`,
