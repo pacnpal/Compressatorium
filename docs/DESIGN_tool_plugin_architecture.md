@@ -499,7 +499,11 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
   cancel/failure, and runs a light **PARAM.SFO `TITLE_ID` readback** from the
   built ISO (reusing the shared `disc_id.read_iso_file` ISO 9660 reader) as an
   advisory check — `supports_delete_on_verify=False`, so a curated source folder
-  is never auto-deleted.
+  is never auto-deleted. Before queuing the native packer, `plan_job` also walks
+  the whole source tree with `utils.path_utils.is_safe_directory_tree`: symlinks
+  and non-regular entries are rejected, and every resolved entry must remain
+  under both the selected source root and a configured volume, so makeps3iso
+  cannot dereference a link and embed files outside the volume boundary.
 - **Job model.** `ConversionJob.input_kind: InputKind` is threaded end-to-end
   (derived from the mode spec at queue time, serialized to a string only at the
   API/persistence edge). The generic `_process_job` flow already handles a

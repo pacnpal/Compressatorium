@@ -149,6 +149,49 @@ async def test_plan_job_rejects_output_outside_volumes(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plan_job_rejects_ps3_dir_with_symlinked_file(tmp_path, monkeypatch):
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    folder = _make_ps3_folder(volume / "MyGame")
+    (folder / "PS3_GAME" / "LEAK.TXT").symlink_to(outside)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(folder),
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.asyncio
+async def test_plan_job_rejects_ps3_dir_with_symlinked_directory(tmp_path, monkeypatch):
+    _confine_to_volume(monkeypatch, tmp_path / "volume")
+    volume = tmp_path / "volume"
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "secret.txt").write_text("secret", encoding="utf-8")
+    folder = _make_ps3_folder(volume / "MyGame")
+    (folder / "PS3_GAME" / "EXTRA").symlink_to(outside_dir, target_is_directory=True)
+
+    with pytest.raises(convert_routes.SkipFile) as exc:
+        await convert_routes.plan_job(
+            str(folder),
+            spec=registry.spec("folder_to_iso"),
+            mode="folder_to_iso",
+            output_dir=None,
+            duplicate_action=convert_routes.DuplicateAction.SKIP,
+            delete_on_verify=False,
+        )
+    assert exc.value.reason is convert_routes.SkipReason.PS3_FOLDER_UNSAFE
+
+
+@pytest.mark.asyncio
 async def test_plan_job_rejects_non_ps3_dir(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()

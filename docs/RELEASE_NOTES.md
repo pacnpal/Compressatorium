@@ -7,6 +7,11 @@ and #179, part of the #177 tech-debt epic).
 
 ### Changed
 
+- **PS3 folder-to-ISO inputs are now recursively confined to configured volumes.**
+  Directory-input planning rejects symlinks and non-regular filesystem entries
+  before invoking `makeps3iso`, preventing a crafted PS3 folder from causing the
+  native packer to read and embed files outside the configured volume boundary.
+
 - **Deterministic ordering across the registry, search, and runner (issue
   #183).** The `ToolRegistry` extension-union helpers (`convertible_extensions`,
   `archive_input_extensions`, `verify_extensions`, `output_extensions`,

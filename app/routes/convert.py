@@ -27,7 +27,7 @@ from services.lock_manager import lock_manager
 from services.tools import InputKind, ModeKind, registry
 from sse_starlette.sse import EventSourceResponse
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
-from utils.path_utils import is_within_configured_volumes
+from utils.path_utils import is_safe_directory_tree, is_within_configured_volumes
 
 router = APIRouter()
 logger = get_logger()
@@ -306,6 +306,7 @@ class SkipReason(Enum):
     PS3_FOLDER_INVALID = "ps3_folder_invalid"
     PS3_OUTPUT_INSIDE_SOURCE = "ps3_output_inside_source"
     PS3_OUTPUT_OUTSIDE_VOLUMES = "ps3_output_outside_volumes"
+    PS3_FOLDER_UNSAFE = "ps3_folder_unsafe"
 
 
 class SkipFile(Exception):  # noqa: N818 - control-flow signal, not an error
@@ -402,6 +403,10 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
         "Default output .iso would land outside the configured volumes "
         "(the PS3 folder is a volume root); choose an in-volume output directory",
     ),
+    SkipReason.PS3_FOLDER_UNSAFE: (
+        400,
+        "PS3 folder contains symlinks or non-regular entries and cannot be packed safely",
+    ),
 }
 
 
@@ -454,6 +459,8 @@ async def _plan_directory_job(
     )
     if not accepts:
         raise SkipFile(SkipReason.PS3_FOLDER_INVALID)
+    if not await run_in_threadpool(is_safe_directory_tree, file_path):
+        raise SkipFile(SkipReason.PS3_FOLDER_UNSAFE)
 
     normalized = os.path.normpath(file_path)
     display_filename = os.path.basename(normalized)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +74,69 @@ def is_within_configured_volumes(path: str, *, treat_archives: bool = True) -> b
             continue
 
     return False
+
+
+def is_safe_directory_tree(path: str) -> bool:
+    """Return whether a directory tree is safe for native recursive readers.
+
+    Native tools such as makeps3iso recursively read the source tree outside of
+    Python's path guards.  Reject symlinks and non-regular filesystem entries,
+    and require every visited entry to remain within both the source root and a
+    configured volume after resolution.
+    """
+    if os.path.islink(path):
+        return False
+
+    root = _resolve_path(path, strict=True)
+    if root is None or not root.is_dir():
+        return False
+
+    try:
+        root_lstat = os.lstat(root)
+    except OSError:
+        return False
+    if stat.S_ISLNK(root_lstat.st_mode):
+        return False
+
+    root_str = str(root)
+    if not is_within_configured_volumes(root_str, treat_archives=False):
+        return False
+
+    walk_errors: list[OSError] = []
+
+    def _record_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    for current, dirs, files in os.walk(
+        root_str, topdown=True, followlinks=False, onerror=_record_walk_error,
+    ):
+        if walk_errors:
+            return False
+        entries = [*dirs, *files]
+        for name in entries:
+            entry = os.path.join(current, name)
+            try:
+                entry_lstat = os.lstat(entry)
+            except OSError:
+                return False
+
+            mode = entry_lstat.st_mode
+            if stat.S_ISLNK(mode):
+                return False
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                return False
+
+            entry_real = _resolve_path(entry, strict=True)
+            if entry_real is None:
+                return False
+            try:
+                entry_real.relative_to(root)
+            except ValueError:
+                return False
+            if not is_within_configured_volumes(str(entry_real), treat_archives=False):
+                return False
+
+    return not walk_errors
 
 
 def ensure_path_within_volumes(path: str, *, treat_archives: bool = True) -> Path:
