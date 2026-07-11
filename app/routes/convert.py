@@ -555,6 +555,7 @@ async def plan_job(
     output_exists = False
 
     display_filename = None
+    bad_ext_reason = _BAD_EXTENSION_REASON.get(spec.tool_id)
 
     # Handle archive files
     if "::" in file_path:
@@ -566,6 +567,11 @@ async def plan_job(
 
         if not os.path.isfile(archive_path):
             raise SkipFile(SkipReason.ARCHIVE_NOT_FOUND)
+
+        if bad_ext_reason is not None:
+            ext = _input_extension(file_path)
+            if ext not in spec.input_extensions:
+                raise SkipFile(bad_ext_reason)
 
         # Calculate output path before extraction to avoid unnecessary work.
         # Use the extension-preserving flattened name so tools whose output
@@ -609,7 +615,6 @@ async def plan_job(
     # direction is validated against the right set. chdman is handled above by
     # the .chd create/extract checks (it drops .chd from input_extensions). The
     # per-tool skip reason carries the tool-specific message.
-    bad_ext_reason = _BAD_EXTENSION_REASON.get(spec.tool_id)
     if bad_ext_reason is not None:
         ext = _input_extension(file_path)
         if ext not in spec.input_extensions:
