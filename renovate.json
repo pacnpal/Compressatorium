@@ -14,7 +14,7 @@
   "platformAutomerge": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "automerge": true,
+    "automerge": false,
     "schedule": ["* * * * 1"]
   },
   "major": {
@@ -22,32 +22,17 @@
   },
   "packageRules": [
     {
-      "description": "Automerge devDependencies (dev-only tooling; does not ship to production)",
-      "matchDepTypes": ["devDependencies"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
-      "automerge": true
-    },
-    {
-      "description": "Runtime Python deps stay manual: no PR CI runs pytest, so these are not auto-validated. Raised as PRs and tracked on the dashboard.",
+      "description": "Runtime Python deps stay manual: no PR CI runs pytest.",
       "matchManagers": ["pip_requirements", "pip_setup", "pep621"],
-      "addLabels": ["python"],
-      "automerge": false
+      "addLabels": ["python"]
     },
     {
       "description": "Docker base-image updates stay manual: the Dockerfile build/hadolint only run on release, not on PRs.",
       "matchManagers": ["dockerfile", "docker-compose"],
-      "addLabels": ["docker"],
-      "automerge": false
+      "addLabels": ["docker"]
     },
     {
-      "description": "Runtime npm deps stay manual: no PR CI runs the frontend build.",
-      "matchManagers": ["npm"],
-      "matchDepTypes": ["dependencies", "peerDependencies", "optionalDependencies"],
-      "addLabels": ["javascript"],
-      "automerge": false
-    },
-    {
-      "description": "Label all npm updates (devDependencies are automerged by the rule above)",
+      "description": "npm updates stay manual by default: vite/svelte and other build-stack deps feed the release-only Docker frontend build (npm ci + npm run build), which is not run on PRs. Lint/format tooling is automerged by the rule below.",
       "matchManagers": ["npm"],
       "addLabels": ["javascript"]
     },
@@ -59,7 +44,7 @@
       "automerge": true
     },
     {
-      "description": "Automerge lint / formatter tool updates (evaluated last so it wins over the manager rules above for these packages)",
+      "description": "Automerge lint / formatter tooling only. These neither feed the frontend build nor ship at runtime, so a bad update's worst case is a failing lint, not broken shipped code. Evaluated last so it wins over the manager rules above (e.g. ruff in requirements-dev.txt, eslint in devDependencies).",
       "matchPackageNames": [
         "eslint",
         "eslint-plugin-svelte",
