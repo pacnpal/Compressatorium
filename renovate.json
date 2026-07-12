@@ -1,0 +1,73 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "security:minimumReleaseAgeNpm"
+  ],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["* * * * 1"],
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "platformAutomerge": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["* * * * 1"]
+  },
+  "major": {
+    "dependencyDashboardApproval": true
+  },
+  "packageRules": [
+    {
+      "description": "Automerge non-major updates for stable (>=1.0.0) packages once tests pass",
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true
+    },
+    {
+      "description": "Automerge all devDependencies (dev-only, low risk)",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
+      "automerge": true
+    },
+    {
+      "description": "Automerge lint / formatter tool updates",
+      "matchPackageNames": [
+        "eslint",
+        "eslint-plugin-svelte",
+        "svelte-eslint-parser",
+        "@eslint/js",
+        "prettier",
+        "ruff"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Automerge GitHub Actions digest and non-major updates",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "automerge": true,
+      "addLabels": ["github-actions"]
+    },
+    {
+      "description": "Automerge Docker digest and non-major base-image updates",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "automerge": true,
+      "addLabels": ["docker"]
+    },
+    {
+      "description": "Label Python (pip) updates to mirror existing conventions",
+      "matchManagers": ["pip_requirements", "pip_setup", "pep621"],
+      "addLabels": ["python"]
+    },
+    {
+      "description": "Label JavaScript (npm) updates to mirror existing conventions",
+      "matchManagers": ["npm"],
+      "addLabels": ["javascript"]
+    }
+  ]
+}
