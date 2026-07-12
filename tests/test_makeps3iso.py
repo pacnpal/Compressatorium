@@ -1133,6 +1133,70 @@ async def test_process_job_revalidation_is_non_destructive_on_overwrite(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_process_job_honors_cancel_during_safety_walk(tmp_path, monkeypatch):
+    # A cancellation that arrives while the pre-pack safety walk is running must
+    # be honored before _clear_existing_output, so an overwrite job cancelled
+    # mid-walk keeps the user's prior output instead of clearing it and aborting.
+    from app.services import job_manager as job_manager_module
+    from app.services.job_manager import job_manager
+    from services.concurrency_manager import concurrency_manager
+    from services.lock_manager import lock_manager
+
+    folder_path = _make_ps3_folder(tmp_path / "volume" / "MyGame")
+    out = str(tmp_path / "volume" / "MyGame.iso")
+    with open(out, "wb") as prior:
+        prior.write(b"previous-iso-contents")
+
+    called = False
+
+    async def fake_convert(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        yield {"progress": 100, "message": "should not run"}
+
+    monkeypatch.setattr(
+        job_manager_module.registry.for_mode("folder_to_iso"), "convert", fake_convert,
+    )
+
+    # Simulate a cancellation arriving *during* the walk: the patched safety
+    # check sets the job's cancel event, then reports the tree as safe. The
+    # worker must then bail out before clearing the existing output.
+    def cancel_midwalk(_path):
+        job_manager._cancel_events["cancelmidwalk"].set()
+        return True
+
+    monkeypatch.setattr(job_manager_module, "is_safe_directory_tree", cancel_midwalk)
+
+    job = ConversionJob(
+        id="cancelmidwalk",
+        file_path=str(folder_path),
+        filename="MyGame",
+        mode=ConversionMode.FOLDER_TO_ISO,
+        status=JobStatus.QUEUED,
+        created_at=datetime.now(timezone.utc),
+        output_path=out,
+        input_kind=InputKind.DIRECTORY,
+        allow_overwrite=True,
+    )
+    job_manager.jobs[job.id] = job
+    try:
+        await job_manager._process_job(job.id)
+        assert job.status == JobStatus.CANCELLED
+        assert called is False
+        # The prior output survives — cancel is honored before clearing.
+        assert os.path.exists(out)
+        with open(out, "rb") as saved:
+            assert saved.read() == b"previous-iso-contents"
+    finally:
+        lock_manager.release_lock(out)
+        lock_manager.release_dir_lock(str(folder_path))
+        concurrency_manager.release(job.id)
+        job_manager.jobs.pop(job.id, None)
+        job_manager._cancel_events.pop(job.id, None)
+        job_manager._cancelled.discard(job.id)
+
+
+@pytest.mark.asyncio
 async def test_process_job_rejects_directory_output(tmp_path):
     # A directory shadowing the output path (MyGame.iso/) is never a valid
     # makeps3iso target. acquire_lock already rejects it (its ``not isfile``

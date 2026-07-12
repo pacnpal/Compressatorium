@@ -1816,6 +1816,14 @@ class JobManager:
                     )
                     return
 
+            # The recursive PS3 safety walk above can take a while on a large
+            # source tree; honor a cancellation requested during it before
+            # deleting the user's existing output, mirroring the post-extract
+            # cancel check. Otherwise an overwrite job cancelled mid-walk would
+            # still clear the prior ISO/split set only to abort immediately.
+            if cancel_event.is_set():
+                raise ConversionCancelled("Conversion cancelled")
+
             await self._clear_existing_output(job)
 
             _convert_service = registry.for_mode(job.mode.value)

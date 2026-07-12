@@ -365,7 +365,14 @@ job cannot be made unsafe by adding a symlink, special file, or volume-escaping
 entry after planning but before `makeps3iso` starts. The worker runs the
 re-check *before* `_clear_existing_output`, so a safety rejection on an
 overwrite job is non-destructive — the prior output is only cleared once the
-source is confirmed still safe.
+source is confirmed still safe. Because that walk can be slow on a large tree,
+the worker also re-checks the cancel event immediately after it (before
+clearing outputs), so a job cancelled mid-walk keeps its prior output. To keep
+the planning-time walk off the hot rejection paths, `_plan_directory_job` runs
+it only after the output is derived and skip/locked collisions short-circuit,
+and the create/batch routes apply queue-depth backpressure (HTTP 429) *before*
+planning when the queue is already full — so a doomed submit never pays for the
+tree walk.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 

@@ -851,6 +851,18 @@ async def create_job(request: JobCreateRequest):
             detail="Access denied: output directory outside configured volumes",
         )
 
+    # Proactive queue-depth check: reject with 429 *before* planning if the
+    # queue is already at capacity, so a full-queue submit doesn't pay for the
+    # PS3 folder safety walk (which stats the whole source tree) just to be
+    # rejected. Parity with the batch-create path, and surfaces backpressure
+    # even when tests or callers stub out ``job_manager.create_job``.
+    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
+    if 0 < max_depth <= job_manager.get_queue_depth():
+        raise HTTPException(
+            status_code=429,
+            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
+        )
+
     try:
         plan = await plan_job(
             request.file_path,
@@ -868,17 +880,6 @@ async def create_job(request: JobCreateRequest):
             status_code=400,
             detail=f"Delete-on-verify blocked: {exc.message}",
         ) from None
-
-    # Proactive queue-depth check: reject with 429 before spending work
-    # on job construction if the queue is already at capacity.  Parity
-    # with the batch-create path, and surfaces backpressure even when
-    # tests or callers stub out ``job_manager.create_job``.
-    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
-    if 0 < max_depth <= job_manager.get_queue_depth():
-        raise HTTPException(
-            status_code=429,
-            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
-        )
 
     try:
         job = await job_manager.create_job(
@@ -935,6 +936,18 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
         raise HTTPException(
             status_code=403,
             detail="Access denied: output directory outside configured volumes",
+        )
+
+    # Fast-fail when the queue is already at capacity, before planning any
+    # candidate — planning a PS3 folder walks its whole source tree, so a
+    # full-queue batch shouldn't pay for that just to be rejected. The
+    # projected-depth check below still runs once the surviving candidate count
+    # is known (for the "would exceed" case where the queue isn't yet full).
+    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
+    if 0 < max_depth <= job_manager.get_queue_depth():
+        raise HTTPException(
+            status_code=429,
+            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
         )
 
     skipped = []
