@@ -22,19 +22,44 @@
   },
   "packageRules": [
     {
-      "description": "Automerge non-major updates for stable (>=1.0.0) packages once tests pass",
-      "matchUpdateTypes": ["minor", "patch"],
-      "matchCurrentVersion": "!/^0/",
-      "automerge": true
-    },
-    {
-      "description": "Automerge all devDependencies (dev-only, low risk)",
+      "description": "Automerge devDependencies (dev-only tooling; does not ship to production)",
       "matchDepTypes": ["devDependencies"],
       "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
       "automerge": true
     },
     {
-      "description": "Automerge lint / formatter tool updates",
+      "description": "Runtime Python deps stay manual: no PR CI runs pytest, so these are not auto-validated. Raised as PRs and tracked on the dashboard.",
+      "matchManagers": ["pip_requirements", "pip_setup", "pep621"],
+      "addLabels": ["python"],
+      "automerge": false
+    },
+    {
+      "description": "Docker base-image updates stay manual: the Dockerfile build/hadolint only run on release, not on PRs.",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "addLabels": ["docker"],
+      "automerge": false
+    },
+    {
+      "description": "Runtime npm deps stay manual: no PR CI runs the frontend build.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies", "peerDependencies", "optionalDependencies"],
+      "addLabels": ["javascript"],
+      "automerge": false
+    },
+    {
+      "description": "Label all npm updates (devDependencies are automerged by the rule above)",
+      "matchManagers": ["npm"],
+      "addLabels": ["javascript"]
+    },
+    {
+      "description": "Automerge GitHub Actions digest re-pins only. Non-major version bumps stay manual because the release pipeline (docker-image.yml) only runs on release, not on PRs.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "addLabels": ["github-actions"],
+      "automerge": true
+    },
+    {
+      "description": "Automerge lint / formatter tool updates (evaluated last so it wins over the manager rules above for these packages)",
       "matchPackageNames": [
         "eslint",
         "eslint-plugin-svelte",
@@ -44,30 +69,6 @@
         "ruff"
       ],
       "automerge": true
-    },
-    {
-      "description": "Automerge GitHub Actions digest and non-major updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
-      "automerge": true,
-      "addLabels": ["github-actions"]
-    },
-    {
-      "description": "Automerge Docker digest and non-major base-image updates",
-      "matchManagers": ["dockerfile", "docker-compose"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
-      "automerge": true,
-      "addLabels": ["docker"]
-    },
-    {
-      "description": "Label Python (pip) updates to mirror existing conventions",
-      "matchManagers": ["pip_requirements", "pip_setup", "pep621"],
-      "addLabels": ["python"]
-    },
-    {
-      "description": "Label JavaScript (npm) updates to mirror existing conventions",
-      "matchManagers": ["npm"],
-      "addLabels": ["javascript"]
     }
   ]
 }
