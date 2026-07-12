@@ -27,7 +27,7 @@ from services.lock_manager import lock_manager
 from services.tools import InputKind, ModeKind, registry
 from sse_starlette.sse import EventSourceResponse
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
-from utils.path_utils import is_within_configured_volumes
+from utils.path_utils import is_safe_directory_tree, is_within_configured_volumes
 
 router = APIRouter()
 logger = get_logger()
@@ -306,6 +306,7 @@ class SkipReason(Enum):
     PS3_FOLDER_INVALID = "ps3_folder_invalid"
     PS3_OUTPUT_INSIDE_SOURCE = "ps3_output_inside_source"
     PS3_OUTPUT_OUTSIDE_VOLUMES = "ps3_output_outside_volumes"
+    PS3_FOLDER_UNSAFE = "ps3_folder_unsafe"
 
 
 class SkipFile(Exception):  # noqa: N818 - control-flow signal, not an error
@@ -402,6 +403,10 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
         "Default output .iso would land outside the configured volumes "
         "(the PS3 folder is a volume root); choose an in-volume output directory",
     ),
+    SkipReason.PS3_FOLDER_UNSAFE: (
+        400,
+        "PS3 folder contains symlinks or non-regular entries and cannot be packed safely",
+    ),
 }
 
 
@@ -455,7 +460,17 @@ async def _plan_directory_job(
     if not accepts:
         raise SkipFile(SkipReason.PS3_FOLDER_INVALID)
 
-    normalized = os.path.normpath(file_path)
+    # Canonicalize the source to its real, symlink-free path before deriving the
+    # job, and pack *that* path. makeps3iso reads the source tree as a native
+    # subprocess, so a submitted path with a symlink in an ancestor component
+    # (e.g. "/vol/link/MyGame" with "link" -> "/vol/real") would otherwise let a
+    # concurrent swap of that link retarget the native reader to an unchecked
+    # tree after validation. Resolving to the real path removes that mutable
+    # window; a symlinked *root* is still rejected outright by
+    # `is_safe_directory_tree` below (which runs on the original submitted path).
+    source_real = await run_in_threadpool(os.path.realpath, file_path)
+
+    normalized = os.path.normpath(source_real)
     display_filename = os.path.basename(normalized)
     output_path = await run_in_threadpool(
         _get_output_path, mode, normalized, output_dir,
@@ -470,7 +485,6 @@ async def _plan_directory_job(
     # guards against *other* jobs, not a job's own output.) Resolve symlinks
     # first so a symlinked output dir into the tree can't slip past this.
     output_real = await run_in_threadpool(os.path.realpath, output_path)
-    source_real = await run_in_threadpool(os.path.realpath, file_path)
     if output_real == source_real or output_real.startswith(source_real + os.sep):
         raise SkipFile(SkipReason.PS3_OUTPUT_INSIDE_SOURCE)
 
@@ -503,11 +517,20 @@ async def _plan_directory_job(
                 get_unique_output_path, output_path, mode,
             )
 
+    # Recursive PS3 safety walk, deferred until the job is known to actually run.
+    # Skip/locked collisions above short-circuit first, so a batch SKIP over an
+    # already-converted large PS3 library isn't forced to stat every entry only
+    # to skip with OUTPUT_EXISTS. Jobs that will queue are still validated here,
+    # and `_process_job` revalidates the exact tree again after acquiring the
+    # directory lock, immediately before makeps3iso runs.
+    if not await run_in_threadpool(is_safe_directory_tree, file_path):
+        raise SkipFile(SkipReason.PS3_FOLDER_UNSAFE)
+
     allow_overwrite = (
         duplicate_action == DuplicateAction.OVERWRITE and output_exists
     )
     return JobPlan(
-        file_path=file_path,
+        file_path=source_real,
         output_path=output_path,
         base_output_path=base_output_path,
         allow_overwrite=allow_overwrite,
@@ -828,6 +851,18 @@ async def create_job(request: JobCreateRequest):
             detail="Access denied: output directory outside configured volumes",
         )
 
+    # Proactive queue-depth check: reject with 429 *before* planning if the
+    # queue is already at capacity, so a full-queue submit doesn't pay for the
+    # PS3 folder safety walk (which stats the whole source tree) just to be
+    # rejected. Parity with the batch-create path, and surfaces backpressure
+    # even when tests or callers stub out ``job_manager.create_job``.
+    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
+    if 0 < max_depth <= job_manager.get_queue_depth():
+        raise HTTPException(
+            status_code=429,
+            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
+        )
+
     try:
         plan = await plan_job(
             request.file_path,
@@ -845,17 +880,6 @@ async def create_job(request: JobCreateRequest):
             status_code=400,
             detail=f"Delete-on-verify blocked: {exc.message}",
         ) from None
-
-    # Proactive queue-depth check: reject with 429 before spending work
-    # on job construction if the queue is already at capacity.  Parity
-    # with the batch-create path, and surfaces backpressure even when
-    # tests or callers stub out ``job_manager.create_job``.
-    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
-    if 0 < max_depth <= job_manager.get_queue_depth():
-        raise HTTPException(
-            status_code=429,
-            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
-        )
 
     try:
         job = await job_manager.create_job(
@@ -912,6 +936,18 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
         raise HTTPException(
             status_code=403,
             detail="Access denied: output directory outside configured volumes",
+        )
+
+    # Fast-fail when the queue is already at capacity, before planning any
+    # candidate — planning a PS3 folder walks its whole source tree, so a
+    # full-queue batch shouldn't pay for that just to be rejected. The
+    # projected-depth check below still runs once the surviving candidate count
+    # is known (for the "would exceed" case where the queue isn't yet full).
+    max_depth = max(0, int(getattr(settings, "max_queue_depth", 0) or 0))
+    if 0 < max_depth <= job_manager.get_queue_depth():
+        raise HTTPException(
+            status_code=429,
+            detail=f"Conversion queue full ({max_depth} jobs). Retry later.",
         )
 
     skipped = []
