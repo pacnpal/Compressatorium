@@ -118,9 +118,14 @@ class VerificationStore:
             old = session.get(_db.Verification, old_normalized)
             if old is None:
                 return
-            # Preserve source_path/verified_at across the rename.
+            # Preserve source_path/verified_at AND produced_meta across the
+            # rename. Dropping produced_meta would leave the renamed record
+            # verified but ineligible for the re-run fast path (a same-filesystem
+            # rename keeps the output's inode/size/mtime, so the recorded output
+            # fingerprint still matches at the new path).
             source_path = old.source_path
             verified_at = old.verified_at
+            produced_meta = old.produced_meta
             session.delete(old)
             session.flush()
             # Upsert under the new key.
@@ -128,11 +133,13 @@ class VerificationStore:
             if existing is not None:
                 existing.source_path = source_path
                 existing.verified_at = verified_at
+                existing.produced_meta = produced_meta
             else:
                 session.add(_db.Verification(
                     chd_path=new_normalized,
                     source_path=source_path,
                     verified_at=verified_at,
+                    produced_meta=produced_meta,
                 ))
             session.commit()
 

@@ -293,3 +293,29 @@ def test_produced_meta_round_trips_through_store(tmp_path):
     other_rec = asyncio.run(store.get_record(str(other)))
     assert other_rec is not None
     assert other_rec["produced_meta"] is None
+
+
+def test_produced_meta_survives_record_move(tmp_path):
+    """Renaming a verified artifact carries produced_meta to the new path, so a
+    later re-queue at the new name can still take the fast path."""
+    import asyncio
+
+    store = VerificationStore(store_path=str(tmp_path / "v.db"))
+    old = tmp_path / "Game.chd"
+    old.write_bytes(b"x")
+    new = tmp_path / "Renamed.chd"
+    meta = {
+        "mode": "createcd",
+        "compression": None,
+        "split": False,
+        "source": {"/vol/Game.cue": {"size": 12, "mtime_ns": 1, "inode": 2, "device": 3}},
+        "output": {"size": 1, "mtime_ns": 4, "inode": 5, "device": 6},
+    }
+    asyncio.run(store.mark_verified(str(old), source_path="/vol/Game.cue",
+                                    produced_meta=meta))
+    asyncio.run(store.move(str(old), str(new)))
+
+    moved = asyncio.run(store.get_record(str(new)))
+    assert moved is not None
+    assert moved["produced_meta"] == meta
+    assert asyncio.run(store.get_record(str(old))) is None
