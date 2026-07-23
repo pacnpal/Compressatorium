@@ -31,7 +31,12 @@ def ensure_auth_token() -> str | None:
                 return token
         token = secrets.token_urlsafe(32)
         token_path.write_text(f"{token}\n", encoding="utf-8")
-        token_path.chmod(0o600)
+        # Best-effort: some bind mounts (CIFS/NTFS-style) reject chmod. The
+        # written token is still the active one, so don't discard it on failure.
+        try:
+            token_path.chmod(0o600)
+        except OSError:
+            pass
         settings.auth_token = token
         return token
     except OSError:
@@ -51,17 +56,31 @@ def _basic_token(value: str) -> str | None:
     return password
 
 
-def _request_token(request: Request) -> str | None:
+def _request_tokens(request: Request) -> list[str]:
+    """Collect every candidate token the request offers, in priority order.
+
+    All sources are gathered (not just the first one present) so a valid
+    ``X-Compressatorium-Token`` or ``access_token`` still authenticates even when
+    a proxy or browser also forwards an unrelated ``Authorization`` header.
+    """
+    tokens: list[str] = []
     auth = request.headers.get("Authorization", "")
-    scheme, _, value = auth.partition(" ")
-    if scheme.lower() == "bearer" and value:
-        return value
-    if scheme.lower() == "basic" and value:
-        return _basic_token(value)
+    parts = auth.split(maxsplit=1)
+    if len(parts) == 2:
+        scheme, value = parts[0].lower(), parts[1]
+        if scheme == "bearer" and value:
+            tokens.append(value)
+        elif scheme == "basic" and value:
+            password = _basic_token(value)
+            if password:
+                tokens.append(password)
     header_token = request.headers.get("X-Compressatorium-Token")
     if header_token:
-        return header_token
-    return request.query_params.get("access_token")
+        tokens.append(header_token)
+    query_token = request.query_params.get("access_token")
+    if query_token:
+        tokens.append(query_token)
+    return tokens
 
 
 def _unauthorized(request: Request) -> Response:
@@ -85,10 +104,11 @@ async def require_auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     expected = ensure_auth_token()
-    provided = _request_token(request)
-    if not expected or not provided or not _tokens_match(provided, expected):
+    if not expected:
         return _unauthorized(request)
-    return await call_next(request)
+    if any(_tokens_match(token, expected) for token in _request_tokens(request)):
+        return await call_next(request)
+    return _unauthorized(request)
 
 
 def _tokens_match(provided: str, expected: str) -> bool:

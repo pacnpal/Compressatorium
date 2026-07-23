@@ -63,6 +63,17 @@ def test_non_ascii_token_is_rejected_without_error(monkeypatch):
     assert response.status_code == 401
 
 
+def test_header_token_used_despite_unrelated_authorization(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(headers={
+        "Authorization": "Basic Zm9vOmJhcg==",  # foo:bar - wrong username
+        "X-Compressatorium-Token": "test-token",
+    }))
+
+    assert response.status_code == 200
+
+
 def test_web_ui_accepts_basic_auth(monkeypatch):
     _reset_auth(monkeypatch, token="secret", username="operator")
     credentials = base64.b64encode(b"operator:secret").decode("ascii")
@@ -114,4 +125,6 @@ def test_auth_token_is_persisted(monkeypatch, tmp_path):
 
     assert token
     assert (tmp_path / "auth_token").read_text(encoding="utf-8").strip() == token
+    # Clear the in-memory token so the second call exercises the disk-read path.
+    monkeypatch.setattr(settings, "auth_token", None)
     assert ensure_auth_token() == token
