@@ -14,7 +14,9 @@ Covers:
 from __future__ import annotations
 
 import io
+import asyncio
 import struct
+import zlib
 from unittest.mock import patch
 
 import pytest
@@ -25,7 +27,9 @@ from app.services.disc_id import (
     _BinSectorStream,
     _CHDReader,
     _CHDSectorStream,
+    _MAX_CHD_HUNK_BYTES,
     _RAW_SECTOR_HEADER_SIZE_MODE2,
+    _dumpmeta_raw,
     _extract_cue,
     _extract_from_chd_sectors,
     _extract_gdi,
@@ -821,6 +825,98 @@ def test_chd_reader_ctype_mini_fill(tmp_path):
         sector = reader.read_sector(0)
         assert sector is not None
         assert sector == b"\x00" * 2048, "MINI hunk must return the fill value, not file bytes"
+
+
+def test_chd_reader_rejects_oversized_hunk(tmp_path):
+    """Reject crafted CHDs before MINI hunks can allocate attacker-sized buffers."""
+    chd = bytearray(124 + 12)
+    chd[:8] = b"MComprHD"
+    struct.pack_into(">I", chd, 8, 124)
+    struct.pack_into(">I", chd, 12, 5)
+    struct.pack_into(">Q", chd, 24, 124)
+    struct.pack_into(">I", chd, 40, _MAX_CHD_HUNK_BYTES + 1)
+    struct.pack_into(">I", chd, 44, 2048)
+    chd[124] = 7  # CTYPE_MINI
+
+    chd_path = tmp_path / "oversized-mini.chd"
+    chd_path.write_bytes(chd)
+
+    with _CHDReader(str(chd_path)) as reader:
+        assert reader.open() is False
+
+
+def test_chd_reader_rejects_hunk_smaller_than_unit(tmp_path):
+    """Reject invalid hunk/unit geometry instead of dividing by zero in read_sector."""
+    chd = bytearray(124)
+    chd[:8] = b"MComprHD"
+    struct.pack_into(">I", chd, 8, 124)
+    struct.pack_into(">I", chd, 12, 5)
+    struct.pack_into(">Q", chd, 24, 124)
+    struct.pack_into(">I", chd, 40, 1)
+    struct.pack_into(">I", chd, 44, 2048)
+
+    chd_path = tmp_path / "bad-geometry.chd"
+    chd_path.write_bytes(chd)
+
+    with _CHDReader(str(chd_path)) as reader:
+        assert reader.open() is False
+
+
+def test_chd_reader_rejects_zlib_output_larger_than_hunk(tmp_path):
+    """Bound zlib decompression output to hunk_bytes."""
+    payload = zlib.compress(b"A" * 4096)
+    chd = bytearray(124 + 12 + len(payload))
+    chd[:8] = b"MComprHD"
+    struct.pack_into(">I", chd, 8, 124)
+    struct.pack_into(">I", chd, 12, 5)
+    struct.pack_into(">Q", chd, 24, 124)
+    struct.pack_into(">I", chd, 40, 2048)
+    struct.pack_into(">I", chd, 44, 2048)
+    struct.pack_into(">I", chd, 108, _CHDReader._CODEC_ZLIB)
+    chd[124] = 0  # CTYPE_CODEC0
+    chd[125:128] = len(payload).to_bytes(4, "big")[1:]
+    chd[128:134] = (136).to_bytes(8, "big")[2:]
+    chd[136:] = payload
+
+    chd_path = tmp_path / "zlib-overrun.chd"
+    chd_path.write_bytes(chd)
+
+    with _CHDReader(str(chd_path)) as reader:
+        assert reader.open() is True
+        assert reader.read_sector(0) is None
+
+
+def test_dumpmeta_raw_times_out(tmp_path, monkeypatch):
+    """chdman dumpmeta must not hang indefinitely."""
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"fake")
+
+    class FakeProc:
+        returncode = 0
+        killed = False
+
+        async def communicate(self):
+            if self.killed:
+                return b"", b""
+            await asyncio.sleep(1)
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(
+        "app.services.disc_id._DUMPMETA_TIMEOUT_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "app.services.disc_id.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    assert asyncio.run(_dumpmeta_raw(str(chd), TAG_GAME, "chdman")) is None
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,147 @@
+name: Take screenshots
+
+# Regenerates the Web UI screenshots in docs/screenshots/ with shot-scraper and
+# commits them back. The screenshots are referenced from README.md and docs/.
+#
+# What it does: builds the Svelte frontend, boots the FastAPI backend against a
+# throwaway fixture volume, drives shot-scraper over shots.yml (one browser per
+# shot — see scripts/take_screenshots.py for why), losslessly optimises the PNGs
+# with Oxipng, uploads the generated screenshots, then commits any changes from
+# a separate write-scoped job.
+#
+# Runs on manual dispatch and on pushes that touch the UI. Changes under
+# docs/screenshots/** are intentionally NOT a trigger, so the commit this
+# workflow makes cannot trigger itself.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "index.html"
+      - "svelte.config.js"
+      - "vite.config.js"
+      - "package.json"
+      - "package-lock.json"
+      - "shots.yml"
+      - "scripts/take_screenshots.py"
+      - "scripts/make_screenshot_fixture.sh"
+      - ".github/workflows/screenshots.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure pip caching
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright/
+          key: ${{ runner.os }}-playwright
+
+      - name: Cache Oxipng
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/
+          key: ${{ runner.os }}-cargo
+
+      - name: Install Oxipng if it is not installed
+        run: which oxipng || cargo install oxipng
+
+      - name: Build frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt shot-scraper
+          shot-scraper install
+
+      - name: Start the app
+        env:
+          CHD_MODE: webui
+          MAX_CONCURRENT_JOBS: "1"
+        run: |
+          scripts/make_screenshot_fixture.sh "$RUNNER_TEMP/fixture"
+          export COMPRESSATORIUM_MOUNT_ROOT="$RUNNER_TEMP/fixture"
+          export STATIC_DIR="$PWD/static"
+          export CHD_DATA_DIR="$RUNNER_TEMP/data"
+          export CHD_TEMP_DIR="$RUNNER_TEMP/data/temp"
+          export PYTHONPATH="$PWD/app"
+          mkdir -p "$CHD_DATA_DIR" "$CHD_TEMP_DIR"
+          python -m uvicorn main:app --host 127.0.0.1 --port 8099 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8099/health > /dev/null; then
+              echo "Server is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not start in time"; cat "$RUNNER_TEMP/server.log"; exit 1
+
+      - name: Take shots
+        run: |
+          python scripts/take_screenshots.py shots.yml
+
+      - name: Optimize PNGs
+        run: |
+          oxipng -o 4 -i 0 --strip safe docs/screenshots/*.png
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: docs/screenshots/*.png
+          if-no-files-found: error
+
+  commit-screenshots:
+    runs-on: ubuntu-latest
+    needs: screenshots
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download screenshots
+        uses: actions/download-artifact@v4
+        with:
+          name: screenshots
+          path: docs/screenshots
+
+      - name: Commit and push
+        run: |-
+          git config user.name "Automated"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/screenshots
+          timestamp=$(date -u)
+          git commit -m "Update Web UI screenshots — ${timestamp}" || exit 0
+          git pull --rebase
+          git push

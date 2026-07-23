@@ -82,7 +82,7 @@ def _e2e_env(tmp_path: Path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_convert(input_path, output_path, mode, *, compression=None,
-                           cancel_event=None):
+                           split=False, cancel_event=None):
         # The member must have been extracted to a real temp file before the
         # tool is invoked, this is the core of the archive-conversion path.
         assert os.path.isfile(input_path), f"member not extracted: {input_path}"
@@ -160,6 +160,33 @@ async def test_archive_member_converts_end_to_end(e2e_env, ext, mode, out_ext):
     # its temp_dir handle, so verify via the now-removed extracted file).
     assert job.temp_dir is None
     assert not os.path.exists(call["input"])
+
+
+@pytest.mark.asyncio
+async def test_invalid_nsz_archive_member_returns_bad_extension(e2e_env):
+    """Invalid Switch archive members should fail validation before output
+    path mapping tries to derive .nsz/.xcz names from the member suffix."""
+    from fastapi import HTTPException
+
+    tmp_path: Path = e2e_env["tmp_path"]
+    archive = tmp_path / "switch.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("bad.txt", b"not-a-switch-container")
+
+    request = JobCreateRequest(
+        file_path=f"{archive}::bad.txt",
+        mode=ConversionMode.NSZ_COMPRESS,
+        duplicate_action=DuplicateAction.SKIP,
+        delete_on_verify=False,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await convert_routes.create_job(request)
+
+    status, detail = convert_routes._SKIP_HTTP[
+        convert_routes.SkipReason.NSZ_BAD_EXTENSION
+    ]
+    assert exc.value.status_code == status == 400
+    assert exc.value.detail == detail
 
 
 @pytest.mark.asyncio
