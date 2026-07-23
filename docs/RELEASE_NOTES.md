@@ -118,6 +118,17 @@ optional 4 GB split for FAT32 targets, and a new CSO mode converts a
 
 #### Fixed
 
+- **File rename and delete now require an explicit confirmation header.**
+  `POST /api/files/rename`, `DELETE /api/files/delete`, and
+  `POST /api/files/delete-batch` are now guarded by the same
+  `X-CHD-Action-Confirm` header used elsewhere for destructive actions — a
+  shared `_require_action_confirmation` helper enforces `rename-file` for rename
+  and `delete-file` for delete (`recursive-delete` still gates non-empty
+  directory removal). The batch endpoint carries the same `delete-file` guard so
+  the single-delete gate can't be bypassed by wrapping a path in a one-item
+  batch. The Web UI sends these headers automatically; existing volume/path and
+  job-lock checks are unchanged.
+
 - **Rename no longer spin-loops when its output is inside a folder being packed.**
   A new `duplicate_action="rename"` job whose output lands in a locked PS3 subtree
   used to probe numbered names (`name_1`, `name_2`, …) in a tight loop. Every
