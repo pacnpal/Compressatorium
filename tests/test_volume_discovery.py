@@ -31,6 +31,22 @@ def test_auto_discovery_uses_data_children_when_env_unset(tmp_path: Path):
     assert settings.volumes == [str(games), str(games2)]
 
 
+def test_auto_discovery_skips_symlink_children(tmp_path: Path):
+    data_root = tmp_path / "data"
+    games = data_root / "games"
+    outside = tmp_path / "outside"
+    games.mkdir(parents=True)
+    outside.mkdir()
+    (data_root / "escape").symlink_to(outside, target_is_directory=True)
+
+    settings = Settings(
+        COMPRESSATORIUM_VOLUMES="",
+        COMPRESSATORIUM_MOUNT_ROOT=str(data_root),
+    )
+
+    assert settings.volumes == [str(games)]
+
+
 def test_startup_scan_caches_discovered_volumes(tmp_path: Path):
     data_root = tmp_path / "data"
     games = data_root / "games"
