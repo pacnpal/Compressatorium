@@ -82,7 +82,7 @@ def _e2e_env(tmp_path: Path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_convert(input_path, output_path, mode, *, compression=None,
-                           cancel_event=None):
+                           split=False, cancel_event=None):
         # The member must have been extracted to a real temp file before the
         # tool is invoked, this is the core of the archive-conversion path.
         assert os.path.isfile(input_path), f"member not extracted: {input_path}"
