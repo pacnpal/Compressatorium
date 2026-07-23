@@ -1562,29 +1562,49 @@ class JobManager:
         return total_size if total_size > 0 else None
 
     @staticmethod
-    def _source_fingerprint(source_path: str) -> Optional[Dict[str, Dict[str, int]]]:
+    def _norm_fps(
+        fingerprints: Optional[Dict[str, Dict[str, object]]],
+    ) -> Dict[str, Dict[str, int]]:
+        """Normalize a ``{realpath: {size, mtime_ns, inode, device}}`` map to
+        plain ints, so a stored (JSON-round-tripped) fingerprint and a freshly
+        computed one compare by equality. ``inode``/``device`` are carried
+        alongside size+mtime_ns — the same four fields the delete-safety
+        snapshot trusts to authorize an irreversible delete, so a reuse is held
+        to no weaker a bar (a copy-restore lands on a new inode, a moved mount on
+        a new device)."""
+        out: Dict[str, Dict[str, int]] = {}
+        for path, fp in (fingerprints or {}).items():
+            out[path] = {
+                "size": int(fp.get("size", -1)),
+                "mtime_ns": int(fp.get("mtime_ns", -1)),
+                "inode": int(fp.get("inode", 0) or 0),
+                "device": int(fp.get("device", 0) or 0),
+            }
+        return out
+
+    def _source_fingerprint(
+        self, source_path: str,
+    ) -> Optional[Dict[str, Dict[str, int]]]:
         """Stat fingerprint of the *complete* source set for ``source_path``.
 
         Uses ``build_delete_snapshot`` so a ``.cue`` / ``.gdi`` descriptor's
         referenced track files are fingerprinted too — a replaced ``.bin`` track
-        (with the descriptor untouched) changes the fingerprint, which is what a
-        descriptor-only mtime check would miss. Returns ``{realpath: {size,
-        mtime_ns}}`` or ``None`` when the set can't be safely enumerated
-        (unsafe/missing tracks, a non-file), so those never qualify for a
-        fast-path reuse.
+        (with the descriptor untouched) changes the fingerprint, which a
+        descriptor-only check would miss. Returns ``{realpath: {size, mtime_ns,
+        inode, device}}`` or ``None`` when the set can't be safely enumerated
+        (unsafe/missing tracks, a non-file), so those never qualify for reuse.
         """
         try:
             snapshot = build_delete_snapshot(source_path)
         except Exception:
             return None
-        out: Dict[str, Dict[str, int]] = {}
-        for path, fp in (snapshot.get("fingerprints") or {}).items():
-            out[path] = {"size": int(fp["size"]), "mtime_ns": int(fp["mtime_ns"])}
-        return out or None
+        return self._norm_fps(snapshot.get("fingerprints")) or None
 
     @staticmethod
     def _output_fingerprint(output_path: str) -> Optional[Dict[str, int]]:
-        """Stat fingerprint (size + mtime_ns) of an output file, or ``None``."""
+        """Stat fingerprint (size + mtime_ns + inode + device) of an output
+        file, or ``None``. inode/device catch a replaced file that happens to
+        preserve size+mtime (e.g. a copy-restore onto a fresh inode)."""
         try:
             st = os.stat(output_path, follow_symlinks=False)
         except OSError:
@@ -1596,6 +1616,8 @@ class JobManager:
             "mtime_ns": int(
                 getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
             ),
+            "inode": int(getattr(st, "st_ino", 0) or 0),
+            "device": int(getattr(st, "st_dev", 0) or 0),
         }
 
     def _build_produced_meta(self, job: ConversionJob) -> Optional[Dict[str, object]]:
@@ -1603,17 +1625,30 @@ class JobManager:
         path: the mode + output-shaping settings and stat fingerprints of the
         complete source set and the output.
 
+        The source fingerprint is the **pre-conversion** delete snapshot
+        (captured when the job was planned, before the converter read the
+        source), re-validated to still describe the on-disk source here. If the
+        source changed between planning and this point — e.g. mutated while the
+        converter was running — the pre-conversion snapshot no longer matches and
+        no reusable metadata is recorded, so a later re-queue can't take the
+        no-op path against an output built from now-stale bytes.
+
         Returns ``None`` (record no meta → no fast path) for an archive-member
-        source or when the source set / output can't be fingerprinted. Computed
-        right after a successful verify, while the source still exists.
+        source, when there is no pre-conversion snapshot, when the source moved
+        since planning, or when the output can't be fingerprinted.
         """
         if "::" in job.file_path:
             # Archive members: the on-disk "source" is the whole archive and the
             # extracted member is transient, so a reuse can't be proven cheaply.
             return None
-        source_fp = self._source_fingerprint(job.file_path)
+        pre = self._delete_plans.get(job.id)
+        if not pre or not pre.get("fingerprints"):
+            return None
+        source_fp = self._norm_fps(pre.get("fingerprints"))
+        if not source_fp or self._source_fingerprint(job.file_path) != source_fp:
+            return None
         output_fp = self._output_fingerprint(job.output_path)
-        if not source_fp or not output_fp:
+        if not output_fp:
             return None
         return {
             "mode": job.mode.value,

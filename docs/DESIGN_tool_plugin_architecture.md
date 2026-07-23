@@ -701,23 +701,42 @@ prior **delete-on-verify** conversion right after its verify passed (the
 captures, off the event loop:
 
 - `mode`, `compression`, `split` — the producing conversion's output shape.
-- `source` — a stat fingerprint (`{realpath: {size, mtime_ns}}`) of the
-  **complete** source set via `build_delete_snapshot`, so a `.cue`/`.gdi`'s
-  referenced track files are fingerprinted alongside the descriptor.
-- `output` — a `{size, mtime_ns}` fingerprint of the produced artifact (taken
-  after the disc-ID embed, so it reflects the final bytes).
+- `source` — a stat fingerprint (`{realpath: {size, mtime_ns, inode, device}}`)
+  of the **complete** source set. It is the job's **pre-conversion** delete
+  snapshot (captured at planning, before the converter read the source),
+  re-validated against the on-disk source at record time: if the source changed
+  between planning and verify — e.g. mutated while the converter was running —
+  the snapshot no longer matches and **no** meta is recorded, so a later
+  re-queue can't no-op against an output built from now-stale bytes.
+- `output` — a `{size, mtime_ns, inode, device}` fingerprint of the produced
+  artifact (taken after the disc-ID embed, so it reflects the final bytes).
+
+The `inode`/`device` fields are the same four stat fields the delete-safety
+snapshot trusts to authorize an *irreversible* delete (`build_delete_snapshot`),
+so a reuse — a strictly less destructive decision — is held to no weaker a bar:
+a copy-restore lands on a new inode, a moved mount on a new device, and either
+forces a re-convert.
 
 `_produced_meta_matches` (off the event loop) then admits the no-op only when
 **all** hold: `mode`/`compression`/`split` equal the current request's, the
 current output fingerprint equals the recorded one (so a replaced/corrupted file
-with a fresh mtime can't pass), and the current complete-source-set fingerprint
-equals the recorded one (so a changed track — not just the descriptor — forces a
-re-convert). `_output_already_verified` additionally excludes directory
-(folder→ISO) jobs (split-set outputs) and `delete_on_verify` *requests* (they
-must run their guarded source deletion), and treats any store hiccup, missing
-record, absent `produced_meta`, or un-fingerprintable source (archive members,
-unsafe/missing tracks) as "no match" — always falling through to a full
-re-convert rather than risk a surprising output.
+can't pass), and the current complete-source-set fingerprint equals the recorded
+one (so a changed track — not just the descriptor — forces a re-convert).
+`_output_already_verified` additionally excludes directory (folder→ISO) jobs
+(split-set outputs) and `delete_on_verify` *requests* (they must run their
+guarded source deletion), and treats any store hiccup, missing record, absent
+`produced_meta`, or un-fingerprintable source (archive members, unsafe/missing
+tracks) as "no match" — always falling through to a full re-convert rather than
+risk a surprising output.
+
+**Known limitation.** `compression` is stored as the request declared it, so
+`None` means "the tool's default." A tool that resolves its default from mutable
+settings (e.g. nsz's `NSZ_COMPRESSION_LEVEL`) could, after an operator changes
+that setting *and* a prior delete-on-verify run was cancelled after verify,
+deliver the earlier-default artifact for a `None`-compression re-queue. That is a
+compression-*level* difference on an otherwise-correct, verified artifact of the
+exact source — not a content mismatch — and is accepted rather than have every
+tool persist its resolved defaults.
 
 ### 3.4 `registry.py`
 

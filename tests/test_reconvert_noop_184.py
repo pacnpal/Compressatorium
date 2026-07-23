@@ -96,16 +96,23 @@ def _seed_files(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 async def _job_with_meta(noop_env, **create_kwargs):
-    """Create a CREATECD job for the seeded .cue and the produced_meta that
-    matches the current on-disk state."""
+    """Create a CREATECD job for the seeded .cue and the produced_meta a prior
+    delete-on-verify run would have recorded for the current on-disk state
+    (built via the same fingerprint helpers the fast path compares with)."""
     tmp_path: Path = noop_env["tmp_path"]
     src, track, out = _seed_files(tmp_path)
     mgr: JobManager = noop_env["mgr"]
     job = await mgr.create_job(
         str(src), ConversionMode.CREATECD, allow_overwrite=True, **create_kwargs,
     )
-    meta = mgr._build_produced_meta(job)
-    assert meta is not None  # sanity: source set + output are fingerprintable
+    meta = {
+        "mode": "createcd",
+        "compression": create_kwargs.get("compression"),
+        "split": bool(create_kwargs.get("split", False)),
+        "source": mgr._source_fingerprint(str(src)),
+        "output": mgr._output_fingerprint(str(out)),
+    }
+    assert meta["source"] and meta["output"]  # fingerprintable
     return mgr, job, src, track, out, meta
 
 
@@ -210,6 +217,55 @@ async def test_reconvert_runs_when_no_record(noop_env):
 
     await mgr._process_job(job.id)
     assert len(noop_env["calls"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_produced_meta_uses_pre_conversion_snapshot(noop_env):
+    # With a stable source and a recorded pre-conversion snapshot, the metadata
+    # is built and pins the source/output fingerprints.
+    from app.utils.delete_plan import build_delete_snapshot
+
+    tmp_path: Path = noop_env["tmp_path"]
+    src, _track, _out = _seed_files(tmp_path)
+    mgr: JobManager = noop_env["mgr"]
+    job = await mgr.create_job(str(src), ConversionMode.CREATECD, allow_overwrite=True)
+    mgr._delete_plans[job.id] = build_delete_snapshot(str(src))
+
+    meta = mgr._build_produced_meta(job)
+    assert meta is not None
+    assert meta["mode"] == "createcd"
+    assert meta["source"] == mgr._source_fingerprint(str(src))
+
+
+@pytest.mark.asyncio
+async def test_build_produced_meta_none_without_snapshot(noop_env):
+    # No pre-conversion snapshot → no reusable metadata (can't prove the source
+    # was stable through conversion).
+    tmp_path: Path = noop_env["tmp_path"]
+    src, _track, _out = _seed_files(tmp_path)
+    mgr: JobManager = noop_env["mgr"]
+    job = await mgr.create_job(str(src), ConversionMode.CREATECD, allow_overwrite=True)
+    assert mgr._build_produced_meta(job) is None
+
+
+@pytest.mark.asyncio
+async def test_build_produced_meta_none_when_source_moved_since_snapshot(noop_env):
+    # Source mutated after the pre-conversion snapshot (e.g. changed while the
+    # converter ran): the snapshot no longer describes the source, so no
+    # metadata is recorded and no future no-op can misfire (P2).
+    from app.utils.delete_plan import build_delete_snapshot
+
+    tmp_path: Path = noop_env["tmp_path"]
+    src, track, _out = _seed_files(tmp_path)
+    mgr: JobManager = noop_env["mgr"]
+    job = await mgr.create_job(str(src), ConversionMode.CREATECD, allow_overwrite=True)
+    mgr._delete_plans[job.id] = build_delete_snapshot(str(src))
+    # Change a track after the snapshot was taken.
+    track.write_bytes(b"mutated-mid-conversion")
+    later = os.stat(track).st_mtime + 50
+    os.utime(track, (later, later))
+
+    assert mgr._build_produced_meta(job) is None
 
 
 def test_produced_meta_round_trips_through_store(tmp_path):
