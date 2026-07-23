@@ -13,7 +13,7 @@ docker-compose up -d
 ```
 
 **Default configuration:**
-- Port: 8080
+- Port: 127.0.0.1:8080:8080 (loopback-only by default)
 - Volume: `./games` → `/data/games`
 - Temp: `/config/temp` (inside `./config`)
 - UID/GID remap: optional via `PUID`/`PGID` (defaults `999:999`)
@@ -110,6 +110,10 @@ After starting with `docker-compose up -d`:
 - **URL:** http://localhost:8080
 - **Health Check:** http://localhost:8080/health
 - **API Docs:** http://localhost:8080/docs
+
+The Web UI examples bind the published port to `127.0.0.1` because the API is
+intended for trusted local access. If you expose it beyond the host, put it
+behind a trusted reverse proxy, VPN, or authentication layer.
 
 ---
 
