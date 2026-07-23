@@ -57,6 +57,14 @@ logger = get_logger("disc_id")
 TAG_GAME = "GAME"  # game / disc serial number (text)
 TAG_NAME = "NAME"  # game / disc title         (text)
 
+# Resource limits for CHD metadata/disc-ID probing. CHD files live in user
+# volumes, so treat header/map fields and chdman output as untrusted input.
+_MAX_CHD_HUNK_BYTES = 8 * 1024 * 1024
+_MAX_CHD_COMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_CHD_LZMA_DICT_BYTES = 16 * 1024 * 1024
+_MAX_DUMPMETA_BYTES = 1 * 1024 * 1024
+_DUMPMETA_TIMEOUT_SECONDS = 15
+
 # ---------------------------------------------------------------------------
 # ISO 9660 constants
 # ---------------------------------------------------------------------------
@@ -620,7 +628,10 @@ class _CHDReader:
             self._hunk_bytes = struct.unpack_from(">I", hdr, 40)[0]
             self._unit_bytes = struct.unpack_from(">I", hdr, 44)[0]
             self._codecs = list(struct.unpack_from(">4I", hdr, 108))
-            if not (self._hunk_bytes > 0 and self._unit_bytes > 0):
+            if not (
+                0 < self._unit_bytes <= self._hunk_bytes <= _MAX_CHD_HUNK_BYTES
+                and self._hunk_bytes % self._unit_bytes == 0
+            ):
                 logger.debug(
                     "disc_id: CHD open failed, hunk_bytes=%d unit_bytes=%d in %s",
                     self._hunk_bytes,
@@ -656,6 +667,8 @@ class _CHDReader:
         Returns None on error or unsupported compression.
         """
         units_per_hunk = self._hunk_bytes // self._unit_bytes
+        if units_per_hunk <= 0:
+            return None
         hunk_idx = lba // units_per_hunk
         hunk_off = (lba % units_per_hunk) * self._unit_bytes
         hunk = self._get_hunk(hunk_idx)
@@ -680,6 +693,8 @@ class _CHDReader:
             ctype = entry[0]
             # Compressed length: bytes 1–3, big-endian
             clen = struct.unpack_from(">I", b"\x00" + entry[1:4])[0]
+            if clen > _MAX_CHD_COMPRESSED_BYTES:
+                return None
             # File offset: bytes 4–9, big-endian
             foff = struct.unpack_from(">Q", b"\x00\x00" + entry[4:10])[0]
 
@@ -711,7 +726,15 @@ class _CHDReader:
     def _decompress(self, codec: int, data: bytes) -> Optional[bytes]:
         try:
             if codec == self._CODEC_ZLIB:
-                return _zlib.decompress(data)
+                decompressor = _zlib.decompressobj()
+                out = decompressor.decompress(data, self._hunk_bytes)
+                if (
+                    len(out) != self._hunk_bytes
+                    or not decompressor.eof
+                    or decompressor.unconsumed_tail
+                ):
+                    return None
+                return out
             if codec == self._CODEC_LZMA:
                 # MAME stores LZMA as 5-byte prop header + raw LZMA1 stream,
                 # matching libchdr's lzma_decompress implementation.
@@ -722,6 +745,8 @@ class _CHDReader:
                 lp = tmp % 5
                 pb = tmp // 5
                 dict_size = struct.unpack_from("<I", data, 1)[0]
+                if dict_size > _MAX_CHD_LZMA_DICT_BYTES:
+                    return None
                 filters = [
                     {
                         "id": _lzma.FILTER_LZMA1,
@@ -731,15 +756,24 @@ class _CHDReader:
                         "dict_size": dict_size,
                     }
                 ]
-                return _lzma.decompress(
-                    data[5:], format=_lzma.FORMAT_RAW, filters=filters
+                decompressor = _lzma.LZMADecompressor(
+                    format=_lzma.FORMAT_RAW, filters=filters
                 )
+                out = decompressor.decompress(data[5:], max_length=self._hunk_bytes)
+                if (
+                    len(out) != self._hunk_bytes
+                    or not decompressor.eof
+                    or decompressor.unused_data
+                ):
+                    return None
+                return out
             if codec == self._CODEC_ZSTD:
                 try:
                     import zstandard  # optional; not required for PS2/PS1
-                    return zstandard.ZstdDecompressor().decompress(
-                        data, max_output_size=self._hunk_bytes * 2
+                    out = zstandard.ZstdDecompressor().decompress(
+                        data, max_output_size=self._hunk_bytes
                     )
+                    return out if len(out) == self._hunk_bytes else None
                 except ImportError:
                     return None
             return None  # unsupported codec (e.g. FLAC for audio tracks)
@@ -1388,7 +1422,20 @@ async def _dumpmeta_raw(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_DUMPMETA_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            logger.debug(
+                "disc_id: dumpmeta tag=%s timed out after %ss in %s",
+                tag,
+                _DUMPMETA_TIMEOUT_SECONDS,
+                chd_path,
+            )
+            return None
         if proc.returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 stderr_text = stderr.decode(errors="replace").strip()
@@ -1400,8 +1447,16 @@ async def _dumpmeta_raw(
                     stderr_text,
                 )
             return None
+        if os.path.getsize(tmp_path) > _MAX_DUMPMETA_BYTES:
+            logger.debug(
+                "disc_id: dumpmeta tag=%s exceeded %d bytes in %s",
+                tag,
+                _MAX_DUMPMETA_BYTES,
+                chd_path,
+            )
+            return None
         with open(tmp_path, "rb") as f:
-            return f.read()
+            return f.read(_MAX_DUMPMETA_BYTES + 1)
     except Exception as e:
         logger.debug("disc_id: dumpmeta tag=%s error: %s", tag, e)
         return None
