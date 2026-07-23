@@ -120,7 +120,7 @@ RUN make -C makeps3iso && \
 # node:lts-slim ships linux/amd64 and linux/arm64 manifests, and the SPA
 # has no native dependencies so QEMU emulation under buildx works.
 # ---------------------------------------------------------------------------
-FROM node:lts-slim@sha256:b31e7a42fdf8b8aa5f5ed477c72d694301273f1069c5a2f71d53c6482e99a2fc AS frontend-builder
+FROM node:lts-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS frontend-builder
 WORKDIR /build
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -267,10 +267,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD if [ "${CHD_MODE:-webui}" = "cli" ]; then \
             exit 0; \
         fi; \
-        if [ "$(id -u)" = "0" ]; then \
-            gosu converter python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
+        if [ "$(/usr/bin/id -u)" = "0" ]; then \
+            /usr/sbin/gosu converter /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
         else \
-            python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
+            /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"; \
         fi
 
 # Create runtime user/group (pinned to 999:999) and prepare ownership for entrypoint privilege drop
