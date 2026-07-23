@@ -79,6 +79,17 @@ and #179, part of the #177 tech-debt epic).
   An optimistic placeholder is now cleared only when its real job first arrives, not
   on every later progress update, so submitting the same file in the same mode twice
   no longer briefly under-counts the queue.
+- **Re-queuing a job whose verified output already exists is now a no-op (issue
+  #184, site 1).** When a job starts and its target artifact is already on disk and
+  recorded verified for this exact source, the pipeline recognizes the prior success
+  and completes the job without re-spawning the converter — the existing verified
+  file is neither re-extracted-from nor cleared. The fast path is deliberately narrow
+  so it can never deliver a surprising output: it applies only to plain file
+  conversions with default output shaping (no explicit compression, no split), the
+  verification record's source must match the job's source, and the on-disk source
+  must be no newer than the verified output (unchanged since it was verified).
+  Directory (folder→ISO) and delete-on-verify jobs always take the normal path — the
+  latter so its guarded source deletion still runs.
 - **All conversion tools now share one subprocess loop.** `z3ds`, `maxcso` and `nsz`
   previously hand-rolled their own ~150-line spawn / stall-timeout / cancel / progress
   loop; they now delegate to the shared `SubprocessRunner` like `chdman`/`dolphin`/

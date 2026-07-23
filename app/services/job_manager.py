@@ -1561,6 +1561,74 @@ class JobManager:
                 pass
         return total_size if total_size > 0 else None
 
+    async def _output_already_verified(self, job: ConversionJob) -> bool:
+        """Whether a prior run already produced and verified this exact output.
+
+        Backs the job-start "recognize prior success" fast path (issue #184,
+        site 1): a re-queued job whose verified artifact is already on disk
+        completes as a no-op instead of re-spawning the converter. Kept
+        deliberately narrow so it can never deliver a surprising output:
+
+        * Only plain file conversions with default output shaping
+          (``compression is None``, ``split`` off) qualify — a request that
+          changes the output shape must re-run the converter.
+        * Directory-input and delete-on-verify jobs take the normal path (the
+          former has split-set outputs, the latter must run its guarded source
+          deletion), so this never short-circuits a pending delete.
+        * The verification store must hold a record for the output whose
+          recorded *source* is this job's source, and the on-disk source must be
+          no newer than the output (unchanged since it was verified). A record
+          without a source (e.g. a manual /info verify) or a mismatched source
+          never qualifies.
+        """
+        if (
+            job.delete_on_verify
+            or job.split
+            or job.compression is not None
+            or job.input_kind == InputKind.DIRECTORY
+            or not job.output_path
+        ):
+            return False
+        try:
+            record = await verification_store.get_record(job.output_path)
+        except Exception as exc:
+            # Never let a verification-store hiccup skip a conversion: on any
+            # lookup failure fall through to the normal path (re-convert).
+            logger.debug(
+                "Prior-success check skipped for %s: %s", job.output_path, exc,
+            )
+            return False
+        if not record or not record.get("source_path"):
+            return False
+        return await run_in_threadpool(
+            self._verified_output_matches_source, job, record["source_path"],
+        )
+
+    @staticmethod
+    def _verified_output_matches_source(
+        job: ConversionJob, recorded_source: str,
+    ) -> bool:
+        """Off-loop check: the verified output exists and its source is unchanged.
+
+        The recorded source must be this job's source (realpath match) and the
+        on-disk source must be no newer than the output, so the output still
+        reflects the current source bytes. Any stat error is treated as "no
+        match" so a missing/racing file falls through to the normal path.
+        """
+        try:
+            if recorded_source != os.path.realpath(job.file_path):
+                return False
+            if not os.path.isfile(job.output_path):
+                return False
+            source_disk = (
+                strip_archive_path(job.file_path)
+                if "::" in job.file_path
+                else job.file_path
+            )
+            return os.path.getmtime(job.output_path) >= os.path.getmtime(source_disk)
+        except OSError:
+            return False
+
     async def _run_job(self, job_id: str):
         try:
             await self._process_job(job_id)
@@ -1740,6 +1808,33 @@ class JobManager:
         )
 
         try:
+            # Fast path: a re-queued job whose verified artifact already exists
+            # completes as a no-op rather than re-spawning the converter (issue
+            # #184, site 1). Checked before extraction / _clear_existing_output
+            # so the existing verified output is neither re-extracted-from nor
+            # deleted. Honors a cancel requested before we got here.
+            if not cancel_event.is_set() and await self._output_already_verified(job):
+                self._cancelled.discard(job_id)
+                job.progress = 100
+                job.output_size = await run_in_threadpool(
+                    self._compute_output_size, job,
+                )
+                job.status = JobStatus.COMPLETED
+                job.completed_at = datetime.now(timezone.utc)
+                job.message = "Output already verified; skipped re-conversion."
+                await self._notify_subscribers(
+                    job_id,
+                    {
+                        "type": "complete",
+                        "job_id": job_id,
+                        "output_path": job.output_path,
+                        "output_size": job.output_size,
+                        "verified": True,
+                        "source_deleted": False,
+                    },
+                )
+                return
+
             input_path = job.file_path
             if "::" in job.file_path:
                 extract_start = time.monotonic()

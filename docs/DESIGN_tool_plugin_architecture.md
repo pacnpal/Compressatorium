@@ -674,6 +674,42 @@ gone, or changed) it returns `None`, and the caller falls back to a file-level S
 is valid for any DAT that indexes the container bytes. New cache/tool code that needs
 freshness-gated metadata must call this rather than reintroducing the two-read pattern.
 
+### 3.3.6 Re-run fast path (`JobManager._output_already_verified`)
+
+`_process_job` recognizes a prior success before it re-spawns the converter: a
+re-queued job whose target artifact is already on disk **and recorded verified
+for this exact source** completes as a no-op instead of re-running the tool
+(issue #184, site 1). The check runs at the top of the conversion `try` block —
+before archive extraction and before `_clear_existing_output` — so the existing
+verified output is neither re-extracted-from nor deleted; on a hit the job jumps
+straight to `COMPLETED` (progress 100, size via the shared
+`_compute_output_size`, a `complete` event with `verified=True`,
+`source_deleted=False`).
+
+The guard is deliberately narrow so it can never deliver a surprising output —
+`_output_already_verified` returns `True` only when **all** hold:
+
+- The job is a plain file conversion with default output shaping:
+  `input_kind == FILE`, `compression is None`, `split` off. A request that
+  changes the output shape (explicit compression, split set) must re-run the
+  converter, and directory (folder→ISO) jobs — whose split-set output is
+  disk-probed — always take the normal path.
+- `delete_on_verify` is off. A delete-on-verify job must run its guarded source
+  deletion, so it never short-circuits here.
+- `verification_store.get_record(output)` returns a record whose `source_path`
+  is **this** job's source (realpath match). A record with no source (e.g. a
+  manual `/info` verify, which stores `source_path=None`) or a different source
+  never qualifies — only a prior delete-on-verify run records an output verified
+  *with* its source, e.g. one whose verify passed but whose delete was cancelled
+  or failed, leaving the source intact for a later re-submit.
+- The on-disk source is **no newer** than the verified output
+  (`getmtime(output) >= getmtime(source)`), so the output still reflects the
+  current source bytes; a source modified since verification falls through and
+  re-converts.
+
+Any stat error in the freshness check is treated as "no match", so a
+missing/racing file falls through to the normal path rather than mis-firing.
+
 ### 3.4 `registry.py`
 
 ```python
