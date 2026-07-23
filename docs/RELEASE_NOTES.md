@@ -62,6 +62,17 @@ and #179, part of the #177 tech-debt epic).
   (via a shared `require_output` seam) instead of a bare "no output" message. (issue
   #179)
 
+### Fixed
+
+- **Verify streams no longer leak their child process on cancellation.** When an
+  SSE verification client disconnects mid-stream (or the consuming task is
+  otherwise cancelled), `chdman` and `dolphin-tool` `verify_stream` now wrap their
+  read loop in a `try/finally` that terminates the still-running child and untracks
+  its PID on every exit path. Previously a cancelled consumer left the native
+  `chdman verify` / `dolphin-tool verify` subprocess running, slowly exhausting the
+  process table and file descriptors. This brings both tools in line with the
+  `nsz`/`maxcso`/`z3ds` verifiers, which already cleaned up in a `finally`.
+
 ## 4.2.0 (2026-06-13)
 
 This release adds the first folder-input tool and the first cross-tool chain. PS3

@@ -1,6 +1,6 @@
 import asyncio
 import os
-from app.services.chdman import ChdmanService
+from app.services.dolphin_tool import DolphinToolService
 
 
 def _pid_exists(pid: int) -> bool:
@@ -13,29 +13,29 @@ def _pid_exists(pid: int) -> bool:
 
 
 def test_verify_stream_cleans_up_subprocess_when_cancelled(tmp_path):
-    """Cancelling a chdman verify stream must terminate its child process."""
+    """Cancelling a dolphin verify stream must terminate its child process."""
     asyncio.run(_verify_stream_cleans_up_subprocess_when_cancelled(tmp_path))
 
 
 async def _verify_stream_cleans_up_subprocess_when_cancelled(tmp_path):
-    """Spawn a long-running fake chdman, cancel mid-stream, assert cleanup."""
-    fake_chdman = tmp_path / "fake_chdman.py"
-    fake_chdman.write_text(
+    """Spawn a long-running fake dolphin-tool, cancel mid-stream, assert cleanup."""
+    fake_dolphin = tmp_path / "fake_dolphin.py"
+    fake_dolphin.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
         "import time\n"
-        "print('Verifying, 1% complete')\n"
+        "print('Verifying: 1%')\n"
         "sys.stdout.flush()\n"
         "time.sleep(60)\n"
     )
-    fake_chdman.chmod(0o755)
+    fake_dolphin.chmod(0o755)
 
-    service = ChdmanService()
-    service.chdman_path = str(fake_chdman)
+    service = DolphinToolService()
+    service.dolphin_tool_path = str(fake_dolphin)
     updates = []
 
     async def consume_updates():
-        async for update in service.verify_stream(str(tmp_path / "sample.chd")):
+        async for update in service.verify_stream(str(tmp_path / "sample.rvz")):
             updates.append(update)
 
     task = asyncio.create_task(consume_updates())
