@@ -63,27 +63,42 @@ class VerificationStore:
 
     # ------------------------------------------------------------------
 
-    def _mark_sync(self, chd_path: str, source_path: str | None) -> None:
+    def _mark_sync(
+        self,
+        chd_path: str,
+        source_path: str | None,
+        produced_meta: dict | None = None,
+    ) -> None:
         normalized = self._normalize(chd_path)
         normalized_source = self._normalize(source_path) if source_path else None
         stmt = sqlite_insert(_db.Verification).values(
             chd_path=normalized,
             source_path=normalized_source,
             verified_at=_utcnow_iso(),
+            produced_meta=produced_meta,
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["chd_path"],
             set_={
                 "source_path": stmt.excluded.source_path,
                 "verified_at": stmt.excluded.verified_at,
+                "produced_meta": stmt.excluded.produced_meta,
             },
         )
         with self._session() as session:
             session.execute(stmt)
             session.commit()
 
-    async def mark_verified(self, chd_path: str, *, source_path: str | None = None) -> None:
-        await run_in_threadpool(self._mark_sync, chd_path, source_path)
+    async def mark_verified(
+        self,
+        chd_path: str,
+        *,
+        source_path: str | None = None,
+        produced_meta: dict | None = None,
+    ) -> None:
+        await run_in_threadpool(
+            self._mark_sync, chd_path, source_path, produced_meta,
+        )
 
     def _clear_sync(self, chd_path: str) -> None:
         normalized = self._normalize(chd_path)
@@ -103,9 +118,14 @@ class VerificationStore:
             old = session.get(_db.Verification, old_normalized)
             if old is None:
                 return
-            # Preserve source_path/verified_at across the rename.
+            # Preserve source_path/verified_at AND produced_meta across the
+            # rename. Dropping produced_meta would leave the renamed record
+            # verified but ineligible for the re-run fast path (a same-filesystem
+            # rename keeps the output's inode/size/mtime, so the recorded output
+            # fingerprint still matches at the new path).
             source_path = old.source_path
             verified_at = old.verified_at
+            produced_meta = old.produced_meta
             session.delete(old)
             session.flush()
             # Upsert under the new key.
@@ -113,11 +133,13 @@ class VerificationStore:
             if existing is not None:
                 existing.source_path = source_path
                 existing.verified_at = verified_at
+                existing.produced_meta = produced_meta
             else:
                 session.add(_db.Verification(
                     chd_path=new_normalized,
                     source_path=source_path,
                     verified_at=verified_at,
+                    produced_meta=produced_meta,
                 ))
             session.commit()
 
@@ -144,6 +166,7 @@ class VerificationStore:
                 "chd_path": row.chd_path,
                 "source_path": row.source_path,
                 "verified_at": row.verified_at,
+                "produced_meta": row.produced_meta,
             }
 
     async def get_record(self, chd_path: str) -> dict[str, str | None] | None:

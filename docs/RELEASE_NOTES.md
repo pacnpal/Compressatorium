@@ -79,6 +79,22 @@ and #179, part of the #177 tech-debt epic).
   An optimistic placeholder is now cleared only when its real job first arrives, not
   on every later progress update, so submitting the same file in the same mode twice
   no longer briefly under-counts the queue.
+- **Re-queuing a job whose verified output already exists is now a no-op (issue
+  #184, site 1).** When a job starts and its target artifact is already on disk and
+  provably the exact result of the current request, the pipeline recognizes the prior
+  success and completes the job without re-spawning the converter — the existing
+  verified file is neither re-extracted-from nor cleared. To make this safe rather
+  than a source of surprising output, a delete-on-verify conversion now records a
+  `produced_meta` snapshot alongside the verification (new nullable
+  `verifications.produced_meta` JSON column, migration `0003`): the producing
+  mode/compression/split plus stat fingerprints of the **complete** source set (a
+  `.cue`/`.gdi` and its track files, not just the descriptor) and of the output. The
+  fast path fires only when a record carries that snapshot **and** the current
+  request's shaping settings, source-set fingerprint, and output fingerprint all
+  match it — so a different compression, a changed `.bin` track, or a replaced/
+  corrupted output all force a full re-convert. A plain `/info` verify records no
+  snapshot and never qualifies; directory (folder→ISO) and delete-on-verify jobs
+  always take the normal path (the latter so its guarded source deletion still runs).
 - **All conversion tools now share one subprocess loop.** `z3ds`, `maxcso` and `nsz`
   previously hand-rolled their own ~150-line spawn / stall-timeout / cancel / progress
   loop; they now delegate to the shared `SubprocessRunner` like `chdman`/`dolphin`/

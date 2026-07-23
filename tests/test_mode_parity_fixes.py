@@ -5,7 +5,7 @@ import os
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -572,10 +572,15 @@ async def test_z3ds_delete_on_verify_marks_output_verified(tmp_path: Path, monke
     await manager._process_job(job.id)
 
     assert job.status == JobStatus.COMPLETED
+    # Delete-on-verify also records a produced_meta snapshot (mode + shaping +
+    # source/output fingerprints) so a later re-queue can no-op safely (#184).
     mark_verified.assert_called_once_with(
         str(output_path),
         source_path=str(source_path),
+        produced_meta=ANY,
     )
+    produced = mark_verified.call_args.kwargs["produced_meta"]
+    assert produced is not None and produced["mode"] == "z3ds_compress"
     assert not source_path.exists()
     assert output_path.exists()
     # A non-verify-class source (.3ds) leaves the tool-wide verification_store
