@@ -240,7 +240,8 @@ async def lifespan(app: FastAPI):
     auth_token = ensure_auth_token()
     if not settings.enable_auth:
         logger.info(
-            "Web UI authentication disabled; set COMPRESSATORIUM_ENABLE_AUTH=true to require a token"
+            "Web UI authentication disabled; set COMPRESSATORIUM_ENABLE_AUTH=true "
+            "to require a token"
         )
     elif auth_token:
         logger.info("Web UI authentication enabled for user %s", settings.auth_username)

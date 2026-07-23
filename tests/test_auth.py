@@ -1,9 +1,11 @@
 import asyncio
 import base64
 
+import pytest
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import auth
 from auth import ensure_auth_token, require_auth_middleware
 from config import settings
 
@@ -124,7 +126,24 @@ def test_auth_token_is_persisted(monkeypatch, tmp_path):
     token = ensure_auth_token()
 
     assert token
-    assert (tmp_path / "auth_token").read_text(encoding="utf-8").strip() == token
+    token_file = tmp_path / "auth_token"
+    assert token_file.read_text(encoding="utf-8").strip() == token
+    # The token file must be created owner-only, never world-readable.
+    assert (token_file.stat().st_mode & 0o077) == 0
     # Clear the in-memory token so the second call exercises the disk-read path.
     monkeypatch.setattr(settings, "auth_token", None)
     assert ensure_auth_token() == token
+
+
+def test_unpersistable_token_fails_fast(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "auth_token", None)
+    monkeypatch.setattr(settings, "enable_auth", True)
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(auth.os, "open", _boom)
+
+    with pytest.raises(RuntimeError, match="could not be persisted"):
+        ensure_auth_token()

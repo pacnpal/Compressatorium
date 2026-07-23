@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import secrets
 from pathlib import Path
 
@@ -10,18 +11,24 @@ from config import settings
 from fastapi import Request, status
 from fastapi.responses import JSONResponse, Response
 
-_TOKEN_FILE = "auth_token"
+_AUTH_FILENAME = "auth_token"
 
 
 def ensure_auth_token() -> str | None:
-    """Return the configured auth token, creating a persistent one if needed."""
+    """Return the configured auth token, creating a persistent one if needed.
+
+    Only relevant when ``COMPRESSATORIUM_ENABLE_AUTH`` is set. When no explicit
+    token is configured, a random one is persisted in the data directory. If it
+    cannot be persisted, startup fails with a clear error rather than installing
+    an in-memory token the operator can never discover.
+    """
     if not settings.enable_auth:
         return None
     if settings.auth_token:
         return settings.auth_token
 
     data_dir = Path(settings.data_dir)
-    token_path = data_dir / _TOKEN_FILE
+    token_path = data_dir / _AUTH_FILENAME
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         if token_path.exists():
@@ -30,19 +37,21 @@ def ensure_auth_token() -> str | None:
                 settings.auth_token = token
                 return token
         token = secrets.token_urlsafe(32)
-        token_path.write_text(f"{token}\n", encoding="utf-8")
-        # Best-effort: some bind mounts (CIFS/NTFS-style) reject chmod. The
-        # written token is still the active one, so don't discard it on failure.
-        try:
-            token_path.chmod(0o600)
-        except OSError:
-            pass
+        # Create the file owner-only (0o600) atomically so the credential is
+        # never briefly world-readable. Filesystems that ignore Unix modes
+        # (CIFS/NTFS bind mounts) still accept the write, so this does not lock
+        # out those deployments.
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{token}\n")
         settings.auth_token = token
         return token
-    except OSError:
-        token = secrets.token_urlsafe(32)
-        settings.auth_token = token
-        return token
+    except OSError as exc:
+        raise RuntimeError(
+            f"Authentication is enabled but the auth token could not be persisted to "
+            f"{token_path} ({exc}). Set COMPRESSATORIUM_AUTH_TOKEN to an explicit value "
+            f"or make the data directory writable."
+        ) from exc
 
 
 def _basic_token(value: str) -> str | None:
@@ -103,7 +112,9 @@ async def require_auth_middleware(request: Request, call_next):
     if not settings.enable_auth or request.url.path == "/health":
         return await call_next(request)
 
-    expected = ensure_auth_token()
+    # The token is resolved once at startup (see main.py lifespan), so read it
+    # directly here instead of re-running the persistence path on every request.
+    expected = settings.auth_token
     if not expected:
         return _unauthorized(request)
     if any(_tokens_match(token, expected) for token in _request_tokens(request)):
