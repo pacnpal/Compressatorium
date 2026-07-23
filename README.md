@@ -320,7 +320,7 @@ The web interface is the easiest way to run Compressatorium:
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -e PUID=$(id -u) \
   -e PGID=$(id -g) \
   -v /path/to/config:/config \
@@ -341,7 +341,7 @@ Mount multiple game directories for better organization:
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v /path/to/config:/config \
   -v /home/user/dreamcast:/data/dreamcast \
   -v /home/user/psp:/data/psp \
@@ -1218,7 +1218,7 @@ services:
   compressatorium:
     image: pacnpal/compressatorium
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - COMPRESSATORIUM_MOUNT_ROOT=/data
       - PUID=99
