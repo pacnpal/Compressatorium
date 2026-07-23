@@ -1,0 +1,59 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "security:minimumReleaseAgeNpm"
+  ],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["* * * * 1"],
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "platformAutomerge": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": false,
+    "schedule": ["* * * * 1"]
+  },
+  "major": {
+    "dependencyDashboardApproval": true
+  },
+  "packageRules": [
+    {
+      "description": "Runtime Python deps stay manual: no PR CI runs pytest.",
+      "matchManagers": ["pip_requirements", "pip_setup", "pep621"],
+      "addLabels": ["python"]
+    },
+    {
+      "description": "Docker base-image updates stay manual: the Dockerfile build/hadolint only run on release, not on PRs.",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "addLabels": ["docker"]
+    },
+    {
+      "description": "npm updates stay manual by default: vite/svelte and other build-stack deps feed the release-only Docker frontend build (npm ci + npm run build), which is not run on PRs. Lint/format tooling is automerged by the rule below.",
+      "matchManagers": ["npm"],
+      "addLabels": ["javascript"]
+    },
+    {
+      "description": "Automerge GitHub Actions digest re-pins only. Non-major version bumps stay manual because the release pipeline (docker-image.yml) only runs on release, not on PRs.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "addLabels": ["github-actions"],
+      "automerge": true
+    },
+    {
+      "description": "Automerge lint / formatter tooling only. These neither feed the frontend build nor ship at runtime, so a bad update's worst case is a failing lint, not broken shipped code. Evaluated last so it wins over the manager rules above (e.g. ruff in requirements-dev.txt, eslint in devDependencies).",
+      "matchPackageNames": [
+        "eslint",
+        "eslint-plugin-svelte",
+        "svelte-eslint-parser",
+        "@eslint/js",
+        "prettier",
+        "ruff"
+      ],
+      "automerge": true
+    }
+  ]
+}

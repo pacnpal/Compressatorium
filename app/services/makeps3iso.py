@@ -92,19 +92,13 @@ class MakePs3IsoService:
         this split set. This mirrors the file-browser fold, which likewise only
         folds a contiguous ``.0``-based set.
         """
-        found: dict[int, str] = {}
-        with contextlib.suppress(OSError):
-            for sibling in os.scandir(os.path.dirname(output_path) or "."):
-                match = re.fullmatch(
-                    re.escape(os.path.basename(output_path)) + r"\.(\d+)",
-                    sibling.name,
-                )
-                if match and sibling.is_file():
-                    found[int(match.group(1))] = sibling.path
         parts: list[str] = []
         idx = 0
-        while idx in found:
-            parts.append(found[idx])
+        while True:
+            candidate = f"{output_path}.{idx}"
+            if not os.path.isfile(candidate):
+                break
+            parts.append(candidate)
             idx += 1
         return parts
 

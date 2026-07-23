@@ -320,7 +320,7 @@ The web interface is the easiest way to run Compressatorium:
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -e PUID=$(id -u) \
   -e PGID=$(id -g) \
   -v /path/to/config:/config \
@@ -328,9 +328,9 @@ docker run -d \
   pacnpal/compressatorium
 ```
 
-Then open **http://localhost:8080** in your browser.
+Then open **http://localhost:8080** in your browser. The Web UI and API are unauthenticated by default. To require a token, set `COMPRESSATORIUM_ENABLE_AUTH=true`: the Web UI then prompts for HTTP Basic auth (username defaults to `admin`), using `COMPRESSATORIUM_AUTH_TOKEN` for the password or the token generated in `/config/auth_token` on first startup.
 
-> **Required:** The `/config` volume must be mounted for persistent data storage.  
+> **Required:** The `/config` volume must be mounted for persistent data storage and the generated auth token.  
 > **Volume discovery:** If `COMPRESSATORIUM_VOLUMES` is unset, the app scans `/data/*` at startup and auto-registers mounted game volumes (restart after mount changes).  
 > **Ownership (optional):** Set `PUID`/`PGID` to match your host user/group (for example Unraid `99:100`). If unset, defaults remain `999:999`.  
 > **Default temp location:** `/config/temp`. To use a different location, set `CHD_TEMP_DIR` and mount it.
@@ -341,7 +341,7 @@ Mount multiple game directories for better organization:
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v /path/to/config:/config \
   -v /home/user/dreamcast:/data/dreamcast \
   -v /home/user/psp:/data/psp \
@@ -356,6 +356,8 @@ In the Web UI, you can specify a custom output directory for converted CHD, Dolp
 ### Screenshots
 
 The Web UI ships with light and dark themes and is fully responsive from desktop down to phones. Each surface below is shown as a light / dark pair.
+
+> These screenshots are generated automatically. The [Take screenshots](.github/workflows/screenshots.yml) GitHub Actions workflow builds the UI, runs it against a throwaway fixture library, captures each surface with [shot-scraper](https://shot-scraper.datasette.io/) (definitions in [`shots.yml`](shots.yml)), optimises the PNGs with [Oxipng](https://github.com/shssoichiro/oxipng), and commits the results back to `docs/screenshots/`. To refresh them, trigger that workflow (or run it locally — see [`docs/SCREENSHOTS.md`](docs/SCREENSHOTS.md)).
 
 #### Workspace
 
@@ -971,6 +973,11 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | DELETE | `/api/files/delete` | Delete a single file or empty directory |
 | POST | `/api/files/delete-batch` | Delete multiple files at once |
 
+**Destructive file actions require explicit confirmation headers:**
+- `POST /api/files/rename` requires `X-CHD-Action-Confirm: rename-file`
+- `DELETE /api/files/delete` requires `X-CHD-Action-Confirm: delete-file` (or `recursive-delete` for a non-empty directory)
+- `POST /api/files/delete-batch` requires `X-CHD-Action-Confirm: delete-file`
+
 ### Conversion Jobs
 
 | Method | Endpoint | Description |
@@ -1060,6 +1067,9 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `PUID` | `999` | Optional runtime UID remap for `converter` before app startup (useful on Unraid/home servers) |
 | `PGID` | `999` | Optional runtime GID remap for `converter`; if that GID already exists, `converter` is reassigned to the existing group |
 | `CHD_DATA_DIR` | `/config` | Directory for persistent application data |
+| `COMPRESSATORIUM_ENABLE_AUTH` | `false` | Enable token authentication for the Web UI and `/api` routes. Off by default; set to `true` to require a token. |
+| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password (used only when auth is enabled). Send as HTTP Basic password for user `admin`, as `Authorization: Bearer`, or as `X-Compressatorium-Token`. |
+| `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI (used only when auth is enabled). |
 | `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Web UI: when true, `Search All` conversions return to the previous file-list view after queueing |
 | `CHD_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Legacy alias for `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` |
 | `CHD_TEMP_DIR` | `/config/temp` | Temporary working directory for archive extraction (auto-created) |
@@ -1211,7 +1221,7 @@ services:
   compressatorium:
     image: pacnpal/compressatorium
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - COMPRESSATORIUM_MOUNT_ROOT=/data
       - PUID=99

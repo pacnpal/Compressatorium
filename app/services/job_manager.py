@@ -25,7 +25,11 @@ from services.makeps3iso import makeps3iso_service
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan
-from utils.path_utils import is_within_configured_volumes, strip_archive_path
+from utils.path_utils import (
+    is_safe_directory_tree,
+    is_within_configured_volumes,
+    strip_archive_path,
+)
 
 logger = get_logger("job_manager")
 
@@ -1785,6 +1789,40 @@ class JobManager:
                     )
                 if cancel_event.is_set():
                     raise ConversionCancelled("Conversion cancelled")
+
+            if job.input_kind == InputKind.DIRECTORY:
+                # Re-check directory-input safety after acquiring the source
+                # subtree lock and immediately before invoking the native
+                # recursive packer. A queued PS3 folder job may have been
+                # valid when planned but mutated before it starts; this guards
+                # the exact tree makeps3iso is about to read. Run it *before*
+                # clearing any existing output so a safety rejection on an
+                # overwrite job is non-destructive: the user's prior ISO/split
+                # set is only removed once the source is confirmed still safe.
+                if not await run_in_threadpool(is_safe_directory_tree, input_path):
+                    job.status = JobStatus.FAILED
+                    job.error_message = (
+                        "PS3 folder contains symlinks, special files, "
+                        "or paths outside configured volumes"
+                    )
+                    job.completed_at = datetime.now(timezone.utc)
+                    await self._notify_subscribers(
+                        job_id,
+                        {
+                            "type": "error",
+                            "job_id": job_id,
+                            "error": job.error_message,
+                        },
+                    )
+                    return
+
+            # The recursive PS3 safety walk above can take a while on a large
+            # source tree; honor a cancellation requested during it before
+            # deleting the user's existing output, mirroring the post-extract
+            # cancel check. Otherwise an overwrite job cancelled mid-walk would
+            # still clear the prior ISO/split set only to abort immediately.
+            if cancel_event.is_set():
+                raise ConversionCancelled("Conversion cancelled")
 
             await self._clear_existing_output(job)
 

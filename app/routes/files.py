@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 from config import settings
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from models import (
     BulkDeleteRequest,
@@ -25,6 +25,7 @@ from utils.junk import is_junk_entry
 from utils.path_utils import (
     ensure_path_within_volumes,
     get_volume_name_for_path,
+    is_configured_volume_root,
     is_within_configured_volumes,
 )
 
@@ -34,6 +35,10 @@ logger = get_logger("files")
 # Upper bound on archives summarized in one /archive-summary request. The browser
 # hydrates the visible page, so this is a safety ceiling, not the normal size.
 MAX_ARCHIVE_SUMMARY_PATHS = 1000
+ACTION_CONFIRM_HEADER = "x-chd-action-confirm"
+CONFIRM_RENAME_FILE = "rename-file"
+CONFIRM_DELETE_FILE = "delete-file"
+CONFIRM_RECURSIVE_DELETE = "recursive-delete"
 
 
 # A makeps3iso ``-s`` split set: ``Game.iso.0``, ``Game.iso.1``, … The numeric
@@ -739,12 +744,24 @@ async def list_archive(
     }
 
 
+def _require_action_confirmation(request: Request, expected: str, action: str) -> None:
+    confirmation = request.headers.get(ACTION_CONFIRM_HEADER, "")
+    if confirmation != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing confirmation header for {action}",
+        )
+
+
 @router.post("/files/rename")
 async def rename_file(
+    request: Request,
     path: str = Query(..., description="Path to file or directory to rename"),
     new_name: str = Query(..., description="New name for the file or directory"),
 ) -> dict:
     """Rename a file or directory."""
+    _require_action_confirmation(request, CONFIRM_RENAME_FILE, "rename action")
+
     # is_within_configured_volumes uses os.path.realpath which hits disk
     if not await run_in_threadpool(is_within_configured_volumes, path, treat_archives=False):
         raise HTTPException(
@@ -820,6 +837,7 @@ async def rename_file(
 
 @router.delete("/files/delete")
 async def delete_file(
+    request: Request,
     path: str = Query(..., description="Path to file or directory to delete"),
     recursive: bool = Query(
         False,
@@ -830,6 +848,11 @@ async def delete_file(
     ),
 ) -> dict:
     """Delete a file, an empty directory, or (with ``recursive``) a non-empty one."""
+    if recursive:
+        _require_action_confirmation(request, CONFIRM_RECURSIVE_DELETE, "recursive delete")
+    else:
+        _require_action_confirmation(request, CONFIRM_DELETE_FILE, "delete action")
+
     if not await run_in_threadpool(is_within_configured_volumes, path, treat_archives=False):
         raise HTTPException(
             status_code=403, detail="Access denied: path outside configured volumes",
@@ -839,6 +862,11 @@ async def delete_file(
         raise HTTPException(status_code=404, detail="File or directory not found")
 
     is_dir = await run_in_threadpool(os.path.isdir, path)
+    if is_dir and await run_in_threadpool(
+        is_configured_volume_root, path, treat_archives=False,
+    ):
+        raise HTTPException(status_code=400, detail="Cannot delete a configured volume root")
+
     # For a recursive directory delete this also rejects the request if any
     # active job's path lives under the directory (see _assert_path_not_in_use).
     await _assert_path_not_in_use(path, is_dir=is_dir)
@@ -871,9 +899,13 @@ async def delete_file(
 
 
 @router.post("/files/delete-batch")
-async def delete_files_batch(request: BulkDeleteRequest) -> dict:
+async def delete_files_batch(request: Request, payload: BulkDeleteRequest) -> dict:
     """Delete multiple files at once."""
-    if not request.paths:
+    # Batch delete shares the single-delete gate: without this the same
+    # confirmation could be bypassed by wrapping a path in a one-item batch.
+    _require_action_confirmation(request, CONFIRM_DELETE_FILE, "delete action")
+
+    if not payload.paths:
         raise HTTPException(status_code=400, detail="No paths provided")
 
     results = []
@@ -905,6 +937,14 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
 
         try:
             if is_dir:
+                if await run_in_threadpool(
+                    is_configured_volume_root, path, treat_archives=False,
+                ):
+                    return {
+                        "path": path,
+                        "success": False,
+                        "error": "Cannot delete a configured volume root",
+                    }
                 # Only delete empty directories for safety
                 # os.listdir can be blocking
                 contents = await run_in_threadpool(os.listdir, path)
@@ -929,7 +969,7 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
             return {"path": path, "success": False, "error": "File operation failed"}
 
     # Process all files
-    for path in request.paths:
+    for path in payload.paths:
         result = await delete_single_file(path)
         results.append(result)
         if result["success"]:
@@ -938,7 +978,7 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
             failed_count += 1
 
     return {
-        "total": len(request.paths),
+        "total": len(payload.paths),
         "success": success_count,
         "failed": failed_count,
         "results": results,
