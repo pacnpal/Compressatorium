@@ -5,15 +5,33 @@
 Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
 and #179, part of the #177 tech-debt epic).
 
-### Fixed
+### Added
 
-- **PS3 ISO duplicate preflight no longer scans the whole output directory per
-  candidate.** Split-output detection now probes the contiguous `.iso.0`,
-  `.iso.1`, … sequence directly instead of enumerating every sibling, so
-  `/api/jobs/check-duplicates` stays lightweight for nonexistent folder-to-ISO
-  candidates while preserving split-set collision checks.
+- **Web UI/API authentication (opt-in).** Optional token authentication for the networked UI and `/api` routes, gated behind `COMPRESSATORIUM_ENABLE_AUTH` (default off). When enabled, operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks. The token is accepted only in request headers (HTTP Basic, `Authorization: Bearer`, or `X-Compressatorium-Token`) — never the URL query string — and state-changing requests are restricted to same-origin callers to prevent CSRF via cached browser credentials.
+
+- **Automated Web UI screenshots.** The screenshots embedded in the README are
+  now generated with [shot-scraper](https://shot-scraper.datasette.io/) instead
+  of captured by hand. A new **Take screenshots** GitHub Actions workflow builds
+  the UI, boots it against a throwaway fixture library, captures every surface in
+  light and dark (definitions in `shots.yml`), optimises the PNGs with Oxipng,
+  and commits them back to `docs/screenshots/`. It can also be run locally. See
+  [`docs/SCREENSHOTS.md`](SCREENSHOTS.md) for the full setup. The stale,
+  unreferenced `ui.png` / `mobile-*` / `tablet-*` captures were removed in favour
+  of the regenerated `docs-desktop-view` / `docs-tablet-view` / `docs-mobile-view`
+  set.
 
 ### Changed
+
+- **PS3 folder-to-ISO inputs are now recursively confined to configured volumes.**
+  Directory-input planning rejects symlinks and non-regular filesystem entries,
+  and the queued worker repeats the same safety walk after acquiring the source
+  directory lock and before clearing any existing output, immediately before
+  invoking `makeps3iso`. A symlinked source root is rejected even when hidden
+  behind a trailing separator, a `.`/`./` component, or a `..`-cancelled
+  symlinked ancestor. This prevents a crafted or mutated PS3 folder from
+  causing the native packer to read and embed files outside the configured
+  volume boundary, and keeps a safety rejection on an overwrite job from
+  deleting the user's prior output.
 
 - **Deterministic ordering across the registry, search, and runner (issue
   #183).** The `ToolRegistry` extension-union helpers (`convertible_extensions`,
@@ -45,6 +63,17 @@ and #179, part of the #177 tech-debt epic).
   exits cleanly but produces no file, the failure still reports the reason nsz printed
   (via a shared `require_output` seam) instead of a bare "no output" message. (issue
   #179)
+
+### Fixed
+
+- **Verify streams no longer leak their child process on cancellation.** When an
+  SSE verification client disconnects mid-stream (or the consuming task is
+  otherwise cancelled), `chdman` and `dolphin-tool` `verify_stream` now wrap their
+  read loop in a `try/finally` that terminates the still-running child and untracks
+  its PID on every exit path. Previously a cancelled consumer left the native
+  `chdman verify` / `dolphin-tool verify` subprocess running, slowly exhausting the
+  process table and file descriptors. This brings both tools in line with the
+  `nsz`/`maxcso`/`z3ds` verifiers, which already cleaned up in a `finally`.
 
 ## 4.2.0 (2026-06-13)
 
@@ -90,6 +119,17 @@ optional 4 GB split for FAT32 targets, and a new CSO mode converts a
   is rejected with a clear message asking for an in-volume output directory.
 
 #### Fixed
+
+- **File rename and delete now require an explicit confirmation header.**
+  `POST /api/files/rename`, `DELETE /api/files/delete`, and
+  `POST /api/files/delete-batch` are now guarded by the same
+  `X-CHD-Action-Confirm` header used elsewhere for destructive actions — a
+  shared `_require_action_confirmation` helper enforces `rename-file` for rename
+  and `delete-file` for delete (`recursive-delete` still gates non-empty
+  directory removal). The batch endpoint carries the same `delete-file` guard so
+  the single-delete gate can't be bypassed by wrapping a path in a one-item
+  batch. The Web UI sends these headers automatically; existing volume/path and
+  job-lock checks are unchanged.
 
 - **Rename no longer spin-loops when its output is inside a folder being packed.**
   A new `duplicate_action="rename"` job whose output lands in a locked PS3 subtree

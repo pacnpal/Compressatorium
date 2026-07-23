@@ -53,6 +53,21 @@ longer premature, it is overdue.
 
 ---
 
+
+### 2.1 Web/API authentication boundary
+
+The FastAPI app can apply a single HTTP middleware (`app/auth.py`) before static
+files and all routers. The entire auth system is gated on
+`COMPRESSATORIUM_ENABLE_AUTH` (default `false`): when disabled, the middleware is
+not registered and no token is generated. When enabled, it protects the Web UI
+and every `/api` route with the same token check, while leaving `/health` open
+for container health checks. Tokens are read from headers only (HTTP Basic,
+`Authorization: Bearer`, or `X-Compressatorium-Token`) — never the query string —
+and state-changing requests (`POST`/`PUT`/`PATCH`/`DELETE`) are additionally
+restricted to same-origin callers (`Sec-Fetch-Site`/`Origin`) so cached browser
+Basic credentials can't be abused cross-site. Keep new routers behind that
+app-level middleware rather than adding per-router auth branches.
+
 ## 2. Target architecture
 
 ```
@@ -358,6 +373,23 @@ flags. One-shot subprocess work (info / header / embedded-hash extraction)
 shares `run_capture()` rather than re-implementing the spawn / cancel / timeout /
 terminate dance per tool.
 
+Directory-input tools that hand a source tree to a native recursive reader must
+validate both at planning time and again in `JobManager._process_job` after the
+source subtree lock is acquired, immediately before invoking the tool. The PS3
+`folder_to_iso` path uses `is_safe_directory_tree` for both checks so a queued
+job cannot be made unsafe by adding a symlink, special file, or volume-escaping
+entry after planning but before `makeps3iso` starts. The worker runs the
+re-check *before* `_clear_existing_output`, so a safety rejection on an
+overwrite job is non-destructive — the prior output is only cleared once the
+source is confirmed still safe. Because that walk can be slow on a large tree,
+the worker also re-checks the cancel event immediately after it (before
+clearing outputs), so a job cancelled mid-walk keeps its prior output. To keep
+the planning-time walk off the hot rejection paths, `_plan_directory_job` runs
+it only after the output is derived and skip/locked collisions short-circuit,
+and the create/batch routes apply queue-depth backpressure (HTTP 429) *before*
+planning when the queue is already full — so a doomed submit never pays for the
+tree walk.
+
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
 `ArchiveService.enforce_archive_limits(members)` is the shared seam any
@@ -500,7 +532,23 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
   cancel/failure, and runs a light **PARAM.SFO `TITLE_ID` readback** from the
   built ISO (reusing the shared `disc_id.read_iso_file` ISO 9660 reader) as an
   advisory check — `supports_delete_on_verify=False`, so a curated source folder
-  is never auto-deleted.
+  is never auto-deleted. Before queuing the native packer, `plan_job` also walks
+  the whole source tree with `utils.path_utils.is_safe_directory_tree`: the root
+  is `lstat`ed after stripping only trailing separators and `.` components
+  (interior `..`/symlinked ancestors are left intact, so the kernel resolves
+  them and `lstat` reports the true final entry — a symlinked root cannot hide
+  behind a trailing `/`, `/.`, `/./`, or a `..`-cancelled symlinked ancestor)
+  and confined to a configured volume, then every
+  entry is `lstat`ed and any symlink or non-regular entry is rejected. Because
+  `os.walk(followlinks=False)` never descends through a link, the surviving
+  entries are all genuine children of the confined root — no per-entry resolve
+  is needed — so makeps3iso cannot dereference a link and embed files outside
+  the volume boundary. The directory job is also **canonicalized to the resolved
+  real source path** (`os.path.realpath`) before being queued, so makeps3iso is
+  handed a symlink-free path: a concurrent swap of a symlinked *ancestor*
+  component after validation cannot retarget the native reader to an unchecked
+  tree. (A symlinked *root* is still rejected outright, since the safety walk
+  runs on the original submitted path.)
 - **Job model.** `ConversionJob.input_kind: InputKind` is threaded end-to-end
   (derived from the mode spec at queue time, serialized to a string only at the
   API/persistence edge). The generic `_process_job` flow already handles a

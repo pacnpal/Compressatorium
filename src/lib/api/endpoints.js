@@ -140,7 +140,7 @@ export const api = {
     const params = new URLSearchParams({ path, new_name: newName });
     return fetchJson(
       buildApiUrl('/files/rename', params),
-      { method: 'POST' },
+      { method: 'POST', headers: { 'X-CHD-Action-Confirm': CONFIRM.RENAME_FILE } },
       'Failed to rename',
     );
   },
@@ -148,15 +148,23 @@ export const api = {
   deleteFile(path, { recursive = false } = {}) {
     const params = new URLSearchParams({ path });
     if (recursive) params.set('recursive', 'true');
+    const headers = {
+      'X-CHD-Action-Confirm': recursive ? CONFIRM.RECURSIVE_DELETE : CONFIRM.DELETE_FILE,
+    };
     return fetchJson(
       buildApiUrl('/files/delete', params),
-      { method: 'DELETE' },
+      { method: 'DELETE', headers },
       'Failed to delete',
     );
   },
 
   deleteBatch(paths) {
-    return jsonPost(`${API_BASE}/files/delete-batch`, { paths }, {}, 'Failed to delete files');
+    return jsonPost(
+      `${API_BASE}/files/delete-batch`,
+      { paths },
+      { headers: { 'X-CHD-Action-Confirm': CONFIRM.DELETE_FILE } },
+      'Failed to delete files',
+    );
   },
 
   // ─── Jobs ─────────────────────────────────────────────────────────────
