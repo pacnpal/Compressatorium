@@ -163,6 +163,33 @@ async def test_archive_member_converts_end_to_end(e2e_env, ext, mode, out_ext):
 
 
 @pytest.mark.asyncio
+async def test_invalid_nsz_archive_member_returns_bad_extension(e2e_env):
+    """Invalid Switch archive members should fail validation before output
+    path mapping tries to derive .nsz/.xcz names from the member suffix."""
+    from fastapi import HTTPException
+
+    tmp_path: Path = e2e_env["tmp_path"]
+    archive = tmp_path / "switch.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("bad.txt", b"not-a-switch-container")
+
+    request = JobCreateRequest(
+        file_path=f"{archive}::bad.txt",
+        mode=ConversionMode.NSZ_COMPRESS,
+        duplicate_action=DuplicateAction.SKIP,
+        delete_on_verify=False,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await convert_routes.create_job(request)
+
+    status, detail = convert_routes._SKIP_HTTP[
+        convert_routes.SkipReason.NSZ_BAD_EXTENSION
+    ]
+    assert exc.value.status_code == status == 400
+    assert exc.value.detail == detail
+
+
+@pytest.mark.asyncio
 async def test_archive_chd_member_rejected_for_recompress(e2e_env):
     """Recompressing a .chd straight out of an archive is a pointless round
     trip, so chdman's copy mode keeps allows_archive_input=False and the route
