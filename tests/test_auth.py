@@ -8,9 +8,9 @@ from auth import ensure_auth_token, require_auth_middleware
 from config import settings
 
 
-def _reset_auth(monkeypatch, *, token="test-token", disabled=False, username="admin"):
+def _reset_auth(monkeypatch, *, token="test-token", enabled=True, username="admin"):
     monkeypatch.setattr(settings, "auth_token", token)
-    monkeypatch.setattr(settings, "disable_auth", disabled)
+    monkeypatch.setattr(settings, "enable_auth", enabled)
     monkeypatch.setattr(settings, "auth_username", username)
 
 
@@ -55,6 +55,14 @@ def test_api_accepts_bearer_token(monkeypatch):
     assert response.status_code == 200
 
 
+def test_non_ascii_token_is_rejected_without_error(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(headers={"X-Compressatorium-Token": "café"}))
+
+    assert response.status_code == 401
+
+
 def test_web_ui_accepts_basic_auth(monkeypatch):
     _reset_auth(monkeypatch, token="secret", username="operator")
     credentials = base64.b64encode(b"operator:secret").decode("ascii")
@@ -80,17 +88,26 @@ def test_health_remains_unauthenticated(monkeypatch):
     assert response.status_code == 200
 
 
-def test_auth_can_be_explicitly_disabled(monkeypatch):
-    _reset_auth(monkeypatch, disabled=True)
+def test_auth_disabled_by_default(monkeypatch):
+    _reset_auth(monkeypatch, enabled=False)
 
     response = _run(_request())
 
     assert response.status_code == 200
 
 
+def test_disabled_auth_generates_no_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "auth_token", None)
+    monkeypatch.setattr(settings, "enable_auth", False)
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+
+    assert ensure_auth_token() is None
+    assert not (tmp_path / "auth_token").exists()
+
+
 def test_auth_token_is_persisted(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "auth_token", None)
-    monkeypatch.setattr(settings, "disable_auth", False)
+    monkeypatch.setattr(settings, "enable_auth", True)
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
 
     token = ensure_auth_token()

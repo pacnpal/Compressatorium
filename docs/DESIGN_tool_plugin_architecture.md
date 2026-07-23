@@ -56,11 +56,13 @@ longer premature, it is overdue.
 
 ### 2.1 Web/API authentication boundary
 
-The FastAPI app applies a single HTTP middleware (`app/auth.py`) before static
-files and all routers. It protects the Web UI and every `/api` route with the
-same token check, while leaving `/health` open for container health checks. Keep
-new routers behind that app-level middleware rather than adding per-router auth
-branches.
+The FastAPI app can apply a single HTTP middleware (`app/auth.py`) before static
+files and all routers. The entire auth system is gated on
+`COMPRESSATORIUM_ENABLE_AUTH` (default `false`): when disabled, the middleware is
+not registered and no token is generated. When enabled, it protects the Web UI
+and every `/api` route with the same token check, while leaving `/health` open
+for container health checks. Keep new routers behind that app-level middleware
+rather than adding per-router auth branches.
 
 ## 2. Target architecture
 

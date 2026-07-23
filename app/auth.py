@@ -15,7 +15,7 @@ _TOKEN_FILE = "auth_token"
 
 def ensure_auth_token() -> str | None:
     """Return the configured auth token, creating a persistent one if needed."""
-    if settings.disable_auth:
+    if not settings.enable_auth:
         return None
     if settings.auth_token:
         return settings.auth_token
@@ -65,7 +65,7 @@ def _request_token(request: Request) -> str | None:
 
 
 def _unauthorized(request: Request) -> Response:
-    headers = {"WWW-Authenticate": f'Basic realm="Compressatorium", charset="UTF-8"'}
+    headers = {"WWW-Authenticate": 'Basic realm="Compressatorium", charset="UTF-8"'}
     if request.url.path.startswith("/api/"):
         return JSONResponse(
             {"detail": "Authentication required"},
@@ -81,11 +81,21 @@ def _unauthorized(request: Request) -> Response:
 
 async def require_auth_middleware(request: Request, call_next):
     """Require authentication for the web UI and API unless explicitly disabled."""
-    if request.url.path == "/health" or settings.disable_auth:
+    if not settings.enable_auth or request.url.path == "/health":
         return await call_next(request)
 
     expected = ensure_auth_token()
     provided = _request_token(request)
-    if not expected or not provided or not secrets.compare_digest(provided, expected):
+    if not expected or not provided or not _tokens_match(provided, expected):
         return _unauthorized(request)
     return await call_next(request)
+
+
+def _tokens_match(provided: str, expected: str) -> bool:
+    """Constant-time token comparison that tolerates non-ASCII input.
+
+    ``secrets.compare_digest`` raises ``TypeError`` for ``str`` arguments
+    containing non-ASCII characters, so compare the UTF-8 encoded bytes to
+    avoid an unhandled 500 when a client sends a non-ASCII token.
+    """
+    return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))

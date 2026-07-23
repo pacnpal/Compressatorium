@@ -7,7 +7,7 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
-- **Web UI/API authentication.** The networked UI and `/api` routes now require authentication by default. Operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks.
+- **Web UI/API authentication (opt-in).** Optional token authentication for the networked UI and `/api` routes, gated behind `COMPRESSATORIUM_ENABLE_AUTH` (default off). When enabled, operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks.
 
 - **Automated Web UI screenshots.** The screenshots embedded in the README are
   now generated with [shot-scraper](https://shot-scraper.datasette.io/) instead

@@ -6,7 +6,7 @@ This file started as a one-time readiness audit (2026-01-20). Several of its old
 
 ## Security
 
-**Web UI/API authentication.** Authentication is enabled by default for the Web UI and `/api` routes. Set `COMPRESSATORIUM_AUTH_TOKEN` (or `CHD_AUTH_TOKEN`) to a strong value, or let startup generate `/config/auth_token` and use that as the HTTP Basic password for user `admin`. `/health` stays unauthenticated for Docker health checks. Only set `COMPRESSATORIUM_DISABLE_AUTH=true` behind another access-control layer.
+**Web UI/API authentication.** Authentication is off by default and gated behind `COMPRESSATORIUM_ENABLE_AUTH`. Set `COMPRESSATORIUM_ENABLE_AUTH=true` to require a token for the Web UI and `/api` routes, then either set `COMPRESSATORIUM_AUTH_TOKEN` (or `CHD_AUTH_TOKEN`) to a strong value or let startup generate `/config/auth_token` and use that as the HTTP Basic password for user `admin`. `/health` stays unauthenticated for Docker health checks. Leave auth disabled only when another access-control layer protects the service.
 
 **Path traversal.** Every file operation goes through `is_within_configured_volumes()` and `ensure_path_within_volumes()` in `app/utils/path_utils.py`. Paths are resolved with `Path.resolve()` and checked against the configured volumes, and symlink loops (ELOOP) are rejected outright instead of slipping through. Used in `files.py` and `convert.py`.
 
@@ -33,9 +33,9 @@ The full environment variable reference lives in [README.md](../README.md#enviro
 | `COMPRESSATORIUM_VOLUMES` | (unset) | Explicit comma-separated volume paths; skips the scan |
 | `PUID` / `PGID` | `999` | Remap the `converter` user/group to match host ownership |
 | `CHD_DATA_DIR` | `/config` | Persistent data; the SQLite DB and generated auth token live here |
-| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password. Use it via HTTP Basic, bearer token, `X-Compressatorium-Token`, or `access_token` for SSE clients. |
-| `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI. |
-| `COMPRESSATORIUM_DISABLE_AUTH` | `false` | Disable built-in auth only when an external access-control boundary protects the service. |
+| `COMPRESSATORIUM_ENABLE_AUTH` | `false` | Enable token auth for the Web UI and `/api`. Off by default; set `true` to require a token. |
+| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password (when auth is enabled). Use it via HTTP Basic, bearer token, `X-Compressatorium-Token`, or `access_token` for SSE clients. |
+| `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI (when auth is enabled). |
 | `MAX_CONCURRENT_JOBS` | `1` | Parallel conversion jobs |
 | `COMPRESSATORIUM_TOOL_NICE` / `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` / `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `10` / `2` / `6` | CPU and I/O priority for **all** tools (chdman, Dolphin, 3DS, Switch, PSP/PS2 CSO, handheld ROM, PS3 ISO). Legacy aliases `CHD_CHDMAN_NICE` / `CHD_CHDMAN_IOPRIO_CLASS` / `CHD_CHDMAN_IOPRIO_LEVEL` still work. Also `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` (chdman/Dolphin info subprocess) and `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` (verify across all tools). Per-tool overrides: `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` for `<TOOL>` = `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ`, `MAKEPS3ISO` (`MAKEPS3ISO` has no `_VERIFY_TIMEOUT`, since makeps3iso has no verify step); `_INFO_TIMEOUT` only for `CHDMAN` and `DOLPHIN_TOOL`. |
 | `SWITCH_KEYS` | (unset) | Directory holding your own Switch `prod.keys`. Source of truth for the Switch (nsz) tool; mount it read-only. When unset, the app best-effort checks `~/.switch` and your mounted volumes. No keys ship with the image. |
@@ -79,10 +79,10 @@ Volume precedence:
 
 ## What you should add yourself
 
-Compressatorium has built-in token authentication but doesn't terminate TLS. For anything reachable beyond your LAN:
+Compressatorium ships built-in token authentication (opt-in) but doesn't terminate TLS. For anything reachable beyond your LAN:
 
 - Put it behind a reverse proxy (nginx or Traefik) with HTTPS.
-- Keep built-in auth enabled, and optionally add another authentication layer at the proxy.
+- Enable built-in auth (`COMPRESSATORIUM_ENABLE_AUTH=true`) and/or add an authentication layer at the proxy.
 - Add security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`) and rate limiting at the proxy.
 - There are no CORS restrictions by default. Add them at the proxy if the API needs protecting.
 - Set up monitoring and log aggregation. Logs go to stdout, or to `LOG_PATH` if you set it.
@@ -135,4 +135,4 @@ Compressatorium has built-in token authentication but doesn't terminate TLS. For
 
 ## Bottom line
 
-The app is safe to run on development and staging right away. For production, keep built-in auth enabled, add a reverse proxy with HTTPS, set resource limits, and decide on monitoring and backups. Nothing in the codebase blocks a production deploy. The gaps are the usual operational ones it leaves to you on purpose.
+The app is safe to run on development and staging right away. For production, enable built-in auth (`COMPRESSATORIUM_ENABLE_AUTH=true`), add a reverse proxy with HTTPS, set resource limits, and decide on monitoring and backups. Nothing in the codebase blocks a production deploy. The gaps are the usual operational ones it leaves to you on purpose.

@@ -39,15 +39,16 @@ class Settings(BaseSettings):
         description="SQLite database file; default: <CHD_DATA_DIR>/compressatorium.db",
     )
 
-    # Web UI authentication. Enabled by default; set a token explicitly or the
-    # app creates a persistent token in CHD_DATA_DIR/auth_token on startup.
+    # Web UI authentication. Disabled by default; set COMPRESSATORIUM_ENABLE_AUTH=true
+    # to require a token for the Web UI and /api routes. When enabled, set a token
+    # explicitly or the app creates a persistent token in CHD_DATA_DIR/auth_token.
+    enable_auth: bool = Field(default=False, alias="COMPRESSATORIUM_ENABLE_AUTH")
     auth_token: str | None = Field(
         default=None,
         alias="COMPRESSATORIUM_AUTH_TOKEN",
         validation_alias=AliasChoices("COMPRESSATORIUM_AUTH_TOKEN", "CHD_AUTH_TOKEN"),
     )
     auth_username: str = Field(default="admin", alias="COMPRESSATORIUM_AUTH_USERNAME")
-    disable_auth: bool = Field(default=False, alias="COMPRESSATORIUM_DISABLE_AUTH")
 
     # Web UI behavior
     search_auto_return_to_file_list: bool = Field(
