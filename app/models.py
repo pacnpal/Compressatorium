@@ -86,29 +86,6 @@ class FileEntry(BaseModel):
     type: str  # "file", "directory", or "archive"
     size: int | None = None
     extension: str | None = None
-    convertible: bool = False
-    has_chd: bool = False
-    has_rvz: bool = False
-    dolphin_ready: bool = False
-    dolphin_path: str | None = None
-    chd_ready: bool = False
-    dolphin_convertible: bool = False
-    z3ds_convertible: bool = False
-    has_z3ds: bool = False
-    z3ds_ready: bool = False
-    z3ds_path: str | None = None
-    nsz_convertible: bool = False
-    has_nsz: bool = False
-    nsz_ready: bool = False
-    nsz_path: str | None = None
-    cso_convertible: bool = False
-    has_cso: bool = False
-    cso_ready: bool = False
-    cso_path: str | None = None
-    romz_convertible: bool = False
-    has_romz: bool = False
-    romz_ready: bool = False
-    romz_path: str | None = None
     archive_items: int | None = None
     # Count of archive members that already have an existing output from any
     # registered tool (.chd/.rvz/.z3ds/.nsz/…), finished or mid-conversion.

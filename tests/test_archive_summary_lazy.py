@@ -77,7 +77,6 @@ async def test_batch_matches_inline_summary(summary_env):
         assert got["archive_items"] == entry.archive_items
         assert got["archive_has_output"] == entry.archive_has_output
         assert got["archive_truncated"] == entry.archive_truncated
-        assert got["has_chd"] == entry.has_chd
         assert got["verifiable_by"] == entry.verifiable_by
 
     # Spot-check the meaningful distinctions the badges rely on.

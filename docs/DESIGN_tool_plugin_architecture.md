@@ -1016,8 +1016,21 @@ at a time. Nothing here changes the wire API until Phase 9 (optional).
   `ADDING_PLATFORMS_AND_TOOLS.md` §15 (no build step, edit JS directly).
 
 ### Phase 9: Cleanup (optional, behavior-preserving)
-- Remove the now-unused legacy `FileEntry` booleans once the frontend reads
-  `outputs` exclusively.
+- ~~Remove the now-unused legacy `FileEntry` booleans once the frontend reads
+  `outputs` exclusively.~~ **Done (issue #186, site 6).** The ~23 legacy
+  per-tool flags (`has_*` / `*_ready` / `*_convertible` / `*_path` and the bare
+  `convertible`) are gone from `FileEntry`, the `_legacy_output_fields` helper
+  and the per-archive `has_chd` special-case are removed from `routes/files.py`,
+  and the two remaining frontend fallbacks (`FileRow` `convertibleBy`,
+  `fileBrowser` `has_chd` merge) now read `convertible_by` / `outputs` /
+  `verifiable_by` exclusively. The per-archive "converted" badge derives from
+  the registry-driven `archive_has_output` count.
+- The verify-route factory (`routes/info.py`) is already registry-driven with no
+  per-tool branching; its six explicit `register_verify_routes(...)` calls are
+  retained deliberately to preserve the module-level `verify_*` handler names the
+  route tests call directly. Folding them into a `registry.all()` loop would
+  require moving the per-tool prefix/detail strings onto the plugin contract and
+  rewriting those tests, for no behavior change, so it stays as-is.
 - Delete the old `services/{chdman,dolphin,z3ds_compress}.py` shims; update
   imports.
 - Consider deriving `config` binary paths from the registry.

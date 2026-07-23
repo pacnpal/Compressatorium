@@ -1,8 +1,14 @@
-"""Phase 7: registry-driven FileEntry outputs must stay in lock-step with the
-legacy per-tool booleans, and the legacy JSON contract must not drift.
+"""Registry-driven FileEntry output detection across the file/search paths.
 
-These tests are the safety net for the refactor that replaced the six
-hand-written flag blocks in ``routes/files.py`` with a single registry loop.
+Phase 7 replaced the six hand-written per-tool flag blocks in
+``routes/files.py`` with a single registry loop, and Phase 9 (issue #186,
+site 6) removed the legacy ``has_*`` / ``*_ready`` / ``*_convertible`` /
+``*_path`` booleans entirely — the frontend reads ``convertible_by`` /
+``outputs`` / ``verifiable_by`` exclusively. These tests are the safety net for
+the detection itself: every branch (no output, finished output, mid-conversion
+lock, self-format input, per-tool convertibility, the archive-member summary)
+must be reported correctly through the registry-driven fields, and the JSON
+contract must stay exactly those fields with no legacy holdovers.
 """
 
 from __future__ import annotations
@@ -15,36 +21,26 @@ import pytest
 from app.routes import files as files_routes
 from app.services.lock_manager import lock_manager
 
-# The exact legacy field surface that frontend (Phase 8) still reads. Phase 7
-# only adds ``convertible_by``/``outputs`` on top of these.
-LEGACY_FILEENTRY_KEYS = {
-    "name", "path", "type", "size", "extension", "convertible", "has_chd",
-    "has_rvz", "dolphin_ready", "dolphin_path", "chd_ready",
-    "dolphin_convertible", "z3ds_convertible", "has_z3ds", "z3ds_ready",
-    "z3ds_path", "nsz_convertible", "has_nsz", "nsz_ready", "nsz_path",
-    "cso_convertible", "has_cso", "cso_ready", "cso_path",
-    "romz_convertible", "has_romz", "romz_ready", "romz_path",
-    "archive_items", "archive_has_output", "archive_truncated",
-    "media_type",
+# The exact FileEntry field surface the frontend reads.
+FILEENTRY_KEYS = {
+    "name", "path", "type", "size", "extension",
+    "archive_items", "archive_has_output", "archive_truncated", "media_type",
+    "convertible_by", "outputs", "verifiable_by", "split_parts",
 }
-LEGACY_SEARCH_KEYS = {
-    "name", "path", "size", "extension", "chd_path", "has_chd", "has_rvz",
-    "dolphin_ready", "dolphin_path", "chd_ready", "convertible",
-    "dolphin_convertible", "z3ds_convertible", "has_z3ds", "z3ds_ready",
-    "z3ds_path", "nsz_convertible", "has_nsz", "nsz_ready", "nsz_path",
-    "cso_convertible", "has_cso", "cso_ready", "cso_path",
-    "romz_convertible", "has_romz", "romz_ready", "romz_path",
-    "in_archive",
+# On-disk search hits mirror the file schema minus the listing-only archive
+# summary / media / split fields, plus the ``in_archive`` marker.
+SEARCH_FILE_KEYS = {
+    "name", "path", "size", "extension", "in_archive",
+    "convertible_by", "outputs", "verifiable_by",
 }
-# Archive members carry the same registry-driven flags as on-disk search hits
-# (issue #128) plus the archive-specific locator keys.
-LEGACY_ARCHIVE_KEYS = LEGACY_SEARCH_KEYS | {
-    "archive_path", "internal_path", "output_stem",
+# Archive containers surface from search with the same schema plus a ``type``.
+SEARCH_ARCHIVE_CONTAINER_KEYS = SEARCH_FILE_KEYS | {"type"}
+# Archive members carry the registry-driven flags plus archive locator keys,
+# but no per-file verify gate (they can't be verified in place).
+ARCHIVE_MEMBER_KEYS = {
+    "name", "path", "size", "extension", "in_archive",
+    "convertible_by", "outputs", "archive_path", "internal_path", "output_stem",
 }
-NEW_KEYS = {"convertible_by", "outputs"}
-# On-disk entries and archive containers also carry the per-file verify gate
-# (issue #146); archive *members* don't (they can't be verified in place).
-NEW_KEYS_WITH_VERIFY = NEW_KEYS | {"verifiable_by"}
 
 
 @pytest.fixture(name="parity_env")
@@ -83,123 +79,75 @@ def _parity_env(tmp_path: Path, monkeypatch):
         lock_manager.release_lock(lock_path)
 
 
-def _assert_agreement(legacy: dict, outputs: list, convertible_by: list[str]) -> None:
-    """The legacy booleans must be reconstructable from outputs/convertible_by."""
-    by_tool = {o.tool_id: o for o in outputs}
-
-    assert legacy["has_chd"] == ("chdman" in by_tool)
-    assert legacy["chd_ready"] == (
-        by_tool["chdman"].exists if "chdman" in by_tool else False
-    )
-
-    assert legacy["has_rvz"] == ("dolphin" in by_tool)
-    assert legacy["dolphin_ready"] == (
-        by_tool["dolphin"].exists if "dolphin" in by_tool else False
-    )
-    assert legacy["dolphin_path"] == (
-        by_tool["dolphin"].path if "dolphin" in by_tool else None
-    )
-
-    assert legacy["has_z3ds"] == ("z3ds" in by_tool)
-    assert legacy["z3ds_ready"] == (
-        by_tool["z3ds"].exists if "z3ds" in by_tool else False
-    )
-    assert legacy["z3ds_path"] == (
-        by_tool["z3ds"].path if "z3ds" in by_tool else None
-    )
-
-    assert legacy["convertible"] == ("chdman" in convertible_by)
-    assert legacy["dolphin_convertible"] == ("dolphin" in convertible_by)
-    assert legacy["z3ds_convertible"] == ("z3ds" in convertible_by)
+# Both the listing (FileEntry.outputs) and the search dicts ("outputs" key)
+# carry OutputStatus objects, so every field is attribute access.
+def _by_tool(outputs: list) -> dict:
+    return {o.tool_id: o for o in outputs}
 
 
 @pytest.mark.asyncio
-async def test_list_files_outputs_agree_with_legacy(parity_env):
+async def test_list_files_output_detection(parity_env):
     listing = await files_routes.list_files(path=parity_env["root"])
     by_name = {e.name: e for e in listing.entries}
     root = parity_env["root"]
-
-    # Archives are a documented exception: has_chd is set from archive-member
-    # scanning, not from registry outputs, so the agreement invariant applies
-    # only to plain files.
-    for entry in listing.entries:
-        if entry.type != "file":
-            continue
-        _assert_agreement(entry.model_dump(), entry.outputs, entry.convertible_by)
 
     # No output present.
     lonely = by_name["lonely.cue"]
     assert lonely.convertible_by == ["chdman"]
     assert lonely.outputs == []
-    assert lonely.has_chd is False and lonely.chd_ready is False
 
     # Finished chdman output.
     done = by_name["done.cue"]
-    assert done.has_chd is True and done.chd_ready is True
     assert [o.tool_id for o in done.outputs] == ["chdman"]
     assert done.outputs[0].exists is True and done.outputs[0].ready is True
 
     # Mid-conversion chdman output (locked, file absent).
     prog = by_name["prog.cue"]
-    assert prog.has_chd is True and prog.chd_ready is False
     assert prog.outputs[0].tool_id == "chdman"
     assert prog.outputs[0].exists is False and prog.outputs[0].ready is False
     assert prog.outputs[0].path == str(Path(root) / "prog.chd")
 
-    # Finished dolphin output for a dolphin-only input.
+    # Finished dolphin output for a dolphin-only input (.wbfs is not
+    # chdman-convertible).
     disc = by_name["disc.wbfs"]
-    assert disc.has_rvz is True and disc.dolphin_ready is True
-    assert disc.dolphin_path == str(Path(root) / "disc.rvz")
-    assert disc.convertible is False  # .wbfs is not chdman-convertible
+    assert "chdman" not in disc.convertible_by
+    assert _by_tool(disc.outputs)["dolphin"].exists is True
+    assert _by_tool(disc.outputs)["dolphin"].path == str(Path(root) / "disc.rvz")
 
     # Self-format dolphin input detects itself.
     movie = by_name["movie.rvz"]
-    assert movie.has_rvz is True and movie.dolphin_ready is True
-    assert movie.dolphin_path == str(Path(root) / "movie.rvz")
+    assert _by_tool(movie.outputs)["dolphin"].path == str(Path(root) / "movie.rvz")
 
     # Finished z3ds output.
     rom = by_name["rom.3ds"]
-    assert rom.has_z3ds is True and rom.z3ds_ready is True
-    assert rom.z3ds_path == str(Path(root) / "rom.z3ds")
     assert [o.tool_id for o in rom.outputs] == ["z3ds"]
+    assert _by_tool(rom.outputs)["z3ds"].path == str(Path(root) / "rom.z3ds")
 
-    # Archive: CHD-only detection via the archive special-casing; the new
-    # registry-driven fields stay empty (archives never emit tool outputs).
+    # Archive: never emits tool outputs itself, but the registry-driven summary
+    # counts the single member with a sibling output (inner.iso -> inner.chd)
+    # regardless of which tool produced it — the replacement for the old
+    # per-archive has_chd badge.
     bundle = by_name["bundle.zip"]
     assert bundle.type == "archive"
-    assert bundle.has_chd is True  # inner.chd exists for the member stem
-    assert bundle.has_rvz is False and bundle.z3ds_ready is False
     assert bundle.convertible_by == []
     assert bundle.outputs == []
-    # The summary count is registry-driven: the single member with a sibling
-    # output (inner.iso -> inner.chd) is counted regardless of which tool
-    # produced it.
     assert bundle.archive_has_output == 1
 
 
 @pytest.mark.asyncio
-async def test_search_files_outputs_agree_with_legacy(parity_env):
+async def test_search_files_output_detection(parity_env):
     results = await files_routes.search_files(
         path=parity_env["root"], recursive=True, include_archives=True,
     )
     by_name = {Path(item["path"]).name: item for item in results["files"]}
 
-    # Archives are a documented exception (mirrors the list_files counterpart):
-    # has_chd can come from archive-member scanning, not registry outputs, so
-    # the agreement invariant applies only to plain on-disk files.
-    for item in results["files"]:
-        if item.get("type") == "archive":
-            continue
-        _assert_agreement(item, item["outputs"], item["convertible_by"])
-
     assert by_name["lonely.cue"]["outputs"] == []
     assert by_name["lonely.cue"]["convertible_by"] == ["chdman"]
-    assert by_name["done.cue"]["chd_ready"] is True
-    assert by_name["prog.cue"]["has_chd"] is True
-    assert by_name["prog.cue"]["chd_ready"] is False
-    assert by_name["disc.wbfs"]["dolphin_path"].endswith("disc.rvz")
-    assert by_name["movie.rvz"]["dolphin_ready"] is True
-    assert by_name["rom.3ds"]["z3ds_ready"] is True
+    assert _by_tool(by_name["done.cue"]["outputs"])["chdman"].ready is True
+    assert _by_tool(by_name["prog.cue"]["outputs"])["chdman"].exists is False
+    assert _by_tool(by_name["disc.wbfs"]["outputs"])["dolphin"].path.endswith("disc.rvz")
+    assert _by_tool(by_name["movie.rvz"]["outputs"])["dolphin"].ready is True
+    assert "z3ds" in _by_tool(by_name["rom.3ds"]["outputs"])
     # The archive container surfaces as a top-level result (browse-only unless an
     # archive-direct mode like romz_extract is active) alongside its members.
     assert by_name["bundle.zip"]["type"] == "archive"
@@ -207,56 +155,38 @@ async def test_search_files_outputs_agree_with_legacy(parity_env):
 
 
 @pytest.mark.asyncio
-async def test_list_files_json_keys_are_additive(parity_env):
-    """Every legacy FileEntry key is preserved; only convertible_by/outputs added."""
+async def test_list_files_json_keys(parity_env):
+    """Every FileEntry carries exactly the registry-driven field surface."""
     listing = await files_routes.list_files(path=parity_env["root"])
     for entry in listing.entries:
-        keys = set(entry.model_dump().keys())
-        assert LEGACY_FILEENTRY_KEYS <= keys
-        # split_parts (issue #98): present on every FileEntry (None unless this
-        # row is a folded makeps3iso split-ISO set). The search path emits plain
-        # dicts without it, so it's only added to the listing's key set.
-        assert keys - LEGACY_FILEENTRY_KEYS == NEW_KEYS_WITH_VERIFY | {"split_parts"}
+        assert set(entry.model_dump().keys()) == FILEENTRY_KEYS
 
 
 @pytest.mark.asyncio
-async def test_search_files_json_keys_are_additive(parity_env):
-    """Search file dicts keep every legacy key; archive dicts stay untouched."""
+async def test_search_files_json_keys(parity_env):
+    """Search dicts carry only the registry-driven fields — no legacy holdovers."""
     results = await files_routes.search_files(
         path=parity_env["root"], recursive=True, include_archives=True,
     )
     for item in results["files"]:
         keys = set(item.keys())
-        assert LEGACY_SEARCH_KEYS <= keys
-        # Archive containers (issue: romz_extract reachable from search) carry
-        # the same file schema plus a ``type`` marker; on-disk hits stay as-is.
         if item.get("type") == "archive":
-            assert keys - LEGACY_SEARCH_KEYS == NEW_KEYS_WITH_VERIFY | {"type"}
+            assert keys == SEARCH_ARCHIVE_CONTAINER_KEYS
         else:
-            assert keys - LEGACY_SEARCH_KEYS == NEW_KEYS_WITH_VERIFY
+            assert keys == SEARCH_FILE_KEYS
 
-    # Archive members are now registry-driven too (issue #128): they expose the
-    # same per-tool flags as on-disk hits, plus archive locator keys, and their
-    # legacy booleans must be reconstructable from outputs/convertible_by.
     for item in results["archives"]:
-        keys = set(item.keys())
-        assert LEGACY_ARCHIVE_KEYS <= keys
-        assert keys - LEGACY_ARCHIVE_KEYS == NEW_KEYS
+        assert set(item.keys()) == ARCHIVE_MEMBER_KEYS
         assert item["in_archive"] is True
-        _assert_agreement(item, item["outputs"], item["convertible_by"])
 
     # bundle.zip::inner.iso has a sibling inner.chd, so the member surfaces as
-    # CHDMAN-convertible with a finished output — and as Dolphin-convertible
-    # (.iso is accepted by both) even though no .rvz sibling exists.
+    # CHDMAN-convertible with a finished output — and as Dolphin- and
+    # CSO-convertible (.iso is accepted by all three) even though only the .chd
+    # sibling exists in the fixture.
     inner = next(i for i in results["archives"] if i["name"] == "inner.iso")
-    assert inner["convertible"] is True
-    assert inner["has_chd"] is True and inner["chd_ready"] is True
     assert "chdman" in inner["convertible_by"]
-    assert inner["dolphin_convertible"] is True
-    assert inner["has_rvz"] is False
-    # ...and as CSO-convertible (.iso -> .cso/.zso via maxcso), surfaced through
-    # the same registry-driven archive-member detection (#128). No .cso sibling
-    # exists in the fixture, so the output flags stay False.
-    assert inner["cso_convertible"] is True
+    assert _by_tool(inner["outputs"])["chdman"].ready is True
+    assert "dolphin" in inner["convertible_by"]
+    assert "dolphin" not in _by_tool(inner["outputs"])
     assert "cso" in inner["convertible_by"]
-    assert inner["has_cso"] is False and inner["cso_ready"] is False
+    assert "cso" not in _by_tool(inner["outputs"])

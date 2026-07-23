@@ -194,49 +194,16 @@ def _verifiable_by(path: str) -> list[str]:
     return [t.id for t in registry.tools_verifying_path(path)]
 
 
-def _legacy_output_fields(
-    convertible_by: list[str], by_tool: dict[str, OutputStatus],
-) -> dict:
-    """Derive the legacy per-tool booleans/paths from registry detection.
-
-    Single source of truth shared by the on-disk and archive-member listing
-    paths so the flat ``has_*`` / ``*_ready`` / ``*_convertible`` flags the
-    frontend still reads can't drift from ``convertible_by`` / ``outputs``.
-    """
-    fields: dict = {}
-    for tool_id, has_key, ready_key, path_key in (
-        ("chdman", "has_chd", "chd_ready", None),
-        ("dolphin", "has_rvz", "dolphin_ready", "dolphin_path"),
-        ("z3ds", "has_z3ds", "z3ds_ready", "z3ds_path"),
-        ("nsz", "has_nsz", "nsz_ready", "nsz_path"),
-        ("cso", "has_cso", "cso_ready", "cso_path"),
-        ("romz", "has_romz", "romz_ready", "romz_path"),
-    ):
-        status = by_tool.get(tool_id)
-        fields[has_key] = status is not None
-        fields[ready_key] = status.exists if status else False
-        if path_key is not None:
-            fields[path_key] = status.path if status else None
-    fields["convertible"] = "chdman" in convertible_by
-    fields["dolphin_convertible"] = "dolphin" in convertible_by
-    fields["z3ds_convertible"] = "z3ds" in convertible_by
-    fields["nsz_convertible"] = "nsz" in convertible_by
-    fields["cso_convertible"] = "cso" in convertible_by
-    fields["romz_convertible"] = "romz" in convertible_by
-    return fields
-
-
 def _summarize_archive(item_path: str) -> dict:
     """Per-archive summary fields for the file listing / archive-summary batch.
 
     Reads the archive once (via the shared mtime-cached member reader) and
     derives: the member count, how many members already have a sibling output
-    from any tool, whether the listing hit the archive limits, whether any
-    member has a CHD sibling (the legacy ``has_chd`` flag), and the per-archive
-    ``verifiable_by`` gate (romz only claims single-ROM .7z/.zip). Shared by the
-    inline ``summarize_archives=True`` path and the lazy ``/archive-summary``
-    batch the browser hydrates with, so both report identical badges. Blocking
-    I/O — call it off the event loop.
+    from any tool, whether the listing hit the archive limits, and the
+    per-archive ``verifiable_by`` gate (romz only claims single-ROM .7z/.zip).
+    Shared by the inline ``summarize_archives=True`` path and the lazy
+    ``/archive-summary`` batch the browser hydrates with, so both report
+    identical badges. Blocking I/O — call it off the event loop.
     """
     archive_result = archive_service.list_archive_contents(
         item_path, include_meta=True,
@@ -244,20 +211,16 @@ def _summarize_archive(item_path: str) -> dict:
     contents = archive_result["entries"]
     archive_dir = os.path.dirname(item_path)
     archive_has_output = 0
-    member_has_chd = False
     for entry in contents:
         _, _, _, member_by_tool = _detect_archive_member_outputs(entry, archive_dir)
         # A member counts as "converted" once any tool already has a sibling
         # output for it, not just CHDMAN.
         if member_by_tool:
             archive_has_output += 1
-        if "chdman" in member_by_tool:
-            member_has_chd = True
     return {
         "archive_items": len(contents),
         "archive_has_output": archive_has_output,
         "archive_truncated": bool(archive_result["truncated"]),
-        "has_chd": member_has_chd,
         "verifiable_by": _verifiable_by(item_path),
     }
 
@@ -383,17 +346,14 @@ async def list_files(
                             continue
 
                         # Registry-driven convertibility + sibling-output
-                        # detection; the legacy booleans below are derived
-                        # from these so they can't drift. Archives are never
-                        # directly convertible (only their members are), so
-                        # skip detection for them.
+                        # detection. Archives are never directly convertible
+                        # (only their members are), so skip detection for them.
                         if is_archive:
-                            convertible_by, outputs, by_tool = [], [], {}
+                            convertible_by, outputs = [], []
                         else:
-                            convertible_by, outputs, by_tool = _detect_file_outputs(
+                            convertible_by, outputs, _ = _detect_file_outputs(
                                 item_path, ext,
                             )
-                        tool_fields = _legacy_output_fields(convertible_by, by_tool)
 
                         archive_items = None
                         archive_has_output = None
@@ -410,7 +370,6 @@ async def list_files(
                                 archive_items = summary["archive_items"]
                                 archive_has_output = summary["archive_has_output"]
                                 archive_truncated = summary["archive_truncated"]
-                                tool_fields["has_chd"] = summary["has_chd"]
                                 verifiable_by = summary["verifiable_by"]
                         else:
                             verifiable_by = _verifiable_by(item_path)
@@ -427,7 +386,6 @@ async def list_files(
                             convertible_by=convertible_by,
                             outputs=outputs,
                             verifiable_by=verifiable_by,
-                            **tool_fields,
                         )
                         entries.append(entry)
                 except OSError:
@@ -550,14 +508,10 @@ async def search_files(
                                         "type": "directory",
                                         "size": None,
                                         "extension": "",
-                                        "chd_path": None,
                                         "in_archive": False,
                                         "convertible_by": dir_convertible_by,
                                         "outputs": dir_outputs,
                                         "verifiable_by": [],
-                                        **_legacy_output_fields(
-                                            dir_convertible_by, {},
-                                        ),
                                     },
                                 )
                             elif recursive_scan and not os.path.islink(item_path):
@@ -565,32 +519,22 @@ async def search_files(
                         elif os.path.isfile(item_path):
                             is_archive = ext in ARCHIVE_EXTENSIONS
                             if is_archive:
-                                convertible_by, outputs, by_tool = [], [], {}
+                                convertible_by, outputs = [], []
                             else:
-                                convertible_by, outputs, by_tool = _detect_file_outputs(
+                                convertible_by, outputs, _ = _detect_file_outputs(
                                     item_path, ext,
                                 )
                             if convertible_by:
-                                tool_fields = _legacy_output_fields(
-                                    convertible_by, by_tool,
-                                )
-                                chd_path = (
-                                    str(Path(item_path).with_suffix(".chd"))
-                                    if tool_fields["convertible"]
-                                    else None
-                                )
                                 files.append(
                                     {
                                         "name": item,
                                         "path": item_path,
                                         "size": os.path.getsize(item_path),
                                         "extension": ext,
-                                        "chd_path": chd_path,
                                         "in_archive": False,
                                         "convertible_by": convertible_by,
                                         "outputs": outputs,
                                         "verifiable_by": _verifiable_by(item_path),
-                                        **tool_fields,
                                     },
                                 )
                             elif include_archive_scan and is_archive:
@@ -611,7 +555,6 @@ async def search_files(
                                         "type": "archive",
                                         "size": os.path.getsize(item_path),
                                         "extension": ext,
-                                        "chd_path": None,
                                         "in_archive": False,
                                         "convertible_by": [],
                                         "outputs": [],
@@ -619,7 +562,6 @@ async def search_files(
                                         # surface on single-ROM .7z/.zip, not on
                                         # every archive container.
                                         "verifiable_by": _verifiable_by(item_path),
-                                        **_legacy_output_fields([], {}),
                                     },
                                 )
                                 # List archive contents. Search surfaces
@@ -642,12 +584,9 @@ async def search_files(
                                         output_stem,
                                         member_convertible_by,
                                         member_outputs,
-                                        member_by_tool,
+                                        _,
                                     ) = _detect_archive_member_outputs(
                                         entry, archive_dir,
-                                    )
-                                    tool_fields = _legacy_output_fields(
-                                        member_convertible_by, member_by_tool,
                                     )
                                     archives.append(
                                         {
@@ -658,13 +597,9 @@ async def search_files(
                                             "size": entry["size"],
                                             "extension": entry["extension"],
                                             "output_stem": output_stem,
-                                            "chd_path": os.path.join(
-                                                archive_dir, f"{output_stem}.chd",
-                                            ),
                                             "in_archive": True,
                                             "convertible_by": member_convertible_by,
                                             "outputs": member_outputs,
-                                            **tool_fields,
                                         },
                                     )
                     except OSError:
@@ -725,12 +660,10 @@ async def list_archive(
 
     def _annotate_members() -> None:
         for file_entry in contents:
-            output_stem, convertible_by, outputs, by_tool = (
+            output_stem, convertible_by, outputs, _ = (
                 _detect_archive_member_outputs(file_entry, archive_dir)
             )
-            file_entry.update(_legacy_output_fields(convertible_by, by_tool))
             file_entry["output_stem"] = output_stem
-            file_entry["chd_path"] = os.path.join(archive_dir, f"{output_stem}.chd")
             file_entry["convertible_by"] = convertible_by
             file_entry["outputs"] = outputs
 
