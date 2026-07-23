@@ -159,7 +159,12 @@ export const api = {
   },
 
   deleteBatch(paths) {
-    return jsonPost(`${API_BASE}/files/delete-batch`, { paths }, {}, 'Failed to delete files');
+    return jsonPost(
+      `${API_BASE}/files/delete-batch`,
+      { paths },
+      { headers: { 'X-CHD-Action-Confirm': CONFIRM.DELETE_FILE } },
+      'Failed to delete files',
+    );
   },
 
   // ─── Jobs ─────────────────────────────────────────────────────────────

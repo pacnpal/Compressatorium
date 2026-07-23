@@ -899,9 +899,13 @@ async def delete_file(
 
 
 @router.post("/files/delete-batch")
-async def delete_files_batch(request: BulkDeleteRequest) -> dict:
+async def delete_files_batch(request: Request, payload: BulkDeleteRequest) -> dict:
     """Delete multiple files at once."""
-    if not request.paths:
+    # Batch delete shares the single-delete gate: without this the same
+    # confirmation could be bypassed by wrapping a path in a one-item batch.
+    _require_action_confirmation(request, CONFIRM_DELETE_FILE, "delete action")
+
+    if not payload.paths:
         raise HTTPException(status_code=400, detail="No paths provided")
 
     results = []
@@ -965,7 +969,7 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
             return {"path": path, "success": False, "error": "File operation failed"}
 
     # Process all files
-    for path in request.paths:
+    for path in payload.paths:
         result = await delete_single_file(path)
         results.append(result)
         if result["success"]:
@@ -974,7 +978,7 @@ async def delete_files_batch(request: BulkDeleteRequest) -> dict:
             failed_count += 1
 
     return {
-        "total": len(request.paths),
+        "total": len(payload.paths),
         "success": success_count,
         "failed": failed_count,
         "results": results,

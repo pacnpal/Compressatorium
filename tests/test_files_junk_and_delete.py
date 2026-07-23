@@ -159,6 +159,7 @@ async def test_delete_batch_blocks_configured_volume_root(vol: Path):
     assert not any(vol.iterdir())
 
     response = await files_routes.delete_files_batch(
+        _request({"x-chd-action-confirm": "delete-file"}),
         files_routes.BulkDeleteRequest(paths=[str(vol)]),
     )
     assert response["success"] == 0
@@ -167,6 +168,29 @@ async def test_delete_batch_blocks_configured_volume_root(vol: Path):
     assert result["success"] is False
     assert "volume root" in result["error"].lower()
     assert vol.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_batch_requires_confirmation_header(vol: Path):
+    # The batch endpoint shares the single-delete confirmation gate; without the
+    # header a one-item batch must not be a way to bypass it.
+    f = vol / "x.bin"
+    f.write_bytes(b"x")
+
+    with pytest.raises(HTTPException) as exc:
+        await files_routes.delete_files_batch(
+            _request(), files_routes.BulkDeleteRequest(paths=[str(f)]),
+        )
+    assert exc.value.status_code == 400
+    assert "confirmation header" in exc.value.detail.lower()
+    assert f.exists()  # nothing deleted without confirmation
+
+    response = await files_routes.delete_files_batch(
+        _request({"x-chd-action-confirm": "delete-file"}),
+        files_routes.BulkDeleteRequest(paths=[str(f)]),
+    )
+    assert response["success"] == 1
+    assert not f.exists()
 
 
 @pytest.mark.asyncio
