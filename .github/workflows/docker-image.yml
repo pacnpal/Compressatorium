@@ -83,19 +83,33 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be a semantic version, optionally prefixed with v: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "Version from release tag: ${VERSION}"
 
       - name: Sync version to package.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_COMMITISH: ${{ github.event.release.target_commitish }}
+          VERSION_SYNC_TOKEN: ${{ secrets.VERSION_SYNC_TOKEN }}
         run: |
-          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json package-lock.json
           if ! git diff --cached --quiet; then
-            git commit -m "chore: sync package.json to v${{ steps.version.outputs.version }} [skip ci]"
-            git remote set-url origin https://x-access-token:${{ secrets.VERSION_SYNC_TOKEN }}@github.com/${{ github.repository }}.git
-            git push origin HEAD:${{ github.event.release.target_commitish }}
+            git commit -m "chore: sync package.json to v${VERSION} [skip ci]"
+            # Authenticate the push with an in-memory Basic auth header so the
+            # write-scoped token is never persisted to .git/config. GitHub's Git
+            # smart-HTTP endpoint expects the PAT via Basic auth (token as the
+            # password), not a Bearer token.
+            ENCODED_AUTH="$(printf 'x-access-token:%s' "${VERSION_SYNC_TOKEN}" | base64 -w0)"
+            echo "::add-mask::${ENCODED_AUTH}"
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${ENCODED_AUTH}" \
+              push origin "HEAD:${TARGET_COMMITISH}"
           fi
 
       - name: Extract Docker metadata
@@ -231,28 +245,33 @@ jobs:
 
     steps:
       - name: Generate summary
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+          IMAGE_TAGS: ${{ needs.build.outputs.image-tags }}
         run: |
-          echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Release" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release:** \`${{ github.event.release.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Prerelease:** \`${{ github.event.release.prerelease }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Images Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Registry | Image |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Docker Hub | \`${{ env.DOCKERHUB_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| GitHub | \`${{ env.GHCR_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Build Details" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Digest:** \`${{ needs.build.outputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Platforms:** \`${{ env.PLATFORMS }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tags" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ needs.build.outputs.image-tags }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "## Docker Build Summary" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### Release" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Release:** \`${RELEASE_TAG}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Prerelease:** \`${RELEASE_PRERELEASE}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### Images Published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Registry | Image |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|----------|-------|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Docker Hub | \`${DOCKERHUB_IMAGE}\` |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| GitHub | \`${GHCR_IMAGE}\` |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### Build Details" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Digest:** \`${IMAGE_DIGEST}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Platforms:** \`${PLATFORMS}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### Tags" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "\`\`\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "${IMAGE_TAGS}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "\`\`\`" >> "${GITHUB_STEP_SUMMARY}"
