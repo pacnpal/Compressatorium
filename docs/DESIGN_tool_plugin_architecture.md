@@ -876,6 +876,27 @@ but grouped under `cso` in the UI. The deliberate `.iso`-not-in-Dolphin-verify
 divergence lives on `verifyExts` (a verify-routing fact), not on a `ModeSpec`
 field, so it is outside the guard's scope.
 
+**Registry-derived frontend fact lists (issue #186, site 3).** Two presentation
+surfaces used to re-type extension/mode facts the registry already owns, so a
+new tool or mode silently missed them:
+
+- `src/lib/util/fileIcon.js` builds its disc/game extension buckets from
+  `registry.all()` via a small `TOOL_MEDIA` map — the one presentation fact the
+  registry can't express (whether a tool's media reads as an optical disc or a
+  cartridge/handheld "game"). `.chd` keeps its own Disc3 glyph and the
+  handheld-ROM archives (`.7z`/`.zip`) get the archive glyph.
+- `src/lib/components/views/HelpView.svelte` generates its per-mode reference
+  table from `registry.all()` (one section per tool + mode-group, in registry
+  order) via `helpModeSections()`. The only hand-authored content lives in
+  `src/lib/tools/helpModes.js`: `MODE_BLURBS` (the human one-liner per mode) and
+  `MODE_OUTPUT` (a display override for reversible/companion outputs the
+  registry stores as a single or `null` `outputExt`).
+
+A single Node-evaluated guard, `tests/test_frontend_registry_derives_186.py`,
+fails if either drifts: a filterable extension with no icon bucket, an
+unclassified tool, a mode with no blurb, a stale blurb/override key, or a mode
+that would render a blank Output cell.
+
 ---
 
 ## 4. The payoff: what a new tool looks like *after*
