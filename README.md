@@ -973,6 +973,11 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | DELETE | `/api/files/delete` | Delete a single file or empty directory |
 | POST | `/api/files/delete-batch` | Delete multiple files at once |
 
+**Destructive file actions require explicit confirmation headers:**
+- `POST /api/files/rename` requires `X-CHD-Action-Confirm: rename-file`
+- `DELETE /api/files/delete` requires `X-CHD-Action-Confirm: delete-file` (or `recursive-delete` for a non-empty directory)
+- `POST /api/files/delete-batch` requires `X-CHD-Action-Confirm: delete-file`
+
 ### Conversion Jobs
 
 | Method | Endpoint | Description |
