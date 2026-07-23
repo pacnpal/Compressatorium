@@ -82,6 +82,27 @@ def test_folder_to_iso_no_companions_before_anything_written(tmp_path):
     ) == []
 
 
+def test_folder_to_iso_missing_output_does_not_scan_siblings(tmp_path, monkeypatch):
+    # Duplicate preflight can be called for many attacker-supplied nonexistent
+    # paths. A missing split set must be a constant-time .0 probe, not a full
+    # scan of every sibling in a large output directory.
+    base = tmp_path / "Fake.iso"
+    for idx in range(10):
+        (tmp_path / f"unrelated-{idx}").write_bytes(b"x")
+
+    def fail_scandir(path):  # noqa: ARG001 - proves the vulnerable path is gone
+        raise AssertionError("folder_to_iso duplicate check scanned siblings")
+
+    monkeypatch.setattr("app.services.makeps3iso.os.scandir", fail_scandir)
+
+    exists, locked = convert_routes.check_output_conflicts(
+        "folder_to_iso", str(base),
+    )
+
+    assert exists is False
+    assert locked is False
+
+
 # --- extractcd sibling: every consumer derives the .bin from companion_outputs.
 # (The folder_to_iso companion side is covered by test_makeps3iso.py.)
 
