@@ -29,19 +29,9 @@
 
   const mediaType = $derived(chdMeta?.media_type ?? entry?.media_type ?? null);
 
-  const convertibleBy = $derived.by(() => {
-    if (Array.isArray(entry?.convertible_by) && entry.convertible_by.length) {
-      return entry.convertible_by;
-    }
-    const legacy = [];
-    if (entry?.convertible) legacy.push('chdman');
-    if (entry?.dolphin_convertible) legacy.push('dolphin');
-    if (entry?.z3ds_convertible) legacy.push('z3ds');
-    if (entry?.nsz_convertible) legacy.push('nsz');
-    if (entry?.cso_convertible) legacy.push('cso');
-    if (entry?.romz_convertible) legacy.push('romz');
-    return legacy;
-  });
+  const convertibleBy = $derived(
+    Array.isArray(entry?.convertible_by) ? entry.convertible_by : [],
+  );
 
   const outputs = $derived(Array.isArray(entry?.outputs) ? entry.outputs : []);
 

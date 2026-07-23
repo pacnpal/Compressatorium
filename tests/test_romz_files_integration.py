@@ -7,8 +7,8 @@ The romz tool claims ``.7z``/``.zip`` as extract-mode inputs and ``.gb``/``.gbc`
    (``type == "archive"``) and is NOT marked directly convertible — the existing
    ``is_archive`` guard must win over romz's input claim, so archive browsing is
    undisturbed.
-2. A loose handheld ROM is marked ``romz_convertible`` and badges its sibling
-   archive output.
+2. A loose handheld ROM lists ``romz`` in ``convertible_by`` and badges its
+   sibling archive output.
 """
 from __future__ import annotations
 
@@ -66,12 +66,11 @@ async def test_archives_stay_archives_after_romz_registers(romz_env):
     pack = by_name["Pack.7z"]
     assert pack.type == "archive"
     # Archives are never directly convertible, even though romz claims .7z.
-    assert pack.romz_convertible is False
     assert pack.convertible_by == []
 
     bundle = by_name["Bundle.zip"]
     assert bundle.type == "archive"
-    assert bundle.romz_convertible is False
+    assert bundle.convertible_by == []
 
 
 @pytest.mark.asyncio
@@ -128,22 +127,19 @@ async def test_loose_rom_is_romz_convertible_and_badges_output(romz_env):
 
     solo = by_name["Solo.gba"]
     assert solo.type == "file"
-    assert solo.romz_convertible is True
     assert "romz" in solo.convertible_by
-    assert solo.has_romz is False
+    assert not any(o.tool_id == "romz" for o in solo.outputs)
 
     done = by_name["Done.gb"]
-    assert done.romz_convertible is True
-    assert done.has_romz is True and done.romz_ready is True
-    assert done.romz_path == str(Path(root) / "Done.gb.zip")
-    assert any(o.tool_id == "romz" for o in done.outputs)
+    assert "romz" in done.convertible_by
+    done_romz = next(o for o in done.outputs if o.tool_id == "romz")
+    assert done_romz.exists is True and done_romz.ready is True
+    assert done_romz.path == str(Path(root) / "Done.gb.zip")
 
     # The multi-file sibling is NOT a romz output: the source row stays a
     # compress source but surfaces no romz output badge or verify-from-output.
     junky = by_name["Junky.gba"]
-    assert junky.romz_convertible is True
-    assert junky.has_romz is False and junky.romz_ready is False
-    assert junky.romz_path is None
+    assert "romz" in junky.convertible_by
     assert not any(o.tool_id == "romz" for o in junky.outputs)
 
 
@@ -176,4 +172,3 @@ async def test_browse_into_romz_archive_shows_rom_but_not_convertible(romz_env):
     rom = members["inner.gba"]
     assert rom["extension"] == ".gba"
     assert rom["convertible_by"] == []
-    assert rom["romz_convertible"] is False

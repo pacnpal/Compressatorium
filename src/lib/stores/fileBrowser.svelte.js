@@ -470,7 +470,6 @@ class FileBrowserStore {
       archive_items: s.archive_items,
       archive_has_output: s.archive_has_output,
       archive_truncated: s.archive_truncated,
-      has_chd: s.has_chd ?? entry.has_chd,
       verifiable_by: Array.isArray(s.verifiable_by) ? s.verifiable_by : entry.verifiable_by,
     };
   }

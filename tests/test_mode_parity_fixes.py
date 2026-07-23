@@ -60,44 +60,51 @@ def test_job_manager_default_max_concurrent_is_one():
     assert manager.max_concurrent == 1
 
 
+def _dolphin_output(outputs):
+    """Return the dolphin OutputStatus (obj or dict) from an outputs list, or None."""
+    for o in outputs:
+        if (o.tool_id if hasattr(o, "tool_id") else o["tool_id"]) == "dolphin":
+            return o
+    return None
+
+
 @pytest.mark.asyncio
-async def test_list_files_populates_has_rvz(files_env):
+async def test_list_files_populates_dolphin_output(files_env):
     """Directory listing should surface Dolphin output presence for inputs."""
     listing = await files_routes.list_files(path=files_env["root"])
     by_name = {entry.name: entry for entry in listing.entries}
 
-    assert by_name["game.iso"].dolphin_convertible is True
-    assert by_name["game.iso"].has_rvz is True
-    assert by_name["game.iso"].dolphin_ready is True
-    assert by_name["game.iso"].dolphin_path == files_env["game_rvz"]
-    assert by_name["wia.iso"].has_rvz is True
-    assert by_name["wia.iso"].dolphin_ready is True
-    assert by_name["wia.iso"].dolphin_path == files_env["wia_output"]
-    assert by_name["other.iso"].dolphin_convertible is True
-    assert by_name["other.iso"].has_rvz is False
-    assert by_name["other.iso"].dolphin_ready is False
-    assert by_name["game.rvz"].has_rvz is True
-    assert by_name["game.rvz"].dolphin_ready is True
+    game = by_name["game.iso"]
+    assert "dolphin" in game.convertible_by
+    assert _dolphin_output(game.outputs).exists is True
+    assert _dolphin_output(game.outputs).path == files_env["game_rvz"]
+    wia = by_name["wia.iso"]
+    assert _dolphin_output(wia.outputs).exists is True
+    assert _dolphin_output(wia.outputs).path == files_env["wia_output"]
+    other = by_name["other.iso"]
+    assert "dolphin" in other.convertible_by
+    assert _dolphin_output(other.outputs) is None
+    assert _dolphin_output(by_name["game.rvz"].outputs).exists is True
 
 
 @pytest.mark.asyncio
-async def test_search_files_populates_has_rvz(files_env):
+async def test_search_files_populates_dolphin_output(files_env):
     """Recursive search results should include Dolphin-product state consistently."""
     results = await files_routes.search_files(
         path=files_env["root"], recursive=True, include_archives=False
     )
     by_name = {Path(item["path"]).name: item for item in results["files"]}
 
-    assert by_name["game.iso"]["dolphin_convertible"] is True
-    assert by_name["game.iso"]["has_rvz"] is True
-    assert by_name["game.iso"]["dolphin_ready"] is True
-    assert by_name["game.iso"]["dolphin_path"] == files_env["game_rvz"]
-    assert by_name["wia.iso"]["has_rvz"] is True
-    assert by_name["wia.iso"]["dolphin_ready"] is True
-    assert by_name["wia.iso"]["dolphin_path"] == files_env["wia_output"]
-    assert by_name["other.iso"]["dolphin_convertible"] is True
-    assert by_name["other.iso"]["has_rvz"] is False
-    assert by_name["other.iso"]["dolphin_ready"] is False
+    game = by_name["game.iso"]
+    assert "dolphin" in game["convertible_by"]
+    assert _dolphin_output(game["outputs"]).exists is True
+    assert _dolphin_output(game["outputs"]).path == files_env["game_rvz"]
+    wia = by_name["wia.iso"]
+    assert _dolphin_output(wia["outputs"]).exists is True
+    assert _dolphin_output(wia["outputs"]).path == files_env["wia_output"]
+    other = by_name["other.iso"]
+    assert "dolphin" in other["convertible_by"]
+    assert _dolphin_output(other["outputs"]) is None
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,21 @@ and #179, part of the #177 tech-debt epic).
   of the regenerated `docs-desktop-view` / `docs-tablet-view` / `docs-mobile-view`
   set.
 
+### Removed
+
+- **Legacy per-tool `FileEntry` flags dropped (issue #186, site 6 — Phase 9
+  cleanup).** The ~23 dual-maintained per-tool booleans/paths on `FileEntry`
+  (`has_chd` / `has_rvz` / `*_ready` / `*_convertible` / `*_path` and the bare
+  `convertible`) are removed. They were pure derivations of the registry-driven
+  `convertible_by` / `outputs` / `verifiable_by` fields the frontend already
+  reads, so the backend now emits only those: the `_legacy_output_fields` helper
+  and the per-archive `has_chd` special-case are gone from `routes/files.py`
+  (the per-archive "converted" badge continues to derive from the
+  registry-driven `archive_has_output` count), and the last two frontend
+  fallbacks (`FileRow` convertibility, `fileBrowser` archive-summary merge) now
+  read the registry-driven fields exclusively. No wire-API change the UI relies
+  on; the file/search JSON simply no longer carries the dead flags.
+
 ### Changed
 
 - **Frontend icon and Help lists now derive from the tool registry (issue #186,
