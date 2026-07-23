@@ -22,6 +22,17 @@ and #179, part of the #177 tech-debt epic).
 
 ### Changed
 
+- **Frontend icon and Help lists now derive from the tool registry (issue #186,
+  site 3).** `src/lib/util/fileIcon.js` builds its disc/game extension buckets
+  from `registry.all()` plus a small tool→media map instead of a hand-typed
+  extension list (so Switch dumps and loose `.7z`/`.zip` archives now get
+  meaningful icons), and the Help view's mode-reference table is generated from
+  the registry — one section per tool and mode-group — with only the human
+  blurbs and multi-output display strings curated in the new
+  `src/lib/tools/helpModes.js`. A Node-evaluated guard
+  (`tests/test_frontend_registry_derives_186.py`) fails if either list drifts
+  from the registry's tools or modes.
+
 - **PS3 folder-to-ISO inputs are now recursively confined to configured volumes.**
   Directory-input planning rejects symlinks and non-regular filesystem entries,
   and the queued worker repeats the same safety walk after acquiring the source

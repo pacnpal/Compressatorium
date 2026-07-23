@@ -3,6 +3,8 @@
   // is the issues URL; `repository.url` is the npm git form
   // (git+https://….git), normalized to a browsable https URL.
   import { repository, bugs } from '../../../../package.json';
+  import { registry } from '$lib/tools/registry.js';
+  import { helpModeSections } from '$lib/tools/helpModes.js';
 
   const repoUrl = repository.url.replace(/^git\+/, '').replace(/\.git$/, '');
   const issuesUrl = bugs?.url ?? `${repoUrl}/issues`;
@@ -55,77 +57,11 @@
     },
   ];
 
-  // Per-tool mode reference. Each row: [mode, what it does, output].
-  const modeGroups = [
-    {
-      tool: 'CHDMAN: Create',
-      rows: [
-        ['createcd', 'CD images. The default for most disc consoles.', '.chd'],
-        ['createdvd', 'DVD-sized media. This is the one for PSP and PS2.', '.chd'],
-        ['createhd', 'Hard-disk images.', '.chd'],
-        ['createraw', 'Raw data with no special disc handling.', '.chd'],
-        ['createld', 'LaserDisc.', '.chd'],
-      ],
-    },
-    {
-      tool: 'CHDMAN: Extract and Copy',
-      rows: [
-        ['extractcd', 'Pull the CD back out of a CHD. Gives you a cue/bin pair.', '.cue + .bin'],
-        ['extractdvd', 'Pull a DVD image back out.', '.iso'],
-        ['extractraw / extracthd', 'Pull the raw or hard-disk image back out.', '.raw'],
-        ['extractld', 'Pull a LaserDisc back out.', '.avi'],
-        ['copy', 'Recompress an existing CHD with different codecs, no re-rip needed.', '.chd'],
-      ],
-    },
-    {
-      tool: 'Dolphin',
-      rows: [
-        ['dolphin_rvz', 'Compress to RVZ. Takes a codec plus a level.', '.rvz'],
-        ['dolphin_wia', 'Compress to WIA. Takes a codec plus a level.', '.wia'],
-        ['dolphin_gcz', 'Compress to GCZ. Fixed compression, ignores codec and level.', '.gcz'],
-        ['dolphin_iso', 'Decompress back to a plain ISO.', '.iso'],
-      ],
-    },
-    {
-      tool: '3DS',
-      rows: [
-        ['z3ds_compress', 'No settings. Fixed Seekable Zstandard.', '.zcci / .zcia / .z3ds / .zcxi / .z3dsx'],
-        ['z3ds_decompress', 'Restore the original ROM from a Z3DS file.', '.cci / .cia / .3ds / .cxi / .3dsx'],
-      ],
-    },
-    {
-      tool: 'Switch',
-      rows: [
-        ['nsz_compress', 'Compress to NSZ/XCZ. Pick a layout (Solid or Block) and a level.', '.nsz / .xcz'],
-        ['nsz_decompress', 'Decompress back to the original NSP/XCI.', '.nsp / .xci'],
-      ],
-    },
-    {
-      tool: 'CSO',
-      rows: [
-        ['cso_compress', 'Compress a PSP/PS2 ISO to CSO v1, the universally-supported default. Pick an effort preset (Fast/Default/Max).', '.cso'],
-        ['cso2_compress', 'Compress to CSO v2 (better block alignment; needs a recent PPSSPP/PCSX2). Same effort presets.', '.cso'],
-        ['zso_compress', 'Compress a PSP/PS2 ISO to ZSO (lz4, faster to decode). Same effort presets.', '.zso'],
-        ['dax_compress', 'Compress to DAX, the legacy PSP format some older tools expect. Same effort presets.', '.dax'],
-        ['cso_decompress', 'Decompress CSO/ZSO/DAX back to a plain ISO.', '.iso'],
-        ['cso_to_chd', 'Convert a CSO/ZSO/DAX straight to CHD in one step (maxcso decompresses to a temp ISO, then chdman packs it). Uses chdman default compression.', '.chd'],
-      ],
-    },
-    {
-      tool: 'Handheld ROM',
-      rows: [
-        ['romz_7z', 'Compress a GB/GBC/GBA/DS ROM to a .7z archive (smallest). Pick an effort preset (Fast/Default/Max).', '.7z'],
-        ['romz_zip', 'Compress to a .zip archive (broadest compatibility). Same effort presets.', '.zip'],
-        ['romz_extract', 'Extract the ROM back out of a .7z/.zip archive.', '.gb / .gbc / .gba / .nds'],
-      ],
-    },
-    {
-      tool: 'PS3 ISO',
-      rows: [
-        ['folder_to_iso', 'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle splits the output into 4 GB parts for FAT32 drives.', '.iso'],
-      ],
-    },
-  ];
+  // Per-tool mode reference. Generated from the registry (one section per
+  // tool + mode-group, in registry order) so the mode set and output columns
+  // can't drift from src/lib/tools/registry.js; the human blurbs and any
+  // multi-output display strings live in src/lib/tools/helpModes.js.
+  const modeGroups = helpModeSections(registry);
 </script>
 
 <section class="view" aria-labelledby="help-title">
@@ -189,15 +125,15 @@
       recompresses in place. Pick the create mode that matches the media. If you compress
       a PSP or PS2 image with createcd instead of createdvd it will not come out right.
     </p>
-    {#each modeGroups as group (group.tool)}
+    {#each modeGroups as group (group.title)}
       <div class="mode-tool">
-        <h3 class="mode-tool-name">{group.tool}</h3>
+        <h3 class="mode-tool-name">{group.title}</h3>
         <table class="mode-table">
           <thead>
             <tr><th scope="col">Mode</th><th scope="col">What it does</th><th scope="col">Output</th></tr>
           </thead>
           <tbody>
-            {#each group.rows as [mode, note, out] (mode)}
+            {#each group.rows as { mode, note, out } (mode)}
               <tr>
                 <th scope="row"><code>{mode}</code></th>
                 <td class="note">{note}</td>
