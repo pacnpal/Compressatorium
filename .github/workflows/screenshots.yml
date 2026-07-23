@@ -6,7 +6,8 @@ name: Take screenshots
 # What it does: builds the Svelte frontend, boots the FastAPI backend against a
 # throwaway fixture volume, drives shot-scraper over shots.yml (one browser per
 # shot — see scripts/take_screenshots.py for why), losslessly optimises the PNGs
-# with Oxipng, then commits any changes.
+# with Oxipng, uploads the generated screenshots, then commits any changes from
+# a separate write-scoped job.
 #
 # Runs on manual dispatch and on pushes that touch the UI. Changes under
 # docs/screenshots/** are intentionally NOT a trigger, so the commit this
@@ -28,7 +29,7 @@ on:
       - ".github/workflows/screenshots.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: screenshots-${{ github.ref }}
@@ -39,6 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -111,6 +114,27 @@ jobs:
       - name: Optimize PNGs
         run: |
           oxipng -o 4 -i 0 --strip safe docs/screenshots/*.png
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: docs/screenshots/*.png
+          if-no-files-found: error
+
+  commit-screenshots:
+    runs-on: ubuntu-latest
+    needs: screenshots
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download screenshots
+        uses: actions/download-artifact@v4
+        with:
+          name: screenshots
+          path: docs/screenshots
 
       - name: Commit and push
         run: |-
