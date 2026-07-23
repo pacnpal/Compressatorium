@@ -61,8 +61,12 @@ files and all routers. The entire auth system is gated on
 `COMPRESSATORIUM_ENABLE_AUTH` (default `false`): when disabled, the middleware is
 not registered and no token is generated. When enabled, it protects the Web UI
 and every `/api` route with the same token check, while leaving `/health` open
-for container health checks. Keep new routers behind that app-level middleware
-rather than adding per-router auth branches.
+for container health checks. Tokens are read from headers only (HTTP Basic,
+`Authorization: Bearer`, or `X-Compressatorium-Token`) — never the query string —
+and state-changing requests (`POST`/`PUT`/`PATCH`/`DELETE`) are additionally
+restricted to same-origin callers (`Sec-Fetch-Site`/`Origin`) so cached browser
+Basic credentials can't be abused cross-site. Keep new routers behind that
+app-level middleware rather than adding per-router auth branches.
 
 ## 2. Target architecture
 

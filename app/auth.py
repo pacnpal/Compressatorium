@@ -6,12 +6,16 @@ import base64
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from config import settings
 from fastapi import Request, status
 from fastapi.responses import JSONResponse, Response
 
 _AUTH_FILENAME = "auth_token"
+
+# Methods that never change server state; exempt from the same-origin check.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
 
 def ensure_auth_token() -> str | None:
@@ -69,8 +73,10 @@ def _request_tokens(request: Request) -> list[str]:
     """Collect every candidate token the request offers, in priority order.
 
     All sources are gathered (not just the first one present) so a valid
-    ``X-Compressatorium-Token`` or ``access_token`` still authenticates even when
-    a proxy or browser also forwards an unrelated ``Authorization`` header.
+    ``X-Compressatorium-Token`` still authenticates even when a proxy or browser
+    also forwards an unrelated ``Authorization`` header. Tokens are never read
+    from the query string, to keep the credential out of access logs, proxy
+    logs, and browser history.
     """
     tokens: list[str] = []
     auth = request.headers.get("Authorization", "")
@@ -86,10 +92,36 @@ def _request_tokens(request: Request) -> list[str]:
     header_token = request.headers.get("X-Compressatorium-Token")
     if header_token:
         tokens.append(header_token)
-    query_token = request.query_params.get("access_token")
-    if query_token:
-        tokens.append(query_token)
     return tokens
+
+
+def _is_forbidden_cross_site(request: Request) -> bool:
+    """Return True for a state-changing request from another origin.
+
+    Because a browser attaches cached HTTP Basic credentials to same-origin
+    requests even when a malicious page triggers them, unsafe methods are
+    restricted to same-origin callers. Modern browsers are judged by the
+    ``Sec-Fetch-Site`` metadata header; older ones fall back to an ``Origin``
+    host comparison. Non-browser clients (curl, scripts) send neither and are
+    allowed through — they authenticate with an explicit token header and are
+    not exposed to CSRF.
+    """
+    if request.method in _SAFE_METHODS:
+        return False
+    sec_fetch_site = request.headers.get("Sec-Fetch-Site")
+    if sec_fetch_site is not None:
+        return sec_fetch_site not in ("same-origin", "none")
+    origin = request.headers.get("Origin")
+    if origin and origin != "null":
+        return urlsplit(origin).netloc != (request.headers.get("Host") or "")
+    return False
+
+
+def _forbidden(request: Request) -> Response:
+    detail = "Cross-origin request forbidden"
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": detail}, status_code=status.HTTP_403_FORBIDDEN)
+    return Response(detail, status_code=status.HTTP_403_FORBIDDEN)
 
 
 def _unauthorized(request: Request) -> Response:
@@ -117,9 +149,11 @@ async def require_auth_middleware(request: Request, call_next):
     expected = settings.auth_token
     if not expected:
         return _unauthorized(request)
-    if any(_tokens_match(token, expected) for token in _request_tokens(request)):
-        return await call_next(request)
-    return _unauthorized(request)
+    if not any(_tokens_match(token, expected) for token in _request_tokens(request)):
+        return _unauthorized(request)
+    if _is_forbidden_cross_site(request):
+        return _forbidden(request)
+    return await call_next(request)
 
 
 def _tokens_match(provided: str, expected: str) -> bool:

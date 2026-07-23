@@ -16,13 +16,13 @@ def _reset_auth(monkeypatch, *, token="test-token", enabled=True, username="admi
     monkeypatch.setattr(settings, "auth_username", username)
 
 
-def _request(path="/api/version", headers=None, query_string=b""):
+def _request(path="/api/version", headers=None, query_string=b"", method="GET"):
     raw_headers = []
     for key, value in (headers or {}).items():
         raw_headers.append((key.lower().encode("latin-1"), value.encode("latin-1")))
     return Request({
         "type": "http",
-        "method": "GET",
+        "method": method,
         "path": path,
         "query_string": query_string,
         "headers": raw_headers,
@@ -85,10 +85,62 @@ def test_web_ui_accepts_basic_auth(monkeypatch):
     assert response.status_code == 200
 
 
-def test_eventsource_can_use_query_token(monkeypatch):
+def test_query_string_token_is_not_accepted(monkeypatch):
     _reset_auth(monkeypatch)
 
     response = _run(_request("/api/jobs/events", query_string=b"access_token=test-token"))
+
+    assert response.status_code == 401
+
+
+def test_cross_site_state_change_is_forbidden(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(
+        "/api/jobs/recover",
+        method="POST",
+        headers={"Authorization": "Bearer test-token", "Sec-Fetch-Site": "cross-site"},
+    ))
+
+    assert response.status_code == 403
+
+
+def test_same_origin_state_change_is_allowed(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(
+        "/api/jobs/recover",
+        method="POST",
+        headers={"Authorization": "Bearer test-token", "Sec-Fetch-Site": "same-origin"},
+    ))
+
+    assert response.status_code == 200
+
+
+def test_cross_origin_via_origin_header_is_forbidden(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(
+        "/api/jobs/recover",
+        method="POST",
+        headers={
+            "Authorization": "Bearer test-token",
+            "Origin": "http://evil.example",
+            "Host": "testserver",
+        },
+    ))
+
+    assert response.status_code == 403
+
+
+def test_non_browser_state_change_is_allowed(monkeypatch):
+    _reset_auth(monkeypatch)
+
+    response = _run(_request(
+        "/api/jobs/recover",
+        method="POST",
+        headers={"Authorization": "Bearer test-token"},
+    ))
 
     assert response.status_code == 200
 

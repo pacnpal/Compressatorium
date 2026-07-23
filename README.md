@@ -1068,7 +1068,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `PGID` | `999` | Optional runtime GID remap for `converter`; if that GID already exists, `converter` is reassigned to the existing group |
 | `CHD_DATA_DIR` | `/config` | Directory for persistent application data |
 | `COMPRESSATORIUM_ENABLE_AUTH` | `false` | Enable token authentication for the Web UI and `/api` routes. Off by default; set to `true` to require a token. |
-| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password (used only when auth is enabled). Send as HTTP Basic password for user `admin`, as `Authorization: Bearer`, as `X-Compressatorium-Token`, or as `access_token` for SSE clients. |
+| `COMPRESSATORIUM_AUTH_TOKEN` / `CHD_AUTH_TOKEN` | generated in `/config/auth_token` | Web UI/API password (used only when auth is enabled). Send as HTTP Basic password for user `admin`, as `Authorization: Bearer`, or as `X-Compressatorium-Token`. |
 | `COMPRESSATORIUM_AUTH_USERNAME` | `admin` | HTTP Basic username for the Web UI (used only when auth is enabled). |
 | `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Web UI: when true, `Search All` conversions return to the previous file-list view after queueing |
 | `CHD_SEARCH_AUTO_RETURN_TO_FILE_LIST` | `true` | Legacy alias for `COMPRESSATORIUM_SEARCH_AUTO_RETURN_TO_FILE_LIST` |
