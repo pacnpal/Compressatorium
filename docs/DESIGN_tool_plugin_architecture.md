@@ -677,38 +677,47 @@ freshness-gated metadata must call this rather than reintroducing the two-read p
 ### 3.3.6 Re-run fast path (`JobManager._output_already_verified`)
 
 `_process_job` recognizes a prior success before it re-spawns the converter: a
-re-queued job whose target artifact is already on disk **and recorded verified
-for this exact source** completes as a no-op instead of re-running the tool
-(issue #184, site 1). The check runs at the top of the conversion `try` block —
-before archive extraction and before `_clear_existing_output` — so the existing
-verified output is neither re-extracted-from nor deleted; on a hit the job jumps
-straight to `COMPLETED` (progress 100, size via the shared
+re-queued job whose target artifact is already on disk **and provably the exact
+result of the current request** completes as a no-op instead of re-running the
+tool (issue #184, site 1). The check runs at the top of the conversion `try`
+block — before archive extraction and before `_clear_existing_output` — so the
+existing verified output is neither re-extracted-from nor deleted; on a hit the
+job jumps straight to `COMPLETED` (progress 100, size via the shared
 `_compute_output_size`, a `complete` event with `verified=True`,
-`source_deleted=False`).
+`source_deleted=False`). A cancel is honored on both sides of the awaited
+lookups: checked before, and re-checked after `_output_already_verified` returns
+(a cancel that lands mid-lookup raises `ConversionCancelled` rather than
+completing the no-op).
 
-The guard is deliberately narrow so it can never deliver a surprising output —
-`_output_already_verified` returns `True` only when **all** hold:
+**The evidence is a `produced_meta` snapshot, not a bare "verified" flag.** A
+plain verification record proves only that *some* file at that path passed
+integrity verification at *some* time — not that the current file is that
+artifact, nor that it matches the current request's output-shaping settings, nor
+that a multi-file source (a `.cue`/`.gdi` and its tracks) is unchanged. So the
+fast path trusts **only** records carrying a `produced_meta` blob, written by a
+prior **delete-on-verify** conversion right after its verify passed (the
+`verifications.produced_meta` JSON column, Alembic migration `0003`). A manual
+`/info` verify records **no** meta and never qualifies. `_build_produced_meta`
+captures, off the event loop:
 
-- The job is a plain file conversion with default output shaping:
-  `input_kind == FILE`, `compression is None`, `split` off. A request that
-  changes the output shape (explicit compression, split set) must re-run the
-  converter, and directory (folder→ISO) jobs — whose split-set output is
-  disk-probed — always take the normal path.
-- `delete_on_verify` is off. A delete-on-verify job must run its guarded source
-  deletion, so it never short-circuits here.
-- `verification_store.get_record(output)` returns a record whose `source_path`
-  is **this** job's source (realpath match). A record with no source (e.g. a
-  manual `/info` verify, which stores `source_path=None`) or a different source
-  never qualifies — only a prior delete-on-verify run records an output verified
-  *with* its source, e.g. one whose verify passed but whose delete was cancelled
-  or failed, leaving the source intact for a later re-submit.
-- The on-disk source is **no newer** than the verified output
-  (`getmtime(output) >= getmtime(source)`), so the output still reflects the
-  current source bytes; a source modified since verification falls through and
-  re-converts.
+- `mode`, `compression`, `split` — the producing conversion's output shape.
+- `source` — a stat fingerprint (`{realpath: {size, mtime_ns}}`) of the
+  **complete** source set via `build_delete_snapshot`, so a `.cue`/`.gdi`'s
+  referenced track files are fingerprinted alongside the descriptor.
+- `output` — a `{size, mtime_ns}` fingerprint of the produced artifact (taken
+  after the disc-ID embed, so it reflects the final bytes).
 
-Any stat error in the freshness check is treated as "no match", so a
-missing/racing file falls through to the normal path rather than mis-firing.
+`_produced_meta_matches` (off the event loop) then admits the no-op only when
+**all** hold: `mode`/`compression`/`split` equal the current request's, the
+current output fingerprint equals the recorded one (so a replaced/corrupted file
+with a fresh mtime can't pass), and the current complete-source-set fingerprint
+equals the recorded one (so a changed track — not just the descriptor — forces a
+re-convert). `_output_already_verified` additionally excludes directory
+(folder→ISO) jobs (split-set outputs) and `delete_on_verify` *requests* (they
+must run their guarded source deletion), and treats any store hiccup, missing
+record, absent `produced_meta`, or un-fingerprintable source (archive members,
+unsafe/missing tracks) as "no match" — always falling through to a full
+re-convert rather than risk a surprising output.
 
 ### 3.4 `registry.py`
 

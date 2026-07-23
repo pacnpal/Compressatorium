@@ -63,27 +63,42 @@ class VerificationStore:
 
     # ------------------------------------------------------------------
 
-    def _mark_sync(self, chd_path: str, source_path: str | None) -> None:
+    def _mark_sync(
+        self,
+        chd_path: str,
+        source_path: str | None,
+        produced_meta: dict | None = None,
+    ) -> None:
         normalized = self._normalize(chd_path)
         normalized_source = self._normalize(source_path) if source_path else None
         stmt = sqlite_insert(_db.Verification).values(
             chd_path=normalized,
             source_path=normalized_source,
             verified_at=_utcnow_iso(),
+            produced_meta=produced_meta,
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["chd_path"],
             set_={
                 "source_path": stmt.excluded.source_path,
                 "verified_at": stmt.excluded.verified_at,
+                "produced_meta": stmt.excluded.produced_meta,
             },
         )
         with self._session() as session:
             session.execute(stmt)
             session.commit()
 
-    async def mark_verified(self, chd_path: str, *, source_path: str | None = None) -> None:
-        await run_in_threadpool(self._mark_sync, chd_path, source_path)
+    async def mark_verified(
+        self,
+        chd_path: str,
+        *,
+        source_path: str | None = None,
+        produced_meta: dict | None = None,
+    ) -> None:
+        await run_in_threadpool(
+            self._mark_sync, chd_path, source_path, produced_meta,
+        )
 
     def _clear_sync(self, chd_path: str) -> None:
         normalized = self._normalize(chd_path)
@@ -144,6 +159,7 @@ class VerificationStore:
                 "chd_path": row.chd_path,
                 "source_path": row.source_path,
                 "verified_at": row.verified_at,
+                "produced_meta": row.produced_meta,
             }
 
     async def get_record(self, chd_path: str) -> dict[str, str | None] | None:

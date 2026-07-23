@@ -129,6 +129,14 @@ class Verification(Base):
     chd_path = Column(String, primary_key=True)
     source_path = Column(String, nullable=True)
     verified_at = Column(String, nullable=False, default="")
+    # Optional snapshot of what produced this verified artifact: the conversion
+    # mode + output-shaping settings and a stat fingerprint of the complete
+    # source set and the output. Populated only by a delete-on-verify
+    # conversion (a manual /info verify leaves it NULL). Lets the job-start
+    # re-run fast path prove an on-disk output is the exact result of the
+    # current request before completing as a no-op. See
+    # docs/DESIGN_tool_plugin_architecture.md §3.3.6.
+    produced_meta = Column(JSON, nullable=True)
 
 
 class Preference(Base):

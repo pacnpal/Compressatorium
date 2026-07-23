@@ -24,7 +24,7 @@ from services.lock_manager import lock_manager
 from services.makeps3iso import makeps3iso_service
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
-from utils.delete_plan import build_delete_plan
+from utils.delete_plan import build_delete_plan, build_delete_snapshot
 from utils.path_utils import (
     is_safe_directory_tree,
     is_within_configured_volumes,
@@ -1561,30 +1561,106 @@ class JobManager:
                 pass
         return total_size if total_size > 0 else None
 
+    @staticmethod
+    def _source_fingerprint(source_path: str) -> Optional[Dict[str, Dict[str, int]]]:
+        """Stat fingerprint of the *complete* source set for ``source_path``.
+
+        Uses ``build_delete_snapshot`` so a ``.cue`` / ``.gdi`` descriptor's
+        referenced track files are fingerprinted too — a replaced ``.bin`` track
+        (with the descriptor untouched) changes the fingerprint, which is what a
+        descriptor-only mtime check would miss. Returns ``{realpath: {size,
+        mtime_ns}}`` or ``None`` when the set can't be safely enumerated
+        (unsafe/missing tracks, a non-file), so those never qualify for a
+        fast-path reuse.
+        """
+        try:
+            snapshot = build_delete_snapshot(source_path)
+        except Exception:
+            return None
+        out: Dict[str, Dict[str, int]] = {}
+        for path, fp in (snapshot.get("fingerprints") or {}).items():
+            out[path] = {"size": int(fp["size"]), "mtime_ns": int(fp["mtime_ns"])}
+        return out or None
+
+    @staticmethod
+    def _output_fingerprint(output_path: str) -> Optional[Dict[str, int]]:
+        """Stat fingerprint (size + mtime_ns) of an output file, or ``None``."""
+        try:
+            st = os.stat(output_path, follow_symlinks=False)
+        except OSError:
+            return None
+        if not os.path.isfile(output_path):
+            return None
+        return {
+            "size": int(st.st_size),
+            "mtime_ns": int(
+                getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+            ),
+        }
+
+    def _build_produced_meta(self, job: ConversionJob) -> Optional[Dict[str, object]]:
+        """Snapshot of what produced this verified artifact, for the re-run fast
+        path: the mode + output-shaping settings and stat fingerprints of the
+        complete source set and the output.
+
+        Returns ``None`` (record no meta → no fast path) for an archive-member
+        source or when the source set / output can't be fingerprinted. Computed
+        right after a successful verify, while the source still exists.
+        """
+        if "::" in job.file_path:
+            # Archive members: the on-disk "source" is the whole archive and the
+            # extracted member is transient, so a reuse can't be proven cheaply.
+            return None
+        source_fp = self._source_fingerprint(job.file_path)
+        output_fp = self._output_fingerprint(job.output_path)
+        if not source_fp or not output_fp:
+            return None
+        return {
+            "mode": job.mode.value,
+            "compression": job.compression,
+            "split": bool(job.split),
+            "source": source_fp,
+            "output": output_fp,
+        }
+
+    def _produced_meta_matches(self, job: ConversionJob, meta: object) -> bool:
+        """Whether the on-disk output is the *exact* result of THIS request.
+
+        Requires the recorded producing settings (mode + compression + split) to
+        equal the current request's, the complete source set to be byte-for-byte
+        unchanged since it was verified (so a different track can't be silently
+        reused), and the output to be unchanged (so a replaced/corrupted file
+        with a fresh mtime can't pass). Any mismatch → re-convert.
+        """
+        if not isinstance(meta, dict):
+            return False
+        if (
+            meta.get("mode") != job.mode.value
+            or meta.get("compression") != job.compression
+            or bool(meta.get("split")) != bool(job.split)
+        ):
+            return False
+        if self._output_fingerprint(job.output_path) != meta.get("output"):
+            return False
+        if self._source_fingerprint(job.file_path) != meta.get("source"):
+            return False
+        return True
+
     async def _output_already_verified(self, job: ConversionJob) -> bool:
         """Whether a prior run already produced and verified this exact output.
 
         Backs the job-start "recognize prior success" fast path (issue #184,
         site 1): a re-queued job whose verified artifact is already on disk
-        completes as a no-op instead of re-spawning the converter. Kept
-        deliberately narrow so it can never deliver a surprising output:
-
-        * Only plain file conversions with default output shaping
-          (``compression is None``, ``split`` off) qualify — a request that
-          changes the output shape must re-run the converter.
-        * Directory-input and delete-on-verify jobs take the normal path (the
-          former has split-set outputs, the latter must run its guarded source
-          deletion), so this never short-circuits a pending delete.
-        * The verification store must hold a record for the output whose
-          recorded *source* is this job's source, and the on-disk source must be
-          no newer than the output (unchanged since it was verified). A record
-          without a source (e.g. a manual /info verify) or a mismatched source
-          never qualifies.
+        completes as a no-op instead of re-spawning the converter. Only a
+        verification record carrying a full ``produced_meta`` snapshot (written
+        by a prior delete-on-verify conversion) can qualify, and only when that
+        snapshot proves the on-disk output is the exact result of the current
+        request — see :meth:`_produced_meta_matches`. Directory-input and
+        delete-on-verify *requests* always take the normal path (the former has
+        split-set outputs, the latter must run its guarded source deletion).
         """
         if (
             job.delete_on_verify
-            or job.split
-            or job.compression is not None
             or job.input_kind == InputKind.DIRECTORY
             or not job.output_path
         ):
@@ -1598,36 +1674,12 @@ class JobManager:
                 "Prior-success check skipped for %s: %s", job.output_path, exc,
             )
             return False
-        if not record or not record.get("source_path"):
+        if not record:
             return False
-        return await run_in_threadpool(
-            self._verified_output_matches_source, job, record["source_path"],
-        )
-
-    @staticmethod
-    def _verified_output_matches_source(
-        job: ConversionJob, recorded_source: str,
-    ) -> bool:
-        """Off-loop check: the verified output exists and its source is unchanged.
-
-        The recorded source must be this job's source (realpath match) and the
-        on-disk source must be no newer than the output, so the output still
-        reflects the current source bytes. Any stat error is treated as "no
-        match" so a missing/racing file falls through to the normal path.
-        """
-        try:
-            if recorded_source != os.path.realpath(job.file_path):
-                return False
-            if not os.path.isfile(job.output_path):
-                return False
-            source_disk = (
-                strip_archive_path(job.file_path)
-                if "::" in job.file_path
-                else job.file_path
-            )
-            return os.path.getmtime(job.output_path) >= os.path.getmtime(source_disk)
-        except OSError:
+        meta = record.get("produced_meta")
+        if not meta:
             return False
+        return await run_in_threadpool(self._produced_meta_matches, job, meta)
 
     async def _run_job(self, job_id: str):
         try:
@@ -1814,6 +1866,10 @@ class JobManager:
             # so the existing verified output is neither re-extracted-from nor
             # deleted. Honors a cancel requested before we got here.
             if not cancel_event.is_set() and await self._output_already_verified(job):
+                # Re-check after the awaited store/stat lookups: a cancel that
+                # landed while they were in flight must win over the no-op.
+                if cancel_event.is_set():
+                    raise ConversionCancelled("Conversion cancelled")
                 self._cancelled.discard(job_id)
                 job.progress = 100
                 job.output_size = await run_in_threadpool(
@@ -2017,8 +2073,19 @@ class JobManager:
                         )
 
                     verified = True
+                    # Snapshot what produced this verified artifact (mode +
+                    # output shaping + source/output fingerprints) so a later
+                    # re-queue can recognize prior success and complete as a
+                    # no-op without re-spawning the converter (#184, site 1).
+                    # The source still exists here (delete runs below), so its
+                    # complete set can be fingerprinted.
+                    produced_meta = await run_in_threadpool(
+                        self._build_produced_meta, job,
+                    )
                     await verification_store.mark_verified(
-                        job.output_path, source_path=job.file_path
+                        job.output_path,
+                        source_path=job.file_path,
+                        produced_meta=produced_meta,
                     )
 
                     if cancel_event.is_set():
