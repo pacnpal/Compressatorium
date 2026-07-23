@@ -7,6 +7,8 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Web UI/API authentication (opt-in).** Optional token authentication for the networked UI and `/api` routes, gated behind `COMPRESSATORIUM_ENABLE_AUTH` (default off). When enabled, operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks. The token is accepted only in request headers (HTTP Basic, `Authorization: Bearer`, or `X-Compressatorium-Token`) — never the URL query string — and state-changing requests are restricted to same-origin callers to prevent CSRF via cached browser credentials.
+
 - **Automated Web UI screenshots.** The screenshots embedded in the README are
   now generated with [shot-scraper](https://shot-scraper.datasette.io/) instead
   of captured by hand. A new **Take screenshots** GitHub Actions workflow builds
