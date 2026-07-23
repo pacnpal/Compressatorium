@@ -66,6 +66,15 @@ and #179, part of the #177 tech-debt epic).
 
 ### Fixed
 
+- **Unsupported archive members return a 400, not a 500.** When an archive
+  member with an extension the target tool doesn't accept (e.g. `switch.zip::bad.txt`
+  for `nsz_compress`) was submitted, `plan_job` derived the output path from the
+  member suffix *before* the input-extension gate ran, so the tool's output-path
+  mapper raised an uncaught `ValueError` and the API answered HTTP 500. The
+  per-tool extension check now also runs inside the archive branch, before any
+  output-path derivation, so these inputs fail early with the intended per-tool
+  skip reason (`NSZ_BAD_EXTENSION` and friends) and a controlled 400 response.
+
 - **Verify streams no longer leak their child process on cancellation.** When an
   SSE verification client disconnects mid-stream (or the consuming task is
   otherwise cancelled), `chdman` and `dolphin-tool` `verify_stream` now wrap their
