@@ -8,6 +8,7 @@
   // Per-submit promise-resolver pattern, same as DuplicateModal.
 
   import { conversion } from '$lib/stores/conversion.svelte.js';
+  import { summarizeMessages } from '$lib/util/messages.js';
   import BaseModal from './BaseModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -26,6 +27,11 @@
   );
 
   // Flatten blocking reasons across items for the warning line.
+  //
+  // Summarized, not raw: items commonly fail the *same* way (two members of one
+  // archive each get the identical "multiple selections from the same archive"
+  // rejection), and the list below is keyed by the message string — duplicate
+  // keys crash the view. See summarizeMessages.
   const blockingMessages = $derived.by(() => {
     const out = [];
     for (const item of items) {
@@ -33,19 +39,23 @@
       for (const m of item.unsafe_paths ?? []) out.push(`Unsafe: ${m}`);
       for (const m of item.missing_paths ?? []) out.push(`Missing: ${m}`);
     }
-    return out;
+    return summarizeMessages(out);
   });
 
   // Non-blocking warnings the backend wants the user to see before
   // confirming, e.g. "Archive input detected; delete-on-verify will
   // remove the entire archive". These don't disable the Confirm
   // button but the user needs to read them.
+  //
+  // Summarized for the same reason: that archive warning is a fixed string
+  // emitted once per archive source, so any multi-archive selection would
+  // otherwise hand the keyed list below one duplicate key per source.
   const planWarnings = $derived.by(() => {
     const out = [];
     for (const item of items) {
       for (const m of item.warnings ?? []) out.push(m);
     }
-    return out;
+    return summarizeMessages(out);
   });
 
   function shortName(p) {
