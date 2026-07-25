@@ -1,11 +1,10 @@
 """Guard the delete-plan confirmation modal against duplicate `{#each}` keys.
 
 ``DeletePlanModal.svelte`` renders the plan's blocking reasons and warnings as
-keyed each blocks keyed by the message *string*. A Svelte key must uniquely
-identify its item, so a repeated message is a hard runtime error
-(``each_key_duplicate``) that unmounts the whole workspace view through
-``<svelte:boundary>`` — the modal that exists to warn about a destructive
-action crashes instead.
+keyed each blocks. A Svelte key must uniquely identify its item, so a repeated
+key is a hard runtime error (``each_key_duplicate``) that unmounts the whole
+workspace view through ``<svelte:boundary>`` — the modal that exists to warn
+about a destructive action crashes instead.
 
 The backend routinely produces repeats: ``build_delete_plan`` appends a fixed
 "Archive input detected…" warning once per archive source, and the convert
@@ -19,11 +18,14 @@ These tests pin both halves of the contract:
   precondition — if that ever stops being true the frontend guard still holds,
   but the test should be revisited); and
 * ``summarizeMessages`` — the shared helper the modal now runs those flattened
-  lists through — collapses them to unique keys, evaluated with Node so the
-  real module runs, not a Python re-implementation.
+  lists through — collapses them to one entry per distinct message, evaluated
+  with Node so the real module runs, not a Python re-implementation.
 
-A static check keeps the modal wired to the helper, so a future edit can't
-reintroduce a raw flattened list under a message key. Node-dependent tests skip
+Identity is separate from presentation there, and the tests hold that line: the
+key is the raw message, while the rendered text carries the ``(×N)`` count and
+is *not* safe to key on (a message ending in that suffix collides with a
+different message repeated that many times). A static check keeps the modal
+wired to the helper and keyed on the identity field. Node-dependent tests skip
 when Node is unavailable.
 """
 from __future__ import annotations
@@ -47,6 +49,7 @@ _ARCHIVE_WARNING = "Archive input detected; delete-on-verify will remove the ent
 
 
 def _find_node() -> str | None:
+    """Locate a Node binary, or None when the suite must skip."""
     found = shutil.which("node")
     if found:
         return found
@@ -56,7 +59,7 @@ def _find_node() -> str | None:
     return None
 
 
-def _summarize(tmp_path: Path, messages: list[str]) -> list[str]:
+def _summarize(tmp_path: Path, messages: list[str]) -> list[dict]:
     """Run the real `summarizeMessages` over `messages` via Node."""
     node = _find_node()
     if node is None:
@@ -104,32 +107,67 @@ def test_repeated_warnings_summarize_to_unique_keys(tmp_path):
     warnings = [w for plan in _archive_member_plans(tmp_path, 3) for w in plan["warnings"]]
 
     summarized = _summarize(tmp_path, warnings)
+    keys = [entry["key"] for entry in summarized]
 
-    assert len(summarized) == len(set(summarized)), (
-        "DeletePlanModal keys its warning list by the message string; these "
-        f"keys collide and would crash the view: {summarized}"
+    assert len(keys) == len(set(keys)), (
+        f"these keys collide and would crash the view: {keys}"
     )
-    assert summarized == [f"{_ARCHIVE_WARNING} (×3)"]
+    assert summarized == [{"key": _ARCHIVE_WARNING, "text": f"{_ARCHIVE_WARNING} (×3)", "count": 3}]
 
 
 def test_summarize_counts_repeats_and_keeps_first_seen_order(tmp_path):
-    assert _summarize(tmp_path, ["b", "a", "b", "c", "b"]) == ["b (×3)", "a", "c"]
-    assert _summarize(tmp_path, ["only once"]) == ["only once"]
+    """Distinct messages collapse in first-seen order, repeats carry a count."""
+    assert _summarize(tmp_path, ["b", "a", "b", "c", "b"]) == [
+        {"key": "b", "text": "b (×3)", "count": 3},
+        {"key": "a", "text": "a", "count": 1},
+        {"key": "c", "text": "c", "count": 1},
+    ]
+    assert _summarize(tmp_path, ["only once"]) == [
+        {"key": "only once", "text": "only once", "count": 1},
+    ]
     assert _summarize(tmp_path, []) == []
 
 
-def test_modal_keyed_message_lists_run_through_the_helper():
-    """Static guard: a message-keyed each block must iterate a summarized list.
+def test_rendered_text_is_never_used_as_the_key(tmp_path):
+    """A message that already ends in the count suffix must not collide.
 
-    Keying by the message is fine *because* the list is deduped first. This
-    fails if a future edit reintroduces a raw flattened list under that key.
+    The rendered text is presentation, not identity: `["a", "a", "a (×2)"]`
+    renders two identical `a (×2)` lines, so keying on the rendered form would
+    still crash. Messages embed user-controlled paths (a file named
+    `game (×2).iso` is enough to construct this pair), so the key is the raw
+    message — unique because that is what the helper deduplicates on.
+    """
+    summarized = _summarize(tmp_path, ["a", "a", "a (×2)"])
+
+    keys = [entry["key"] for entry in summarized]
+    texts = [entry["text"] for entry in summarized]
+
+    assert keys == ["a", "a (×2)"]
+    assert len(keys) == len(set(keys)), f"keys collide: {keys}"
+    # The hazard this guards: the *rendered* forms are the colliding pair.
+    assert len(set(texts)) < len(texts), (
+        "expected the rendered text to collide here; if it no longer does, this "
+        "test has stopped covering the suffix-collision case"
+    )
+
+
+def test_modal_keyed_message_lists_use_a_summarized_identity_key():
+    """Static guard: message lists must be summarized and keyed on `.key`.
+
+    Two ways to reintroduce the crash: drop `summarizeMessages` (duplicate raw
+    messages), or key on the rendered text instead of the identity field. This
+    fails on either.
     """
     src = _MODAL.read_text(encoding="utf-8")
 
-    keyed_lists = set(re.findall(r"{#each\s+(\w+)\.slice\([^)]*\)\s+as\s+m\s+\(m\)}", src))
-    assert keyed_lists, "DeletePlanModal no longer renders message lists keyed by the message"
+    keyed_lists = re.findall(r"{#each\s+(\w+)\.slice\([^)]*\)\s+as\s+m\s+\(([^)]*)\)}", src)
+    assert keyed_lists, "DeletePlanModal no longer renders keyed message lists"
 
-    for name in sorted(keyed_lists):
+    for name, key_expr in keyed_lists:
+        assert key_expr.strip() == "m.key", (
+            f"`{name}` is keyed by `{key_expr.strip()}`; key on the raw-message "
+            "identity (`m.key`), never the rendered text, which can collide"
+        )
         derived = re.search(
             rf"const {name} = \$derived\.by\(\(\) => {{(.*?)\n  }}\);",
             src,
@@ -137,6 +175,6 @@ def test_modal_keyed_message_lists_run_through_the_helper():
         )
         assert derived, f"could not locate the `{name}` derivation in DeletePlanModal"
         assert "summarizeMessages(" in derived.group(1), (
-            f"`{name}` is rendered keyed by the message string but is not deduped "
-            "through summarizeMessages — duplicate messages would crash the view"
+            f"`{name}` feeds a keyed list but is not deduped through "
+            "summarizeMessages — duplicate messages would crash the view"
         )

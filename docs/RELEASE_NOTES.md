@@ -119,8 +119,12 @@ and #179, part of the #177 tech-debt epic).
   archive" per offending member — so any multi-archive selection handed the list
   duplicate keys, which Svelte treats as a hard runtime error. Both lists now go
   through a shared `summarizeMessages` helper that collapses repeats to one line
-  and tags it with its count (`… (×12)`), so the keys are unique and the modal
-  reads better than the old wall of identical lines. Present since the 4.0.0
+  tagged with its count (`… (×12)`), which also reads better than the old wall
+  of identical lines. Identity stays separate from presentation: each row is
+  keyed by the raw message — unique because that is what the helper
+  deduplicates on — while the count suffix appears only in the rendered text,
+  so a message that itself ends in a `(×N)` suffix can't collide with a
+  different message that repeated that many times. Present since the 4.0.0
   Svelte 5 rebuild and unchanged through 4.1.0 / 4.2.0.
 
 - **Unsupported archive members return a 400, not a 500.** When an archive

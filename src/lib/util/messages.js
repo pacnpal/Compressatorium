@@ -1,28 +1,38 @@
 // Helpers for rendering flattened per-item message lists.
 
 /**
- * Collapse a flattened message list down to unique lines, tagging any line
- * that occurred more than once with its count (`… (×3)`).
+ * @typedef {object} SummarizedMessage
+ * @property {string} key   the raw message — unique across the returned list,
+ *                          safe to use as an `{#each}` key
+ * @property {string} text  what to render: the raw message, suffixed with its
+ *                          occurrence count when it repeated
+ * @property {number} count how many times the raw message occurred
+ */
+
+/**
+ * Collapse a flattened message list to one entry per distinct message, in
+ * first-seen order, carrying the number of times each occurred.
  *
  * Plan-style payloads carry one message array per item, and the *same* text
  * routinely repeats across items: `/api/jobs/delete-plan` appends the fixed
  * "Archive input detected; delete-on-verify will remove the entire archive"
  * once per archive source, and the "multiple selections from the same archive"
  * rejection once per offending member. Flattening those arrays therefore hands
- * the view a list with duplicate strings.
+ * the view a list with duplicate strings, and a keyed `{#each}` over duplicate
+ * keys is a hard Svelte runtime error (`each_key_duplicate`) that unmounts the
+ * whole view through `<svelte:boundary>` — the confirmation modal crashes
+ * instead of warning.
  *
- * That matters because these lists render in keyed `{#each … as m (m)}` blocks
- * keyed by the message itself. A key must uniquely identify its item, so a
- * repeated string is a hard Svelte runtime error (`each_key_duplicate`) that
- * unmounts the whole view through `<svelte:boundary>` — the confirmation modal
- * crashes instead of warning. Summarizing keeps the keys unique, drops a wall
- * of identical lines, and preserves the "how many sources" signal the raw list
- * carried.
- *
- * Order follows first occurrence, so the summary reads in plan order.
+ * Identity is deliberately kept separate from presentation. `key` is the raw
+ * message, which is unique by construction because that is what this function
+ * deduplicates on; `text` is the rendered form, which is *not* a safe key: a
+ * message that literally ends in the count suffix would collide with a
+ * different message that repeated that many times (messages embed
+ * user-controlled paths, so a file named `game (×2).iso` is enough to
+ * construct that pair).
  *
  * @param {Iterable<string>|null|undefined} messages
- * @returns {string[]} unique messages, repeats suffixed with their count
+ * @returns {SummarizedMessage[]} one entry per distinct message, first-seen order
  */
 export function summarizeMessages(messages) {
   const order = [];
@@ -31,12 +41,16 @@ export function summarizeMessages(messages) {
   // even where reactivity isn't wanted (same workaround as jobs.svelte.js).
   const counts = Object.create(null);
   for (const raw of messages ?? []) {
-    const text = typeof raw === 'string' ? raw : String(raw);
-    if (counts[text] === undefined) {
-      counts[text] = 0;
-      order.push(text);
+    const key = typeof raw === 'string' ? raw : String(raw);
+    if (counts[key] === undefined) {
+      counts[key] = 0;
+      order.push(key);
     }
-    counts[text] += 1;
+    counts[key] += 1;
   }
-  return order.map((text) => (counts[text] > 1 ? `${text} (×${counts[text]})` : text));
+  return order.map((key) => ({
+    key,
+    text: counts[key] > 1 ? `${key} (×${counts[key]})` : key,
+    count: counts[key],
+  }));
 }

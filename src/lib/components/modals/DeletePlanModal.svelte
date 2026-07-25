@@ -30,8 +30,9 @@
   //
   // Summarized, not raw: items commonly fail the *same* way (two members of one
   // archive each get the identical "multiple selections from the same archive"
-  // rejection), and the list below is keyed by the message string — duplicate
-  // keys crash the view. See summarizeMessages.
+  // rejection), and the list below is keyed per entry — duplicate keys crash
+  // the view. summarizeMessages keys on the raw message and renders the count
+  // separately, so the key can't collide with a rendered line.
   const blockingMessages = $derived.by(() => {
     const out = [];
     for (const item of items) {
@@ -50,6 +51,7 @@
   // Summarized for the same reason: that archive warning is a fixed string
   // emitted once per archive source, so any multi-archive selection would
   // otherwise hand the keyed list below one duplicate key per source.
+  // Renders `m.text`, keys on `m.key`.
   const planWarnings = $derived.by(() => {
     const out = [];
     for (const item of items) {
@@ -80,7 +82,7 @@
           <strong>Blocked.</strong>
           {#if blockingMessages.length > 0}
             <ul class="dp-block-list">
-              {#each blockingMessages.slice(0, 8) as m (m)}<li>{m}</li>{/each}
+              {#each blockingMessages.slice(0, 8) as m (m.key)}<li>{m.text}</li>{/each}
               {#if blockingMessages.length > 8}<li>…and {blockingMessages.length - 8} more</li>{/if}
             </ul>
           {:else}
@@ -106,7 +108,7 @@
         <div>
           <strong>Heads up:</strong>
           <ul class="dp-warn-list">
-            {#each planWarnings.slice(0, 8) as m (m)}<li>{m}</li>{/each}
+            {#each planWarnings.slice(0, 8) as m (m.key)}<li>{m.text}</li>{/each}
             {#if planWarnings.length > 8}<li>…and {planWarnings.length - 8} more</li>{/if}
           </ul>
         </div>
