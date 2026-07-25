@@ -108,6 +108,25 @@ and #179, part of the #177 tech-debt epic).
 
 ### Fixed
 
+- **The delete-on-verify confirmation no longer crashes the view for archive
+  sources.** Selecting two or more archives with **Delete sources after
+  successful verification** enabled took down the whole workspace with "This
+  view crashed / `each_key_duplicate`" before a single job was queued. The
+  confirmation modal renders the plan's warnings and blocking reasons in keyed
+  `{#each}` blocks keyed by the message text, and the backend emits a *fixed*
+  string per item — one "Archive input detected; delete-on-verify will remove
+  the entire archive" per archive source, one "multiple selections from the same
+  archive" per offending member — so any multi-archive selection handed the list
+  duplicate keys, which Svelte treats as a hard runtime error. Both lists now go
+  through a shared `summarizeMessages` helper that collapses repeats to one line
+  tagged with its count (`… (×12)`), which also reads better than the old wall
+  of identical lines. Identity stays separate from presentation: each row is
+  keyed by the raw message — unique because that is what the helper
+  deduplicates on — while the count suffix appears only in the rendered text,
+  so a message that itself ends in a `(×N)` suffix can't collide with a
+  different message that repeated that many times. Present since the 4.0.0
+  Svelte 5 rebuild and unchanged through 4.1.0 / 4.2.0.
+
 - **Unsupported archive members return a 400, not a 500.** When an archive
   member with an extension the target tool doesn't accept (e.g. `switch.zip::bad.txt`
   for `nsz_compress`) was submitted, `plan_job` derived the output path from the
