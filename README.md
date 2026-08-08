@@ -577,7 +577,7 @@ workflow (queue, verify, delete-on-verify, archives) is in the
 - ROMs must be **decrypted** before compression (encrypted ROMs will not work).
 - Decompression (`z3ds_decompress`) does not offer delete-on-verify: the restored ROM is not itself a verify-class file, so the compressed source can't be confirmed before deletion.
 
-### Environment Variables
+### 3DS Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -678,7 +678,7 @@ shared picker behavior, including the Reset-to-default button.)
   be committed. The file only needs to be readable by uid 999 (`converter`).
 * Keys are never logged.
 
-### Environment Variables
+### Switch Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -764,7 +764,7 @@ for it yet).
 * An `.iso` row can be handled by CHDMAN, Dolphin, or CSO; the primary-tool picker
   decides which one acts on it.
 
-### Environment Variables
+### CSO Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -831,7 +831,7 @@ default; ext4, NTFS, and exFAT targets don't need it.
 - The makeps3iso binary (GPL-3.0, from `bucanero/ps3iso-utils`) is built into the
   Docker image and builds on both `linux/amd64` and `linux/arm64`.
 
-### Environment Variables
+### PS3 ISO Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
