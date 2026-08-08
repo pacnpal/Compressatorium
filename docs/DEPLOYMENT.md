@@ -66,6 +66,13 @@ Volume precedence:
 - Put `CHD_TEMP_DIR` and CHD output on SSD or cache to cut array contention.
 - Don't run other heavy services during a conversion.
 - Always set container CPU/memory limits on a shared host.
+- **Synology DSM:** the `cpus:` limit in the default compose files fails the
+  container at startup on DSM (`NanoCPUs can not be set, as your kernel does
+  not support CPU CFS scheduler or the cgroup is not mounted`) because DSM's
+  Docker implementation lacks CPU CFS bandwidth control. Remove the `cpus:`
+  lines (the `memory:` limit still works), or pin to specific cores with a
+  top-level `cpuset: "0-1"` instead — see
+  [DOCKER-COMPOSE.md#synology-dsm-and-other-cfs-less-kernels](DOCKER-COMPOSE.md#synology-dsm-and-other-cfs-less-kernels).
 
 ## What's already in the image
 

@@ -209,6 +209,35 @@ deploy:
       memory: 512M     # Reserved 512MB RAM
 ```
 
+### Synology DSM (and other CFS-less kernels)
+
+Synology DSM's Docker/Container Manager doesn't support CPU CFS bandwidth
+control (some other embedded/NAS kernels have the same gap), so the `cpus:`
+limit above (Docker's `NanoCPUs` setting) fails the container at startup with:
+
+```
+Error response from daemon: NanoCPUs can not be set, as your kernel does not
+support CPU CFS scheduler or the cgroup is not mounted
+```
+
+Compose has no way to detect this at parse time, so there's no single
+compose file that works everywhere. Pick one of these instead:
+
+- **Remove the CPU limit (simplest, recommended):** delete or comment out the
+  `cpus:` lines under both `limits:` and `reservations:`; keep `memory:`,
+  which is unaffected. `MAX_CONCURRENT_JOBS=1` plus the
+  `COMPRESSATORIUM_TOOL_NICE`/`COMPRESSATORIUM_TOOL_IOPRIO_*` niceness/I-O
+  priority settings already keep a conversion from saturating the host, so
+  the CPU limit is a secondary safeguard here, not a required one.
+- **Pin to specific cores with `cpuset` instead:** add a top-level
+  `cpuset: "0-1"` on the service (a sibling of `deploy:`, not nested under
+  `resources:`) to restrict the container to specific CPU cores via the
+  `cpuset` cgroup controller, which Synology does support. **This is not a
+  drop-in replacement for `cpus:`** — `cpuset` pins to a set of cores rather
+  than capping the proportion of CPU time used, so the container can still
+  use up to 100% of each pinned core. Size the core count to the compute
+  budget you actually want.
+
 ---
 
 ## Troubleshooting
@@ -217,6 +246,11 @@ deploy:
 ```bash
 docker-compose logs
 ```
+
+If the error is `NanoCPUs can not be set, as your kernel does not support CPU
+CFS scheduler or the cgroup is not mounted` (common on Synology DSM), see
+[Synology DSM (and other CFS-less kernels)](#synology-dsm-and-other-cfs-less-kernels)
+above.
 
 ### Check health status
 ```bash
