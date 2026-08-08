@@ -211,32 +211,46 @@ deploy:
 
 ### Synology DSM (and other CFS-less kernels)
 
-Synology DSM's Docker/Container Manager doesn't support CPU CFS bandwidth
-control (some other embedded/NAS kernels have the same gap), so the `cpus:`
-limit above (Docker's `NanoCPUs` setting) fails the container at startup with:
+The error covers two distinct causes — Synology DSM is the common one, but
+the same message also fires when a host's cgroup controllers simply aren't
+mounted (a Docker/host misconfiguration unrelated to Synology):
 
 ```
 Error response from daemon: NanoCPUs can not be set, as your kernel does not
 support CPU CFS scheduler or the cgroup is not mounted
 ```
 
-Compose has no way to detect this at parse time, so there's no single
+On DSM specifically, the Docker/Container Manager kernel doesn't support CPU
+CFS bandwidth control, so the `cpus:` limit above (Docker's `NanoCPUs`
+setting) fails outright — that's the documented, known-affected case below.
+If you're not on Synology, check which controllers are actually mounted
+before assuming the same fix applies: `cat /sys/fs/cgroup/cgroup.controllers`
+(cgroup v2) or `ls /sys/fs/cgroup/cpuset` (cgroup v1) — if `cpuset` isn't
+listed/present either, the `cpuset` workaround below will fail the same way
+and dropping `cpus:` entirely is the only option.
+
+Compose has no way to detect either cause at parse time, so there's no single
 compose file that works everywhere. Pick one of these instead:
 
 - **Remove the CPU limit (simplest, recommended):** delete or comment out the
   `cpus:` lines under both `limits:` and `reservations:`; keep `memory:`,
-  which is unaffected. `MAX_CONCURRENT_JOBS=1` plus the
-  `COMPRESSATORIUM_TOOL_NICE`/`COMPRESSATORIUM_TOOL_IOPRIO_*` niceness/I-O
-  priority settings already keep a conversion from saturating the host, so
-  the CPU limit is a secondary safeguard here, not a required one.
+  which is unaffected. **This leaves CPU usage unbounded** — a conversion can
+  use up to 100% of every core the container can see. `MAX_CONCURRENT_JOBS=1`
+  only limits how many jobs run at once, not how much CPU each one takes, and
+  the `COMPRESSATORIUM_TOOL_NICE`/`COMPRESSATORIUM_TOOL_IOPRIO_*` settings
+  only change scheduling *priority* relative to other processes on the host
+  (see `nice(1)`/`ionice(1)`) — they make a conversion yield under
+  contention, they don't cap it. If you need an actual CPU ceiling on a host
+  that can't use `cpus:`, use `cpuset` below instead.
 - **Pin to specific cores with `cpuset` instead:** add a top-level
   `cpuset: "0-1"` on the service (a sibling of `deploy:`, not nested under
   `resources:`) to restrict the container to specific CPU cores via the
-  `cpuset` cgroup controller, which Synology does support. **This is not a
-  drop-in replacement for `cpus:`** — `cpuset` pins to a set of cores rather
-  than capping the proportion of CPU time used, so the container can still
-  use up to 100% of each pinned core. Size the core count to the compute
-  budget you actually want.
+  `cpuset` cgroup controller, which Synology does support (see the cgroup
+  check above for other hosts). **This is not a drop-in replacement for
+  `cpus:`** — `cpuset` pins to a set of cores rather than capping the
+  proportion of CPU time used, so the container can still use up to 100% of
+  each pinned core. Size the core count to the compute budget you actually
+  want.
 
 ---
 

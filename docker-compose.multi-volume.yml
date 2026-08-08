@@ -37,13 +37,15 @@ services:
     # Resource limits (adjust based on your system)
     # NOTE (Synology / other CFS-less kernels): if the container fails to
     # start with "NanoCPUs can not be set, as your kernel does not support
-    # CPU CFS scheduler or the cgroup is not mounted", your host's kernel
-    # doesn't support CPU CFS bandwidth control. Delete/comment out the two
+    # CPU CFS scheduler or the cgroup is not mounted", the error covers two
+    # distinct causes — DSM's known lack of CPU CFS bandwidth control, or (on
+    # other hosts) a cgroup controller that simply isn't mounted, in which
+    # case `cpuset` below may fail the same way. Delete/comment out the two
     # `cpus:` lines below (the `memory:` limits are unaffected and still
-    # work), or replace them with a top-level `cpuset: "0-1"` to pin specific
-    # cores instead. See
+    # work; this leaves CPU usage unbounded), or replace them with a
+    # top-level `cpuset: "0-1"` to pin specific cores instead. See
     # docs/DOCKER-COMPOSE.md#synology-dsm-and-other-cfs-less-kernels for the
-    # full explanation, including why `cpuset` is not a drop-in equivalent.
+    # full explanation, including how to check which cause applies to you.
     deploy:
       resources:
         limits:
