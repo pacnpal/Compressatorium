@@ -64,11 +64,21 @@ class ToolPlugin(Protocol):
     ) -> str:
         """Resolve the output path for a conversion."""
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         """Detect an existing sibling output this tool could produce.
 
         Returns ``None`` when the tool cannot produce an output for this
         input or no output is present (neither finished nor mid-conversion).
+
+        ``from_archive`` marks a *synthesised* path: the location an archive
+        member would occupy once extracted, which does not exist yet. It is the
+        same distinction ``output_path``'s ``treat_as_stem`` draws, and it
+        matters wherever a tool's output name depends on the input's
+        surroundings rather than on the input alone — a member never brings its
+        siblings with it, so it can only ever produce a single-file output. Most
+        tools swap a suffix and can ignore it.
         """
 
     def accepts_directory(self, path: str) -> bool:
@@ -286,7 +296,9 @@ class BaseTool:
             "compression_type": raw.get("compression_type"),
         }
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         return None
 
     def accepts_directory(self, path: str) -> bool:

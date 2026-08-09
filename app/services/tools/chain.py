@@ -99,7 +99,9 @@ class ChainTool(BaseTool):
             final.mode, input_path, output_dir, treat_as_stem=treat_as_stem,
         )
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         """Badge the source when the chain's own product already exists.
 
         Resolved per chain spec rather than against a literal ``.chd``: the

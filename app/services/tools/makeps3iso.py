@@ -64,7 +64,9 @@ class MakePs3IsoTool(BaseTool):
         # disc rips). Does disk I/O — callers run it off the event loop.
         return ps3.is_ps3_iso_source(path)
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         # Sibling "<folder>.iso" badge next to a convertible PS3 folder. Guard on
         # isdir so the file-listing's per-file detection loop (which calls every
         # tool's detect_output) never fabricates a "<file>.iso" candidate.

@@ -103,7 +103,9 @@ class JwudTool(BaseTool):
         # and deleting the source would risk the only copy.
         return verification_enabled(compression)
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         # Compress direction only: badge "the .wux already exists" next to a
         # .wud source (mirrors z3ds/maxcso). The job pipeline's
         # check_output_conflicts still guards the decompress direction.
@@ -115,10 +117,14 @@ class JwudTool(BaseTool):
             # the same .wux against every member of the set.
             return None
         # Resolve through the same output-path math the job uses, so a complete
-        # split set badges game.wux rather than game_part1.wux — and an archive
-        # member (whose synthetic path has no set behind it on disk) badges the
-        # game_part1.wux the archive planner actually targets.
-        candidate = self.output_path("jwud_compress", input_path)
+        # split set badges game.wux rather than game_part1.wux. `from_archive`
+        # forwards to `treat_as_stem`, which is exactly what `plan_job` passes
+        # for a member — extraction hands over one part, never the set, so the
+        # badge lands on the game_part1.wux the archive planner really targets
+        # even when a complete set happens to sit in the same directory.
+        candidate = self.output_path(
+            "jwud_compress", input_path, treat_as_stem=from_archive,
+        )
         file_exists, is_converting = lock_manager.check_file_status(candidate)
         if not (file_exists or is_converting):
             return None

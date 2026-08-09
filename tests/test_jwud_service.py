@@ -757,11 +757,12 @@ def test_archived_split_part_keeps_its_own_stem(tmp_path):
 def test_a_bare_split_name_with_nothing_on_disk_keeps_its_stem(tmp_path):
     """The archive-listing path: a synthetic member path with no set behind it.
 
-    `_detect_archive_member_outputs` synthesises `<archive_dir>/game_part1.wud`
-    and hands it to `detect_output`, which has no archive flag to consult. The
-    set is only claimed once its parts are really on disk, so detection lands on
-    the same `game_part1.wux` the archive planner targets rather than probing an
-    unrelated `game.wux`.
+    `_detect_archive_member_outputs` synthesises `<archive_dir>/game_part1.wud`.
+    The set is only claimed once its parts are really on disk, so even before
+    the `from_archive` flag is consulted, detection lands on the same
+    `game_part1.wux` the archive planner targets rather than an unrelated
+    `game.wux`. (The flag settles the case where a real set *is* extracted in
+    that directory — see `test_tool_seams_generalized`.)
     """
     synthetic = tmp_path / "game_part1.wud"
 

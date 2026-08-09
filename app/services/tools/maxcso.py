@@ -107,7 +107,9 @@ class MaxcsoTool(BaseTool):
         super().__init__(binary_path)
         self._service = maxcso_service
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         # Compress direction only: badge "the .cso/.zso/.dax already exists" next
         # to an .iso source. Decompress-direction badging is out of scope.
         source = Path(input_path)

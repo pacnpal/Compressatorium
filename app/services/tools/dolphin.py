@@ -72,7 +72,9 @@ class DolphinTool(BaseTool):
         super().__init__(binary_path)
         self._service = dolphin_tool_service
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         source = Path(input_path)
         source_ext = source.suffix.lower()
         if source_ext not in self.input_extensions:

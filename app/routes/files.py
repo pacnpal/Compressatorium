@@ -110,12 +110,18 @@ def _fold_split_iso_entries(entries: list[FileEntry]) -> list[FileEntry]:
 
 def _detect_file_outputs(
     item_path: str,
+    *,
+    from_archive: bool = False,
 ) -> tuple[list[str], list[OutputStatus], dict[str, OutputStatus]]:
     """Drive convertibility + output detection off the tool registry.
 
     Returns the tool ids that accept this input, the detected sibling
     outputs, and a ``{tool_id: OutputStatus}`` index used to derive the
     legacy per-tool booleans from a single source of truth.
+
+    ``from_archive`` marks ``item_path`` as the synthesised location an archive
+    member would occupy rather than a real file, and is forwarded to each
+    tool's ``detect_output``.
     """
     convertible_by: list[str] = []
     outputs: list[OutputStatus] = []
@@ -127,7 +133,7 @@ def _detect_file_outputs(
         # since only game_part1.wud drives the set).
         if tool.converts_path(item_path):
             convertible_by.append(tool.id)
-        status = tool.detect_output(item_path)
+        status = tool.detect_output(item_path, from_archive=from_archive)
         if status is not None:
             outputs.append(status)
             by_tool[tool.id] = status
@@ -169,13 +175,21 @@ def _detect_archive_member_outputs(
     job pipeline — which extracts the member into the archive's directory before
     converting — and means any newly registered archive-aware tool surfaces in
     the browse/search views without another CHD-style special case.
+
+    The path is synthetic, so detection is told so (``from_archive=True``, the
+    listing-side counterpart of the ``treat_as_stem=True`` ``plan_job`` passes
+    for the same member). Without it a tool whose output name depends on the
+    input's *neighbours* would read this directory's real contents as if they
+    belonged to the member: a jwud member named ``game_part1.wud`` beside a
+    genuine extracted split set would badge the set's ``game.wux`` while the
+    planner targeted ``game_part1.wux``.
     """
     output_stem = (
         entry.get("output_stem") or Path(entry["internal_path"]).stem
     )
     member_ext = (entry.get("extension") or Path(entry["name"]).suffix).lower()
     synthetic_input = os.path.join(archive_dir, f"{output_stem}{member_ext}")
-    _, outputs, by_tool = _detect_file_outputs(synthetic_input)
+    _, outputs, by_tool = _detect_file_outputs(synthetic_input, from_archive=True)
     # `_detect_file_outputs` derives convertibility from each tool's
     # `converts_path` — but a member is only convertible in *place* when a tool
     # can accept

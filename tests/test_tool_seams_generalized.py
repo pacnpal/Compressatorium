@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from app.models import ConversionJob, ConversionMode, InputKind, JobStatus
+from app.services import jwudtool as jwud_service
 from app.services.tools import registry
 from app.services.tools.base import BaseTool
 
@@ -387,6 +388,63 @@ def test_split_source_is_convertible_only_through_its_primary(tmp_path):
         assert registry.tools_converting_path(str(part)) == []
         # Still a .wud by extension — the narrowing is per-file, not per-type.
         assert ".wud" in registry.get("jwud").input_extensions
+
+
+def _complete_split_set(tmp_path: Path) -> Path:
+    """A byte-accurate 25 GB dump, sparse so it costs no disk."""
+    written = 0
+    for index in range(1, jwud_service.WUD_SPLIT_MAX_PARTS + 1):
+        size = min(
+            jwud_service.WUD_SPLIT_PART_SIZE,
+            jwud_service.WUD_IMAGE_SIZE - written,
+        )
+        with (tmp_path / f"game_part{index}.wud").open("wb") as fh:
+            fh.truncate(size)
+        written += size
+    return tmp_path / "game_part1.wud"
+
+
+def test_detect_output_honors_the_archive_flag_over_the_surrounding_disk(tmp_path):
+    """An archive member must not read its neighbours as its own split set.
+
+    `_detect_archive_member_outputs` synthesises `<archive_dir>/game_part1.wud`,
+    which is indistinguishable from a real primary if that directory happens to
+    hold an extracted set. `from_archive` is the listing-side counterpart of the
+    `treat_as_stem=True` that `plan_job` passes for the same member, so the
+    badge lands on the output the planner actually targets.
+    """
+    primary = _complete_split_set(tmp_path)
+    (tmp_path / "game.wux").write_bytes(b"whole-disc output")
+    (tmp_path / "game_part1.wux").write_bytes(b"single-member output")
+    tool = registry.get("jwud")
+
+    # A real on-disk primary drives the joined set, so it badges the disc's
+    # product...
+    on_disk = tool.detect_output(str(primary))
+    assert on_disk is not None
+    assert on_disk.path == str(tmp_path / "game.wux")
+
+    # ...but the same path as an archive member badges the member's own
+    # product, because extraction hands over one part and never the set.
+    member = tool.detect_output(str(primary), from_archive=True)
+    assert member is not None
+    assert member.path == str(tmp_path / "game_part1.wux")
+
+
+def test_detect_output_ignores_the_archive_flag_for_single_file_tools(tmp_path):
+    # The seven tools that predate the flag swap a suffix and nothing else, so
+    # a synthesised path resolves exactly like a real one.
+    source = tmp_path / "Game.3ds"
+    source.write_bytes(b"rom")
+    (tmp_path / "Game.z3ds").write_bytes(b"compressed rom")
+    tool = registry.get("z3ds")
+
+    plain = tool.detect_output(str(source))
+    from_archive = tool.detect_output(str(source), from_archive=True)
+
+    assert plain is not None
+    assert from_archive is not None
+    assert plain.path == from_archive.path
 
 
 def test_split_source_companions_cover_the_whole_set(tmp_path):
