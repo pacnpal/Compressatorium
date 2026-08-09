@@ -1920,10 +1920,11 @@ declared extension:
 ```python
 @staticmethod
 def _output_stem(name: str) -> str:
-    lower = name.lower()
-    for ext in sorted(NKIT2ISO_CONVERTIBLE_EXTENSIONS, key=len, reverse=True):
-        if lower.endswith(ext):
-            return name[: -len(ext)]
+    # Reuse the shared matcher — it already does case-insensitive longest-suffix
+    # matching and hands back the full extension, so the strip is one slice.
+    matched = match_extension(name, NKIT2ISO_CONVERTIBLE_EXTENSIONS)
+    if matched is not None:
+        return name[: -len(matched)]
     return str(Path(name).with_suffix(""))
 ```
 

@@ -10,6 +10,7 @@ delegates to its service via the wrapper's ``_service`` attribute, so patching
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 import pytest
 
@@ -173,3 +174,36 @@ def test_verify_modes_covers_every_verifying_tool():
     # ...and the tool that genuinely cannot verify stays out.
     assert "nkit_restore" not in covered
     assert not hasattr(registry.get("nkit"), "verify")
+
+
+def test_every_plugin_accepts_job_managers_convert_kwargs():
+    """Every registered plugin must be callable the way the pipeline calls it.
+
+    ``JobManager._process_job`` does::
+
+        registry.for_mode(job.mode.value).convert(
+            input_path, output_path, mode,
+            compression=..., split=..., cancel_event=...,
+        )
+
+    unconditionally, for every mode. A plugin that omits a kwarg it doesn't use
+    (``split`` applies only to makeps3iso) raises ``TypeError`` the first time a
+    real job runs — and unit tests that drive the underlying *service* directly
+    never catch it, because the plugin is the boundary the pipeline calls.
+    ``docs/ADDING_PLATFORMS_AND_TOOLS.md`` §5.3 warns about this in prose; this
+    enforces it.
+
+    Binding the signature (rather than checking parameter names) proves the call
+    would actually succeed, including for a plugin that takes ``**kwargs``.
+    """
+    for tool in registry.all():
+        try:
+            inspect.signature(tool.convert).bind(
+                "/in", "/out", "any_mode",
+                compression=None, split=False, cancel_event=None,
+            )
+        except TypeError as exc:  # pragma: no cover - the failure is the message
+            pytest.fail(
+                f"{tool.id}.convert cannot be called the way job_manager calls "
+                f"it, so every job for this tool would raise: {exc}"
+            )

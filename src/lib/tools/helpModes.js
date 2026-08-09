@@ -66,7 +66,8 @@ export const MODE_BLURBS = {
   // NKit
   nkit_restore:
     'Rebuild the full GameCube/Wii ISO from an NKit-shrunk .nkit.iso/.nkit.gcz. '
-    + 'No settings; the result is CRC32-checked against the NKit header. That '
+    + 'No per-job settings; the result is CRC32-checked against the NKit header. '
+    + 'That '
     + 'check is skipped for a Wii image restored without its removed update '
     + 'partition — playable, but not bit-exact, and the job says so.',
   nkit_to_rvz:
