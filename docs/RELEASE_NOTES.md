@@ -28,16 +28,23 @@ and #179, part of the #177 tech-debt epic).
   The `/api/jwud-verify` endpoints check a `.wux` structurally — header magic and
   fields, then every sector-index entry against the file's real length — which
   catches a truncated copy or a corrupt index table, and is as deep as the format
-  allows since WUX stores no content checksums. Only `.wux` is verifiable, so
+  allows since WUX stores no content checksums. Both header size fields are
+  pinned to the format's only real values (a 32 KiB sector and a whole disc
+  image) rather than merely sanity-checked, since the index table's size scales
+  inversely with the declared sector size — so no file, however crafted, can
+  dictate how much work a verification does. Only `.wux` is verifiable, so
   delete-on-verify is offered on compress but not on decompress. `/api/jwud-info`
   reads the same header, reporting the original image size and the ratio.
 
   **Split dumps work too.** wudump writes `game_part1.wud` … `game_part12.wud`
   and JWUDTool joins them when you pick part 1. Only part 1 is offered as a
   source; the rest stay listed (so you can see and delete them) but aren't
-  convertible alone, since a part is not a disc image. The product is named
-  after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify takes
-  the whole set instead of orphaning eleven parts.
+  convertible alone, since a part is not a disc image. A *complete* set's
+  product is named after the disc (`game.wux`, not `game_part1.wux`), and
+  delete-on-verify takes the whole set instead of orphaning eleven parts. A
+  half-copied set, one with a gap, an orphan part and an archived part all keep
+  their own name — none of them can produce the disc, so none of them may claim
+  its output and risk overwriting an unrelated finished image.
 
   **Delete-on-verify is guarded per job (`delete_on_verify_is_safe`).** A third
   input-side hook, because the verification toggle below would otherwise create

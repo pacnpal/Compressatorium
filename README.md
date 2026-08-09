@@ -924,10 +924,14 @@ archive.
   `game_part1.wud` beside it is left alone and keeps its own name, so it fails
   with JWUDTool's size complaint rather than planning the whole set's output.
   While a split conversion is running, the other parts count as in use, so they
-  can't be renamed or deleted out from under it. The product is
+  can't be renamed or deleted out from under it. A **complete** set's product is
   named after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify
   removes the **whole set** rather than orphaning the eleven parts it didn't
-  name. The names are matched exactly as JNUSLib defines them, so a renamed set
+  name. "Complete" is measured: the parts must run 1…N with no gap and add up to
+  exactly one disc image, the same thing JWUDTool requires before it will join
+  them. A half-copied dump keeps its part name, so a failed conversion can never
+  cost you an unrelated `game.wux` that was already there.
+  The names are matched exactly as JNUSLib defines them, so a renamed set
   (`MyGame_part1.wud`) reads as an ordinary image. A split set can't be
   converted from inside an archive — the sibling parts aren't extracted with the
   member — so an archived part keeps its own name and fails with JWUDTool's own

@@ -89,6 +89,13 @@ JWUD_NO_VERIFY = "noverify"
 WUX_HEADER_SIZE = 0x20
 WUX_MAGIC = b"WUX0"
 WUX_MAGIC_1 = 0x1099D02E
+# sectorSize is stored in the header, but JNUSLib's WUDImageCompressedInfo only
+# ever writes 0x8000 and the real 25 GB image confirms it (763,712 entries,
+# sector array at 0x2F0000). Pinning it is a hard bound on the work `verify`
+# will do: the index table is one u32 per logical sector, so a crafted header
+# declaring a 4-byte sector would claim ~6.25 billion entries (a ~25 GB table)
+# and tie up the verification lane unpacking a sparse file for hours.
+WUX_SECTOR_SIZE = 0x8000
 # Every Wii U disc image is exactly this size. JNUSLib refuses to compress or
 # decompress anything else, so it doubles as a container-validity check.
 WUD_IMAGE_SIZE = 0x5D3A00000  # 25,025,314,816 bytes
@@ -144,6 +151,31 @@ def split_set_parts(primary_path: str) -> list[str]:
     return parts
 
 
+def split_set_is_complete(primary_path: str) -> bool:
+    """Whether ``game_part1.wud``'s parts add up to a whole disc image on disk.
+
+    A set is usable only when the parts run 1…N with no gap *and* sum to
+    exactly ``WUD_IMAGE_SIZE`` — the same thing JNUSLib requires before it will
+    join them. Half a dump (parts 1 and 2 of 12) is named like a set but cannot
+    produce the disc, so it must not claim the set's output name.
+
+    Returns ``False`` for anything that isn't part 1, and for a part 1 that
+    doesn't exist (an archive member's synthetic path), which is what keeps
+    output detection agreeing with the archive planner.
+    """
+    if split_part_index(primary_path) != 1:
+        return False
+    total = 0
+    for path in [primary_path, *split_set_parts(primary_path)]:
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            return False
+        if total > WUD_IMAGE_SIZE:
+            return False
+    return total == WUD_IMAGE_SIZE
+
+
 def is_split_secondary(file_path: str) -> bool:
     """Whether this is a non-primary member of a split set that exists on disk.
 
@@ -181,6 +213,12 @@ def read_wux_header(file_path: str) -> dict:
     geometry. Raises ``ValueError`` when the file is not a structurally valid
     WUX container (the caller turns that into a verify failure or, for
     ``info``, into "no extra detail available").
+
+    Both size fields are pinned to the format's only real values rather than
+    merely sanity-checked, which is what keeps the derived ``entry_count``
+    constant: a header is free to *claim* a tiny sector size, and the index
+    table's size scales inversely with it, so anything looser would let a
+    crafted file dictate how much work ``verify`` does.
     """
     with open(file_path, "rb") as fh:
         header = fh.read(WUX_HEADER_SIZE)
@@ -192,8 +230,11 @@ def read_wux_header(file_path: str) -> dict:
     )
     if magic != WUX_MAGIC or magic1 != WUX_MAGIC_1:
         raise ValueError("missing the WUX0 magic")
-    if sector_size <= 0 or sector_size % 4:
-        raise ValueError(f"invalid sector size {sector_size}")
+    if sector_size != WUX_SECTOR_SIZE:
+        raise ValueError(
+            f"declares a {sector_size}-byte sector size; WUX sectors are always "
+            f"{WUX_SECTOR_SIZE} bytes",
+        )
     if uncompressed_size != WUD_IMAGE_SIZE:
         raise ValueError(
             f"declares an uncompressed size of {uncompressed_size} bytes; a Wii U "
@@ -302,25 +343,29 @@ class JwudToolService:
     def output_stem(input_path: str, *, from_archive: bool = False) -> str:
         """The output filename stem for an input.
 
-        Normally the input's own stem, but a split set's primary
-        (``game_part1.wud``) names its product after the *disc*, ``game.wux``,
+        Normally the input's own stem, but the primary of a *complete* split
+        set (``game_part1.wud``) names its product after the disc, ``game.wux``,
         not ``game_part1.wux`` — the parts are one image, and the part number
-        has no meaning once they're joined. Pure name math (no disk access), so
-        the result is identical for a real file and a duplicate-check probe.
+        has no meaning once they're joined.
 
-        Two cases keep their own stem, both for the same reason: they name an
-        input that cannot actually produce the whole-set output, so planning
+        Everything else keeps its own stem, always for the same reason: it names
+        an input that cannot produce the whole-set output, so claiming
         ``game.wux`` would let an authorized overwrite unlink an unrelated
         finished image before the conversion fails.
 
         * A stray ``game_part7.wud`` with no part 1 beside it (deliberately
           still convertible, so JWUDTool answers with its own size complaint).
+        * An incomplete set — parts 1 and 2 of a 12-part dump, or a gap in the
+          middle. Named like a set, but JWUDTool will refuse to join it.
         * Any part pulled from an archive: extraction hands the converter that
           one member, never the sibling parts (``extract_related_files``
           expands ``.cue``/``.gdi`` only), so an archived set can't convert.
+
+        Reads the sizes of the sibling parts, so call it off the event loop —
+        the same constraint ``converts_path`` already carries.
         """
         stem = Path(input_path).stem
-        if not from_archive and split_part_index(input_path) == 1:
+        if not from_archive and split_set_is_complete(input_path):
             return stem.rsplit("_part", 1)[0]
         return stem
 

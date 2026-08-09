@@ -981,6 +981,20 @@ Both hooks may touch the disk (they look for the sibling primary / enumerate the
 set), so they run in the `files.py` threadpool scan and inside
 `build_delete_plan`, never on the event loop.
 
+**Naming the set's product is a third disk-reading decision.** Part 1 of a set
+produces `game.wux`, not `game_part1.wux` — the parts are one image and the part
+number is meaningless once they're joined. But that rewrite is only correct when
+the set can actually *be* joined, so `JwudToolService.output_stem` gates it on
+`split_set_is_complete()`: parts 1…N present with no gap **and** summing to
+exactly `WUD_IMAGE_SIZE`, which is what JNUSLib itself requires. A half-finished
+dump, a set with a hole in it, an orphan part, and an archive member (whose
+synthesised path has no set behind it on disk) all keep their own stem. The
+reason is `allow_overwrite`: an input that claims `game.wux` but cannot produce
+it would let the worker unlink an unrelated finished image *before* JWUDTool
+failed. Deriving it from disk state rather than a flag also keeps
+`detect_output` — which has no archive parameter to consult — landing on the
+same path the archive planner targets.
+
 #### Per-job delete-on-verify guard (`delete_on_verify_is_safe`)
 
 `ModeSpec.supports_delete_on_verify` answers "can this *mode* offer it?", which

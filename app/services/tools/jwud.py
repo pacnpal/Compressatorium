@@ -114,8 +114,10 @@ class JwudTool(BaseTool):
             # Part 7's product is part 1's product; badging it here would show
             # the same .wux against every member of the set.
             return None
-        # Resolve through the same output-path math the job uses, so a split
-        # primary badges game.wux rather than game_part1.wux.
+        # Resolve through the same output-path math the job uses, so a complete
+        # split set badges game.wux rather than game_part1.wux — and an archive
+        # member (whose synthetic path has no set behind it on disk) badges the
+        # game_part1.wux the archive planner actually targets.
         candidate = self.output_path("jwud_compress", input_path)
         file_exists, is_converting = lock_manager.check_file_status(candidate)
         if not (file_exists or is_converting):

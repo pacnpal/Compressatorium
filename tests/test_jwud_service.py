@@ -2,8 +2,9 @@
 
 These mock ``asyncio.create_subprocess_exec``, so they need neither a Java
 runtime, the JWUDTool jar, nor a 25 GB disc image. The WUX fixtures are built
-from the real container layout (JNUSLib ``WUDImageCompressedInfo``), just with
-a tiny sector size so a full, structurally valid container fits in a few KB.
+from the real container layout (JNUSLib ``WUDImageCompressedInfo``) at the real
+sector size, so a full, structurally valid container is a ~3 MB file rather than
+a 25 GB one.
 """
 from __future__ import annotations
 
@@ -18,7 +19,11 @@ from app.services.chdman import ConversionCancelled
 
 service = jwud_module.jwudtool_service
 
-SECTOR = jwud_module.WUD_IMAGE_SIZE // 1024  # a whole number of sectors
+
+# The format's only sector size, so the fixtures have the same geometry the real
+# tool writes: 763,712 index entries and a sector array at 0x2F0000, which lands
+# a whole structurally valid container in about 3 MB.
+SECTOR = jwud_module.WUX_SECTOR_SIZE
 
 
 def _build_wux(
@@ -63,6 +68,25 @@ def _build_wux(
 
     path.write_bytes(body)
     return path
+
+
+def _build_split_set(tmp_path: Path, *, parts: int = jwud_module.WUD_SPLIT_MAX_PARTS):
+    """Lay down ``game_part1.wud`` … as sparse files with the real part sizes.
+
+    A complete set is 11 parts of exactly 2 GiB plus a 1,402,994,688-byte
+    twelfth. The files are sparse (``truncate``), so a byte-accurate 25 GB dump
+    costs no disk — and ``os.path.getsize`` reports the sizes the completeness
+    check reads. Pass ``parts`` < 12 for a half-finished dump.
+    """
+    written = 0
+    for index in range(1, parts + 1):
+        remaining = jwud_module.WUD_IMAGE_SIZE - written
+        size = min(jwud_module.WUD_SPLIT_PART_SIZE, remaining)
+        path = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % index)
+        with path.open("wb") as fh:
+            fh.truncate(size)
+        written += size
+    return tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 1)
 
 
 class _FakeProcess:
@@ -364,6 +388,30 @@ def test_read_wux_header_rejects_malformed_containers(tmp_path, kwargs, match):
         jwud_module.read_wux_header(str(wux))
 
 
+@pytest.mark.asyncio
+async def test_read_wux_header_rejects_a_nonstandard_sector_size(tmp_path):
+    """A tiny declared sector size must be refused before any table math.
+
+    The index table holds one u32 per logical sector, so a 4-byte sector claims
+    ~6.25 billion entries — a ~25 GB table. Against a sparse file that costs
+    almost no disk, `verify` would sit in the threadpool unpacking it for hours,
+    so the size is pinned to the only value the format is ever written with.
+    """
+    hostile = tmp_path / "game.wux"
+    hostile.write_bytes(
+        struct.pack(
+            "<4sIIIQ", jwud_module.WUX_MAGIC, jwud_module.WUX_MAGIC_1,
+            4, 0, jwud_module.WUD_IMAGE_SIZE,
+        ) + b"\0" * (jwud_module.WUX_HEADER_SIZE - 0x18),
+    )
+
+    with pytest.raises(ValueError, match="sector size"):
+        jwud_module.read_wux_header(str(hostile))
+    # And the caller turns that into an ordinary verify failure, not a hang.
+    result = await service.verify(str(hostile))
+    assert result["valid"] is False
+
+
 def test_read_wux_header_rejects_a_stub_file(tmp_path):
     stub = tmp_path / "game.wux"
     stub.write_bytes(b"WUX0")
@@ -536,14 +584,51 @@ def test_split_secondary_needs_the_primary_beside_it(tmp_path):
     assert jwud_module.is_split_secondary(str(orphan)) is False
 
 
-def test_split_primary_names_its_output_after_the_disc():
+def test_split_primary_names_its_output_after_the_disc(tmp_path):
     # game_part1.wud is one member of one image, so the product is game.wux --
     # naming it game_part1.wux would imply a per-part output.
+    primary = _build_split_set(tmp_path)
+
     assert service.get_output_path_for_mode(
-        "jwud_compress", "/data/game_part1.wud",
-    ) == "/data/game.wux"
-    assert service.output_stem("/data/game_part1.wud") == "game"
-    assert service.output_stem("/data/game.wud") == "game"
+        "jwud_compress", str(primary),
+    ) == str(tmp_path / "game.wux")
+    assert service.output_stem(str(primary)) == "game"
+    assert service.output_stem(str(tmp_path / "game.wud")) == "game"
+
+
+def test_incomplete_split_set_keeps_the_part_stem(tmp_path):
+    """Half a dump is named like a set but cannot produce the disc.
+
+    JWUDTool refuses to join parts that don't add up to a whole image, so if the
+    primary claimed `game.wux` an authorized overwrite would unlink an unrelated
+    finished image before that failure ever happened.
+    """
+    primary = _build_split_set(tmp_path, parts=2)
+
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+    assert service.get_output_path_for_mode(
+        "jwud_compress", str(primary),
+    ) == str(tmp_path / "game_part1.wux")
+
+
+def test_split_set_with_a_gap_is_not_complete(tmp_path):
+    """A missing middle part breaks the set even when the tail is present."""
+    primary = _build_split_set(tmp_path)
+    (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 3)).unlink()
+
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_split_set_completeness_is_measured_in_bytes(tmp_path):
+    """All twelve names present, but one part short-written: still not a disc."""
+    primary = _build_split_set(tmp_path)
+    with (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 5)).open("wb") as fh:
+        fh.truncate(jwud_module.WUD_SPLIT_PART_SIZE - 1)
+
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
 
 
 # --- verification toggle -----------------------------------------------------
@@ -635,28 +720,52 @@ def test_orphan_split_part_keeps_its_own_stem(tmp_path):
     so JWUDTool can reject it — but if it planned `game.wux`, an overwrite job
     would unlink an unrelated finished image before that failure.
     """
-    assert service.output_stem("/data/game_part7.wud") == "game_part7"
+    primary = _build_split_set(tmp_path)
+    orphan = tmp_path / "orphans" / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 7)
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"stray part")
+
+    assert service.output_stem(str(orphan)) == "game_part7"
     assert service.get_output_path_for_mode(
-        "jwud_compress", "/data/game_part7.wud",
-    ) == "/data/game_part7.wux"
-    # Part 1 still names the product after the disc.
+        "jwud_compress", str(orphan),
+    ) == str(orphan.parent / "game_part7.wux")
+    # Part 1 of a complete set still names the product after the disc.
     assert service.get_output_path_for_mode(
-        "jwud_compress", "/data/game_part1.wud",
-    ) == "/data/game.wux"
+        "jwud_compress", str(primary),
+    ) == str(tmp_path / "game.wux")
 
 
-def test_archived_split_part_keeps_its_own_stem():
+def test_archived_split_part_keeps_its_own_stem(tmp_path):
     """Archive extraction hands over one member, never the sibling parts.
 
     `extract_related_files` expands .cue/.gdi only, so an archived split set
     can't convert — and if it planned `game.wux`, an authorized overwrite would
     unlink an unrelated finished image before that failure.
     """
-    assert service.output_stem("/data/game_part1.wud", from_archive=True) == "game_part1"
+    primary = _build_split_set(tmp_path)
+
+    assert service.output_stem(str(primary), from_archive=True) == "game_part1"
     assert service.get_output_path_for_mode(
         "jwud_compress", "game_part1.wud", "/data", treat_as_stem=True,
     ) == "/data/game_part1.wux"
     # The on-disk primary is unaffected: it really does drive the whole set.
     assert service.get_output_path_for_mode(
-        "jwud_compress", "/data/game_part1.wud",
-    ) == "/data/game.wux"
+        "jwud_compress", str(primary),
+    ) == str(tmp_path / "game.wux")
+
+
+def test_a_bare_split_name_with_nothing_on_disk_keeps_its_stem(tmp_path):
+    """The archive-listing path: a synthetic member path with no set behind it.
+
+    `_detect_archive_member_outputs` synthesises `<archive_dir>/game_part1.wud`
+    and hands it to `detect_output`, which has no archive flag to consult. The
+    set is only claimed once its parts are really on disk, so detection lands on
+    the same `game_part1.wux` the archive planner targets rather than probing an
+    unrelated `game.wux`.
+    """
+    synthetic = tmp_path / "game_part1.wud"
+
+    assert jwud_module.split_set_is_complete(str(synthetic)) is False
+    assert service.get_output_path_for_mode(
+        "jwud_compress", str(synthetic),
+    ) == str(tmp_path / "game_part1.wux")
