@@ -134,6 +134,47 @@ def _strip_trailing_dot_and_seps(path: str) -> str:
     return (drive + tail) or path
 
 
+def source_companions_are_safe(file_path: str, mode: str) -> bool:
+    """Whether every sibling input this mode's tool also consumes stays in-volume.
+
+    The single-file analogue of :func:`is_safe_directory_tree`, and it exists
+    for the same reason: a multi-file source drags in files the request never
+    named, and the native converter opens them *itself* — JNUSLib enumerates a
+    split Wii U set's parts from part 1 rather than taking a list from us — so
+    the volume boundary the route enforced on ``file_path`` has to be enforced
+    on the companions too. Rejects a symlinked companion outright rather than
+    following it, plus anything resolving outside the configured volumes.
+
+    Scoped to ``mode``'s own tool, not the registry-wide union: another
+    plugin's multi-file semantics must not veto a job it has no part in (a
+    chdman ``createhd`` on a raw file that happens to be named
+    ``game_part1.wud`` never reads the sibling parts). A no-op for the tools
+    whose ``source_companions`` is ``[]``.
+
+    Like the directory check this is a *point-in-time* answer, so both callers
+    matter: ``plan_job`` rejects at queue time, and the worker re-checks after
+    taking the job's locks, since a queued job's companion can be swapped for a
+    symlink in between.
+
+    Blocking I/O (an ``lstat`` and a ``realpath`` per companion); call it off
+    the event loop.
+    """
+    from services.tools import registry  # local: avoids an import cycle
+
+    try:
+        tool = registry.for_mode(mode)
+    except KeyError:
+        return True
+    for companion in tool.source_companions(file_path):
+        if os.path.islink(companion):
+            return False
+        if not is_within_configured_volumes(
+            os.path.realpath(companion), treat_archives=False,
+        ):
+            return False
+    return True
+
+
 def is_safe_directory_tree(path: str) -> bool:
     """Return whether a directory tree is safe for native recursive readers.
 

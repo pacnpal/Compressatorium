@@ -154,10 +154,17 @@ def split_set_parts(primary_path: str) -> list[str]:
 def split_set_is_complete(primary_path: str) -> bool:
     """Whether ``game_part1.wud``'s parts add up to a whole disc image on disk.
 
-    A set is usable only when the parts run 1…N with no gap *and* sum to
-    exactly ``WUD_IMAGE_SIZE`` — the same thing JNUSLib requires before it will
-    join them. Half a dump (parts 1 and 2 of 12) is named like a set but cannot
-    produce the disc, so it must not claim the set's output name.
+    A set is usable only with the exact layout JNUSLib's
+    ``WUDDiscReaderSplitted`` assumes: parts running 1…N with no gap, every part
+    but the last exactly ``WUD_SPLIT_PART_SIZE``, and the last one the remainder
+    that brings the total to ``WUD_IMAGE_SIZE``. Half a dump (parts 1 and 2 of
+    12) is named like a set but cannot produce the disc, so it must not claim
+    the set's output name.
+
+    Checking each part rather than only the total matters because the reader
+    computes a part's offset from its *index*, not from the sizes of the parts
+    before it: an undersized part balanced by an oversized later one sums
+    correctly while every byte past the short part is misaddressed.
 
     Returns ``False`` for anything that isn't part 1, and for a part 1 that
     doesn't exist (an archive member's synthetic path), which is what keeps
@@ -168,11 +175,15 @@ def split_set_is_complete(primary_path: str) -> bool:
     total = 0
     for path in [primary_path, *split_set_parts(primary_path)]:
         try:
-            total += os.path.getsize(path)
+            size = os.path.getsize(path)
         except OSError:
             return False
-        if total > WUD_IMAGE_SIZE:
+        # A full 2 GiB until the remainder is smaller, which happens exactly
+        # once — on the last part of a whole image. A short part anywhere else
+        # leaves `total` below WUD_IMAGE_SIZE and fails the check below.
+        if size != min(WUD_SPLIT_PART_SIZE, WUD_IMAGE_SIZE - total):
             return False
+        total += size
     return total == WUD_IMAGE_SIZE
 
 

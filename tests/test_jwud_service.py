@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from app.services import jwudtool as jwud_module
 from app.services.chdman import ConversionCancelled
+from app.services.tools import registry as tool_registry
 
 service = jwud_module.jwudtool_service
+tool = tool_registry.get("jwud")
 
 
 # The format's only sector size, so the fixtures have the same geometry the real
@@ -631,6 +634,87 @@ def test_split_set_completeness_is_measured_in_bytes(tmp_path):
     assert service.output_stem(str(primary)) == "game_part1"
 
 
+def test_split_set_parts_are_checked_individually_not_just_summed(tmp_path):
+    """A short part balanced by a long one sums right and is still unjoinable.
+
+    JNUSLib computes a part's offset from its *index*, not from the sizes of the
+    parts before it, so every byte past a short part is misaddressed even though
+    the total is exactly one disc image. Summing alone would accept this.
+    """
+    primary = _build_split_set(tmp_path)
+    short = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 3)
+    long = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 4)
+    with short.open("wb") as fh:
+        fh.truncate(jwud_module.WUD_SPLIT_PART_SIZE - 4096)
+    with long.open("wb") as fh:
+        fh.truncate(jwud_module.WUD_SPLIT_PART_SIZE + 4096)
+
+    # The total is still exactly WUD_IMAGE_SIZE...
+    total = sum(
+        (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % i)).stat().st_size
+        for i in range(1, jwud_module.WUD_SPLIT_MAX_PARTS + 1)
+    )
+    assert total == jwud_module.WUD_IMAGE_SIZE
+    # ...and the set is still rejected.
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_eleven_parts_summing_to_a_disc_is_not_a_valid_set(tmp_path):
+    """The right total in the wrong number of parts is still the wrong layout."""
+    _build_split_set(tmp_path, parts=11)
+    primary = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 1)
+    # Give part 11 the leftover so the eleven parts sum to a whole image.
+    leftover = jwud_module.WUD_IMAGE_SIZE - 10 * jwud_module.WUD_SPLIT_PART_SIZE
+    with (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 11)).open("wb") as fh:
+        fh.truncate(leftover)
+
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_split_members_are_excluded_from_the_metadata_scan(tmp_path):
+    """`.wud` is a produced output, so the DAT walk would hash every 2 GiB part.
+
+    A part is a slice of a disc image and can never match a DAT, so the whole
+    ~25 GB set would be read for nothing.
+    """
+    _build_split_set(tmp_path)
+
+    for index in range(1, jwud_module.WUD_SPLIT_MAX_PARTS + 1):
+        assert tool.scannable_path(
+            str(tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % index)),
+        ) is False
+    # A whole-image .wud (what a decompress job writes) stays scannable.
+    assert tool.scannable_path(str(tmp_path / "game.wud")) is True
+    assert tool.scannable_path(str(tmp_path / "game.wux")) is True
+
+
+def test_a_lone_split_named_wud_is_still_scannable(tmp_path):
+    """A whole disc image that merely *looks* like a part is an ordinary image.
+
+    The veto is on membership of a real set, not on the name: `converts_path`
+    and `output_stem` already treat a split-like name with no set behind it as
+    an independent file, and excluding it from DAT matching would contradict
+    that for no benefit.
+    """
+    lone = tmp_path / "game_part1.wud"
+    lone.write_bytes(b"a whole disc image that happens to be named this")
+    # A stray part elsewhere, with no part 1 beside it — the same case
+    # `is_split_secondary` deliberately leaves convertible.
+    orphan_dir = tmp_path / "elsewhere"
+    orphan_dir.mkdir()
+    orphan = orphan_dir / "game_part7.wud"
+    orphan.write_bytes(b"likewise")
+
+    assert tool.scannable_path(str(lone)) is True
+    assert tool.scannable_path(str(orphan)) is True
+
+    # Put a real set behind the name and it becomes a slice again.
+    _build_split_set(tmp_path)
+    assert tool.scannable_path(str(lone)) is False
+
+
 # --- verification toggle -----------------------------------------------------
 
 
@@ -770,3 +854,79 @@ def test_a_bare_split_name_with_nothing_on_disk_keeps_its_stem(tmp_path):
     assert service.get_output_path_for_mode(
         "jwud_compress", str(synthetic),
     ) == str(tmp_path / "game_part1.wux")
+
+
+@pytest.mark.asyncio
+async def test_process_job_revalidates_split_companions_after_locking(
+    tmp_path, monkeypatch,
+):
+    """A queued split job's companion can be swapped for a symlink before it runs.
+
+    `plan_job` clears the set at queue time, but the job may sit in the queue.
+    JWUDTool enumerates and opens the parts itself, so a `game_part2.wud`
+    replaced with a link out of the volumes would have its bytes folded into the
+    .wux. The worker re-checks under the job's locks — and before clearing any
+    existing output, so a rejection on an overwrite job is non-destructive.
+    """
+    from app.models import ConversionJob, ConversionMode, JobStatus
+    from app.services import job_manager as job_manager_module
+    from app.services.job_manager import job_manager
+    from services.concurrency_manager import concurrency_manager
+    from services.lock_manager import lock_manager
+
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    primary = _build_split_set(volume)
+    outside = tmp_path / "outside-secret.wud"
+    outside.write_bytes(b"secret")
+    # Swap part 2 for a link out of the volume, as if it happened while queued.
+    part2 = volume / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 2)
+    part2.unlink()
+    part2.symlink_to(outside)
+
+    out = str(volume / "game.wux")
+    existing = volume / "game.wux"
+    existing.write_bytes(b"the user's prior output")
+
+    for attr in ("chd_volumes", "data_mount_root"):
+        monkeypatch.setattr(
+            job_manager_module.source_companions_are_safe.__globals__["settings"],
+            attr,
+            str(volume),
+        )
+
+    called = False
+
+    async def fake_convert(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        yield {"progress": 100, "message": "should not run"}
+
+    monkeypatch.setattr(
+        job_manager_module.registry.for_mode("jwud_compress"), "convert", fake_convert,
+    )
+
+    job = ConversionJob(
+        id="jwudunsafe1",
+        file_path=str(primary),
+        filename=primary.name,
+        mode=ConversionMode.JWUD_COMPRESS,
+        status=JobStatus.QUEUED,
+        created_at=datetime.now(timezone.utc),
+        output_path=out,
+        allow_overwrite=True,
+    )
+    job_manager.jobs[job.id] = job
+    try:
+        await job_manager._process_job(job.id)
+        assert job.status == JobStatus.FAILED
+        assert "companion" in (job.error_message or "")
+        assert called is False
+        # Non-destructive: the prior output survives the rejection.
+        assert existing.read_bytes() == b"the user's prior output"
+    finally:
+        lock_manager.release_lock(out)
+        concurrency_manager.release(job.id)
+        job_manager.jobs.pop(job.id, None)
+        job_manager._cancel_events.pop(job.id, None)
+        job_manager._cancelled.discard(job.id)

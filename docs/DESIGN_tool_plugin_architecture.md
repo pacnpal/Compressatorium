@@ -1085,6 +1085,48 @@ Both hooks may touch the disk (they look for the sibling primary / enumerate the
 set), so they run in the `files.py` threadpool scan and inside
 `build_delete_plan`, never on the event loop.
 
+A set also costs two things a single-file source never did, and both are
+registry-driven rather than jwud branches:
+
+- **Containment.** `source_companions` is *name*-derived, so a companion can be
+  whatever the filesystem puts under that name. The converter opens them itself
+  — JNUSLib enumerates the parts from part 1 rather than taking a list from us —
+  so the volume boundary the route enforces on the submitted path has to be
+  enforced on the companions too. `utils.path_utils.source_companions_are_safe`
+  rejects a symlinked companion outright (rather than following it) and any
+  companion resolving outside the configured volumes.
+
+  Two properties make it correct, and both were review findings:
+
+  * **Checked twice, like the directory case.** `plan_job` rejects at queue time
+    with `SOURCE_COMPANION_UNSAFE`, and `_process_job` re-checks after taking
+    the job's locks — a queued job's `game_part2.wud` can be swapped for a
+    symlink in between, and the plan-time answer would be stale. The re-check
+    runs *before* clearing any existing output, so a rejection on an overwrite
+    job leaves the user's prior file intact. This is the same shape (and the
+    same ordering rationale) as the `is_safe_directory_tree` re-check that
+    guards makeps3iso's recursive read.
+  * **Scoped to the mode's own tool**, not the registry-wide union that
+    `build_delete_plan` uses. Deletion should take everything any tool considers
+    part of the source; conversion should consult only the tool that will read
+    it, or a chdman `createhd` on a raw file that happens to be named
+    `game_part1.wud` would be rejected over a sibling chdman never opens. A
+    no-op for the tools whose `source_companions` is `[]`.
+- **Scan cost.** `.wud` is a produced output, so `scannable_extensions` puts
+  every `game_partN.wud` in the DAT-match walk — twelve 2 GiB files SHA1'd in
+  full, ~25 GB per set, to match nothing, because a part is a slice of a disc
+  image rather than one. `ToolPlugin.scannable_path(path) -> bool` (default
+  `True`) is the per-file veto on that walk, the scan-side analogue of
+  `converts_path`; the registry drops a path any tool rejects, since a file some
+  tool knows is not a standalone artifact cannot match a DAT whatever the others
+  think. It may do *bounded* disk I/O: the veto is on membership of a real set
+  rather than on the name, so a lone `game_part1.wud` stays scannable and the
+  same path stops being scannable once its siblings appear — which a pure
+  filename check could not express, and which keeps the hook agreeing with
+  `converts_path` and `output_stem`. It runs once per candidate across the whole
+  library, so implementations stay to a stat or two and never a read, inside the
+  threadpool scan walk rather than on the event loop.
+
 **Naming the set's product is a third disk-reading decision.** Part 1 of a set
 produces `game.wux`, not `game_part1.wux` — the parts are one image and the part
 number is meaningless once they're joined. But that rewrite is only correct when
