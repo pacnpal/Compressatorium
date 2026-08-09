@@ -1325,6 +1325,10 @@ npm run lint        # ESLint (JS + .svelte), flat config in eslint.config.js
 
 The multi-stage `Dockerfile` has a dedicated `frontend-builder` stage that runs `npm ci && npm run build` inside `node:lts-slim`, then copies the output into the Python runtime image. The runtime image has no Node; `node:lts-slim` ships `linux/amd64` + `linux/arm64` so the existing multi-arch buildx pipeline keeps working unchanged.
 
+### Adding a conversion tool or platform
+
+`docs/ADDING_PLATFORMS_AND_TOOLS.md` is the full developer guide: the vertical slice from the binary in the Docker image, through the service and tool plugin, the job pipeline and FastAPI routes, up to the Svelte registry entry — plus an exhaustive file inventory, a copy/paste checklist, and a table of which existing tool to copy for each shape of tool. `docs/DESIGN_tool_plugin_architecture.md` covers *why* the contract looks the way it does.
+
 ---
 
 ## Acknowledgments
