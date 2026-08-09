@@ -1201,6 +1201,12 @@ The default compose files include conservative CPU/memory limits to help avoid h
 - Prefer SSD/cache for `CHD_TEMP_DIR` and CHD output to reduce array contention.
 - Avoid running other heavy services during conversion.
 - Always set container CPU/memory limits on shared hosts.
+- **Synology DSM:** DSM's Docker/Container Manager doesn't support CPU CFS
+  bandwidth control, so the default `cpus:` limit fails the container at
+  startup with `NanoCPUs can not be set, as your kernel does not support CPU
+  CFS scheduler or the cgroup is not mounted`. Remove/comment out the `cpus:`
+  lines (keep `memory:`) or switch to `cpuset: "0-1"` core pinning instead —
+  see [docs/DOCKER-COMPOSE.md#synology-dsm-and-other-cfs-less-kernels](docs/DOCKER-COMPOSE.md#synology-dsm-and-other-cfs-less-kernels).
 
 2. **Multiple Volumes:**
 ```bash

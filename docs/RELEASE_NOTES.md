@@ -108,6 +108,17 @@ and #179, part of the #177 tech-debt epic).
 
 ### Fixed
 
+- **Documented the Synology DSM `cpus:`/NanoCPUs startup failure (issue #248).**
+  DSM's Docker implementation doesn't support CPU CFS bandwidth control, so the
+  default compose files' `cpus:` limit makes the container fail to start with
+  `NanoCPUs can not be set, as your kernel does not support CPU CFS scheduler
+  or the cgroup is not mounted`. The compose files, README, and
+  `docs/DOCKER-COMPOSE.md`/`docs/DEPLOYMENT.md` now flag this next to the
+  limit and document the fix: drop the `cpus:` lines (keep `memory:`), or pin
+  cores with `cpuset: "0-1"` instead (not equivalent — it pins cores rather
+  than capping CPU time). There's no compose-level way to auto-detect kernel
+  CFS support, so this remains a documented manual step on affected hosts.
+
 - **The delete-on-verify confirmation no longer crashes the view for archive
   sources.** Selecting two or more archives with **Delete sources after
   successful verification** enabled took down the whole workspace with "This
