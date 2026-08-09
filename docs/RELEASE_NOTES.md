@@ -37,6 +37,34 @@ and #179, part of the #177 tech-debt epic).
 
 ### Changed
 
+- **"Adding a tool" guide brought back in sync with the code.**
+  `docs/ADDING_PLATFORMS_AND_TOOLS.md` had drifted behind the Phase 7/9
+  registry-driven cleanups and still told contributors to write code that no
+  longer exists. Corrected throughout, and consistently across all four views of
+  the same list (the §3 inventory, the §5 walkthrough, the §6 checklist and the
+  §14 file map): listings are tool-neutral, so there are **no** `FileEntry`
+  per-tool flags, no `routes/files.py` edit and no `FileRow.svelte` fallback to
+  add; `plan_job` input validation is three data lines
+  (`SkipReason` + `_SKIP_HTTP` + `_BAD_EXTENSION_REASON`), not an `if`-block;
+  `fileIcon.js` takes one `TOOL_MEDIA` entry rather than extension lists; Help
+  needs a `helpModes.js` blurb rather than a hand-written table row; and
+  compression defaults are declared on the frontend descriptor
+  (`defaultCompression` / `compressionLevelRange`) rather than branched on in
+  `conversion.svelte.js`. Also documented the parts of the contract that had
+  never been written up — `ModeSpec.companion_exts` / `input_kinds`,
+  `ChainSpec`, `accepts_directory()`, `companion_outputs()`, the `split` convert
+  kwarg, `BaseTool._basic_info_fields`, the full registry query surface, and the
+  fact that info/verify routes are optional — plus the eighth (synthetic
+  `ChainTool`) registration and its ordering constraint, the five-stage
+  Dockerfile, `PYTHONPATH=app` on every test command, and the correct
+  tool-id-vs-binary-name pairings (`cso`←maxcso, `romz`←7z). Fixed the internal
+  contradiction about `tests/conftest.py` stubbing tool binaries (it does not;
+  it is DB-only), filled the missing §7 (a "which existing tool should I copy?"
+  decision table, so the section numbering no longer skips), and added the
+  screenshot-refresh and doc-maintenance steps. The guide is now linked from
+  `README.md`, `AGENTS.md` and `CLAUDE.md`, which previously pointed only at the
+  design doc.
+
 - **Frontend icon and Help lists now derive from the tool registry (issue #186,
   site 3).** `src/lib/util/fileIcon.js` builds its disc/game extension buckets
   from `registry.all()` plus a small tool→media map instead of a hand-typed

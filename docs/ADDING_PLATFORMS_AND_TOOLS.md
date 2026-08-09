@@ -7,29 +7,35 @@ vertical slice, from the binary in the Docker image, through the Python service
 and tool plugin, the job pipeline, the FastAPI routes, and finally the Svelte
 web UI, and shows how to add a tool and a platform in tandem.
 
-It is written against the codebase as it stands today, with seven tools already
-wired up:
+It is written against the codebase as it stands today, with seven real tools
+plus one synthetic pipeline tool already wired up:
 
-| Tool | Binary | Service module | Plugin | Handles |
-|------|--------|----------------|--------|---------|
-| **chdman** | `mame-tools` (`/usr/bin/chdman`) | `app/services/chdman.py` | `app/services/tools/chdman.py` | CD/DVD/HD/Raw/LaserDisc game images to/from `.chd` |
-| **dolphin-tool** | `dolphin-emu` (`/usr/local/bin/dolphin-tool`) | `app/services/dolphin_tool.py` | `app/services/tools/dolphin.py` | GameCube/Wii images to/from `.rvz/.wia/.gcz/.iso` |
-| **z3ds_compressor** | built from source via CMake (`/usr/local/bin/z3ds_compressor`) | `app/services/z3ds_compress.py` | `app/services/tools/z3ds.py` | Nintendo 3DS ROMs to/from `.zcci/.zcia/.z3ds/.zcxi/.z3dsx` |
-| **nsz** | `nsz` pip package (on PATH) | `app/services/nsz.py` | `app/services/tools/nsz.py` | Nintendo Switch `.nsp`/`.xci` to/from `.nsz`/`.xcz` |
-| **maxcso** | built from source (`/usr/local/bin/maxcso`) | `app/services/maxcso.py` | `app/services/tools/maxcso.py` | PSP/PS2 `.iso` to/from `.cso` (CSO v1/v2) / `.zso` / `.dax` (tool id `cso`) |
-| **7z** | `p7zip-full` (`7z` on PATH) | `app/services/romz.py` | `app/services/tools/romz.py` | Handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` to/from `.7z`/`.zip` (tool id `romz`) |
-| **makeps3iso** | built from source (`/usr/local/bin/makeps3iso`) | `app/services/makeps3iso.py` | `app/services/tools/makeps3iso.py` | A decrypted PS3 folder (`PS3_GAME/` layout) packed to `.iso` (tool id `makeps3iso`, directory input) |
+| Tool id | Binary | Service module | Plugin | Handles |
+|---------|--------|----------------|--------|---------|
+| **`chdman`** | `mame-tools` (`/usr/bin/chdman`) | `app/services/chdman.py` | `app/services/tools/chdman.py` | CD/DVD/HD/Raw/LaserDisc game images to/from `.chd` |
+| **`dolphin`** | `dolphin-emu` (`/usr/local/bin/dolphin-tool`) | `app/services/dolphin_tool.py` | `app/services/tools/dolphin.py` | GameCube/Wii images to/from `.rvz/.wia/.gcz/.iso` |
+| **`z3ds`** | built from source (`/usr/local/bin/z3ds_compressor`) | `app/services/z3ds_compress.py` | `app/services/tools/z3ds.py` | Nintendo 3DS ROMs to/from `.zcci/.zcia/.z3ds/.zcxi/.z3dsx` |
+| **`nsz`** | `nsz` pip package (on PATH) | `app/services/nsz.py` | `app/services/tools/nsz.py` | Nintendo Switch `.nsp`/`.xci` to/from `.nsz`/`.xcz` |
+| **`cso`** | maxcso, built from source (`/usr/local/bin/maxcso`) | `app/services/maxcso.py` | `app/services/tools/maxcso.py` | PSP/PS2 `.iso` to/from `.cso` (v1/v2) / `.zso` / `.dax` |
+| **`romz`** | `p7zip-full` (`7z` on PATH) | `app/services/romz.py` | `app/services/tools/romz.py` | Handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` to/from `.7z`/`.zip` |
+| **`makeps3iso`** | built from source (`/usr/local/bin/makeps3iso`) | `app/services/makeps3iso.py` | `app/services/tools/makeps3iso.py` | A decrypted PS3 folder (`PS3_GAME/` layout) packed to `.iso` — **directory input** |
+| **`chain`** | *(none — drives the tools above)* | *(none)* | `app/services/tools/chain.py` | Composite `cso_to_chd`: `.cso/.zso/.dax` → `.iso` → `.chd` as one job |
+
+Note the **tool id is not always the binary name**: maxcso registers as `cso`,
+7z registers as `romz`. The id is what the registry, the API and the frontend
+key on; use it consistently.
 
 > **Three tool shapes.** Most tools take a file matched by suffix, and that is
-> the path this guide walks. Two newer shapes sit on the same plugin/registry
-> contract and have their own seams: a **directory-input** tool (makeps3iso, the
-> last row above) selects a folder through `accepts_directory` / `InputKind`
-> instead of a suffix, and a **chain** mode (`cso_to_chd`) runs two existing
-> tools as one job through a `ChainSpec`. If you're adding either of those, read
-> the file-suffix walkthrough below for the shared plumbing (routes, job
-> pipeline, frontend registry), then see the two seam writeups in
+> the path this guide walks. Two other shapes sit on the same plugin/registry
+> contract and have their own seams: a **directory-input** tool (`makeps3iso`)
+> selects a folder through `accepts_directory` / `InputKind` instead of a
+> suffix, and a **chain** tool (`chain`, whose only mode is `cso_to_chd`) runs
+> two existing tools as one job through a `ChainSpec`. If you're adding either
+> of those, read the file-suffix walkthrough below for the shared plumbing
+> (routes, job pipeline, frontend registry), then see the two seam writeups in
 > `docs/DESIGN_tool_plugin_architecture.md` (§3.3.3 cross-tool chaining and
-> §3.3.4 directory inputs) for the parts that differ.
+> §3.3.4 directory inputs) for the parts that differ. §7 below is a "which of
+> these should I copy?" decision table.
 
 > **`romz` is the "produces archives / reuses an existing binary" example.** It
 > needs no Dockerfile build step (the `7z` CLI already ships via `p7zip-full`)
@@ -120,31 +126,44 @@ touching the same layers in the same order:
 Two supporting layers:
 
 - **`app/models.py`** holds the `ConversionMode` enum (every mode string lives
-  here) and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`).
+  here), the `InputKind` enum, the `OutputStatus` / `FileEntry` listing models,
+  and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`,
+  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`).
 - **`app/config.py`** `Settings` holds the binary path for each tool
-  (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`).
+  (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`, `nsz_path`,
+  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`) plus the shared and
+  per-tool nice/ioprio/timeout policy knobs.
 
 ### The tool registry
 
 `app/services/tools/` is the heart of the backend. It has five parts:
 
-- **`spec.py`** defines `ModeKind` (`CREATE` / `EXTRACT` / `COPY` / `COMPRESS`)
-  and the frozen `ModeSpec` dataclass: per-mode metadata that the routes and
-  pipeline read instead of branching on the mode string.
-- **`base.py`** defines the `ToolPlugin` protocol (the contract) and a `BaseTool`
-  helper that supplies sensible defaults so concrete plugins stay tiny.
+- **`spec.py`** defines `ModeKind` (`CREATE` / `EXTRACT` / `COPY` / `COMPRESS`),
+  the frozen `ModeSpec` dataclass (per-mode metadata that the routes and
+  pipeline read instead of branching on the mode string), and `ChainSpec` /
+  `ChainStep` for composite modes. It re-exports `InputKind` from `models` (it
+  lives there to avoid an import cycle).
+- **`base.py`** defines the `ToolPlugin` protocol (the contract), the
+  `EmbeddedHashUnavailable` exception, and a `BaseTool` helper that supplies
+  sensible defaults so concrete plugins stay tiny.
 - **`registry.py`** defines `ToolRegistry`, the lookup object. It indexes tools
-  by id and by mode and answers `for_mode(mode)`, `spec(mode)`,
-  `archive_input_extensions()`, `verify_extensions()`, `output_extensions()`,
-  `scannable_extensions()` (which drives the library scan / DAT-match
-  discovery), and friends.
+  by id and by mode and answers `all()`, `get(tool_id)`, `for_mode(mode)`,
+  `spec(mode)`, `mode_specs()`, `convertible_extensions()`,
+  `archive_input_extensions()`, `tools_accepting_archive_member(ext)`,
+  `tools_for_input(filename)`, `tools_for_directory(path)`,
+  `tool_for_verify(path)`, `tools_verifying_path(path)`, `verify_extensions()`,
+  `output_extensions()`, and `scannable_extensions()` (which drives the library
+  scan / DAT-match discovery).
 - **`chdman.py` / `dolphin.py` / `z3ds.py` / `nsz.py` / `maxcso.py` / `romz.py` /
-  `makeps3iso.py`** are the seven plugins. Each is a thin `BaseTool` subclass that
-  holds `ModeSpec` rows and delegates the real work to the underlying service
-  singleton (`makeps3iso.py` is the directory-input one; see §3.3.4 of the design
-  doc).
-- **`__init__.py`** builds the `registry` singleton and registers all seven
-  tools. This is the single wiring point.
+  `makeps3iso.py`** are the seven real plugins. Each is a thin `BaseTool`
+  subclass that holds `ModeSpec` rows and delegates the real work to the
+  underlying service singleton (`makeps3iso.py` is the directory-input one; see
+  §3.3.4 of the design doc). **`chain.py`** is the eighth registration: a
+  synthetic `ChainTool` with no binary and no service, which drives the others
+  through the registry (design doc §3.3.3).
+- **`__init__.py`** builds the `registry` singleton and registers all eight.
+  This is the single wiring point. Order matters at the end: `ChainTool` takes
+  the registry itself and must register *after* the component tools it drives.
 
 ### The plugin contract: `ModeSpec` and `BaseTool`
 
@@ -154,7 +173,7 @@ A `ModeSpec` row (`spec.py`) describes one mode:
 @dataclass(frozen=True)
 class ModeSpec:
     mode: str                                 # wire value == a ConversionMode value
-    tool_id: str                              # "chdman" | "dolphin" | "z3ds"
+    tool_id: str                              # must equal the owning tool's `id`
     kind: ModeKind                            # CREATE | EXTRACT | COPY | COMPRESS
     label: str                                # UI label
     group: str                                # UI group id
@@ -164,7 +183,21 @@ class ModeSpec:
     supports_compression_level: bool = False  # dolphin rvz/wia only
     supports_delete_on_verify: bool = False
     allows_archive_input: bool = False        # True for convertible-source modes; see §17
+    # Sibling outputs written beside the primary output, as suffix swaps off it
+    # (extractcd's .cue -> its .bin data track). Read by BaseTool.companion_outputs
+    # so conflict detection, overwrite cleanup, size accounting and in-use
+    # tracking all enumerate companions from one place. Leave empty and override
+    # companion_outputs() instead when the set is dynamic (makeps3iso's split parts).
+    companion_exts: tuple[str, ...] = ()
+    # FILE by default. A folder-input mode (makeps3iso) sets {InputKind.DIRECTORY}.
+    input_kinds: frozenset[InputKind] = frozenset({InputKind.FILE})
 ```
+
+A composite mode uses **`ChainSpec`** instead, which is a structural superset of
+`ModeSpec`: every field above exists with the same meaning, so all the registry,
+route and `job_manager` consumers work unchanged. The extras (`steps`,
+`intermediate_exts`, `verify_step`) are read only by `ChainTool`. You need this
+only when your "tool" is really an ordered pipeline over existing modes.
 
 A plugin subclasses `BaseTool` and provides:
 
@@ -173,10 +206,12 @@ A plugin subclasses `BaseTool` and provides:
 | `id`, `display_name`, `binary_path` | identity + binary path (from settings) |
 | `modes` | a tuple of `ModeSpec` rows |
 | `output_extensions`, `verify_extensions` | produced extensions and verify-accepted extensions. `output_extensions` drives the "output exists" badges **and** the registry-driven library scan / DAT-matching discovery (`registry.scannable_extensions()` = the union of output + verify), so list every extension your tool actually writes (including sidecars like CHDMAN's extractcd `.bin`). |
-| `convert(input_path, output_path, mode, *, compression=None, cancel_event=None)` | async generator yielding `{"progress": int, "message": str}`, raising `ConversionCancelled` when `cancel_event` fires |
-| `verify(path)` / `verify_stream(path)` | deep integrity check, one-shot and streaming |
-| `info(path)` / `info_model(raw, path)` | metadata dict + the Pydantic model it maps to |
+| `convert(input_path, output_path, mode, *, compression=None, split=False, cancel_event=None)` | async generator yielding `{"progress": int, "message": str}`, raising `ConversionCancelled` when `cancel_event` fires. `split` is honored only by modes that declare it (makeps3iso's `-s` 4 GB FAT32 split); every other tool accepts and ignores it, exactly as it does a `compression` it doesn't use. |
+| `verify(path)` / `verify_stream(path)` | deep integrity check, one-shot and streaming. **Optional in practice**: a tool with no user-facing verify (makeps3iso) simply registers no verify route. |
+| `info(path)` / `info_model(raw, path)` | metadata dict + the Pydantic model it maps to. `BaseTool._basic_info_fields(raw)` maps the shared `BasicFileInfo` keys (`file`, `size`, `size_display`, `format`, `extension`, `compressed`, `compression_type`) in one place — the five "what is this file" tools (z3ds, nsz, cso, romz, makeps3iso) build their model from it instead of re-typing the mapping. |
 | `output_path(mode, input_path, output_dir=None, *, treat_as_stem=False)` | compute the output path |
+| `accepts_directory(path)` | the directory analogue of `ext in input_extensions`. Default `False`; a tool with an `InputKind.DIRECTORY` mode overrides it to run its source-layout detector. May do disk I/O — it runs off the event loop. |
+| `companion_outputs(output_path, mode)` | sibling paths this mode writes *besides* `output_path` (never including it). `BaseTool` derives them from `ModeSpec.companion_exts` as pure path math; override only when the set is dynamic (makeps3iso's size-dependent split parts). |
 | `detect_output(input_path)` | optional, returns an `OutputStatus` so the file list can badge "output already exists". May content-validate the candidate before claiming it: `romz` only reports a `.7z`/`.zip` sibling as its output when it's a genuine single-ROM archive (not just any file matching the `Game.gba.7z` naming), so the badge and the source row's verify-from-output flow track real outputs. |
 | `verifies_path(path)` | optional per-file refinement of `verify_extensions`. Default (in `BaseTool`) is a plain extension match; override when your tool claims a broad container extension but only handles a subset (`romz` claims `.7z`/`.zip` yet only verifies single-ROM archives). `routes/files.py` materializes the result into `FileEntry.verifiable_by`, which the frontend gates the Verify/Info row-actions on. May do disk I/O — it runs inside the threadpool scan. |
 | `active_pids()` | PIDs for the debug heartbeat |
@@ -185,11 +220,12 @@ A plugin subclasses `BaseTool` and provides:
 | `embedded_hash_is_exhaustive` | optional flag (default `False`). Set `True` only when your container bytes can never appear in a DAT (e.g. a recompressed image), so a content-hash miss is definitive and the file-level fallback is skipped; leave `False` if your file's own SHA1 might be indexed. |
 
 `BaseTool` fills in `input_extensions` (the union of every mode's
-`input_extensions`), `spec(mode)`, no-op `detect_output` / `post_convert`, the
+`input_extensions`), `spec(mode)`, no-op `detect_output` / `post_convert`,
+`accepts_directory` (`False`), `companion_outputs` (from `companion_exts`), the
 extension-match `verifies_path` default, and the `embedded_hashes` default
 (`[]`, `embedded_hash_is_exhaustive=False`), so a real plugin only overrides
-what differs. See `app/services/tools/z3ds.py` for the
-smallest complete example (~120 lines, mostly delegation). For one-shot
+what differs. See `app/services/tools/z3ds.py` for the smallest complete
+example (~130 lines, mostly delegation). For one-shot
 subprocess work (info / header / hash extraction), reuse the shared
 `SubprocessRunner.run_capture()` (cancel/timeout-aware, applies the tool
 nice/ioprio policy) rather than re-implementing the spawn loop — see
@@ -255,7 +291,7 @@ the non-obvious rows is in §8 to §14.
 | 2 | `.dockerignore` | Verify the binary/source you reference isn't excluded. `app/`, `static/`, `migrations/` are copied; `tests/` and most `*.md` are excluded. | New tool (check only) |
 | 3 | `requirements.txt` | Add any new **Python** runtime dependency the service imports. | If service needs a new pip dep |
 | 4 | `requirements-dev.txt` | Add test-only Python deps. | Rare |
-| 5 | `.local-bin/` | Local-dev copy of a from-source binary (z3ds lives here for `run_dev.sh`). Add yours so the app runs outside Docker. | New from-source tool |
+| 5 | `.local-bin/` | Local-dev copy of a from-source binary. Only `z3ds_compressor` is committed here today; maxcso and makeps3iso are built in the image only, so local runs need them on `PATH` or a `<TOOL>_PATH` override. Add yours if you want `run_dev.sh` to work out of the box. | New from-source tool |
 | 6 | `entrypoint.sh` | Add the binary path env passthrough; extend the **CLI batch mode** loop if the tool should run headless (see §9). | New tool, CLI support optional |
 
 ### 3.2 Backend code
@@ -266,10 +302,10 @@ the non-obvious rows is in §8 to §14.
 | 8 | `app/services/<tool>.py` | The underlying service: `_build_command`, the subprocess spawn, progress parsing, cancel handling, the `*_CONVERTIBLE_EXTENSIONS` set, `*_OUTPUT_FORMATS`, and the module singleton. | New tool |
 | 9 | `app/services/tools/<tool>.py` | The plugin: a `BaseTool` subclass with `id`, `display_name`, `modes` (`ModeSpec` rows), `output_extensions`, `verify_extensions`, delegating `convert`/`verify`/`info`/`output_path`/`detect_output` to the service. Optionally override `embedded_hashes` (DAT-match fast path) / `embedded_hash_is_exhaustive`; the default falls back to file-level SHA1. | New tool |
 | 10 | `app/services/tools/__init__.py` | One line: `registry.register(<Tool>(settings.<tool>_path))` (plus the import). This is the only dispatch wiring. | New tool |
-| 11 | `app/models.py` | Add `ConversionMode` value(s); add a `<Tool>Info` model; add `FileEntry` flags (`<tool>_convertible`, `has_<tool>`, `<tool>_ready`, `<tool>_path`). | New mode and/or tool |
-| 12 | `app/routes/convert.py` | Usually nothing for output paths or dispatch (the registry handles both). Add an extension-validation block in `plan_job` if your inputs need a specific check, mirroring the z3ds one. | New tool, sometimes |
-| 13 | `app/routes/files.py` | Add the per-tool convertibility/output-existence flags in the directory scan **and** in `search_files`, paralleling the z3ds flags. | New tool |
-| 14 | `app/routes/info.py` | A `GET /<tool>-info` endpoint, plus one `register_verify_routes(router, registry.get("<tool>"))` call to generate the verify trio. | New tool |
+| 11 | `app/models.py` | Add `ConversionMode` value(s) and a `<Tool>Info` model. **No `FileEntry` change** — listings are tool-neutral (`convertible_by` / `outputs` / `verifiable_by`), see §5.8. | New mode and/or tool |
+| 12 | `app/routes/convert.py` | Add `SkipReason.<TOOL>_BAD_EXTENSION`, its `_SKIP_HTTP` message, and one `_BAD_EXTENSION_REASON["<tool>"]` entry. No `if`-block: validation is table-driven. | New tool |
+| 13 | `app/routes/files.py` | **Nothing.** The directory scan and `search_files` loop over `registry.all()`; a registered tool is annotated automatically. | Never (registry-driven) |
+| 14 | `app/routes/info.py` | A `_VERIFY_CONFIG["<tool>"]` entry + one `register_verify_routes(router, registry.get("<tool>"))` call, and a hand-written `GET /<tool>-info` endpoint. Both are optional for a tool with no user-facing verify/info (makeps3iso registers neither). | New tool |
 | 15 | `app/services/job_manager.py` | Usually nothing: convert and verify dispatch through the registry. Touch only for special post-processing (disc-id tagging, multi-file sidecars). | Rare |
 | 16 | `app/services/disc_id.py` | Add a serial/title parser if the new **disc** platform should get GAME/NAME tags embedded (chdman create modes only). | New disc platform, optional |
 | 17 | `app/services/archive.py` | Nothing for a new tool, and that's by design: browse lists every *known* source (`convertible_extensions()` minus archives), and the convert gate is `archive_input_extensions()` — both come straight from the registry. Just declare your `input_extensions` and your members show up when folks browse in; set `allows_archive_input=True` only when a mode should also convert them in place (see §17.5). | Rare |
@@ -281,12 +317,12 @@ the non-obvious rows is in §8 to §14.
 | # | File | What you do | When |
 |---|------|-------------|------|
 | 20 | `src/lib/api/endpoints.js` | `get<Tool>Info`, `verify<Tool>`, `verifyBatch<Tool>` client methods alongside the existing ones. | New tool |
-| 21 | `src/lib/tools/registry.js` | **One new entry** in the `TOOLS` array. Everything downstream (sidebar, workspace, badges, modals, verify dispatch, SSE URL building) looks up this registry. | New mode and/or tool |
+| 21 | `src/lib/tools/registry.js` | **One new entry** in the `TOOLS` array. Everything downstream (sidebar, workspace, badges, modals, verify dispatch, SSE URL building, compression defaults, icons, Help) looks up this registry. | New mode and/or tool |
 | 22 | `src/styles/tokens.css` | Add a semantic token only if you need a new tool accent / badge color. Most tools reuse existing tokens via `accent: 'var(--badge-<token>)'`. Add it under **both** `:root` and `:root.dark`. | If new visual identity |
-| 22a | `src/lib/util/fileIcon.js` | Single ext→icon map (`DISC_EXTS`/`GAME_EXTS`). Add your new file extensions to the right bucket so rows get a sensible icon. `FileRow.svelte` delegates to `iconForEntry()`, so this is the only place to edit. | New extensions |
-| 22b | `src/lib/components/panels/FileRow.svelte` | The `convertibleBy` derived value has a **legacy fallback** that rebuilds the tool list from per-tool booleans (`entry.<tool>_convertible`). Add your `<tool>_convertible` line. | New tool |
-| 22c | `src/lib/stores/conversion.svelte.js` | `defaultCompressionFor(toolId)` seeds the initial compression value per tool. Return `[]` for a tool with no compression UI (3DS); for a preset/codec dropdown, seed the default option (e.g. CSO returns `['max']`). This is also what the shared **Reset to default** button restores — declare it once here and the button works for your tool for free (it lives in `CompressionPicker.svelte`, gated on the tool having codecs, and calls `conversion.resetCompression()` / `isCompressionDefault`; no per-tool wiring). | New tool |
-| 22d | `src/lib/components/views/HelpView.svelte` | The in-app Help page hard-codes the tool blurbs and the per-tool mode reference table. Add your tool + modes. | New tool (docs) |
+| 22a | `src/lib/util/fileIcon.js` | **One `TOOL_MEDIA` entry** mapping your tool id to `'disc'` or `'game'`. The `DISC_EXTS`/`GAME_EXTS` sets are *derived* from the registry, so you never re-type extensions — you only say which bucket your media reads as. The coverage guard (`tests/test_frontend_registry_derives_186.py`) fails until every registered tool is classified. | New tool |
+| 22b | `src/lib/stores/conversion.svelte.js` | **Nothing.** `defaultCompressionFor()` / `defaultLevelFor()` read `defaultCompression` and `compressionLevelRange` off your registry descriptor. Declare them in `registry.js` (item 21) and the initial value, the slider default, and the shared **Reset to default** button in `CompressionPicker.svelte` all work for free. | Never (registry-driven) |
+| 22c | `src/lib/tools/helpModes.js` | One `MODE_BLURBS` line per new mode (and a `MODE_OUTPUT` override only when a single `outputExt` can't tell the story — a reversible mode whose output depends on the input, or a companion pair like extractcd's `.cue` + `.bin`). The same guard test fails on a mode with no blurb or a stale key. | New mode |
+| 22d | `src/lib/components/views/HelpView.svelte` | One curated **tool blurb**. The per-tool mode reference *table* is generated via `helpModeSections(registry)`, so modes and output columns can't drift — only the prose is hand-written. | New tool (docs) |
 
 ### 3.4 Tests
 
@@ -294,11 +330,14 @@ the non-obvious rows is in §8 to §14.
 |---|------|-------------|------|
 | 23 | `tests/test_<tool>_routes.py` | Info + verify endpoint tests (copy `test_z3ds_routes.py`). | New tool |
 | 24 | `tests/test_<tool>_service.py` | `convert`/`verify`/cancel/bad-extension tests (copy `test_z3ds_verification_service.py`). | New tool |
-| 25 | `tests/test_tool_registry.py` | Assert your modes resolve to your tool and the spec flags are right. Bump the mode count, extend the legacy `_legacy_tool_for_mode` ladder, the `convertible_extensions` union, `tools_for_input`/`tool_for_verify` cases, and the `output_path` + `output_extensions` parametrize lists. | New tool/mode |
-| 26 | `tests/test_mode_parity_fixes.py` | Add the mode so single-vs-batch validation parity is enforced; update the delete-on-verify error-message assertions if your compress mode supports it. | New mode |
-| 26a | `tests/test_dispatch_routing.py` | Extend the legacy convert/verify dispatch ladder (`_legacy_dispatch_id`) and the patched-tool tuple so your modes route to your service. | New tool |
-| 26b | `tests/test_files_outputs_parity.py` | Add your `<tool>_convertible/has_<tool>/<tool>_ready/<tool>_path` keys to `LEGACY_FILEENTRY_KEYS` **and** `LEGACY_SEARCH_KEYS` (they assert the exact legacy key surface). | New tool |
-| 26c | `tests/test_archive_conversion_e2e.py` + `tests/test_archive_preference.py` | Add `MATRIX` rows per direction and assert your source exts are in `registry.archive_input_extensions()` (see §17.7). Make parametrize `ids` unique if an extension repeats across modes. | New archive-aware tool |
+| 25 | `tests/test_tool_registry.py` | Assert your modes resolve to your tool and the spec flags are right. Bump the resolved-mode count (currently `29`), extend the `_legacy_tool_for_mode` ladder, the `convertible_extensions` union, `tools_for_input`/`tool_for_verify` cases, and the `output_path` + `output_extensions` parametrize lists. | New tool/mode |
+| 26 | `tests/test_mode_parity_fixes.py` | Add the mode so single-vs-batch validation parity is enforced; update the delete-on-verify error-message assertions if your compress mode supports it. See also `tests/test_single_batch_plan_parity.py`. | New mode |
+| 26a | `tests/test_dispatch_routing.py` | Extend the convert/verify dispatch ladder (`_legacy_dispatch_id`) and the patched-tool tuple so your modes route to your service. | New tool |
+| 26b | `tests/test_files_outputs_parity.py` | **Usually nothing.** It asserts the *exact* tool-neutral `FileEntry` JSON surface (`convertible_by` / `outputs` / `verifiable_by` / …). Touch it only if you change that surface — adding a tool must not. | Rare |
+| 26c | `tests/test_frontend_registry_derives_186.py` | Runs the real JS under Node and fails if the registry-derived frontend facts drift: an unclassified tool in `TOOL_MEDIA`, an extension with no icon bucket, a mode with no `MODE_BLURBS` entry, a stale key, or a null-output mode with no `MODE_OUTPUT` override. Nothing to edit — it's the guard that tells you what you forgot. | New tool/mode (guard) |
+| 26d | `tests/test_archive_conversion_e2e.py` + `tests/test_archive_preference.py` | Add `MATRIX` rows per direction and assert your source exts are in `registry.archive_input_extensions()` (see §17.7). Make parametrize `ids` unique if an extension repeats across modes. | New archive-aware tool |
+| 26e | `tests/test_companion_outputs_182.py` | Assert `companion_outputs()` for your mode if it writes sidecars. | If `companion_exts` set |
+| 26f | `tests/test_verify_routes_factory.py` | Covers the generated verify trio generically; extend if your `_VERIFY_CONFIG` entry has unusual naming. | Rare |
 | 27 | `tests/conftest.py` | **No change for a tool binary.** `conftest.py` is DB-only; it does *not* stub tool binaries. Per-tool route/service tests define their own mocks (monkeypatch `info_routes.<service>` or `app.services.<tool>.asyncio.create_subprocess_exec`). | Rare |
 
 ### 3.5 CI / quality gates (must stay green)
@@ -325,10 +364,13 @@ the non-obvious rows is in §8 to §14.
 | 40 | `docker-compose.yml` / `.cli.yml` / `.multi-volume.yml` | Document/override the new `<TOOL>_PATH` env or CLI mode env if relevant. | If ops needs the knob |
 | 41 | `package.json` | The version lives here. A release bumps `package.json` and publishes a GitHub Release; there is no `.version` file or `sync-version.sh` script. | Every release |
 | 42 | `README.md` | Supported-formats/tool table, feature list. Also the **Docker Hub** description (published from README by CI). | New tool/platform |
-| 43 | `RELEASE_NOTES.md` | Changelog entry. | Every change |
-| 44 | `DEPLOYMENT.md`, `DOCKER-COMPOSE.md` | New env vars / volumes / tool requirements. | If deploy surface changes |
+| 43 | `docs/RELEASE_NOTES.md` | Changelog entry. | Every change |
+| 44 | `docs/DEPLOYMENT.md`, `docs/DOCKER-COMPOSE.md` | New env vars / volumes / tool requirements. | If deploy surface changes |
 | 45 | `AGENTS.md`, `.github/copilot-instructions.md` | Runbook / AI guidance, update if conventions change. | Optional |
 | 46 | `app/main.py` | The FastAPI `description=` (shown at `/docs`) names the tools. Add the new tool so it stays accurate. | New tool |
+| 47 | `docs/DESIGN_tool_plugin_architecture.md` | The plugin contract + shared infrastructure. Update it whenever you change a *shared seam* (a new `ModeSpec` field, a new `ToolPlugin` method, a new registry query) — not for a tool that merely uses the existing contract. | If the contract changes |
+| 48 | **This file** | If you changed a shared seam above, the step that adds a tool changed too. Update the affected section, the §3 inventory, the §6 checklist and the §14 map together — they are four views of the same list and drift as a set. | If the contract changes |
+| 49 | `shots.yml` + `docs/screenshots/` | Screenshots are generated by shot-scraper, never hand-captured. A new tool adds a sidebar entry, so refresh them (push triggers the **Take screenshots** workflow); add a `shots.yml` entry if you introduce a genuinely new surface. See `docs/SCREENSHOTS.md`. | If the UI changes |
 
 ---
 
@@ -420,8 +462,8 @@ mirrors z3ds exactly.
 
 ### 5.1 Install the binary: `Dockerfile`
 
-Three patterns exist in the current `Dockerfile` (a three-stage build: `builder`,
-`frontend-builder`, runtime). Pick the one that fits:
+Three patterns exist in the current `Dockerfile` (a five-stage build — see §8
+for the stage list). Pick the one that fits:
 
 - **Distro package** (chdman via `mame-tools`, pinned to a `snapshot.debian.org`
   `.deb` with per-arch SHA256 checks).
@@ -459,13 +501,21 @@ list. The `zstd` CLI is already installed (z3ds's `verify_stream` shells out to
 ### 5.2 Add the binary path setting: `app/config.py`
 
 Add next to the other tool paths (`chdman_path`, `dolphin_tool_path`,
-`z3ds_compressor_path`):
+`z3ds_compressor_path`, `nsz_path`, `maxcso_path`, `sevenzip_path`,
+`makeps3iso_path`):
 
 ```python
 nszip_path: str = Field(
     default="/usr/local/bin/nszip", alias="NSZIP_PATH",
 )
 ```
+
+The default may be a bare binary name (`nsz`, `7z`) when the tool arrives on
+`PATH` rather than at a fixed location. Note the setting is named after the
+**binary**, while the plugin is named after the **tool id** — `RomzTool` is
+constructed from `settings.sevenzip_path`, `MaxcsoTool` from
+`settings.maxcso_path` under tool id `cso`. Keep the pairing obvious in
+`services/tools/__init__.py`.
 
 This lets ops override the path/env without code changes, and is what the plugin
 passes to its service in `__init__`.
@@ -629,7 +679,14 @@ This is the single dispatch wiring step. Add the import and one `register` call:
 from .nszip import NszipTool
 ...
 registry.register(NszipTool(settings.nszip_path))
+# ...then the existing ChainTool line, which must stay last:
+registry.register(ChainTool(registry))
 ```
+
+Put your `register` call **above** the `ChainTool(registry)` line at the bottom
+of the file. `ChainTool` is handed the registry itself and resolves its
+component tools at construction, so everything it drives must already be
+registered.
 
 Once registered, `job_manager` and `convert.py` dispatch your mode through the
 registry with no further edits. The registry validates on register: duplicate
@@ -676,16 +733,35 @@ nszip needs none of that.
 ### 5.7 Validation + output dispatch: `app/routes/convert.py`
 
 Output paths and the generic spec-flag validation are handled by the registry,
-so you usually add **only** an extension-validation block. `plan_job` validates
-the input extension per tool; mirror the z3ds block (which checks
-`spec.tool_id == "z3ds"` and the input extension against the spec). For nszip:
+so you add **only three data lines**, no `if`-block. Plan-time input validation
+is table-driven: the generic check is "the input extension must be one the mode
+declares", and `_BAD_EXTENSION_REASON` maps a tool id to the skip reason used
+when it fails. So:
 
 ```python
-if spec.tool_id == "nszip":
-    ext = Path(file_path).suffix.lower()
-    if ext not in spec.input_extensions:
-        raise SkipFile(SkipReason.NSZIP_BAD_EXTENSION)   # add the reason to the enum
+# 1. app/routes/convert.py — the reason
+class SkipReason(Enum):
+    ...
+    NSZIP_BAD_EXTENSION = auto()
+
+# 2. its HTTP status + message
+_SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
+    ...
+    SkipReason.NSZIP_BAD_EXTENSION: (400, "File is not a supported Switch dump"),
+}
+
+# 3. opt into the generic extension check
+_BAD_EXTENSION_REASON: dict[str, SkipReason] = {
+    ...
+    "nszip": SkipReason.NSZIP_BAD_EXTENSION,
+}
 ```
+
+`chdman` is deliberately **absent** from `_BAD_EXTENSION_REASON`: it validates
+by `.chd` presence (create needs a non-`.chd`, extract/copy need a `.chd`)
+because it drops `.chd` from its `input_extensions`. Write a bespoke check only
+if your tool has that kind of structural rule; otherwise the table entry is the
+whole job.
 
 Everything else is spec-driven:
 
@@ -710,25 +786,37 @@ Everything else is spec-driven:
   real, useful conversion.
   See §17.5.
 
-### 5.8 Mark inputs convertible in listings: `app/routes/files.py`
+### 5.8 Listings: nothing to do
 
-`files.py` annotates each file in directory listings and search results with
-per-tool convertibility and output-existence flags so the UI can badge rows and
-gate selection. It imports the registry and computes per-tool flags (today
-`is_chd_convertible` / `is_dolphin_convertible` / `is_z3ds_convertible` plus
-`has_*` output-existence checks).
+**This step no longer exists.** `files.py` used to carry a hand-written flag
+block per tool; it is now a single loop over `registry.all()`, and `FileEntry`
+is tool-neutral. There are **no** `<tool>_convertible` / `has_<tool>` /
+`<tool>_ready` / `<tool>_path` fields to add anywhere — in the model, the
+directory scan, `search_files`, or the frontend. Adding them back would fail
+`tests/test_files_outputs_parity.py`, which pins the exact JSON surface.
 
-1. Add the model fields. In `app/models.py` `FileEntry`, add
-   `nszip_convertible: bool = False` and, for "output already exists" badges,
-   `has_nszip: bool = False`, `nszip_ready: bool = False`,
-   `nszip_path: str | None = None`, paralleling the z3ds fields.
-2. In the directory scan, compute `is_nszip_convertible` from the extension and
-   an output-existence check (use your plugin's `detect_output(...)` or an
-   inline check modeled on the z3ds path), then set them on the `FileEntry`.
-3. Do the same in `search_files`, both in the "is this file interesting" test
-   and where it records the flags.
+What the listing reports instead, entirely from your plugin:
+
+| `FileEntry` field | Filled from |
+|-------------------|-------------|
+| `convertible_by: list[str]` | tool ids whose `input_extensions` accept the file (or `accepts_directory(path)` for a folder row) |
+| `outputs: list[OutputStatus]` | each tool's `detect_output(path)` — this is what drives the "output already exists" badge |
+| `verifiable_by: list[str]` | each tool's `verifies_path(path)` — gates the Verify/Info row actions |
+| `archive_has_output`, `split_parts` | derived by `files.py` itself; no per-tool input |
+
+So: declare accurate `input_extensions`, implement `detect_output` if you want
+the "output exists" badge, and override `verifies_path` only if your tool
+over-claims a container extension. The listing follows automatically, in both
+the directory scan and recursive search.
 
 ### 5.9 Info + verify endpoints: `app/routes/info.py`
+
+Both info and verify are **optional**. A tool whose unit of work has no path to
+route on, or that has no meaningful user-facing integrity check, registers
+neither — `makeps3iso` is the precedent (its only check is a backend PARAM.SFO
+`TITLE_ID` readback, and a folder has no extension to route Info on). If you
+skip them, also leave `getInfo` / `verify` / `verifyBatch` **undefined** in the
+frontend descriptor (§5.11) so the row-action helpers skip your tool.
 
 Verify endpoints are **factory-generated**. You don't hand-write them, but there
 are **two** edits, not one:
@@ -750,9 +838,10 @@ verify_cso, verify_cso_events, verify_cso_batch_events = register_verify_routes(
 )
 ```
 
-`register_verify_routes(router, tool)` generates the trio (`/api/<tool>-verify`,
-`/api/nszip-verify/events`, `/api/nszip-verify-batch/events`) from the plugin's
-`verify_extensions`, acquires the global verify lane
+`register_verify_routes(router, tool)` generates the trio
+(`/api/nszip-verify`, `/api/nszip-verify/events`,
+`/api/nszip-verify-batch/events` — the `url_prefix` prepended to `verify`) from
+the plugin's `verify_extensions`, acquires the global verify lane
 (`_acquire_verify_lane_or_429`, bounded by `workload_limiter`), and calls
 `verification_store.mark_verified(path)` on success. No per-tool extension
 constants are needed; the factory reads them off the plugin.
@@ -804,17 +893,29 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
   defaultMode: 'nszip_compress',
   glyph: 'NSW',                           // 2-3 char affordance for sidebar / dashboard
   accent: 'var(--badge-dat-match)',       // CSS color or token
-  // compressionStyle / compressionCodecs only if the tool exposes codec choices
-  // (chdman uses 'multi', dolphin 'single-with-level'); omit for a fixed compressor.
+
+  // --- compression UI (all optional; omit for a fixed compressor) ---
+  // 'none' | 'multi' (chdman: comma-joined codec list) | 'single-with-level'
+  compressionStyle: 'single-with-level',
+  compressionCodecs: [/* { value, label, hint } */],
+  compressionLevelRange: { min: 1, max: 22, default: 18 },
+  // Seed for the initial selection AND what the shared "Reset to default"
+  // button restores. Read by conversion.svelte.js — declaring it here is the
+  // whole wiring; there is no per-tool branch in the store.
+  defaultCompression: ['solid'],
+
   modes: [
     { mode: 'nszip_compress', kind: 'compress', label: 'Compress to NSZ/XCZ',
       group: 'nszip',
       outputExt: null,                    // mapped from input extension
       inputExtensions: ['.nsp', '.xci'],
+      // inputKinds: ['directory'],       // only for a folder-input mode
       supportsCompression: false,
       supportsCompressionLevel: false,
       supportsDeleteOnVerify: true,
-      allowsArchiveInput: false },
+      allowsArchiveInput: false,
+      // supportsSplit: true,             // only if the mode declares a split flag
+    },
   ],
   getInfo:     (path) => api.getNszipInfo(path),
   verify:      (path, opts) => api.verifyNszip(path, opts),
@@ -823,9 +924,19 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
 },
 ```
 
-That's the entire frontend change. The tool fields above are the real schema;
-chdman additionally carries `prefix`, and tools with codec choices carry
-`compressionStyle` / `compressionCodecs`. You do **NOT** need to:
+The `ToolDescriptor` / `ModeEntry` JSDoc typedefs at the top of `registry.js`
+are the authoritative schema — read them before adding an entry. Two shapes
+worth knowing:
+
+- **No Info/Verify.** Leave `getInfo` / `verify` / `verifyBatch` as `undefined`
+  and `sourceExts` / `verifyExts` empty, as `makeps3iso` does; the row-action
+  helpers (`infoToolsForPath`, `toolForVerifyPath`) then skip the tool.
+- **A chain mode lives on an existing tool's entry**, not its own: `cso_to_chd`
+  is a mode inside the `cso` descriptor with `group: 'chain'`. The backend's
+  synthetic `chain` tool has no frontend descriptor of its own.
+
+That's the entire frontend change apart from the two one-line registrations in
+§3.3 items 22a and 22c. You do **NOT** need to:
 
 - Edit a `VERIFY_URL` map. `registry.verifyUrl(toolId, kind)` derives both single
   and batch URLs from `verifyPrefix` (`''` for chdman, `'<segment>'` otherwise).
@@ -835,6 +946,12 @@ chdman additionally carries `prefix`, and tools with codec choices carry
 - Edit the Sidebar, Workspace, file list, conversion config, or any modal. They
   call `registry.specFor(mode)`, `registry.forTool(id)`,
   `registry.modesByGroup(id)`, `registry.toolForVerifyPath(path)`, and so on.
+- Edit `conversion.svelte.js` for compression defaults. It reads
+  `defaultCompression` / `compressionLevelRange` off the descriptor.
+- Retype extension lists in `fileIcon.js` or mode rows in `HelpView.svelte`.
+  Both derive from the registry (see §3.3 items 22a and 22d).
+- Add a `<tool>_convertible` fallback to `FileRow.svelte`. It reads
+  `entry.convertible_by` only; the old per-tool booleans are gone.
 
 > **Build step.** The SPA compiles with Vite. Run `npm run dev` for HMR against
 > the FastAPI backend, or `npm run build` to emit `static/index.html` +
@@ -851,25 +968,46 @@ Add, modeled on the existing suites:
 - `tests/test_nszip_service.py`, `convert`/`verify` happy path, cancel path,
   bad-extension rejection (copy `tests/test_z3ds_verification_service.py`).
 - Extend `tests/test_tool_registry.py` so your mode resolves to your tool with
-  the right spec flags.
+  the right spec flags (and bump the resolved-mode count).
 - Extend `tests/test_mode_parity_fixes.py` so single-job and batch-job validation
   stay in lockstep for the new mode.
+- Extend `tests/test_dispatch_routing.py` so convert + verify dispatch to your
+  service.
 
 Run them:
 
 ```bash
-# from the repo root
-pytest -q tests/test_nszip_routes.py tests/test_tool_registry.py tests/test_mode_parity_fixes.py
+# from the repo root, with app/ on PYTHONPATH
+PYTHONPATH=app python -m pytest -q tests/test_nszip_routes.py \
+    tests/test_tool_registry.py tests/test_mode_parity_fixes.py
 ```
 
-`tests/conftest.py` stubs the binaries, so tests don't need the real tool
-installed.
+**`tests/conftest.py` does *not* stub tool binaries** — it is DB-only. Each
+per-tool suite mocks what it needs: route tests monkeypatch
+`info_routes.<service>`, service tests monkeypatch
+`app.services.<tool>.asyncio.create_subprocess_exec`. Copy the mocking style
+from the suite you're cloning rather than expecting a shared fixture.
+
+Then run the whole suite (`PYTHONPATH=app python -m pytest -q tests`) — the
+guard tests are designed to tell you what you missed. In particular
+`tests/test_frontend_registry_derives_186.py` fails on a tool with no
+`TOOL_MEDIA` bucket or a mode with no Help blurb, and
+`tests/test_files_outputs_parity.py` fails if you added a per-tool field to
+`FileEntry`.
 
 ### 5.13 Docs + version
 
-- Update `README.md` (tool table / supported formats) and `RELEASE_NOTES.md`.
+- Update `README.md` (tool table / supported formats) and
+  `docs/RELEASE_NOTES.md`.
 - Update the FastAPI app description in `app/main.py` (the `description=` shown
   at `/docs`) so it names the new tool. It lists every tool, so keep it current.
+- Refresh the screenshots: a new tool changes the sidebar, and the images in
+  `docs/screenshots/` are generated from `shots.yml` by shot-scraper, not
+  captured by hand. Pushing runs the **Take screenshots** workflow, which
+  regenerates and commits them; see `docs/SCREENSHOTS.md` to run it locally.
+- If you changed a shared seam (not just used it), update
+  `docs/DESIGN_tool_plugin_architecture.md` **and this guide** — see §3.6 items
+  47–48.
 - The version lives in `package.json`. A release bumps it and publishes a GitHub
   Release tagged `vX.Y.Z`, which is what triggers the image build (see §10).
 
@@ -899,23 +1037,29 @@ PLUGIN (app/services/tools/<tool>.py)
     tool over-claims a container extension (drives FileEntry.verifiable_by)
 [ ] optional: embedded_hashes()/embedded_hash_is_exhaustive for the DAT-match
     fast path (default falls back to file-level SHA1)
+[ ] optional: companion_exts (or override companion_outputs) if the mode writes
+    sidecars beside its primary output
+[ ] optional: accepts_directory() + input_kinds={InputKind.DIRECTORY} for a
+    folder-input tool (design doc §3.3.4)
 [ ] optional: allows_archive_input=True on source modes (both registries) — see §17.
     (Your members already show up in browse just by bein' declared input_extensions;
     this flag's only for *converting* them straight out of the archive.)
 
 REGISTER (app/services/tools/__init__.py)
 [ ] registry.register(<Tool>(settings.<tool>_path))
+    (before the ChainTool registration at the end of the file)
 
 MODE + MODELS (app/models.py)
 [ ] ConversionMode.<TOOL>_<ACTION> with a consistent prefix
 [ ] <Tool>Info model (if it has an info modal)
-[ ] FileEntry: <tool>_convertible / has_<tool> / <tool>_ready / <tool>_path
+[ ] FileEntry: NOTHING — listings are tool-neutral (§5.8)
 
 ROUTES
-[ ] convert.py: SkipReason.<TOOL>_BAD_EXTENSION + _SKIP_HTTP entry + is_<tool>
-    flag + extension-validation block in plan_job
-[ ] files.py: compute flags in the directory scan + search_files
-[ ] info.py: _VERIFY_CONFIG["<tool>"] entry + register_verify_routes(...) +
+[ ] convert.py: SkipReason.<TOOL>_BAD_EXTENSION + _SKIP_HTTP entry +
+    _BAD_EXTENSION_REASON["<tool>"] entry (three data lines, no if-block)
+[ ] files.py: NOTHING — the scan loops over registry.all()
+[ ] info.py (optional, skip if no user-facing verify/info):
+    _VERIFY_CONFIG["<tool>"] entry + register_verify_routes(...) +
     /<tool>-info + _is_<tool>_info_file + service import
 
 PIPELINE (app/services/job_manager.py)
@@ -924,15 +1068,24 @@ PIPELINE (app/services/job_manager.py)
 
 FRONTEND
 [ ] src/lib/api/endpoints.js: get<Tool>Info, verify<Tool>, verifyBatch<Tool>
-[ ] src/lib/tools/registry.js: one new entry in the TOOLS array
-[ ] src/lib/util/fileIcon.js + FileRow.svelte: ext→icon + convertibleBy legacy line
-[ ] src/lib/stores/conversion.svelte.js: defaultCompressionFor branch
-[ ] src/lib/components/views/HelpView.svelte: tool blurb + mode table rows
+    (skip if the tool has no info/verify routes)
+[ ] src/lib/tools/registry.js: one new entry in the TOOLS array — including
+    defaultCompression / compressionStyle / compressionLevelRange if it has a
+    compression UI
+[ ] src/lib/util/fileIcon.js: one TOOL_MEDIA entry ('disc' or 'game')
+[ ] src/lib/tools/helpModes.js: MODE_BLURBS line per mode (+ MODE_OUTPUT
+    override for input-derived / companion-pair outputs)
+[ ] src/lib/components/views/HelpView.svelte: the curated tool blurb only
+[ ] src/lib/stores/conversion.svelte.js: NOTHING — reads the descriptor
+[ ] src/lib/components/panels/FileRow.svelte: NOTHING — reads convertible_by
 [ ] src/styles/tokens.css: --badge-<tool> (only if new accent), both :root + .dark
 
 TESTS + DOCS
-[ ] tests/test_<tool>_routes.py, tests/test_<tool>_service.py, registry, mode-parity
-[ ] tests/conftest.py: binary stub fixture
+[ ] tests/test_<tool>_routes.py, tests/test_<tool>_service.py
+[ ] extend: test_tool_registry (bump mode count), test_dispatch_routing,
+    test_mode_parity_fixes, and the archive matrix if archive-aware
+[ ] tests/conftest.py: NOTHING — it's DB-only; mock per test file
+[ ] full suite green: PYTHONPATH=app python -m pytest -q tests
 [ ] README / RELEASE_NOTES / package.json version bump
 [ ] app/main.py: add the tool to the FastAPI description= string (shown at /docs)
 
@@ -943,19 +1096,58 @@ PERIPHERAL (don't forget)
 [ ] entrypoint.sh: CLI-mode loop (only if headless batch support wanted)
 [ ] disc_id.py: serial/title parser (only for new disc platforms w/ tagging)
 [ ] migrations/: new Alembic rev (only if persisting new columns/tables)
-[ ] docker-compose*.yml + DEPLOYMENT.md + DOCKER-COMPOSE.md: env/volume docs
+[ ] docker-compose*.yml + docs/DEPLOYMENT.md + docs/DOCKER-COMPOSE.md: env/volume docs
+[ ] screenshots refreshed (shots.yml / Take screenshots workflow) — a new tool
+    changes the sidebar
+[ ] docs/DESIGN_tool_plugin_architecture.md + this guide, IF you changed a
+    shared seam rather than just using it
 [ ] lint clean: ruff, pylint, eslint, hadolint (Dockerfile), markdownlint
 [ ] CI awareness: hadolint + Trivy gate the release build; CodeQL scans new code
 ```
 
 ---
 
+## 7. Which existing tool should I copy?
+
+Every tool in the repo is a working reference implementation. Find the row that
+matches the shape of what you're adding and copy that one — it will already
+have solved the awkward part.
+
+| Your tool… | Copy | Because it is the reference for |
+|------------|------|---------------------------------|
+| …is a plain compressor: one file in, one file out, both directions | **z3ds** (`services/z3ds_compress.py` + `tools/z3ds.py`) | The smallest complete plugin (~130 lines, mostly delegation). Progress estimated from output-file growth when the binary reports no percentage. **This is the default answer.** |
+| …exposes several output formats from one binary | **cso** (maxcso) | Five modes on one service (`cso_compress`, `cso2_compress`, `zso_compress`, `dax_compress`, `cso_decompress`), with an effort-preset compression UI rather than a codec list. |
+| …reuses a binary that already ships, and/or produces archives | **romz** (7z) | No Dockerfile work. Reuses `services/archive.py` for the read side. Shows `verifies_path()` / content-validating `detect_output()` for a tool that over-claims `.7z`/`.zip`, and the visible-but-not-convertible archive case (§17.5). |
+| …needs user-supplied keys or secrets | **nsz** | pip-packaged binary, `SWITCH_KEYS` resolution, the throwaway-`$HOME` trick for a binary with no `--keys` flag, and UI gating via `GET /api/tools`. See §16. |
+| …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. |
+| …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
+| …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
+| …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
+
+Whatever you copy, the *shape* of the work is the same: a service that owns the
+subprocess, a plugin that owns the metadata, one `registry.register(...)` line,
+and one entry in the frontend `TOOLS` array.
+
+---
+
 ## 8. The Docker image in depth: `Dockerfile`, `.dockerignore`, deps
 
-The image is a **three-stage** multi-arch build on `debian:trixie-slim`: a
-`builder` stage (compiles from-source binaries), a `frontend-builder` stage on
-`node:lts-slim` (runs `npm ci && npm run build` for the Svelte UI), and the
-runtime stage (no Node).
+The image is a **five-stage** multi-arch build. Four stages build things and
+the fifth is the runtime:
+
+| Stage | Base | Builds |
+|-------|------|--------|
+| `builder` | `debian:trixie-slim` | z3ds_compressor (from source) |
+| `maxcso-builder` | `debian:trixie-slim` | maxcso (from source) |
+| `makeps3iso-builder` | `debian:trixie-slim` | makeps3iso (from source) |
+| `frontend-builder` | `node:lts-slim` | the Svelte UI (`npm ci && npm run build`) |
+| *(runtime)* | `debian:trixie-slim` | the final image — no Node, no toolchain |
+
+Every base image is **pinned by digest** (`debian:trixie-slim@sha256:…`), so
+adding a stage means copying an existing `FROM` line verbatim rather than
+writing a bare tag. A tool with a heavy or slow build gets its own stage (the
+three source-built tools each have one) so it caches independently; a small
+build can join the existing `builder` stage.
 
 **Build args & arch.** `ARG TARGETARCH` (set in the runtime stage) is
 `amd64`/`arm64`. A from-source build (g++) compiles per-arch automatically. A
@@ -1055,12 +1247,16 @@ Run these before pushing (they mirror Codacy):
 
 ```bash
 # from the repo root
-ruff check app tests            # style/lint, config in pyproject.toml ([tool.ruff], py310)
-pylint app                      # config in .pylintrc / pyproject.toml ([tool.pylint])
-pytest -q tests                 # full suite (binaries are stubbed in conftest)
-npm run lint                    # ESLint over JS + .svelte, eslint.config.js
-hadolint Dockerfile             # if you touched the Dockerfile
+ruff check .                             # config in pyproject.toml ([tool.ruff], py310)
+pylint app                               # config in .pylintrc / pyproject.toml
+PYTHONPATH=app python -m pytest -q tests # full suite
+npm run lint                             # ESLint over JS + .svelte, eslint.config.js
+hadolint Dockerfile                      # if you touched the Dockerfile
 ```
+
+`PYTHONPATH=app` is not optional: intra-project imports are written
+`from services.x import y`, so `app/` must be on the path (this is also why
+`run_dev.sh` sets it).
 
 Conventions baked into the configs that affect new tool code:
 
@@ -1100,7 +1296,8 @@ example a tool-specific metadata cache). In that case:
 ```bash
 ./scripts/new_migration.sh "add nszip metadata table"
 # edit the generated migrations/versions/000X_*.py (upgrade/downgrade)
-pytest -q tests/test_alembic_migrations.py tests/test_db_migration.py
+PYTHONPATH=app python -m pytest -q \
+    tests/test_alembic_migrations.py tests/test_db_migration.py
 ```
 
 `migrations/env.py` and `migrations/versions/0001_baseline_schema.py` are the
@@ -1153,27 +1350,28 @@ app/config.py                       nszip_path Field (NSZIP_PATH)
 app/services/nszip.py               NszipService + NSZIP_CONVERTIBLE_EXTENSIONS + singleton
 app/services/tools/nszip.py         NszipTool plugin (BaseTool + ModeSpec rows)
 app/services/tools/__init__.py      registry.register(NszipTool(settings.nszip_path))
-app/models.py                       ConversionMode.NSZIP_COMPRESS; NszipInfo; FileEntry flags
-app/routes/convert.py               extension-validation block in plan_job (if needed)
-app/routes/files.py                 flags in the directory scan + search_files
+app/models.py                       ConversionMode.NSZIP_COMPRESS; NszipInfo  (FileEntry: nothing)
+app/routes/convert.py               SkipReason + _SKIP_HTTP entry + _BAD_EXTENSION_REASON entry
+app/routes/files.py                 NOTHING (registry-driven scan)
 app/routes/info.py                  _VERIFY_CONFIG entry + register_verify_routes(get("nszip")) + /nszip-info + _is_nszip_info_file + service import
-app/routes/convert.py               SkipReason + _SKIP_HTTP + is_<tool> flag + plan_job validation
 app/services/job_manager.py         usually nothing (registry dispatches)
 src/lib/api/endpoints.js            getNszipInfo, verifyNszip, verifyBatchNszip
-src/lib/tools/registry.js           one new entry in TOOLS
-src/lib/util/fileIcon.js            add new exts to DISC_EXTS/GAME_EXTS
-src/lib/components/panels/FileRow.svelte   icon ext list + convertibleBy legacy line
-src/lib/stores/conversion.svelte.js defaultCompressionFor branch (return [] for no-codec)
-src/lib/components/views/HelpView.svelte   tool blurb + mode reference rows
+src/lib/tools/registry.js           one new entry in TOOLS (+ defaultCompression etc.)
+src/lib/util/fileIcon.js            one TOOL_MEDIA entry ('disc' or 'game')
+src/lib/tools/helpModes.js          MODE_BLURBS line per mode (+ MODE_OUTPUT if needed)
+src/lib/components/views/HelpView.svelte   the curated tool blurb only
+src/lib/stores/conversion.svelte.js NOTHING (reads defaultCompression off the descriptor)
+src/lib/components/panels/FileRow.svelte   NOTHING (reads entry.convertible_by)
 src/styles/tokens.css               (only if new badge classes; both :root + .dark)
 tests/test_nszip_routes.py          info+verify endpoint tests
 tests/test_nszip_service.py         convert/verify/cancel/bad-ext tests
 tests/test_tool_registry.py         mode resolves to nszip; counts + ext unions + matrices
-tests/test_dispatch_routing.py      extend convert/verify legacy dispatch ladder
-tests/test_files_outputs_parity.py  add <tool>_* keys to LEGACY_*_KEYS sets
+tests/test_dispatch_routing.py      extend convert/verify dispatch ladder
+tests/test_frontend_registry_derives_186.py  guard only — run it, don't edit it
 tests/test_mode_parity_fixes.py     add nszip_compress to the parity matrix
 tests/test_archive_conversion_e2e.py + test_archive_preference.py  archive matrix (if archive-aware)
 tests/conftest.py                   DB-only; no tool-binary stub (mocks live per-test-file)
+tests/test_files_outputs_parity.py  nothing to add — it pins the tool-neutral FileEntry surface
 docker-compose*.yml                 (optional) NSZIP_PATH / CLI env docs
 package.json                        version bump (release)
 app/main.py                         add the tool to the FastAPI description= (shown at /docs)
@@ -1214,11 +1412,14 @@ DEPLOYMENT.md / DOCKER-COMPOSE.md    new env var, if any
 - **The image runs as uid 999 (`converter`).** Binaries must be executable by a
   non-root user; install them to a world-readable path like `/usr/local/bin`.
 - **Most convertible-source modes are archive-aware.** chdman *create* and
-  *extract*, Dolphin, 3DS, and Switch (nsz) all accept members straight out of
-  `.zip/.7z/.rar` (chdman extract decompresses a `.chd` pulled from an archive);
-  only chdman *copy* stays opted out, because re-CHD'ing a `.chd` from inside an
-  archive is a pointless round trip. See **§17** for how to wire archive
-  input into a new tool. If your tool genuinely can't read its inputs from inside
+  *extract*, Dolphin, 3DS, Switch (nsz), CSO (all five modes) and the
+  `cso_to_chd` chain accept members straight out of `.zip/.7z/.rar` (chdman
+  extract decompresses a `.chd` pulled from an archive). Three opt out, each for
+  its own reason: chdman *copy* (re-CHD'ing a `.chd` from inside an archive is a
+  pointless round trip), *romz* (recompressing an already-archived ROM is
+  recursive — its members stay visible but non-convertible, §17.5), and
+  *makeps3iso* (its input is a folder, not a member). See **§17** for how to
+  wire archive input into a new tool. If your tool genuinely can't read its inputs from inside
   an archive, leave `allows_archive_input=False` on its `ModeSpec` (the default)
   and the single guard in `plan_job` blocks archive (`::`) members automatically.
 - **Binary path is config, not hardcoded.** Always read `settings.<tool>_path`
@@ -1343,10 +1544,11 @@ preserves the original protection measures.
 
 Users keep dumps inside `.zip`/`.7z`/`.rar` archives, so every tool that takes a
 *convertible source* can convert a member straight out of the archive without a
-manual unzip first. Today chdman *create* and *extract*, Dolphin, 3DS, and Switch
-(nsz) all support this — chdman extract even decompresses a `.chd` pulled from an
-archive back to a game image; only chdman *copy* opts out, because re-CHD'ing a
-`.chd` from inside an archive is a pointless round trip.
+manual unzip first. Today chdman *create* and *extract*, Dolphin, 3DS, Switch
+(nsz), CSO and the `cso_to_chd` chain all support this — chdman extract even
+decompresses a `.chd` pulled from an archive back to a game image. The three
+opt-outs are chdman *copy* (a pointless round trip), *romz* (recursive; see
+§17.5) and *makeps3iso* (folder input, so there is no member to convert).
 
 The pipeline is **tool-agnostic and registry-driven**: a member arrives as a
 `"<archive>::<member>"` pseudo-path, the job layer extracts it to a real temp
@@ -1490,6 +1692,6 @@ Run them:
 
 ```bash
 # from the repo root
-pytest -q tests/test_archive_conversion_e2e.py tests/test_archive_preference.py
+PYTHONPATH=app python -m pytest -q \
+    tests/test_archive_conversion_e2e.py tests/test_archive_preference.py
 ```
-

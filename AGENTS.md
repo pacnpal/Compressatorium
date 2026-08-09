@@ -6,7 +6,11 @@ A quick execution guide for agents working in this repo. Treat it as an operatio
 
 - `README.md`
 - `docs/RELEASE_NOTES.md`
-- `docs/DESIGN_tool_plugin_architecture.md`
+- `docs/ADDING_PLATFORMS_AND_TOOLS.md` — **start here to add a conversion tool
+  or a new platform/mode**: the step-by-step walkthrough, the exhaustive
+  file inventory, and a copy/paste checklist
+- `docs/DESIGN_tool_plugin_architecture.md` — *why* the plugin contract and
+  shared infrastructure look the way they do
 - `docs/DOCKER-COMPOSE.md`
 - `docs/DEPLOYMENT.md`
 - `.github/workflows/docker-image.yml`
