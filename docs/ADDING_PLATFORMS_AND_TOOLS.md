@@ -212,6 +212,8 @@ A plugin subclasses `BaseTool` and provides:
 | `output_path(mode, input_path, output_dir=None, *, treat_as_stem=False)` | compute the output path |
 | `accepts_directory(path)` | the directory analogue of `ext in input_extensions`. Default `False`; a tool with an `InputKind.DIRECTORY` mode overrides it to run its source-layout detector. May do disk I/O — it runs off the event loop. |
 | `companion_outputs(output_path, mode)` | sibling paths this mode writes *besides* `output_path` (never including it). `BaseTool` derives them from `ModeSpec.companion_exts` as pure path math; override only when the set is dynamic (makeps3iso's size-dependent split parts). |
+| `overwrite_targets(output_path, mode)` | every path an authorized overwrite must sweep, primary **first**. A superset of `companion_outputs`: it includes the primary, and it covers artifacts only a *failed* run leaves (an interrupted makeps3iso `-s` build leaves the base *and* numbered parts, which never coexist on success — so `companion_outputs`, describing a finished output, under-reports). Enumeration only; the pipeline validates and unlinks. Default = primary + companions. |
+| `is_ready()` | **async.** Whether the tool's runtime prerequisites are met. `False` ⇒ `GET /api/tools` reports it unavailable and the frontend hides it, instead of offering jobs that can only fail. Default `True`; override for a tool gated on an operator-supplied secret or an optional binary (`NszTool` → `prod.keys`). Threadpool anything that touches disk. |
 | `detect_output(input_path)` | optional, returns an `OutputStatus` so the file list can badge "output already exists". May content-validate the candidate before claiming it: `romz` only reports a `.7z`/`.zip` sibling as its output when it's a genuine single-ROM archive (not just any file matching the `Game.gba.7z` naming), so the badge and the source row's verify-from-output flow track real outputs. |
 | `verifies_path(path)` | optional per-file refinement of `verify_extensions`. Default (in `BaseTool`) is a plain extension match; override when your tool claims a broad container extension but only handles a subset (`romz` claims `.7z`/`.zip` yet only verifies single-ROM archives). `routes/files.py` materializes the result into `FileEntry.verifiable_by`, which the frontend gates the Verify/Info row-actions on. May do disk I/O — it runs inside the threadpool scan. |
 | `active_pids()` | PIDs for the debug heartbeat |
@@ -221,7 +223,8 @@ A plugin subclasses `BaseTool` and provides:
 
 `BaseTool` fills in `input_extensions` (the union of every mode's
 `input_extensions`), `spec(mode)`, no-op `detect_output` / `post_convert`,
-`accepts_directory` (`False`), `companion_outputs` (from `companion_exts`), the
+`accepts_directory` (`False`), `is_ready` (`True`), `companion_outputs` (from
+`companion_exts`), `overwrite_targets` (primary + companions), the
 extension-match `verifies_path` default, and the `embedded_hashes` default
 (`[]`, `embedded_hash_is_exhaustive=False`), so a real plugin only overrides
 what differs. See `app/services/tools/z3ds.py` for the smallest complete
@@ -760,23 +763,24 @@ are chdman-specific: GAME/NAME disc-id tagging after `createcd`/`createdvd`, and
 `.bin` sidecar handling for multi-track CD inputs. A clean single-file tool like
 nszip needs none of that.
 
-> **Exception: a *second* directory-input tool is not drop-in.** "The pipeline
-> needs no edits" holds for file-based tools. The directory path is currently
-> written for the only directory tool that exists, so a new one would silently
-> inherit PS3 behavior until these are generalized into shared seams:
->
-> - `job_manager._clear_existing_output` calls
->   `makeps3iso_service.remove_outputs(...)` for **every** `InputKind.DIRECTORY`
->   job, so overwrite cleanup for your tool would run makeps3iso's split-part
->   logic. This is the one that silently corrupts rather than errors.
-> - `routes/convert.py::_plan_directory_job` raises PS3-specific skip reasons
->   (`PS3_FOLDER_INVALID`, `PS3_OUTPUT_INSIDE_SOURCE`,
->   `PS3_OUTPUT_OUTSIDE_VOLUMES`, `PS3_FOLDER_UNSAFE`), and the worker's
->   post-lock safety re-walk records a PS3-specific error.
->
-> Generalize those first (a plugin-level cleanup hook and tool-neutral skip
-> reasons), then add your tool. Per the repo's modularity rule, that
-> generalization is the work — not a per-tool branch alongside the existing one.
+**Overwrite cleanup is the one hook the pipeline asks you for.** Before an
+authorized overwrite, `job_manager._clear_existing_output` asks the owning
+plugin for `overwrite_targets(output_path, mode)` and applies one
+validate-then-unlink pass — no branch on tool identity or input kind. The
+`BaseTool` default (primary + `companion_outputs`) is right for most modes;
+override it when a *failed* run can leave artifacts a successful one never
+would. `MakePs3IsoTool` is the example: an interrupted `-s` build leaves the
+not-yet-renamed base **and** numbered parts, a combination `companion_outputs`
+deliberately won't report, so its override returns both.
+
+> **Still directory-specific: the plan-time skip reasons.**
+> `routes/convert.py::_plan_directory_job` raises PS3-named reasons
+> (`PS3_FOLDER_INVALID`, `PS3_OUTPUT_INSIDE_SOURCE`,
+> `PS3_OUTPUT_OUTSIDE_VOLUMES`, `PS3_FOLDER_UNSAFE`), and the worker's post-lock
+> safety re-walk records a PS3-specific error. These are wire-visible message
+> strings rather than behavior, so a second directory tool wants its own reasons
+> (or tool-neutral ones) rather than inheriting these — but unlike the old
+> cleanup branch, nothing here silently does the wrong thing to your files.
 
 ### 5.7 Validation + output dispatch: `app/routes/convert.py`
 
@@ -1146,11 +1150,11 @@ ROUTES
 PIPELINE (app/services/job_manager.py)
 [ ] usually nothing (registry dispatches convert + verify)
 [ ] only for special post-processing (disc-id tags, multi-file sidecars)
-[ ] NOT true for a SECOND directory-input tool: _clear_existing_output runs
-    makeps3iso's cleanup for every InputKind.DIRECTORY job, and the directory
-    skip reasons are PS3-specific. Generalize those seams first — see §5.6
-[ ] NOT true for a SECOND keys-gated tool: GET /api/tools branches on
-    tool.id == "nsz", so yours is never hidden — see §16.5
+[ ] directory-input tool: implement overwrite_targets() so the sweep clears
+    YOUR artifacts (see §5.6); the directory skip reasons in convert.py are
+    still PS3-named, so add your own
+[ ] keys/secret-gated tool: implement is_ready() so the UI hides it until the
+    prerequisite is present — see §16.5
 
 FRONTEND
 [ ] src/lib/api/endpoints.js: get<Tool>Info, verify<Tool>, verifyBatch<Tool>
@@ -1205,8 +1209,8 @@ have solved the awkward part.
 | …is a plain compressor: one file in, one file out, both directions | **z3ds** (`services/z3ds_compress.py` + `tools/z3ds.py`) | The smallest complete plugin (~130 lines, mostly delegation). Progress estimated from output-file growth when the binary reports no percentage. **This is the default answer.** |
 | …exposes several output formats from one binary | **cso** (maxcso) | Five modes on one service (`cso_compress`, `cso2_compress`, `zso_compress`, `dax_compress`, `cso_decompress`), with an effort-preset compression UI rather than a codec list. |
 | …reuses a binary that already ships, and/or produces archives | **romz** (7z) | No Dockerfile work. Reuses `services/archive.py` for the read side. Shows `verifies_path()` / content-validating `detect_output()` for a tool that over-claims `.7z`/`.zip`, and the visible-but-not-convertible archive case (§17.5). |
-| …needs user-supplied keys or secrets | **nsz** | pip-packaged binary, `SWITCH_KEYS` resolution, the throwaway-`$HOME` trick for a binary with no `--keys` flag, and UI gating via `GET /api/tools`. See §16 — **note §16.5**: the backend readiness check is still nsz-specific, so a second gated tool needs a shared seam first. |
-| …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. **Read the §5.6 warning first** — the directory job path still hard-codes makeps3iso's overwrite cleanup. |
+| …needs user-supplied keys or secrets | **nsz** | pip-packaged binary, `SWITCH_KEYS` resolution, the throwaway-`$HOME` trick for a binary with no `--keys` flag, and UI gating via `GET /api/tools`. See §16, and implement `is_ready()` (§16.5) so the UI hides your tool until its prerequisite is present. |
+| …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. Override `overwrite_targets()` too, so an authorized overwrite sweeps your artifacts rather than makeps3iso's split parts (§5.6). |
 | …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
@@ -1229,8 +1233,8 @@ the metadata, one `registry.register(...)` line, and one entry in the frontend
   different format works without touching it. Both were `modes[0]` /
   hard-coded-`.chd` lookups until they were generalized — if you're reading a
   checkout that predates that, generalize them before adding a second chain.
-- **A second directory-input tool needs pipeline work first.** See the warning
-  in §5.6.
+- **A directory-input tool owns its own overwrite cleanup.** Override
+  `overwrite_targets()`; see §5.6.
 
 ---
 
@@ -1631,13 +1635,12 @@ exposes availability and the frontend hides unavailable tools entirely:
 - **Backend:** `GET /api/tools` (in `app/routes/info.py`) returns
   `{"available": [...], "unavailable": [...]}`. A tool lands in `unavailable`
   when its readiness check fails (for nsz, `keys_available()` is false).
-  **This half is *not* generic yet:** `list_tools()` awaits
-  `nsz_service.keys_available()` and branches on `tool.id == "nsz"` — there is
-  no plugin readiness callback. A second gated tool stays permanently
-  "available" and advertises a converter that can only fail at runtime, so you
-  must either extend that endpoint or (better, per the modularity rule) add a
-  readiness seam to the plugin contract — e.g. an `is_ready()` defaulting to
-  `True` on `BaseTool` — and have `list_tools()` loop over it.
+  The check is **your plugin's**, not the route's: `list_tools()` awaits
+  `tool.is_ready()` for every registered tool. `BaseTool` returns `True`, so
+  ordinary tools need nothing; override it when your tool can't run without
+  something the operator supplies. Keep it off the event loop if it touches
+  disk — `NszTool.is_ready` threadpools its `keys_available()` probe, which may
+  walk the configured volumes.
 - **Frontend:** `App.svelte` fetches it on mount and calls
   `ui.applyToolAvailability(available)`, which stores `ui.hiddenTools`. Sidebar
   and the dashboard derive their tool list as
