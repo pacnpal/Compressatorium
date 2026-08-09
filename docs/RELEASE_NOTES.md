@@ -7,6 +7,58 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Two per-tool branches on shared paths became plugin hooks
+  (`overwrite_targets`, `is_ready`).** Both were single-tool special cases
+  sitting on code every tool runs through, so a *second* tool of the same shape
+  would have silently inherited the first one's behavior.
+
+  `JobManager._clear_existing_output` branched on `input_kind == DIRECTORY` and
+  called `makeps3iso_service.remove_outputs` directly, so any future
+  folder-input tool would have had its outputs swept by makeps3iso's split-part
+  logic — the wrong files deleted and its own companions left behind, with no
+  error. The sweep now asks the owning plugin for `ToolPlugin.overwrite_targets()`
+  and runs one validate-then-unlink pass for every mode, file or directory.
+  `BaseTool` defaults it to the primary plus `companion_outputs`;
+  `MakePs3IsoTool` overrides it with the base plus every numbered part, sharing
+  one `MakePs3IsoService.output_artifacts` enumerator with its failure cleanup
+  so the two can't drift. The blocking stat/unlink pass also moved off the event
+  loop for file jobs, matching what directory jobs already did.
+
+  `GET /api/tools` computed `nsz_service.keys_available()` and branched on
+  `tool.id == "nsz"`, so only Switch could ever be hidden; a second tool needing
+  operator-supplied keys would have been advertised in the UI while unable to
+  run. Availability now awaits each plugin's `ToolPlugin.is_ready()` (default
+  `True`; `NszTool` overrides it with the threadpooled keys probe).
+
+  A third instance of the same pattern, in `ChainTool`: `detect_output`
+  hard-coded a `.chd` candidate and `_final_tool()` read `self.modes[0]`, so a
+  second `ChainSpec` would have badged the first chain's product and delegated
+  verify/info to the first chain's final tool. Both now resolve per spec —
+  `detect_output` takes the candidate extension from whichever mode accepts the
+  input, and verify/info resolve the owning spec by output extension (they get a
+  path and no mode).
+
+  No API or behavior change for existing tools — the makeps3iso, nsz and
+  `cso_to_chd` paths behave exactly as before. Two deliberate refinements while
+  the sweep was being unified:
+
+  - **A dangling symlink on an output path is now removed rather than ignored.**
+    `os.path.exists`/`isfile` both follow symlinks and report `False` for a
+    dangling one, so the old file-job check skipped it silently and the
+    converter could write *through* the link — landing the output wherever it
+    pointed, outside the validated volume. The sweep now tests with
+    `lexists`/`islink` (unlinking a symlink removes the link, never its target)
+    and still rejects any other non-file occupant before removing anything.
+  - **An authorized overwrite always clears the output's verification record**,
+    even when the sweep removed nothing. If something else deleted the prior
+    output while the job sat queued, the record would otherwise survive and
+    report the freshly built, unverified artifact as verified.
+
+  Tests: new `tests/test_tool_seams_generalized.py` pins each hook against a
+  *synthetic* second tool (a fake directory tool, a gated non-nsz tool, a
+  `.foo`→`.bar` `ChainSpec`), which is what catches a regression back to an
+  id/kind branch — asserting on the single existing instance passes either way.
+
 - **Web UI/API authentication (opt-in).** Optional token authentication for the networked UI and `/api` routes, gated behind `COMPRESSATORIUM_ENABLE_AUTH` (default off). When enabled, operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks. The token is accepted only in request headers (HTTP Basic, `Authorization: Bearer`, or `X-Compressatorium-Token`) — never the URL query string — and state-changing requests are restricted to same-origin callers to prevent CSRF via cached browser credentials.
 
 - **Automated Web UI screenshots.** The screenshots embedded in the README are

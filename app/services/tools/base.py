@@ -143,6 +143,20 @@ class ToolPlugin(Protocol):
         instead of blocking until the current file finishes.
         """
 
+    async def is_ready(self) -> bool:
+        """Whether this tool's runtime prerequisites are met.
+
+        A tool that cannot run at all in the current deployment — a missing
+        user-supplied key file, an absent optional binary — reports ``False``
+        so ``GET /api/tools`` lists it as unavailable and the frontend hides
+        it entirely, rather than offering a converter that can only fail at
+        job time. Default ``True``: most tools ship with everything they need.
+
+        Async because a readiness probe may touch the disk (nsz searches the
+        configured volumes for ``prod.keys``); implementations that block
+        should hop to a threadpool rather than stall the event loop.
+        """
+
     def active_pids(self) -> list[int]:
         """Return PIDs of in-flight subprocesses for this tool."""
 
@@ -150,6 +164,22 @@ class ToolPlugin(Protocol):
         self, input_path: str, output_path: str, mode: str,
     ) -> None:
         """Optional post-processing hook after a successful conversion."""
+
+    def overwrite_targets(self, output_path: str, mode: str) -> list[str]:
+        """Every path to clear before an **authorized** overwrite, primary first.
+
+        The superset of ``companion_outputs``: it includes ``output_path``
+        itself, and it enumerates artifacts a prior *failed* run may have left
+        behind even when they can't coexist with a finished output (a
+        makeps3iso ``-s`` build interrupted mid-split leaves both the
+        not-yet-renamed base and some numbered parts). ``companion_outputs``
+        describes a *successful* output set and is the wrong list to delete
+        from; this one describes everything the overwrite must sweep.
+
+        The job pipeline calls this instead of branching on tool identity, and
+        rejects the whole overwrite if any entry exists as a non-file, so an
+        override must list paths, never remove them.
+        """
 
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         """Sibling output paths this mode writes beside ``output_path``.
@@ -227,6 +257,11 @@ class BaseTool:
         # Default: no embedded hash; callers fall back to file-level SHA1.
         return []
 
+    async def is_ready(self) -> bool:
+        # Default: nothing to check. Tools gated on a user-supplied secret or
+        # an optional binary override this (see nsz / prod.keys).
+        return True
+
     async def post_convert(
         self, input_path: str, output_path: str, mode: str,
     ) -> None:
@@ -241,3 +276,10 @@ class BaseTool:
         # parts) override this with their own disk-aware probe.
         exts = self.spec(mode).companion_exts
         return [str(Path(output_path).with_suffix(ext)) for ext in exts]
+
+    def overwrite_targets(self, output_path: str, mode: str) -> list[str]:
+        # Default: the finished output set — the primary plus its companions.
+        # Correct for every mode whose failed runs leave nothing a successful
+        # run wouldn't. makeps3iso overrides (a mid-split failure can leave the
+        # base *and* numbered parts, which never coexist on success).
+        return [output_path, *self.companion_outputs(output_path, mode)]

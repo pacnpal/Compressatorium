@@ -126,5 +126,17 @@ class NszTool(BaseTool):
     def info_model(self, raw: dict, path: str) -> NszInfo:
         return NszInfo(**self._basic_info_fields(raw))
 
+    async def is_ready(self) -> bool:
+        """Switch content is encrypted, so nsz is useless without ``prod.keys``.
+
+        The app ships none (they're console-specific and copyrighted); the
+        operator supplies their own. Until they do, report unavailable so the
+        UI hides the tool rather than offering jobs that can only fail.
+
+        ``keys_available`` can walk the configured volumes, so it goes to a
+        threadpool.
+        """
+        return await run_in_threadpool(self._service.keys_available)
+
     def active_pids(self) -> list[int]:
         return self._service.active_pids()

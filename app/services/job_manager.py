@@ -21,7 +21,6 @@ from services.chd_metadata_store import chd_metadata_store
 from services.chdman import ConversionCancelled, chdman_service
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
-from services.makeps3iso import makeps3iso_service
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -810,46 +809,63 @@ class JobManager:
         """
         if not job.allow_overwrite or not job.output_path:
             return
-        if job.input_kind == InputKind.DIRECTORY:
-            # makeps3iso output is a single .iso OR a split set (.0/.1/…); clear
-            # all of it via the tool's own part-aware cleanup. But a destination
-            # that already exists as a *directory* named like the output can't be
-            # cleared by remove_outputs (its os.remove() fails on a dir and is
-            # suppressed); makeps3iso would then write *inside* it while the job
-            # still reports the bare path as its output. Reject rather than
-            # corrupt — mirroring the non-file guard on the file-job path below.
-            if await run_in_threadpool(os.path.isdir, job.output_path):
-                raise RuntimeError("Output path exists and is not a file")
-            await run_in_threadpool(
-                makeps3iso_service.remove_outputs, job.output_path,
-            )
-            await verification_store.clear(job.output_path)
-            return
-        # Clear the primary output and every companion the mode wrote beside it
-        # (enumerated from the tool, not re-derived). Companions are cleared even
-        # when the primary is already gone: a lone companion (e.g. a stray
-        # extractcd .bin whose .cue was deleted) is what made
-        # check_output_conflicts authorize the overwrite, so it must not be left
-        # to collide with the new output. Validate the whole set first — a
+        # Tool-neutral: the mode's own plugin enumerates everything to sweep
+        # (primary + companions, or for makeps3iso the base plus any numbered
+        # split parts). Directory-input jobs take this same path — there is no
+        # per-tool branch here, so a second folder-input tool gets correct
+        # cleanup instead of inheriting makeps3iso's part logic.
+        #
+        # Companions are cleared even when the primary is already gone: a lone
+        # companion (e.g. a stray extractcd .bin whose .cue was deleted) is what
+        # made check_output_conflicts authorize the overwrite, so it must not be
+        # left to collide with the new output. Validate the whole set first — a
         # non-file occupant (a directory squatting on the primary or a companion
         # name) can't be unlinked, so reject before removing anything rather than
         # deleting the primary and then failing against the stray occupant.
-        targets = [
-            job.output_path,
-            *registry.for_mode(job.mode.value).companion_outputs(
-                job.output_path, job.mode.value,
+        tool = registry.for_mode(job.mode.value)
+        mode, output_path = job.mode.value, job.output_path
+
+        # Enumeration is inside the hop, not before it: a tool's
+        # ``overwrite_targets`` may probe the disk (makeps3iso walks .0/.1/…),
+        # which would otherwise block the event loop on a slow/network volume.
+        await run_in_threadpool(
+            lambda: self._sweep_overwrite_targets(
+                tool.overwrite_targets(output_path, mode),
             ),
-        ]
+        )
+        # Unconditional: an authorized overwrite replaces whatever lives at this
+        # path, so a verification record for it is stale even when the sweep
+        # removed nothing — the prior output may have been deleted by something
+        # else while the job sat in the queue. Letting the record survive would
+        # report the freshly built, unverified artifact as verified.
+        await verification_store.clear(output_path)
+
+    @staticmethod
+    def _sweep_overwrite_targets(targets: list[str]) -> None:
+        """Validate then unlink ``targets``.
+
+        Blocking stat/unlink work, kept in one sync helper so the caller runs
+        the whole enumerate-check-remove sequence off the event loop in a single
+        hop (the check must stay atomic with respect to its own removals).
+
+        Uses ``lexists``/``islink`` rather than ``exists``/``isfile``: both of
+        the latter *follow* symlinks and so report False for a **dangling** one,
+        which would leave it in place for the converter to write through —
+        potentially landing the output outside the validated volume. Unlinking a
+        symlink removes the link itself and never its target, so a link sitting
+        on an authorized-overwrite path is safe to clear; anything else that
+        isn't a regular file (a directory, a device node) can't be unlinked at
+        all and is rejected before anything is removed.
+        """
+        def _removable(path: str) -> bool:
+            return os.path.islink(path) or os.path.isfile(path)
+
         for target in targets:
-            if os.path.exists(target) and not os.path.isfile(target):
+            if os.path.lexists(target) and not _removable(target):
                 raise RuntimeError("Output path exists and is not a file")
-        primary_removed = False
         for target in targets:
-            if os.path.isfile(target):
+            if os.path.lexists(target) and _removable(target):
                 os.remove(target)
-                primary_removed = primary_removed or target == job.output_path
-        if primary_removed:
-            await verification_store.clear(job.output_path)
 
     def _get_queued_and_processing_jobs(self) -> tuple[list[str], list[str]]:
         """Get lists of queued and processing job IDs.

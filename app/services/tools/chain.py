@@ -100,19 +100,29 @@ class ChainTool(BaseTool):
         )
 
     def detect_output(self, input_path: str) -> OutputStatus | None:
+        """Badge the source when the chain's own product already exists.
+
+        Resolved per chain spec rather than against a literal ``.chd``: the
+        candidate extension comes from whichever mode accepts this input, so a
+        second chain with a different final format badges its own output
+        instead of silently probing the first chain's.
+        """
         source = Path(input_path)
-        if source.suffix.lower() not in self.input_extensions:
-            return None
-        candidate = str(source.with_suffix(".chd"))
-        file_exists, is_locked = lock_manager.check_file_status(candidate)
-        if not (file_exists or is_locked):
-            return None
-        return OutputStatus(
-            tool_id=self.id,
-            exists=file_exists,
-            ready=file_exists and not is_locked,
-            path=candidate,
-        )
+        ext = source.suffix.lower()
+        for spec in self.modes:
+            if ext not in spec.input_extensions or not spec.output_ext:
+                continue
+            candidate = str(source.with_suffix(spec.output_ext))
+            file_exists, is_locked = lock_manager.check_file_status(candidate)
+            if not (file_exists or is_locked):
+                continue
+            return OutputStatus(
+                tool_id=self.id,
+                exists=file_exists,
+                ready=file_exists and not is_locked,
+                path=candidate,
+            )
+        return None
 
     # --------------------------------------------------------------- convert
     def convert(
@@ -235,22 +245,41 @@ class ChainTool(BaseTool):
         ensure_headroom(targets, margin_bytes=margin)
 
     # ------------------------------------------------------ verify / info
-    def _final_tool(self):
-        spec = self.modes[0]
+    def _spec_for_output(self, path: str):
+        """The chain spec whose final product ``path`` is.
+
+        Verify/info arrive with a path and no mode, so the chain is identified
+        by its output extension. Falls back to the first spec when nothing
+        matches, which is also the single-chain case today.
+        """
+        ext = Path(path).suffix.lower()
+        for spec in self.modes:
+            if spec.output_ext and spec.output_ext.lower() == ext:
+                return spec
+        return self.modes[0]
+
+    def _final_tool(self, path: str):
+        """The registered tool that owns verify/info for ``path``.
+
+        Resolved from the matching spec's ``verify_step`` rather than
+        ``modes[0]``, so a second chain ending in a different tool delegates to
+        *its* final tool instead of the first chain's.
+        """
+        spec = self._spec_for_output(path)
         step = spec.steps[spec.verify_step]
         return self._registry.get(step.tool_id)
 
     async def verify(self, path: str) -> dict:
-        return await self._final_tool().verify(path)
+        return await self._final_tool(path).verify(path)
 
     def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._final_tool().verify_stream(path)
+        return self._final_tool(path).verify_stream(path)
 
     async def info(self, path: str) -> dict:
-        return await self._final_tool().info(path)
+        return await self._final_tool(path).info(path)
 
     def info_model(self, raw: dict, path: str) -> "BaseModel":
-        return self._final_tool().info_model(raw, path)
+        return self._final_tool(path).info_model(raw, path)
 
     def active_pids(self) -> list[int]:
         seen: set[int] = set()

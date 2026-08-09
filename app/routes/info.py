@@ -926,17 +926,15 @@ async def get_romz_info(
 async def list_tools():
     """Which tools the frontend should show.
 
-    A tool is unavailable when its runtime prerequisites are missing. Today the
-    only gated tool is Switch (nsz), which needs the operator's prod.keys; when
-    they aren't found it is reported unavailable so the UI hides it entirely.
+    A tool is unavailable when its own ``is_ready()`` says its runtime
+    prerequisites are missing — today that's Switch (nsz), which needs the
+    operator's prod.keys, but the check is the plugin's, not this route's, so
+    any future gated tool is covered by implementing the hook.
     """
-    nsz_ready = await run_in_threadpool(nsz_service.keys_available)
     available, unavailable = [], []
     for tool in registry.all():
-        if tool.id == "nsz" and not nsz_ready:
-            unavailable.append(tool.id)
-        else:
-            available.append(tool.id)
+        target = available if await tool.is_ready() else unavailable
+        target.append(tool.id)
     return {"available": available, "unavailable": unavailable}
 
 
