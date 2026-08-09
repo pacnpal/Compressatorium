@@ -49,6 +49,11 @@ and #179, part of the #177 tech-debt epic).
   no other tool changes) and the shared request validator rejects the
   combination for single and batch alike.
 
+  The set is protected end to end: `source_companions` also feeds
+  `JobManager._track_candidate_paths`, so renaming or deleting part 5 while the
+  conversion is running is refused like any other in-use path (that helper's
+  hard-coded `.cue`/`.gdi` gate is now registry-driven for the non-track case).
+
   **The verification pass is now a choice.** It stays on by default, but the
   tool picker's dropdown — where other tools put their codec, since WUX has none
   — offers **Skip verification**, which passes `-noVerify` and roughly halves the

@@ -919,15 +919,19 @@ archive.
   joins them when you select part 1. Only part 1 is offered as a source — the
   other parts stay listed, so you can see and delete them, but they can't be
   selected or queued (the API rejects them too), since a part is not a disc
-  image. A stray part with no `game_part1.wud` beside it is left alone and
-  keeps its own name, so it fails with JWUDTool's size complaint rather than
-  planning the whole set's output. The product is
+  image — though the row can still be ticked in the file list, so the rejection
+  arrives on submit rather than greying the checkbox out. A stray part with no
+  `game_part1.wud` beside it is left alone and keeps its own name, so it fails
+  with JWUDTool's size complaint rather than planning the whole set's output.
+  While a split conversion is running, the other parts count as in use, so they
+  can't be renamed or deleted out from under it. The product is
   named after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify
   removes the **whole set** rather than orphaning the eleven parts it didn't
   name. The names are matched exactly as JNUSLib defines them, so a renamed set
   (`MyGame_part1.wud`) reads as an ordinary image. A split set can't be
   converted from inside an archive — the sibling parts aren't extracted with the
-  member — and that attempt fails with JWUDTool's own size complaint.
+  member — so an archived part keeps its own name and fails with JWUDTool's own
+  size complaint, rather than claiming the whole set's output name.
 - **Disk space.** Decompressing always writes a full ~23 GiB image, and the
   conversion runs in a temp directory next to the destination before being moved
   into place, so the output volume needs room for the finished file.

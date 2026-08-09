@@ -643,3 +643,20 @@ def test_orphan_split_part_keeps_its_own_stem(tmp_path):
     assert service.get_output_path_for_mode(
         "jwud_compress", "/data/game_part1.wud",
     ) == "/data/game.wux"
+
+
+def test_archived_split_part_keeps_its_own_stem():
+    """Archive extraction hands over one member, never the sibling parts.
+
+    `extract_related_files` expands .cue/.gdi only, so an archived split set
+    can't convert — and if it planned `game.wux`, an authorized overwrite would
+    unlink an unrelated finished image before that failure.
+    """
+    assert service.output_stem("/data/game_part1.wud", from_archive=True) == "game_part1"
+    assert service.get_output_path_for_mode(
+        "jwud_compress", "game_part1.wud", "/data", treat_as_stem=True,
+    ) == "/data/game_part1.wux"
+    # The on-disk primary is unaffected: it really does drive the whole set.
+    assert service.get_output_path_for_mode(
+        "jwud_compress", "/data/game_part1.wud",
+    ) == "/data/game.wux"

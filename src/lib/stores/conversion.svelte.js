@@ -137,18 +137,19 @@ class ConversionStore {
       );
     }
     if (entry.type === 'directory') return false;
-    if (!this.allowsInput(entry.path)) return false;
-    // The extension match stays the source of truth (it encodes the mode's
-    // declared inputs); the listing's `convertible_by` may only NARROW it, the
-    // same rule `registry.verifyToolForPath` applies on the verify side. This is
-    // what keeps the non-primary members of a multi-file source unselectable —
-    // a split Wii U dump's game_part2.wud is a .wud by extension, but only
-    // game_part1.wud drives the set, and plan_job rejects the rest.
-    if (Array.isArray(entry.convertible_by)
-        && !entry.convertible_by.includes(this.currentTool?.id)) {
-      return false;
-    }
-    return true;
+    // NOTE: deliberately does NOT narrow by `entry.convertible_by`. That flag is
+    // a tool-level, mode-agnostic listing annotation, while this gate is
+    // mode-specific, and the two disagree by design: chdman drops `.chd` from
+    // `input_extensions` (so a finished `.chd` isn't badged as a convertible
+    // source and its `convertible_by` is empty), yet `.chd` is exactly what
+    // extract/copy take. Gating on it made every CHDMAN extract/copy row
+    // unselectable. The mode-aware rejection lives in `plan_job`, which asks the
+    // owning tool's `converts_path` — so a split Wii U dump's `game_part2.wud`
+    // can still be ticked here but is rejected on submit with a clear message,
+    // the same way the other per-file plan rejections behave. A mode-aware
+    // listing annotation would let this gate narrow correctly; that's a
+    // listing-surface change, not a selection-store one.
+    return this.allowsInput(entry.path);
   }
 
   /**

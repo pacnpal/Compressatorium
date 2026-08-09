@@ -299,23 +299,28 @@ class JwudToolService:
     # ----- output paths -----------------------------------------------------
 
     @staticmethod
-    def output_stem(input_path: str) -> str:
+    def output_stem(input_path: str, *, from_archive: bool = False) -> str:
         """The output filename stem for an input.
 
         Normally the input's own stem, but a split set's primary
         (``game_part1.wud``) names its product after the *disc*, ``game.wux``,
         not ``game_part1.wux`` — the parts are one image, and the part number
         has no meaning once they're joined. Pure name math (no disk access), so
-        the result is identical for a real file, an archive member and a
-        duplicate-check probe.
+        the result is identical for a real file and a duplicate-check probe.
+
+        Two cases keep their own stem, both for the same reason: they name an
+        input that cannot actually produce the whole-set output, so planning
+        ``game.wux`` would let an authorized overwrite unlink an unrelated
+        finished image before the conversion fails.
+
+        * A stray ``game_part7.wud`` with no part 1 beside it (deliberately
+          still convertible, so JWUDTool answers with its own size complaint).
+        * Any part pulled from an archive: extraction hands the converter that
+          one member, never the sibling parts (``extract_related_files``
+          expands ``.cue``/``.gdi`` only), so an archived set can't convert.
         """
         stem = Path(input_path).stem
-        # ONLY part 1 renames: it is the member that stands for the whole set.
-        # A stray game_part7.wud with no part 1 beside it stays convertible (so
-        # JWUDTool can reject it with its own size complaint) — but it must keep
-        # its own stem, or an overwrite job would plan `game.wux` and could
-        # unlink an unrelated finished image before failing.
-        if split_part_index(input_path) == 1:
+        if not from_archive and split_part_index(input_path) == 1:
             return stem.rsplit("_part", 1)[0]
         return stem
 
@@ -351,7 +356,10 @@ class JwudToolService:
         output_ext = JWUD_OUTPUT_FORMATS.get(ext)
         if output_ext is None:
             raise ValueError(f"Unsupported file extension: {ext}")
-        filename = f"{JwudToolService.output_stem(input_path)}{output_ext}"
+        filename = (
+            f"{JwudToolService.output_stem(input_path, from_archive=treat_as_stem)}"
+            f"{output_ext}"
+        )
         if output_dir:
             return str(Path(output_dir) / filename)
         return str(input_p.parent / filename)

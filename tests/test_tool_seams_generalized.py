@@ -443,3 +443,35 @@ def test_jwud_delete_on_verify_tracks_the_verification_choice():
     assert tool.delete_on_verify_is_safe("jwud_compress", None) is True
     assert tool.delete_on_verify_is_safe("jwud_compress", "verify") is True
     assert tool.delete_on_verify_is_safe("jwud_compress", "noverify") is False
+
+
+def test_active_split_job_protects_its_other_parts(tmp_path):
+    """Rename/delete must see every part of an in-flight split conversion.
+
+    Without this, deleting part 5 mid-run fails a conversion that may already
+    have cleared an existing output for overwrite.
+    """
+    from app.services.job_manager import job_manager
+
+    parts = _split_set(tmp_path, 3)
+
+    tracked = job_manager._track_candidate_paths(str(parts[0]))
+
+    assert sorted(tracked) == sorted(str(p) for p in parts[1:])
+    # An ordinary single-file source still reports nothing extra.
+    plain = tmp_path / "solo.wud"
+    plain.write_bytes(b"image")
+    assert job_manager._track_candidate_paths(str(plain)) == []
+
+
+def test_cue_track_protection_is_unchanged(tmp_path):
+    """The .cue/.gdi path still parses tracks out of the file's contents."""
+    from app.services.job_manager import job_manager
+
+    (tmp_path / "game.bin").write_bytes(b"track")
+    cue = tmp_path / "game.cue"
+    cue.write_text('FILE "game.bin" BINARY\n  TRACK 01 MODE1/2352\n')
+
+    tracked = job_manager._track_candidate_paths(str(cue))
+
+    assert [Path(p).name for p in tracked] == ["game.bin"]
