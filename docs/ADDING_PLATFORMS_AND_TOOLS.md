@@ -977,8 +977,9 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
 
 #### Compression UI fields
 
-The example above is a **fixed compressor** and declares none of these. Add them
-only when your tool really exposes compression choices:
+The example above is a **fixed compressor**: it declares only
+`compressionStyle: 'none'` and omits the codec, level and default fields. Add
+the rest only when your tool really exposes compression choices:
 
 | Field | Meaning |
 |-------|---------|
@@ -1215,10 +1216,11 @@ have solved the awkward part.
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
 
-For a **binary-backed** tool — every row above except the last two — the *shape*
-of the work is the same: a service that owns the subprocess, a plugin that owns
-the metadata, one `registry.register(...)` line, and one entry in the frontend
-`TOOLS` array. The last two rows are the exceptions:
+For a **binary-backed** tool — every row above except **chain** — the *shape* of
+the work is the same: a service that owns the subprocess, a plugin that owns the
+metadata, one `registry.register(...)` line, and one entry in the frontend
+`TOOLS` array. That includes `dolphin` and `makeps3iso`, which are ordinary in
+this respect however unusual their inputs or hashes are. Two notes on top:
 
 - **A chain tool has no service and no new frontend entry.** `ChainTool` spawns
   nothing itself; it drives already-registered tools through the registry, and

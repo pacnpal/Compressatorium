@@ -38,9 +38,10 @@ and #179, part of the #177 tech-debt epic).
   input, and verify/info resolve the owning spec by output extension (they get a
   path and no mode).
 
-  No API or behavior change for existing tools — the makeps3iso, nsz and
-  `cso_to_chd` paths behave exactly as before. Two deliberate refinements while
-  the sweep was being unified:
+  No API change, and no change to how the makeps3iso, nsz and `cso_to_chd`
+  conversions themselves run. Existing behavior is unchanged **except** for two
+  deliberate refinements to the overwrite path, made while the sweep was being
+  unified:
 
   - **A dangling symlink on an output path is now removed rather than ignored.**
     `os.path.exists`/`isfile` both follow symlinks and report `False` for a
