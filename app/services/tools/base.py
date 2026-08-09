@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from models import OutputStatus
+from utils.path_utils import match_extension
 
 from .spec import ModeSpec
 
@@ -93,8 +94,9 @@ class ToolPlugin(Protocol):
     def converts_path(self, path: str) -> bool:
         """Whether this tool can convert a concrete file *on its own*.
 
-        The input-side mirror of ``verifies_path``: the default is a plain
-        match against ``input_extensions``, but a tool whose source is really a
+        The input-side mirror of ``verifies_path``: the default is the shared
+        whole-filename match against ``input_extensions`` (so a compound
+        extension resolves), but a tool whose source is really a
         *set* of files overrides it so only the primary member is offered.
         JWUDTool's split Wii U dumps are the case — ``game_part1.wud`` through
         ``game_part12.wud`` are one disc image, and selecting part 7 alone can
@@ -238,6 +240,19 @@ class ToolPlugin(Protocol):
         override must list paths, never remove them.
         """
 
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        """Bytes this mode will write for ``input_path``, if cheaply knowable.
+
+        Only for *preflight sizing* — the chain's disk-headroom check, which
+        must hold source + full intermediate + partial final at once and cannot
+        estimate the intermediate from a ratio when a container's shrink factor
+        varies by an order of magnitude (a scrubbed Wii NKit, a highly
+        compressed CSO). Return ``None`` when the answer isn't in a header the
+        tool can read for free; callers fall back to ``ChainStep.output_ratio``.
+        Never a correctness input, so an unreadable file is ``None``, not an
+        error. Blocking (a small header read) — call it off the event loop.
+        """
+
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         """Sibling output paths this mode writes beside ``output_path``.
 
@@ -306,11 +321,12 @@ class BaseTool:
         return False
 
     def converts_path(self, path: str) -> bool:
-        # Default: a plain extension match, the same rule the listing used
-        # before this hook existed. Tools whose source is a *set* of files
-        # (jwud's split Wii U dumps) override it so only the primary is
-        # offered; every other tool inherits the extension match.
-        return Path(path).suffix.lower() in self.input_extensions
+        # Default: the same whole-filename `input_extensions` match the listing
+        # used before this hook existed, so a compound extension still resolves
+        # (nkit2iso's .nkit.iso, whose Path.suffix is the generic .iso). Tools
+        # whose source is a *set* of files (jwud's split Wii U dumps) override it
+        # so only the primary is offered; every other tool inherits the match.
+        return match_extension(path, self.input_extensions) is not None
 
     def source_companions(self, path: str) -> list[str]:
         # Default: a single-file source consumes nothing else.
@@ -323,9 +339,11 @@ class BaseTool:
         return True
 
     def verifies_path(self, path: str) -> bool:
-        # Default: a plain extension match. Tools that over-claim a container
-        # extension (e.g. romz on .7z/.zip) override with per-file inspection.
-        return Path(path).suffix.lower() in self.verify_extensions
+        # Default: a declared-extension match (suffix-based, so a compound
+        # extension resolves — see utils.path_utils.match_extension). Tools that
+        # over-claim a container extension (e.g. romz on .7z/.zip) override with
+        # per-file inspection.
+        return match_extension(path, self.verify_extensions) is not None
 
     async def embedded_hashes(
         self, path: str, *, cancel_event: asyncio.Event | None = None,
@@ -337,6 +355,12 @@ class BaseTool:
         # Default: nothing to check. Tools gated on a user-supplied secret or
         # an optional binary override this (see nsz / prod.keys).
         return True
+
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        # Default: unknown. Tools whose source header states the output size
+        # (maxcso's CSO/ZSO/DAX, nkit2iso's NKit) override it so the chain
+        # preflight sizes the intermediate exactly instead of by ratio.
+        return None
 
     async def post_convert(
         self, input_path: str, output_path: str, mode: str,

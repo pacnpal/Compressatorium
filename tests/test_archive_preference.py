@@ -43,6 +43,10 @@ def test_archive_input_extensions_cover_all_source_tools():
     assert {".cso", ".zso", ".dax"} <= exts           # CSO (maxcso decompress)
     assert {".wud", ".wux"} <= exts                   # Wii U (JWUDTool)
     assert ".chd" in exts                             # chdman extract-from-archive
+    assert {".nkit.iso", ".nkit.gcz"} <= exts         # NKit restore-from-archive
+    # The compound source does NOT pull the generic tails in on its own: `.gcz`
+    # is here because Dolphin declares it, and `.iso` because chdman/cso do.
+    assert ".nkit" not in exts
     # Handheld ROMs are browse-only, not convertible in place, so they stay OUT
     # of the convert-gate set (recompressing an archived ROM would be recursive).
     assert not ({".gb", ".gbc", ".gba", ".nds"} & exts)

@@ -20,6 +20,7 @@ from services.maxcso import (
     MAXCSO_COMPRESS_EXTENSIONS,
     MAXCSO_DECOMPRESS_EXTENSIONS,
     maxcso_service,
+    uncompressed_iso_size,
 )
 
 from .base import BaseTool
@@ -167,6 +168,15 @@ class MaxcsoTool(BaseTool):
 
     def info_model(self, raw: dict, path: str) -> CsoInfo:
         return CsoInfo(**self._basic_info_fields(raw))
+
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        # Decompress only: the CSO/ZSO/DAX header states the ISO size, which is
+        # what a chain preflight needs (a highly compressed container is a small
+        # fraction of the ISO maxcso writes, so a ratio badly under-counts). The
+        # compress direction's output size isn't knowable up front.
+        if mode != "cso_decompress":
+            return None
+        return uncompressed_iso_size(input_path)
 
     def active_pids(self) -> list[int]:
         return self._service.active_pids()

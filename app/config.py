@@ -151,6 +151,28 @@ class Settings(BaseSettings):
     jwudtool_path: str = Field(
         default="/usr/local/bin/jwudtool", alias="JWUDTOOL_PATH",
     )
+    # nkit2iso binary path (NKit-shrunk GameCube/Wii image -> plain .iso). Built
+    # from source (DonMikone/nkit2iso, MIT) into the image at
+    # /usr/local/bin/nkit2iso; set NKIT2ISO_PATH to relocate/override.
+    nkit2iso_path: str = Field(
+        default="/usr/local/bin/nkit2iso", alias="NKIT2ISO_PATH",
+    )
+    # What nkit2iso does with a Wii image whose update partition was removed at
+    # shrink time: that data is not in the file and cannot be regenerated.
+    #   "none"     - zero-fill the region (default). Fully offline; the result is
+    #                playable but not redump-verifiable, and the CRC32 check is
+    #                skipped, so the job reports the caveat in its final message.
+    #   "download" - fetch the publicly archived recovery partition and splice it
+    #                in for a bit-exact restore. This is the ONLY situation in
+    #                which nkit2iso touches the network, so it stays opt-in: a
+    #                converter should not reach out to the internet unless the
+    #                operator asked it to.
+    # The tool's own "ask" mode is deliberately not offered — it prompts on a
+    # terminal, and a job worker has no one to answer it.
+    nkit2iso_recovery: str = Field(
+        default="none", alias="NKIT2ISO_RECOVERY",
+        pattern="^(none|download)$",
+    )
 
     # Extra free space (MB) a chained conversion (e.g. cso->iso->chd) keeps
     # beyond its estimated peak before starting. A chain holds source + full
@@ -348,6 +370,18 @@ class Settings(BaseSettings):
     )
     jwud_ioprio_level: int | None = Field(
         default=None, alias="COMPRESSATORIUM_JWUD_IOPRIO_LEVEL",
+    )
+    # nkit2iso (NKit -> ISO): one restore subprocess, and no info/verify child
+    # process of its own (integrity is the header CRC32 checked inline during the
+    # restore), so only the nice/ioprio overrides are exposed.
+    nkit2iso_nice: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_NKIT2ISO_NICE",
+    )
+    nkit2iso_ioprio_class: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_NKIT2ISO_IOPRIO_CLASS",
+    )
+    nkit2iso_ioprio_level: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_NKIT2ISO_IOPRIO_LEVEL",
     )
     verify_progress_timeout: int = Field(
         default=0,

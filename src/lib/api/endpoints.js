@@ -313,6 +313,13 @@ export const api = {
     return fetchJson(buildApiUrl('/romz-info', params), undefined, 'Failed to get ROM info');
   },
 
+  // NKit sources only. There is no verifyNkit/verifyBatchNkit counterpart:
+  // nkit2iso has no verify subcommand (see the registry entry).
+  getNkitInfo(path) {
+    const params = new URLSearchParams({ path });
+    return fetchJson(buildApiUrl('/nkit-info', params), undefined, 'Failed to get NKit info');
+  },
+
   getJwudInfo(path) {
     const params = new URLSearchParams({ path });
     return fetchJson(buildApiUrl('/jwud-info', params), undefined, 'Failed to get Wii U image info');

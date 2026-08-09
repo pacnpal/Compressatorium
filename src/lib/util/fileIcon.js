@@ -28,6 +28,7 @@ export const TOOL_MEDIA = {
   chdman: 'disc', // CD / DVD / LaserDisc images
   cso: 'disc', // compressed PSP / PS2 ISOs
   makeps3iso: 'disc', // PS3 disc images (folder → .iso; no file exts today)
+  nkit: 'disc', // NKit-shrunk GameCube / Wii disc images
   jwud: 'disc', // Wii U disc images (.wud / .wux)
   dolphin: 'game', // GameCube / Wii disc images, shown as game media
   z3ds: 'game', // 3DS ROMs

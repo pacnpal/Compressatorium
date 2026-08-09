@@ -113,6 +113,44 @@ RUN make -C makeps3iso && \
     chmod +x makeps3iso/makeps3iso
 
 # ---------------------------------------------------------------------------
+# nkit2iso builder stage: compile nkit2iso (NKit-shrunk GameCube/Wii image ->
+# full .iso) from source.
+#
+# DonMikone/nkit2iso is MIT, pure Go with no third-party modules (stdlib only:
+# crypto/aes, crypto/sha1, compress/zlib), so `go build` needs no network after
+# the clone and compiles per-arch automatically — linux/amd64 and linux/arm64
+# buildx both work, same as the C builder stages. It needs its own stage rather
+# than joining `builder` because it wants a Go toolchain (its go.mod requires
+# 1.26.5, newer than Debian trixie's golang package), so the official golang
+# image is used, digest-pinned like every other base here.
+#
+# The golang images set GOTOOLCHAIN=local, so the pinned image's own Go must
+# satisfy go.mod rather than a newer toolchain being fetched mid-build. That is
+# deliberate: if a future NKIT2ISO_REF raises the requirement past this base, the
+# build fails loudly here instead of silently reaching out to the network.
+#
+# CGO_ENABLED=0 yields a static binary: nothing to add to the runtime stage's
+# shared-library list.
+# ---------------------------------------------------------------------------
+FROM golang:1.26-trixie@sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e AS nkit2iso-builder
+ENV DEBIAN_FRONTEND=noninteractive
+# Pinned to an immutable commit so release images are reproducible. main @
+# 2026-07-18 (ahead of the v0.1.0 tag). Override with
+# --build-arg NKIT2ISO_REF=<tag|sha> to update nkit2iso intentionally.
+ARG NKIT2ISO_REF=b97129c157edf704da5bbf65e6d9e642c843b922
+RUN git clone https://github.com/DonMikone/nkit2iso.git /tmp/nkit2iso && \
+    git -C /tmp/nkit2iso checkout "${NKIT2ISO_REF}"
+
+WORKDIR /tmp/nkit2iso
+
+# -ldflags stamps the pinned ref into `nkit2iso -version`; -s -w drops the debug
+# tables (the binary is shipped, not debugged, in the image).
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.version=${NKIT2ISO_REF}" \
+      -o nkit2iso . && \
+    chmod +x nkit2iso
+
+# ---------------------------------------------------------------------------
 # Frontend builder stage: compile the Svelte 5 SPA with Vite.
 #
 # Output is emitted to /build/static via vite.config.js (build.outDir),
@@ -249,6 +287,10 @@ RUN wget -q "${JWUDTOOL_URL}" -O /tmp/jwudtool.jar && \
       > /usr/local/bin/jwudtool && \
     chmod +x /usr/local/bin/jwudtool && \
     jwudtool -help > /dev/null
+
+# Install nkit2iso from its builder stage (NKit-shrunk GC/Wii image -> .iso).
+# MIT, statically linked (CGO_ENABLED=0), so it needs no extra runtime libs.
+COPY --from=nkit2iso-builder /tmp/nkit2iso/nkit2iso /usr/local/bin/nkit2iso
 
 # Copy application
 COPY app/ /app/

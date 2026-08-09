@@ -27,6 +27,7 @@ from utils.path_utils import (
     get_volume_name_for_path,
     is_configured_volume_root,
     is_within_configured_volumes,
+    match_extension,
 )
 
 router = APIRouter()
@@ -119,6 +120,11 @@ def _detect_file_outputs(
     outputs, and a ``{tool_id: OutputStatus}`` index used to derive the
     legacy per-tool booleans from a single source of truth.
 
+    Convertibility is matched against the whole filename rather than a
+    pre-computed ``Path.suffix``, so a tool declaring a compound extension
+    (nkit2iso's ``.nkit.iso``) is recognised — see
+    ``utils.path_utils.match_extension``.
+
     ``from_archive`` marks ``item_path`` as the synthesised location an archive
     member would occupy rather than a real file, and is forwarded to each
     tool's ``detect_output``.
@@ -127,8 +133,8 @@ def _detect_file_outputs(
     outputs: list[OutputStatus] = []
     by_tool: dict[str, OutputStatus] = {}
     for tool in registry.all():
-        # ``converts_path`` is the extension match by default; a tool whose
-        # source is a *set* of files narrows it per-file (jwud leaves the
+        # ``converts_path`` defaults to that same whole-filename match; a tool
+        # whose source is a *set* of files narrows it per-file (jwud leaves the
         # secondary members of a split Wii U dump visible but non-convertible,
         # since only game_part1.wud drives the set).
         if tool.converts_path(item_path):
@@ -187,8 +193,13 @@ def _detect_archive_member_outputs(
     output_stem = (
         entry.get("output_stem") or Path(entry["internal_path"]).stem
     )
-    member_ext = (entry.get("extension") or Path(entry["name"]).suffix).lower()
-    synthetic_input = os.path.join(archive_dir, f"{output_stem}{member_ext}")
+    # Extension-PRESERVING flattened name (not stem + trailing suffix): a
+    # compound-extension source keeps its whole ".nkit.iso", which is what the
+    # owning tool's detect_output needs to resolve its sibling output. For a
+    # plain extension the two are identical.
+    synthetic_input = os.path.join(
+        archive_dir, archive_service._output_name_for_member(entry["internal_path"]),
+    )
     _, outputs, by_tool = _detect_file_outputs(synthetic_input, from_archive=True)
     # `_detect_file_outputs` derives convertibility from each tool's
     # `converts_path` — but a member is only convertible in *place* when a tool
@@ -196,7 +207,10 @@ def _detect_archive_member_outputs(
     # it straight from an archive. Re-derive against `allows_archive_input` so a
     # listing-only member (a romz ROM) is shown without offering a conversion
     # `plan_job` would reject (ARCHIVE_INPUT_NOT_ALLOWED).
-    convertible_by = registry.tools_accepting_archive_member(member_ext)
+    # Pass the member's NAME, not just its extension: a compound-extension
+    # source (.nkit.iso) is only distinguishable from the generic tail the
+    # listing records (.iso) by the full name.
+    convertible_by = registry.tools_accepting_archive_member(entry["internal_path"])
     return output_stem, convertible_by, outputs, by_tool
 
 

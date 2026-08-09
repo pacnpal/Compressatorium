@@ -7,8 +7,9 @@ explicitly in ``__init__.py``.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from utils.path_utils import match_extension
 
 if TYPE_CHECKING:
     from .base import ToolPlugin
@@ -81,29 +82,37 @@ class ToolRegistry:
                     exts.update(mode.input_extensions)
         return tuple(sorted(exts))  # sorted for cross-run determinism (issue #183)
 
-    def tools_accepting_archive_member(self, ext: str) -> list[str]:
-        """Tool ids with at least one ``allows_archive_input`` mode for ``ext``.
+    def tools_accepting_archive_member(self, member: str) -> list[str]:
+        """Tool ids with an ``allows_archive_input`` mode accepting ``member``.
 
-        The archive-member analogue of ``ext in tool.input_extensions``: a tool
-        is only convertible-in-place when some mode of it both takes the ext AND
-        allows archive input. A listing-only member (a romz ROM, surfaced
-        because it's a known source extension) has no ``allows_archive_input``
-        mode, so it is correctly excluded — visible, but no in-place conversion
-        affordance.
+        The archive-member analogue of :meth:`tools_for_input`: a tool is only
+        convertible-in-place when some mode of it both takes the member's
+        extension AND allows archive input. A listing-only member (a romz ROM,
+        surfaced because it's a known source extension) has no
+        ``allows_archive_input`` mode, so it is correctly excluded — visible,
+        but no in-place conversion affordance.
+
+        ``member`` may be the member's path/name or just its extension: the
+        shared :func:`~utils.path_utils.match_extension` suffix match handles
+        both, so a compound-extension source (``.nkit.iso``) resolves whether
+        the caller kept the full name or only the generic ``.iso`` tail the
+        listing recorded.
         """
-        ext = ext.lower()
         return [
             tool.id
             for tool in self._tools.values()
             if any(
-                mode.allows_archive_input and ext in mode.input_extensions
+                mode.allows_archive_input
+                and match_extension(member, mode.input_extensions) is not None
                 for mode in tool.modes
             )
         ]
 
     def tools_for_input(self, filename: str) -> list[ToolPlugin]:
-        ext = Path(filename).suffix.lower()
-        return [t for t in self._tools.values() if ext in t.input_extensions]
+        return [
+            t for t in self._tools.values()
+            if match_extension(filename, t.input_extensions) is not None
+        ]
 
     def tools_for_directory(self, path: str) -> list[ToolPlugin]:
         """Tools that accept ``path`` (a directory) as their input unit.
@@ -141,9 +150,11 @@ class ToolRegistry:
         return seen
 
     def tool_for_verify(self, path: str) -> ToolPlugin | None:
-        ext = Path(path).suffix.lower()
         return next(
-            (t for t in self._tools.values() if ext in t.verify_extensions),
+            (
+                t for t in self._tools.values()
+                if match_extension(path, t.verify_extensions) is not None
+            ),
             None,
         )
 

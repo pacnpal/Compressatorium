@@ -73,6 +73,18 @@ export const MODE_BLURBS = {
   jwud_decompress:
     'Restore the original .wud from a .wux, byte for byte. Same verification '
     + 'choice as the compress direction.',
+
+  // NKit
+  nkit_restore:
+    'Rebuild the full GameCube/Wii ISO from an NKit-shrunk .nkit.iso/.nkit.gcz. '
+    + 'No per-job settings; the result is CRC32-checked against the NKit header. '
+    + 'That '
+    + 'check is skipped for a Wii image restored without its removed update '
+    + 'partition — playable, but not bit-exact, and the job says so.',
+  nkit_to_rvz:
+    'Restore an NKit image and compress it straight to RVZ in one job (nkit2iso '
+    + 'to a temp ISO, then dolphin-tool). The full-size ISO never lands in your '
+    + 'library. Uses dolphin default compression.',
   // PS3
   folder_to_iso:
     'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle '

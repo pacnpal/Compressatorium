@@ -319,8 +319,9 @@ class BaseTool:
 ### 3.3 `runner.py`: shared subprocess orchestration
 
 This collapses the ~150 near-identical lines that were duplicated in every
-tool's `convert()`. All eight conversion tools now delegate their streaming loop
-here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso`, `jwudtool` directly, and
+tool's `convert()`. All nine conversion tools now delegate their streaming loop
+here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso`, `nkit2iso`, `jwudtool`
+directly, and
 `z3ds_compress`, `maxcso`, `nsz` via the size-based-progress seam below (their
 CLIs print no parseable percent, so the growing output file is the progress
 signal).
@@ -532,6 +533,66 @@ sits **above** the plugin contract rather than rewriting it.
 
 New chained conversions (xci→nsp, wud→wua, a future folder→iso→chd) are a new
 `ChainSpec` row + its component modes — no new machinery.
+
+#### A step can flag a caveat the chain must not bury (`warning`)
+
+Each step's updates overwrite the job's `message`, so a caveat an *earlier* step
+raised about its own output is gone by the time the chain finishes — and the
+terminal `{"progress": 100, "message": "Conversion complete"}` says nothing.
+That matters when the caveat changes what the output *is*: nkit2iso restoring a
+Wii image whose update partition was removed produces a playable but **not**
+bit-exact ISO, and `nkit_to_rvz` would otherwise report an unqualified success.
+
+A step opts in by marking that update with `warning: True`; `ChainTool` collects
+them and appends them to its own terminal message (itself marked `warning`).
+`job_manager` reads only `progress` and `message`, so the extra key is inert for
+a direct job and needs no contract change.
+
+Note what this does **not** buy: the flag arrives mid-run, long after
+`supports_delete_on_verify` was read at plan time. It informs the operator; it
+cannot gate the pipeline. That is why `nkit_to_rvz` declines delete-on-verify
+outright rather than conditionally — see the flag's comment in `chain.py`.
+
+#### `expected_output_size`: preflight sizing without a tool-specific import
+
+`ChainTool._preflight_headroom` has to bound three things at once (source, full
+intermediate, partial final) before it starts, and `ChainStep.output_ratio` is
+too blunt for it: a heavily compressed `.cso` or a scrubbed `.nkit.iso` can be
+an order of magnitude smaller than the `.iso` its step will write, so a ratio on
+the input size under-counts badly and the preflight passes on a volume that then
+fills up mid-job.
+
+It used to solve that by importing `services.maxcso.uncompressed_iso_size`
+directly — a single-tool special case sitting on code every chain runs through,
+the same shape as the `overwrite_targets` / `is_ready` branches removed earlier.
+A second chain whose first step was a different tool would silently get the
+ratio fallback with no way to do better.
+
+The contract now carries it:
+
+```python
+def expected_output_size(self, input_path: str, mode: str) -> int | None:
+    """Bytes this mode will write, if cheaply knowable from a header."""
+```
+
+`BaseTool` returns `None` (fall back to `output_ratio`). `MaxcsoTool` returns
+`uncompressed_iso_size` for `cso_decompress`; `Nkit2IsoTool` returns the image
+size the NKit header states. `ChainTool` asks `steps[0]`'s tool and never names
+a tool itself. It is **preflight only** — never a correctness input — so an
+unreadable file is `None`, not an error. Blocking (a small header read), so call
+it off the event loop.
+
+#### A chain's output name comes from its FIRST step
+
+`ChainTool.output_path` used to delegate to the *last* step's tool, which is
+correct only while every chain source has a plain single suffix. The first step
+is the one that owns the input, so only its tool knows how to strip the source
+name: `nkit_restore` must drop a whole compound `.nkit.iso`, where dolphin (the
+final step of `nkit_to_rvz`) would leave `Game.nkit.rvz`. The rule is now "the
+first step's own output path, with the chain's declared `output_ext` swapped
+in", which is identical to the old behaviour for `cso_to_chd` (`Game.cso` ->
+`Game.iso` -> `Game.chd`). `detect_output` and the scratch intermediate's name
+follow the same rule.
 
 ### 3.3.4 Directory inputs (`InputKind`, `accepts_directory`)
 
@@ -786,11 +847,11 @@ class ToolRegistry:
     def convertible_extensions(self) -> tuple[str, ...]:   # sorted (issue #183)
         return tuple(sorted(set().union(*(t.input_extensions for t in self._tools.values()))))
     def tools_for_input(self, filename: str) -> list[ToolPlugin]:
-        ext = Path(filename).suffix.lower()
-        return [t for t in self._tools.values() if ext in t.input_extensions]
+        return [t for t in self._tools.values()
+                if match_extension(filename, t.input_extensions) is not None]
     def tool_for_verify(self, path: str) -> ToolPlugin | None:
-        ext = Path(path).suffix.lower()
-        return next((t for t in self._tools.values() if ext in t.verify_extensions), None)
+        return next((t for t in self._tools.values()
+                     if match_extension(path, t.verify_extensions) is not None), None)
     # Discovery helpers (issue #131): the union of every tool's produced /
     # verifiable extensions drives the registry-driven library scan, so a new
     # tool's outputs become scannable for free.
@@ -801,6 +862,48 @@ class ToolRegistry:
     def scannable_extensions(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.output_extensions()) | set(self.verify_extensions())))
 ```
+
+#### Extension matching is a suffix match (`utils.path_utils.match_extension`)
+
+Every "does this tool handle this file?" decision goes through one helper:
+
+```python
+def match_extension(name: str, extensions: Iterable[str]) -> str | None:
+    """The longest declared extension ``name`` ends with, else None."""
+```
+
+It replaced the `Path(name).suffix.lower() in declared` test that used to be
+re-typed at each site (`tools_for_input`, `tool_for_verify`,
+`BaseTool.verifies_path`, the archive-member gate in `services/archive.py`, and
+the plan-time input gate in `routes/convert.py`). The reason is **compound
+extensions**: nkit2iso's sources are `.nkit.iso` and `.nkit.gcz`, whose trailing
+component is the generic `.iso` / `.gcz` that CHDMAN, Dolphin and maxcso already
+own. A single-component match can only see the generic tail, so the specific
+format could not be declared without either over-claiming every ISO or
+hard-coding a content sniff.
+
+Three properties make this safe to apply everywhere:
+
+- **Single-component declarations are unchanged.** `game.iso` ends with `.iso`
+  and nothing else, so every pre-existing tool matches exactly what it did
+  before. (`tests/test_compound_extension_matching.py` pins this.)
+- **Per-tool, not global.** Each tool is asked independently, so an NKit image is
+  claimed by nkit *and* by the generic-tail owners, the same way a raw `.iso` is
+  already claimed by chdman, dolphin and cso. The user picks; nothing is
+  displaced.
+- **Longest match wins within a tool**, so a caller that needs the concrete key
+  (the archive listing) gets the most specific answer rather than an arbitrary
+  one.
+
+The subject may be a full path, a bare filename, or an extension string
+(`".nkit.iso"` still ends with `".iso"`), so a caller holding only a member's
+recorded extension uses the same helper.
+
+Two display-side sites deliberately still record the plain `Path.suffix`: the
+archive listing's `entry["extension"]` and, downstream of it, the frontend icon
+buckets. They want the generic tail. Convertibility for those rows is re-derived
+from the member's *name* via `registry.tools_accepting_archive_member(member)`,
+which takes a name-or-extension for exactly this reason.
 
 > **Ordering (issue #183):** the extension-union helpers return a **sorted
 > `tuple`**, not a `frozenset`. Hash-seeded set iteration order varies across
@@ -906,7 +1009,8 @@ extension alone would offer the affordance where the tool can't actually use it
 
 The plugin contract closes that gap with `ToolPlugin.verifies_path(path) ->
 bool`: the per-file refinement of `verify_extensions`. `BaseTool` defaults it to
-the plain extension match, so existing tools are unaffected; `RomzTool`
+the declared-extension match (`match_extension`, §3.4), so existing tools are
+unaffected; `RomzTool`
 overrides it to inspect the archive's members (exactly one handheld-ROM member —
 the same invariant verify/extract enforce, via
 `RomzService.is_single_rom_archive`). The registry exposes
@@ -1036,6 +1140,17 @@ conversion-time check would otherwise silently inherit "safe".
 > `source_companions` is the obvious next consolidation, but it would move that
 > security surface — and the `unsafe_paths` wire strings tests pin — so it is
 > deliberately left for its own change.
+#### Source-tool ordering is most-specific-first
+
+`registry.toolsForSourcePath` / `infoToolsForPath` rank claiming tools by the
+**length of the matched `sourceExts` entry**, not declaration order. The Info
+modal walks that list and keeps the first `getInfo()` that returns, so with a
+plain order a `.nkit.iso` would reach Dolphin's header reader first — and that
+reader *succeeds*, because an NKit image carries a genuine GC/Wii disc header,
+reporting the shrunk file as if it were an ordinary disc. Ranking the compound
+claim above the generic tail it shares (`.iso`) puts the tool that actually
+understands the container first. This mirrors the backend's longest-match
+`match_extension` (§3.4).
 
 ### 3.7 Frontend descriptor (`src/lib/tools/registry.js`)
 

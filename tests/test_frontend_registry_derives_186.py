@@ -32,6 +32,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 _REGISTRY_JS = _SRC / "lib" / "tools" / "registry.js"
 _HELP_MODES_JS = _SRC / "lib" / "tools" / "helpModes.js"
 _FILE_ICON_JS = _SRC / "lib" / "util" / "fileIcon.js"
+_FILE_BROWSER_JS = _SRC / "lib" / "stores" / "fileBrowser.svelte.js"
 
 
 def _find_node() -> str | None:
@@ -87,6 +88,10 @@ def _dump(tmp_path: Path) -> dict:
         " output_keys: Object.keys(MODE_OUTPUT),"
         " sections: helpModeSections(registry).map((s) => ({"
         "   title: s.title, rows: s.rows })),"
+        " info_order: Object.fromEntries(["
+        "   'Game.nkit.iso','Game.nkit.gcz','Game.iso','Game.gcz',"
+        "   'out.chd','disc.rvz','Game.cso','Game.7z'"
+        " ].map((p) => [p, registry.infoToolsForPath(p).map((t) => t.id)])),"
         "};\n"
         "process.stdout.write(JSON.stringify(__out));\n"
     )
@@ -158,3 +163,85 @@ def test_help_table_covers_exactly_the_registry_modes(tmp_path):
         for row in section["rows"]:
             assert row["note"], f"mode {row['mode']} rendered an empty blurb"
             assert row["out"], f"mode {row['mode']} rendered an empty output"
+
+
+def test_every_filter_option_can_match_a_row(tmp_path):
+    """Each dropdown option must be able to select rows, including compound ones.
+
+    ``allFilterableExts()`` is built from ``sourceExts``/``verifyExts``, so it
+    offers ``.nkit.iso`` — but the backend records only the trailing
+    ``Path.suffix`` (``.iso``) in ``FileEntry.extension``. The store's filter
+    therefore has to match the row NAME as a suffix; an equality test against
+    ``extension`` silently yields an empty list for every compound option.
+
+    This drives the real ``filteredEntries`` getter under Node against a
+    synthetic row per option, so a regression shows up as "this filter shows
+    nothing" rather than being invisible until someone tries it.
+    """
+    node = _find_node()
+    if node is None:
+        pytest.skip("node not available to evaluate the frontend modules")
+
+    registry_src = _REGISTRY_JS.read_text(encoding="utf-8")
+    registry_src = "const api = {};\n" + _strip_imports(registry_src)
+    # Lift the getter's body out of the class so it can be exercised without
+    # Svelte's rune compiler, keeping the assertion on the SHIPPED source.
+    browser_src = _FILE_BROWSER_JS.read_text(encoding="utf-8")
+    start = browser_src.index("get filteredEntries() {")
+    end = browser_src.index("\n  }", start) + len("\n  }")
+    body = browser_src[start:end].replace("get filteredEntries() {", "", 1)
+    body = body[: body.rindex("}")]
+    body = body.replace("this.sortedEntries", "rows").replace("this.filter", "filter")
+
+    script = tmp_path / "filter_eval.mjs"
+    script.write_text(
+        registry_src
+        + "\nfunction filteredEntries(rows, filter) {" + body + "}\n"
+        + "const exts = registry.allFilterableExts();\n"
+        # One row per option, named the way the app would see it, with the
+        # backend's own `extension` value: the plain trailing suffix.
+        + "const rows = exts.map((ext) => ({"
+        + "  type: 'file', name: `Game${ext}`, path: `/vol/Game${ext}`,"
+        + "  extension: ext.slice(ext.lastIndexOf('.')) }));\n"
+        + "const empty = exts.filter((ext) => filteredEntries(rows, ext).length === 0);\n"
+        + "process.stdout.write(JSON.stringify({ exts, empty }));\n"
+    )
+    proc = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        pytest.fail(f"Could not evaluate the file-browser filter via node:\n{proc.stderr}")
+    data = json.loads(proc.stdout)
+
+    assert data["exts"], "the filter dropdown offered no options at all"
+    assert not data["empty"], (
+        "these extension-filter options match no row and would render an empty "
+        f"list: {sorted(data['empty'])}"
+    )
+
+
+def test_info_tool_order_prefers_the_most_specific_claim(tmp_path):
+    """A compound claim must outrank the generic tail — including a verify owner.
+
+    ``FileInfoModal`` keeps the first ``getInfo()`` that returns. Dolphin's
+    reader succeeds on both NKit forms (they carry a real GC/Wii disc header,
+    and a ``.nkit.gcz`` is a real GCZ), so if it is tried first the modal never
+    reaches ``/nkit-info`` and reports the shrunk image as an ordinary disc.
+    The ``.gcz`` case is the sharp one: Dolphin owns it as a *verify* extension.
+    """
+    order = _dump(tmp_path)["info_order"]
+
+    assert order["Game.nkit.iso"][0] == "nkit"
+    assert order["Game.nkit.gcz"][0] == "nkit"
+    # The generic-tail owners still follow as fallbacks, not replacements.
+    assert "dolphin" in order["Game.nkit.gcz"]
+
+    # Single-suffix paths keep their previous ordering: the verify owner leads
+    # where one exists, otherwise declared order.
+    assert order["out.chd"][0] == "chdman"
+    assert order["disc.rvz"][0] == "dolphin"
+    assert order["Game.cso"][0] == "cso"
+    assert order["Game.7z"][0] == "romz"
+    assert order["Game.iso"][0] == "chdman"
+    assert order["Game.gcz"][0] == "dolphin"
+    # A plain .iso/.gcz must never route Info at nkit.
+    assert "nkit" not in order["Game.iso"]
+    assert "nkit" not in order["Game.gcz"]

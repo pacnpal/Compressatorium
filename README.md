@@ -2,11 +2,11 @@
 
 > **Fork notice:** This is a fork of MarcTV's Docker CHD Converter. It adds a Web UI and more conversion tools on top of the original CLI converter. Thanks to [MarcTV](https://github.com/MarcTV) for the original.
 
-A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), **makeps3iso** (PS3 decrypted folder → ISO), and **JWUDTool** (Wii U WUD ↔ WUX). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
+A game image converter that wraps nine tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), **makeps3iso** (PS3 decrypted folder → ISO), **nkit2iso** (NKit-shrunk GameCube/Wii image → ISO), and **JWUDTool** (Wii U WUD ↔ WUX). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
 
 ## Features
 
-* **Eight tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), PS3 ISO (a decrypted PS3 folder packed to `.iso`), or Wii U (WUD ↔ WUX), chosen per job.
+* **Nine tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), PS3 ISO (a decrypted PS3 folder packed to `.iso`), NKit (an NKit-shrunk GameCube/Wii image restored to a full `.iso`), or Wii U (WUD ↔ WUX), chosen per job.
 * **Web UI** for browsing files and converting them. The tool picker filters the whole interface down to the tool you chose.
 * **Nested directories and archives.** Browse subfolders and look inside ZIP, 7z, and RAR archives.
 * **Multiple volume mounts** so you can keep separate game libraries separate.
@@ -14,7 +14,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 * **Existing-output detection** with skip, rename, or overwrite.
 * **Delete-on-verify.** Optionally remove the source after a conversion verifies. Off by default.
 * **Progress tracking** through a live job queue.
-* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, and Wii U files.
+* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, NKit, and Wii U files.
 
 ### Supported Conversions
 
@@ -28,6 +28,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 | **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
 | **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed); a verify-after-conversion toggle | None | `JWUDTool` (Java) |
+| **NKit** | NKit-shrunk GameCube / Wii discs | .nkit.iso, .nkit.gcz | .iso, .rvz (via the `nkit_to_rvz` chain) | None (fixed) | None | `nkit2iso` (+ dolphin-tool for `nkit_to_rvz`) |
 
 Most conversions above are lossless and fully reversible, including **3DS**, which
 now decompresses back to the original ROM as well. This uses
@@ -50,11 +51,22 @@ resulting `.chd` gives you an `.iso`, not the original `.cso`/`.zso`/`.dax`, so
 delete-on-verify here trades the compressed source for a CHD. See
 [PSP / PS2 Support](#psp--ps2-support-cso--zso--dax).
 
-Each tool's full mode list (e.g. CHDMAN's `createcd`/`extractcd`, CSO's
-`cso2_compress`, the ROM packer's `romz_7z`/`romz_zip`/`romz_extract`, and the PS3
-packer's `folder_to_iso`) is in [Supported Operations](#supported-operations).
+**NKit** is one-directional for the opposite reason: this app never *writes* NKit,
+it only restores it. `nkit_restore` rebuilds the original `.iso` — bit-exact and
+CRC32-verified, except for a Wii image missing its update partition (see
+[NKit Support](#nkit-support-nkit--iso)) — which you can then hand to Dolphin or
+CHDMAN like any other disc image — or use the
+one-step `nkit_to_rvz` chain, which restores and compresses to RVZ in a single job
+so the full-size ISO never lands in your library. See
+[NKit Support](#nkit-support-nkit--iso).
 
 > **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, Switch dumps, and Wii U images. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
+Each tool's full mode list (e.g. CHDMAN's `createcd`/`extractcd`, CSO's
+`cso2_compress`, the ROM packer's `romz_7z`/`romz_zip`/`romz_extract`, the PS3
+packer's `folder_to_iso`, and NKit's `nkit_restore`/`nkit_to_rvz`) is in
+[Supported Operations](#supported-operations).
+
+> **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, Switch dumps, and NKit images. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
 
 ### MAME Redump DAT Integration
 
@@ -948,6 +960,91 @@ archive.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher |
+## NKit Support (.nkit → .iso)
+
+The NKit tool restores an NKit-shrunk GameCube or Wii disc image back to a plain,
+full-size `.iso`, using [nkit2iso](https://github.com/DonMikone/nkit2iso).
+
+NKit (Nanook's format) shrinks a disc by dropping everything a program can
+recreate: the pseudo-random "junk" padding Nintendo writes between and after
+files, the inter-file gaps, files whose contents are entirely junk, and — for Wii
+— the AES encryption and the H0–H3 hash tree. Restoring means regenerating all of
+it and putting the original layout back, then CRC32-checking the result against
+the value stored in the NKit header. A successful job is therefore bit-exact,
+with one exception: a Wii image whose update partition was removed at shrink time
+cannot be, because that data is not in the file. Under the default
+`NKIT2ISO_RECOVERY=none` its region is zero-filled and the CRC32 check is skipped
+— the ISO is playable but not redump-verifiable, and the job's final message says
+so (details in the notes below).
+
+This is a one-way tool: Compressatorium never *writes* NKit. Once restored, the
+`.iso` is an ordinary source you can feed to Dolphin (→ `.rvz`) or CHDMAN.
+
+### How to Use
+
+Select **NKit** as the primary tool and pick a `.nkit.iso` or `.nkit.gcz`. There
+are two modes:
+
+- **`nkit_restore`** writes `<name>.iso` next to the source (or in a custom
+  output directory).
+- **`nkit_to_rvz`** goes straight to `<name>.rvz` in one job: nkit2iso restores
+  into a scratch directory and dolphin-tool compresses that to RVZ, so the
+  full-size ISO never lands in your library. This is usually what you want —
+  NKit is a shrink format no emulator reads, and RVZ is both readable by Dolphin
+  and smaller than NKit. The final RVZ uses dolphin's default compression; run
+  the two steps as separate jobs if you want to pick a codec and level.
+
+Members inside a ZIP/7z/RAR work for both modes — browse in and convert the
+member directly.
+
+A `.nkit.gcz` is a GCZ-compressed NKit stream; nkit2iso inflates it on the fly, so
+both source forms produce the same output.
+
+**Info** reads the NKit header directly (no subprocess) and reports which console
+the disc is for, its game ID and title, the size the restored ISO will occupy, and
+the CRC32 the restore is checked against — worth a look before spending a restore
+on a multi-gigabyte image.
+
+### Notes
+
+- **Compound extensions.** `.nkit.iso` and `.nkit.gcz` are matched on the *whole*
+  suffix, so a plain `.iso` or `.gcz` is never offered to this tool, and an NKit
+  image is still visible to CHDMAN/Dolphin/CSO (which own the generic tails) if
+  you deliberately want one of those instead.
+- **No verify.** nkit2iso has no verify subcommand: integrity is the header CRC32
+  it checks inline during the restore, so a completed job *is* the verification
+  and there is nothing to re-run afterwards. The tool also deliberately does not
+  claim `.iso` as a verify extension — verify routing picks the first tool
+  matching an extension, so claiming it would hijack the Verify action for every
+  CD/DVD ISO in a library (the same reason Dolphin keeps `.iso` off its verify
+  list).
+- **No delete-on-verify, for either mode.** `nkit_restore` has nothing to verify
+  its output against. `nkit_to_rvz` produces a `.rvz` Dolphin *can* verify, but
+  that check is structural — it confirms the RVZ container, not that the disc
+  inside matches the original. A Wii image restored without its update partition
+  (see below) yields a cleanly verifying RVZ that is nonetheless not bit-exact,
+  and deleting the NKit source on that evidence would destroy the only file a
+  later recovery-enabled restore could use. Delete the source yourself once
+  you're satisfied with the result.
+- **Removed Wii update partitions.** Some Wii images were shrunk by dropping the
+  update (system-menu/IOS) partition, whose data is not in the file and cannot be
+  regenerated. By default (`NKIT2ISO_RECOVERY=none`) that region is zero-filled,
+  exactly as official NKit does without its recovery files: the ISO is playable,
+  the CRC32 check is skipped, and the job's final message says plainly that the
+  result is **not** redump-verifiable. Set `NKIT2ISO_RECOVERY=download` to have
+  nkit2iso fetch the matching publicly-archived recovery partition and splice it
+  back in for a bit-exact restore. That is the only situation in which the tool
+  touches the network, which is why it is opt-in. The tool's own interactive
+  `ask` mode is never used — a job worker has no terminal to answer it on.
+- The nkit2iso binary (MIT, from `DonMikone/nkit2iso`) is a static Go binary built
+  into the Docker image for both `linux/amd64` and `linux/arm64`.
+
+### NKit Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NKIT2ISO_PATH` | `/usr/local/bin/nkit2iso` | Path to the nkit2iso binary |
+| `NKIT2ISO_RECOVERY` | `none` | `none` (offline, zero-fill a removed Wii update partition) or `download` (fetch the archived recovery partition for a bit-exact restore) |
 
 (Global vars, including the tool-neutral priority knobs, are in [Environment Variables](#environment-variables).)
 
@@ -958,6 +1055,10 @@ archive.
 - `GET /api/jwud-verify/events?path=<path>` - Streaming verification (SSE)
 - `POST /api/jwud-verify-batch/events` - Batch verification (SSE)
 - `POST /api/jobs` or `POST /api/jobs/batch` - Queue a job with `mode: "jwud_compress"` or `"jwud_decompress"`
+- `POST /api/jobs` or `POST /api/jobs/batch` - Queue an NKit job. Use `mode: "nkit_restore"` (→ `.iso`) or `mode: "nkit_to_rvz"` (→ `.rvz`) with the `.nkit.iso`/`.nkit.gcz` as the input path (`file_path` for a single job, `file_paths` for a batch).
+- `GET /api/nkit-info?path=<file>` - NKit header details: platform, game ID, title, disc number/version, restored size, stored CRC32, and the shrunk-to-original ratio.
+
+There is no verify endpoint for this tool, for the reason in the notes above.
 
 ---
 
@@ -1062,6 +1163,9 @@ All actions are queued and processed by the job queue (FIFO). The queue is the o
 
 **Wii U**
 - `jwud_compress` (.wud → .wux), `jwud_decompress` (.wux → .wud)
+**NKit (GameCube/Wii)**
+- `nkit_restore` (.nkit.iso / .nkit.gcz → the original full-size `.iso`)
+- `nkit_to_rvz` (.nkit.iso / .nkit.gcz → .rvz, one-step chain through nkit2iso + dolphin-tool)
 
 Notes:
 - Compression settings apply to CHD **create**/**copy**, Dolphin RVZ/WIA, Switch (`nsz_compress`), the CSO/CSO v2/ZSO/DAX compress modes, and the handheld ROM compress modes (`romz_7z`/`romz_zip`) — the last two take an effort preset. Other modes ignore them.
@@ -1070,6 +1174,8 @@ Notes:
 - Dolphin GCZ/ISO outputs ignore compression selection.
 - 3DS and Wii U compression use fixed settings (no user configuration needed).
 - Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, CSO, and Wii U), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
+- 3DS compression uses fixed settings (no user configuration needed).
+- Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, CSO, and NKit), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
 
 ---
 
@@ -1208,6 +1314,8 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `Z3DS_COMPRESSOR_PATH` | `/usr/local/bin/z3ds_compressor` | Path to z3ds_compressor binary |
 | `MAXCSO_PATH` | `/usr/local/bin/maxcso` | Path to maxcso binary (PSP/PS2 CSO/CSO v2/ZSO/DAX) |
 | `MAKEPS3ISO_PATH` | `/usr/local/bin/makeps3iso` | Path to the makeps3iso binary (PS3 folder → ISO) |
+| `NKIT2ISO_PATH` | `/usr/local/bin/nkit2iso` | Path to the nkit2iso binary (NKit → ISO) |
+| `NKIT2ISO_RECOVERY` | `none` | What nkit2iso does with a Wii image whose update partition was removed: `none` zero-fills it (offline; playable but not redump-verifiable), `download` fetches the archived recovery partition for a bit-exact restore. `download` is the only path on which the tool uses the network. |
 | `NSZ_PATH` | `nsz` | Path to the nsz binary (Nintendo Switch); resolved on PATH by default |
 | `SEVENZIP_PATH` | `7z` | Path to the 7z binary (handheld ROM archives); resolved on PATH by default (set an absolute path or `7zz` if your distro ships the newer `7zip` package) |
 | `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher (Wii U WUD ↔ WUX); the image ships a launcher that execs the bundled jar with a headless JRE |
@@ -1224,7 +1332,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for every tool (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |
 | `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` | `60` | Timeout in seconds for `info`/`header` subprocesses, used by chdman and Dolphin (nsz/3DS read info from the filesystem, so it doesn't apply to them). 0 disables. Legacy alias: `CHD_INFO_TIMEOUT`. |
 | `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `0` | Timeout in seconds for verify runs across all tools (0 disables). Legacy alias: `CHD_VERIFY_TIMEOUT`. |
-| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), `MAKEPS3ISO`, or `JWUD` (Wii U) (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO` and `JWUD` take the `_NICE`/`_IOPRIO_*` knobs but have no `_VERIFY_TIMEOUT`: makeps3iso has no verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
+| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), `MAKEPS3ISO`, `NKIT2ISO`, or `JWUD` (Wii U) (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO`, `NKIT2ISO` and `JWUD` take the `_NICE`/`_IOPRIO_*` knobs but have no `_VERIFY_TIMEOUT`: neither makeps3iso nor nkit2iso has a verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
 | `COMPRESSATORIUM_<TOOL>_INFO_TIMEOUT` | (shared default) | Optional per-tool info-timeout override, only for `<TOOL>` = `CHDMAN` or `DOLPHIN_TOOL` (the only tools whose `info` runs a subprocess); falls back to the shared `COMPRESSATORIUM_TOOL_INFO_TIMEOUT`. |
 | `CHD_ARCHIVE_MAX_ENTRIES` | `5000` | Max archive members to list (0 disables limit) |
 | `CHD_ARCHIVE_MAX_MEMBER_SIZE` | `0` | Max size in bytes per archive member (0 disables limit) |
@@ -1388,6 +1496,7 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.wud` - Wii U disc images (Wii U compression)
 - `.wux` - compressed Wii U disc images (Wii U decompression)
 - A decrypted PS3 folder (one containing a `PS3_GAME/` directory) - packed to `.iso` (PS3 ISO tool; the input is a folder, not a file)
+- `.nkit.iso`, `.nkit.gcz` - NKit-shrunk GameCube/Wii disc images (NKit restore). These are matched on the whole compound extension, so a plain `.iso`/`.gcz` is never mistaken for one
 
 **Archive formats (Web UI):**
 - `.zip` - ZIP archives
@@ -1402,6 +1511,8 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.7z`, `.zip` - Handheld ROM archives (7z; `romz_extract` restores the original `.gb`/`.gbc`/`.gba`/`.nds`)
 - `.iso` (and a split `.iso.0`/`.iso.1`/… set on FAT32) - PS3 ISO packed from a decrypted folder (makeps3iso)
 - `.wux` - Compressed Wii U disc images (JWUDTool; `jwud_decompress` restores the original `.wud`)
+- `.iso` - the full-size GameCube/Wii disc image restored from an NKit source (nkit2iso)
+- `.rvz` - a GameCube/Wii disc restored from NKit and compressed in one job (the `nkit_to_rvz` chain)
 
 ---
 
@@ -1472,5 +1583,6 @@ This project is a fork of the original Docker CHD Converter project by [MarcTV](
 - [maxcso](https://github.com/unknownbrackets/maxcso) by [unknownbrackets](https://github.com/unknownbrackets) - PSP/PS2 CSO/ZSO/DAX compression
 - [nsz](https://github.com/nicoboss/nsz) by [nicoboss](https://github.com/nicoboss) - Nintendo Switch NSP/XCI compression
 - [ps3iso-utils (makeps3iso)](https://github.com/bucanero/ps3iso-utils) by [bucanero](https://github.com/bucanero) - PS3 decrypted folder → ISO (GPL-3.0)
+- [nkit2iso](https://github.com/DonMikone/nkit2iso) by [DonMikone](https://github.com/DonMikone) - NKit-shrunk GameCube/Wii image → ISO (MIT), a clean-room Go reimplementation of the NKit algorithms created by [Nanook](https://github.com/Nanook/NKitv1)
 
 Thanks to everyone who built and shared these tools.

@@ -29,9 +29,10 @@ from typing import TYPE_CHECKING
 
 from config import settings
 from models import OutputStatus
+from fastapi.concurrency import run_in_threadpool
 from services.disk import create_scratch_dir, ensure_headroom
 from services.lock_manager import lock_manager
-from services.maxcso import uncompressed_iso_size
+from utils.path_utils import match_extension
 
 from .base import BaseTool
 from .spec import ChainSpec, ChainStep, ModeKind
@@ -69,10 +70,58 @@ CSO_TO_CHD = ChainSpec(
 )
 
 
+# .nkit.iso/.nkit.gcz -> .iso (nkit2iso, bit-exact) -> .rvz (dolphin_rvz).
+# NKit is a shrink format no emulator reads, so the restored ISO is almost never
+# the thing a body wants to keep — it's a 4.7 GB stepping stone to RVZ, which
+# Dolphin reads natively and which compresses better than NKit anyway. Chaining
+# means the full-size ISO lives in the scratch dir and never lands in the
+# library. dolphin_rvz is pinned as the target because RVZ is the format the
+# README already recommends over WIA/GCZ.
+NKIT_TO_RVZ = ChainSpec(
+    mode="nkit_to_rvz",
+    tool_id="chain",
+    kind=ModeKind.COMPRESS,
+    label="NKit → RVZ",
+    group="chain",
+    output_ext=".rvz",
+    input_extensions=frozenset({".nkit.iso", ".nkit.gcz"}),
+    steps=(
+        # RVZ compression dominates: the NKit restore is a linear rebuild, while
+        # dolphin-tool re-compresses the whole disc.
+        ChainStep(tool_id="nkit", mode="nkit_restore", weight=0.35, output_ratio=3.0),
+        ChainStep(tool_id="dolphin", mode="dolphin_rvz", weight=0.65, output_ratio=1.0),
+    ),
+    intermediate_exts=(".iso",),
+    verify_step=1,
+    # No compression knob, same as cso_to_chd and for a sharper reason: the
+    # RVZ codec/level guards in ``_validate_request_compression`` are keyed on
+    # ``spec.tool_id == "dolphin"``, and a chain's tool_id is "chain", so
+    # advertising the picker here would accept a comma-joined codec list the
+    # route can't reject and dolphin can't honor. Making that guard chain-aware
+    # means reading ``ChainSpec.steps`` from the route, which the design keeps
+    # exclusive to ChainTool. The final RVZ therefore uses dolphin's defaults;
+    # pick a level by running nkit_restore and dolphin_rvz as two jobs.
+    supports_compression=False,
+    supports_compression_level=False,
+    # NO delete-on-verify, even though dolphin can verify the final .rvz. That
+    # verify is *structural* — it confirms the RVZ container, not that its
+    # contents match the original disc. When the source is a Wii image whose
+    # update partition was removed and NKIT2ISO_RECOVERY is "none", step 1
+    # zero-fills the gap and skips its CRC32 check, yet the resulting RVZ still
+    # verifies cleanly. Deleting the source on that evidence would destroy the
+    # only file a later NKIT2ISO_RECOVERY=download run could restore bit-exact.
+    # The flag is a static ModeSpec field read at plan time, before the restore
+    # can report whether it was exact, so there is no safe "only when exact"
+    # setting — and the failure mode is silent data loss. Off.
+    supports_delete_on_verify=False,
+    allows_archive_input=True,
+)
+
+
 class ChainTool(BaseTool):
     id = "chain"
     display_name = "Pipeline"
-    modes = (CSO_TO_CHD,)
+    modes = (CSO_TO_CHD, NKIT_TO_RVZ)
     # The chain's outputs/verify are owned by the final step's tool (chdman
     # already claims .chd), so the chain claims neither set — it must not
     # double-register .chd in verify_extensions / output_extensions.
@@ -94,10 +143,26 @@ class ChainTool(BaseTool):
         *,
         treat_as_stem: bool = False,
     ) -> str:
-        final = self.spec(mode).steps[-1]
-        return self._registry.for_mode(final.mode).output_path(
-            final.mode, input_path, output_dir, treat_as_stem=treat_as_stem,
+        """Name the chain's product: the FIRST step's stem, the chain's suffix.
+
+        The first step owns the input, so only its tool knows how to strip the
+        source name correctly — ``nkit_restore`` has to drop a whole compound
+        ``.nkit.iso``, which the final step's tool (dolphin) would leave as
+        ``Game.nkit.rvz``. Taking the first step's own output path and swapping
+        in the chain's declared ``output_ext`` gets both right, and is identical
+        to delegating to the last step for a plain-suffix chain like
+        ``cso_to_chd`` (``Game.cso`` -> ``Game.iso`` -> ``Game.chd``).
+        """
+        spec = self.spec(mode)
+        first = spec.steps[0]
+        intermediate = self._registry.for_mode(first.mode).output_path(
+            first.mode, input_path, output_dir, treat_as_stem=treat_as_stem,
         )
+        if not spec.output_ext:
+            return intermediate
+        # The intermediate always carries a plain single suffix (it is a
+        # tool-written file, not a user-named one), so with_suffix is safe here.
+        return str(Path(intermediate).with_suffix(spec.output_ext))
 
     def detect_output(
         self, input_path: str, *, from_archive: bool = False,
@@ -105,16 +170,17 @@ class ChainTool(BaseTool):
         """Badge the source when the chain's own product already exists.
 
         Resolved per chain spec rather than against a literal ``.chd``: the
-        candidate extension comes from whichever mode accepts this input, so a
-        second chain with a different final format badges its own output
-        instead of silently probing the first chain's.
+        candidate comes from whichever mode accepts this input, so a second
+        chain with a different final format badges its own output instead of
+        silently probing the first chain's.
         """
-        source = Path(input_path)
-        ext = source.suffix.lower()
         for spec in self.modes:
-            if ext not in spec.input_extensions or not spec.output_ext:
+            if (
+                match_extension(input_path, spec.input_extensions) is None
+                or not spec.output_ext
+            ):
                 continue
-            candidate = str(source.with_suffix(spec.output_ext))
+            candidate = self.output_path(spec.mode, input_path)
             file_exists, is_locked = lock_manager.check_file_status(candidate)
             if not (file_exists or is_locked):
                 continue
@@ -154,15 +220,37 @@ class ChainTool(BaseTool):
         spec = self.spec(mode)
         work_dir = create_scratch_dir("cmptr-chain-")
         try:
-            self._preflight_headroom(input_path, output_path, spec, work_dir)
+            # Off the event loop: the preflight stats the source, asks the
+            # first step's plugin for a header-derived size (a read, and a zlib
+            # block for a .nkit.gcz), and calls statvfs on two volumes — all
+            # blocking, and all potentially slow on a network mount.
+            await run_in_threadpool(
+                self._preflight_headroom, input_path, output_path, spec, work_dir,
+            )
 
             total_weight = sum(s.weight for s in spec.steps) or 1.0
             weights = [s.weight / total_weight for s in spec.steps]
             n = len(spec.steps)
-            stem = Path(input_path).stem
+            # Name the intermediate off the FIRST step's own output path, not
+            # Path(input_path).stem: a compound-extension source (.nkit.iso)
+            # would otherwise leave "Game.nkit" as the stem and write the
+            # scratch ISO as "Game.nkit.iso".
+            stem = Path(
+                self._registry.for_mode(spec.steps[0].mode).output_path(
+                    spec.steps[0].mode, input_path,
+                )
+            ).stem
             current_in = input_path
             cumulative = 0.0
             intermediate_source = input_path  # what feeds the final (for tagging)
+            # Caveats a step raised about its own output. A later step's
+            # messages replace the earlier ones in the job row, so anything a
+            # step needs the operator to KNOW (nkit2iso restoring a Wii image
+            # without its update partition: playable, but not bit-exact) has to
+            # be carried to the terminal message or it is lost. Steps opt in by
+            # marking an update with ``warning``; job_manager reads only
+            # progress/message, so the extra key is inert everywhere else.
+            caveats: list[str] = []
 
             for i, step in enumerate(spec.steps):
                 tool = self._registry.for_mode(step.mode)
@@ -196,6 +284,8 @@ class ChainTool(BaseTool):
                     compression=step_compression, cancel_event=cancel_event,
                 ):
                     last_message = update.get("message") or last_message
+                    if update.get("warning") and last_message not in caveats:
+                        caveats.append(last_message)
                     raw = update.get("progress") or 0
                     aggregate = int(round(base + span * (raw / 100.0)))
                     yield {
@@ -212,7 +302,18 @@ class ChainTool(BaseTool):
             await self._registry.for_mode(final_step.mode).post_convert(
                 intermediate_source, output_path, final_step.mode,
             )
-            yield {"progress": 100, "message": "Conversion complete"}
+            complete = "Conversion complete"
+            if caveats:
+                # Keep the caveat AND the fact that the chain finished: the
+                # output is real and usable, it just isn't what an unqualified
+                # "complete" would imply.
+                yield {
+                    "progress": 100,
+                    "message": f"{complete} — {' '.join(caveats)}",
+                    "warning": True,
+                }
+            else:
+                yield {"progress": 100, "message": complete}
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -225,15 +326,21 @@ class ChainTool(BaseTool):
             return  # can't size the input; skip rather than block the job
         if input_size <= 0:
             return
-        # Prefer the true uncompressed ISO size from the container header: a
-        # highly compressed .cso/.zso/.dax can be a small fraction of the ISO
-        # maxcso will write, so a ratio on the compressed size badly under-counts
-        # the intermediate. The final .chd is at most the ISO size (chdman
-        # compresses), so the uncompressed size is a safe bound for both.
-        uncompressed = uncompressed_iso_size(input_path)
-        if uncompressed and uncompressed > 0:
-            intermediate_bytes = uncompressed
-            final_bytes = uncompressed
+        # Prefer the true intermediate size the FIRST step's tool can read out
+        # of the source header, instead of a ratio on the (possibly tiny)
+        # compressed input: a heavily compressed .cso/.zso/.dax, or a scrubbed
+        # .nkit.iso, can be a small fraction of the .iso its tool will write.
+        # Asked through the plugin contract rather than importing one tool's
+        # reader here, so a new chain's first step brings its own answer.
+        first = spec.steps[0]
+        expected = self._registry.for_mode(first.mode).expected_output_size(
+            input_path, first.mode,
+        )
+        if expected and expected > 0:
+            # Every chain so far ends in a compressing step, so the final output
+            # is at most the intermediate — a safe bound for both targets.
+            intermediate_bytes = expected
+            final_bytes = expected
         else:
             n = len(spec.steps)
             intermediate_bytes = int(

@@ -93,6 +93,62 @@ and #179, part of the #177 tech-debt epic).
   verify-side pair. `.cue`/`.gdi` track files still go through delete_plan's own
   content parser rather than the new hook — folding those in would move their
   unsafe-reference handling, so it is left for its own change.
+- **New tool: NKit → ISO (`nkit2iso`).** Restores an NKit-shrunk GameCube or Wii
+  disc image (`.nkit.iso`, `.nkit.gcz`) back to a plain, full-size `.iso`, using
+  [nkit2iso](https://github.com/DonMikone/nkit2iso) (MIT, a static Go binary
+  built into the image for `linux/amd64` and `linux/arm64`). One mode,
+  `nkit_restore`, with no settings: NKit drops everything a program can recreate
+  (junk padding, gaps, all-junk files, and for Wii the AES encryption and H0–H3
+  hash tree), and the restore rebuilds all of it, then CRC32-checks the result
+  against the value stored in the NKit header — so a completed job is bit-exact.
+  Archive members work too: an NKit image inside a `.zip`/`.7z`/`.rar` converts
+  in place.
+
+  This is a one-way tool — Compressatorium never *writes* NKit — so there is no
+  compress direction. It also registers **no info or verify routes**: nkit2iso
+  has no such subcommand, integrity is the header CRC32 checked inline during
+  the restore, and for the same reason delete-on-verify is not offered.
+
+  A Wii image whose update partition was removed at shrink time cannot come back
+  byte-exact — that data simply is not in the file. By default
+  (`NKIT2ISO_RECOVERY=none`) the region is zero-filled, exactly as official NKit
+  does without its recovery files, and the job's final message says plainly that
+  the ISO is playable but **not** redump-verifiable. Set
+  `NKIT2ISO_RECOVERY=download` to have nkit2iso fetch the publicly archived
+  recovery partition and splice it in for a bit-exact restore; that is the only
+  path on which the tool touches the network, which is why it is opt-in. The
+  tool's own interactive `ask` mode is never used — a job worker has no terminal
+  to answer it on.
+
+  New env vars: `NKIT2ISO_PATH`, `NKIT2ISO_RECOVERY`, plus the usual
+  `COMPRESSATORIUM_NKIT2ISO_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` overrides.
+
+- **NKit info (`GET /api/nkit-info`).** nkit2iso has no `info` subcommand, so
+  this reads the NKit/disc header directly — the same one the binary reads —
+  and reports the console (GameCube or Wii), game ID and title, disc number and
+  version, the size the restored ISO will occupy, the CRC32 the restore is
+  checked against, and the shrunk-to-original ratio. Worth a look before
+  spending a restore on a multi-gigabyte image. A `.nkit.gcz` is handled by
+  inflating a single zlib block to reach the header — with every header-supplied
+  length bounded against the file's real size first, so a crafted container
+  can't drive a multi-gigabyte read. A file named `.nkit.iso` whose bytes carry
+  no NKit marker reports 422, not 500.
+
+- **New one-step pipeline: `nkit_to_rvz` (NKit → ISO → RVZ).** The second
+  `ChainSpec`, alongside `cso_to_chd`. NKit is a shrink format no emulator
+  reads, so the restored ISO is nearly always a stepping stone to RVZ — which
+  Dolphin reads natively and which compresses better than NKit anyway. Chaining
+  keeps the full-size ISO in a scratch directory instead of the library. Neither
+  NKit mode offers delete-on-verify: dolphin's RVZ verify is *structural* (it
+  confirms the container, not that the disc inside matches the original), and a
+  Wii image restored without its update partition yields a cleanly verifying RVZ
+  that is not bit-exact — deleting the source on that evidence would destroy the
+  only file a later recovery-enabled restore could use. The final RVZ uses
+  dolphin's defaults; run the
+  two steps as separate jobs to pick a codec and level (the RVZ codec guards in
+  `_validate_request_compression` key on `spec.tool_id == "dolphin"`, and making
+  them chain-aware would mean reading `ChainSpec.steps` from the route, which
+  the design keeps exclusive to `ChainTool`).
 
 - **Two per-tool branches on shared paths became plugin hooks
   (`overwrite_targets`, `is_ready`).** Both were single-tool special cases
@@ -176,6 +232,66 @@ and #179, part of the #177 tech-debt epic).
   on; the file/search JSON simply no longer carries the dead flags.
 
 ### Changed
+
+- **Extension matching is now a suffix match, so a tool can declare a compound
+  extension.** Every "does this tool handle this file?" check used to be
+  `Path(name).suffix.lower() in declared`, re-typed at each site. That can only
+  ever see one trailing component, which made a format like `.nkit.iso`
+  undeclarable: its trailing component is the generic `.iso` that CHDMAN,
+  Dolphin and maxcso already own, so the choice would have been over-claiming
+  every ISO or hard-coding a content sniff.
+
+  The check moved behind one shared helper,
+  `utils.path_utils.match_extension(name, extensions)`, which returns the
+  longest declared extension the name ends with. It is used by
+  `registry.tools_for_input` / `tool_for_verify` /
+  `tools_accepting_archive_member`, `BaseTool.verifies_path`, the archive-member
+  gate, `routes/files.py`'s output detection, and the plan-time input gate in
+  `routes/convert.py`. The frontend already matched with `endsWithAny`, so it
+  needed no change.
+
+  **No behavior change for any existing tool**: every other declaration is a
+  single component, and `game.iso` ends with `.iso` and nothing else. Matching is
+  per-tool, so an NKit image is claimed by `nkit` *and* by the generic-tail
+  owners — the same way a raw `.iso` is already claimed by chdman, dolphin and
+  cso — rather than displacing them. `tests/test_compound_extension_matching.py`
+  pins both halves.
+
+  Two consumers needed a matching tweak. On the frontend,
+  `registry.toolsForSourcePath` / `infoToolsForPath` now rank claiming tools by
+  **matched-extension length** instead of declaration order: the Info modal keeps
+  the first `getInfo()` that returns, and Dolphin's header reader *succeeds* on an
+  NKit image (it carries a genuine GC/Wii disc header), so without the ranking a
+  `.nkit.iso` would have been described as an ordinary disc. And `ChainTool` now
+  names its product from the **first** step's stem plus the chain's own
+  `output_ext` rather than delegating to the last step's tool, which would have
+  produced `Game.nkit.rvz`; the result is identical for `cso_to_chd`.
+
+- **Chain steps can flag a caveat that survives to the terminal message.** A
+  later step's messages replace earlier ones, so anything an earlier step needs
+  the operator to *know* (nkit2iso restoring a Wii image without its update
+  partition: playable, but not bit-exact) was lost when the chain reported a
+  bare "Conversion complete". A step now marks such an update with
+  `warning: True` and `ChainTool` carries those into its own final message;
+  `job_manager` reads only `progress`/`message`, so the key is inert elsewhere.
+
+- **`test_delete_on_verify_iff_output_is_verifiable` became
+  `test_delete_on_verify_requires_a_verifiable_output`.** The old test asserted
+  equivalence in both directions. The safety-critical direction still holds for
+  every mode with no exceptions (delete ⇒ the output must be verifiable), but
+  the converse is wrong: verification proves an output is *well-formed*, not
+  that the conversion preserved the source. A mode whose pipeline can be lossy
+  now declines the flag via an explicit, documented allow-list.
+
+- **`ToolPlugin.expected_output_size(input_path, mode)`.** `ChainTool`'s
+  disk-headroom preflight imported `services.maxcso.uncompressed_iso_size`
+  directly — a single-tool special case on code every chain runs through, the
+  same shape as the `overwrite_targets` / `is_ready` branches removed earlier, so
+  a second chain starting with a different tool would silently fall back to a
+  ratio. The preflight now asks the first step's plugin. `BaseTool` returns
+  `None` (fall back to `ChainStep.output_ratio`); `MaxcsoTool` answers for
+  `cso_decompress`, `Nkit2IsoTool` from the NKit header. Preflight-only, never a
+  correctness input, so an unreadable file is `None` rather than an error.
 
 - **"Adding a tool" guide brought back in sync with the code.**
   `docs/ADDING_PLATFORMS_AND_TOOLS.md` had drifted behind the Phase 7/9
