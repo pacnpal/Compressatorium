@@ -442,3 +442,46 @@ def test_delete_on_verify_iff_output_is_verifiable():
                 f"{mode.mode}: supports_delete_on_verify={mode.supports_delete_on_verify} "
                 f"but outputs {sorted(outs)} verifiable against {sorted(vexts)} = {verifiable}"
             )
+
+
+def test_a_modes_inputs_can_exceed_the_tools_listing_extensions():
+    """`convertible_by` is tool-level and mode-agnostic; a mode's inputs are not.
+
+    ChdmanTool deliberately drops `.chd` from `input_extensions` so a finished
+    CHD isn't badged as a convertible *source* in listings — but `.chd` is
+    exactly what its extract/copy modes take. So for a `.chd` row,
+    `FileEntry.convertible_by` is empty while `extractcd` accepts it.
+
+    This is a trap for consumers: anything gating a *mode-specific* decision on
+    the tool-level annotation will reject valid inputs. Gating file-row
+    selection on it made every CHDMAN extract/copy row unselectable. The
+    mode-aware question is `registry.for_mode(mode).converts_path(path)`; use
+    that instead, and note it is only meaningful for tools whose union really
+    does describe their modes (which is why `plan_job` applies it alongside the
+    per-mode extension check rather than on its own).
+    """
+    chdman = registry.get("chdman")
+
+    # The divergence itself.
+    assert ".chd" not in chdman.input_extensions
+    assert ".chd" in registry.spec("extractcd").input_extensions
+    assert ".chd" in registry.spec("copy").input_extensions
+
+    # So a .chd is claimed by no tool at the listing level...
+    assert registry.tools_converting_path("/data/out.chd") == []
+    # ...even though extract/copy are exactly the modes that consume it.
+    assert registry.for_mode("extractcd").id == "chdman"
+
+    # Every other tool's union does cover its modes, so the annotation and the
+    # mode agree for them; chdman is the single documented exception.
+    diverging = {
+        tool.id
+        for tool in registry.all()
+        for mode in tool.modes
+        if not mode.input_extensions <= tool.input_extensions
+    }
+    assert diverging == {"chdman"}, (
+        "a new tool's mode declares inputs its `input_extensions` union omits; "
+        "listing-level `convertible_by` will not describe it, so any consumer "
+        f"gating on that annotation must be re-checked: {sorted(diverging)}"
+    )
