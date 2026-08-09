@@ -321,7 +321,8 @@ app = FastAPI(
     title="Compressatorium",
     description=(
         "Web UI for converting game files with chdman, dolphin-tool, "
-        "z3ds_compressor, nsz, maxcso, and 7z (handheld ROM archives)"
+        "z3ds_compressor, nsz, maxcso, 7z (handheld ROM archives), "
+        "and makeps3iso (PS3 folder to ISO)"
     ),
     version=get_version(),
     lifespan=lifespan,
