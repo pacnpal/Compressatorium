@@ -1234,6 +1234,13 @@ this respect however unusual their inputs or hashes are. Two notes on top:
   `tests/test_frontend_parity_186.py` skips that field via
   `_TOOL_ID_EXCEPTIONS` — today `{"cso_to_chd"}`. Add your mode there (or key the
   exception off `ChainSpec` rather than a literal) or the parity test fails.
+
+  Before starting, **`grep -rn cso_to_chd app src tests`**. This list has been
+  incomplete twice; the grep is the only reliable inventory. Most of the ~14
+  hits are things a second chain gets naturally (the `ConversionMode` member, a
+  `_BAD_EXTENSION_REASON` row, Help blurbs, test fixtures), but read each one and
+  decide — anything that names the *one* chain by literal is a site that may need
+  yours too.
   `ChainTool` resolves the output candidate and the verify/info owner **per
   spec** (`detect_output` takes the candidate extension from the mode that
   accepts the input; verify/info resolve the owning spec by output extension,
