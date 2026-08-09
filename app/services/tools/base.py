@@ -151,6 +151,18 @@ class ToolPlugin(Protocol):
         handle, not on extension alone.
         """
 
+    def scannable_path(self, path: str) -> bool:
+        """Whether the library metadata / DAT-match scan should read this file.
+
+        ``scannable_extensions`` picks the walk by *type*; this vetoes an
+        individual path within it. Default ``True`` — override only when a name
+        matching a produced extension is provably not a standalone artifact, so
+        hashing it can only ever waste I/O. Any tool answering ``False`` drops
+        the path from the walk, since a file no tool considers scannable is one
+        no DAT can match. Pure name math: it runs once per candidate across the
+        whole library, so it must not touch the disk.
+        """
+
     def convert(
         self,
         input_path: str,
@@ -344,6 +356,12 @@ class BaseTool:
         # over-claim a container extension (e.g. romz on .7z/.zip) override with
         # per-file inspection.
         return match_extension(path, self.verify_extensions) is not None
+
+    def scannable_path(self, path: str) -> bool:
+        # Default: every path the extension walk found is worth scanning, the
+        # rule the scan used before this hook existed. Only a tool that knows a
+        # name cannot be a standalone artifact (a jwud split part) vetoes one.
+        return True
 
     async def embedded_hashes(
         self, path: str, *, cancel_event: asyncio.Event | None = None,

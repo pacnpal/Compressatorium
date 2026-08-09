@@ -1085,6 +1085,27 @@ Both hooks may touch the disk (they look for the sibling primary / enumerate the
 set), so they run in the `files.py` threadpool scan and inside
 `build_delete_plan`, never on the event loop.
 
+A set also costs two things a single-file source never did, and both are
+registry-driven rather than jwud branches:
+
+- **Containment.** `source_companions` is *name*-derived, so a companion can be
+  whatever the filesystem puts under that name. The converter opens them itself
+  — JNUSLib enumerates the parts from part 1 rather than taking a list from us —
+  so the volume boundary the route enforces on the submitted path has to be
+  enforced on the companions too, before the job starts. `plan_job` rejects a
+  symlinked companion outright (rather than following it) and any companion
+  resolving outside the configured volumes, with
+  `SOURCE_COMPANION_UNSAFE`. It is a no-op for the eight tools whose
+  `source_companions` is `[]`.
+- **Scan cost.** `.wud` is a produced output, so `scannable_extensions` puts
+  every `game_partN.wud` in the DAT-match walk — twelve 2 GiB files SHA1'd in
+  full, ~25 GB per set, to match nothing, because a part is a slice of a disc
+  image rather than one. `ToolPlugin.scannable_path(path) -> bool` (default
+  `True`) is the per-file veto on that walk, the scan-side analogue of
+  `converts_path`; the registry drops a path any tool rejects, since a file some
+  tool knows is not a standalone artifact cannot match a DAT whatever the others
+  think. Pure name math — it runs once per candidate across the whole library.
+
 **Naming the set's product is a third disk-reading decision.** Part 1 of a set
 produces `game.wux`, not `game_part1.wux` — the parts are one image and the part
 number is meaningless once they're joined. But that rewrite is only correct when

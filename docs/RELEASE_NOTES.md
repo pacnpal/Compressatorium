@@ -47,7 +47,15 @@ and #179, part of the #177 tech-debt epic).
   its output and risk overwriting an unrelated finished image. Output detection
   gained a matching `from_archive` flag (`ToolPlugin.detect_output`), so an
   archive member is never mistaken for a real file with real neighbours; the
-  seven pre-existing tools ignore it.
+  pre-existing tools ignore it. "Complete" is checked part by part, not just as
+  a total: a short part balanced by a long one sums to a whole image but is
+  still unjoinable, because the reader computes each part's offset from its
+  index. A set whose sibling parts are symlinks, or resolve outside the
+  configured volumes, is refused before the job starts (`plan_job`) — the
+  converter opens those files itself, so that is the only place to stop it. And
+  because `.wud` is a produced output, the DAT-match scan would otherwise SHA1
+  all twelve 2 GiB parts of every set; a new `ToolPlugin.scannable_path` hook
+  (default `True`) drops them from the walk.
 
   **Delete-on-verify is guarded per job (`delete_on_verify_is_safe`).** A third
   input-side hook, because the verification toggle below would otherwise create

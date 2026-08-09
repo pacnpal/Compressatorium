@@ -16,8 +16,10 @@ import pytest
 
 from app.services import jwudtool as jwud_module
 from app.services.chdman import ConversionCancelled
+from app.services.tools import registry as tool_registry
 
 service = jwud_module.jwudtool_service
+tool = tool_registry.get("jwud")
 
 
 # The format's only sector size, so the fixtures have the same geometry the real
@@ -629,6 +631,63 @@ def test_split_set_completeness_is_measured_in_bytes(tmp_path):
 
     assert jwud_module.split_set_is_complete(str(primary)) is False
     assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_split_set_parts_are_checked_individually_not_just_summed(tmp_path):
+    """A short part balanced by a long one sums right and is still unjoinable.
+
+    JNUSLib computes a part's offset from its *index*, not from the sizes of the
+    parts before it, so every byte past a short part is misaddressed even though
+    the total is exactly one disc image. Summing alone would accept this.
+    """
+    primary = _build_split_set(tmp_path)
+    short = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 3)
+    long = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 4)
+    with short.open("wb") as fh:
+        fh.truncate(jwud_module.WUD_SPLIT_PART_SIZE - 4096)
+    with long.open("wb") as fh:
+        fh.truncate(jwud_module.WUD_SPLIT_PART_SIZE + 4096)
+
+    # The total is still exactly WUD_IMAGE_SIZE...
+    total = sum(
+        (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % i)).stat().st_size
+        for i in range(1, jwud_module.WUD_SPLIT_MAX_PARTS + 1)
+    )
+    assert total == jwud_module.WUD_IMAGE_SIZE
+    # ...and the set is still rejected.
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_eleven_parts_summing_to_a_disc_is_not_a_valid_set(tmp_path):
+    """The right total in the wrong number of parts is still the wrong layout."""
+    _build_split_set(tmp_path, parts=11)
+    primary = tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 1)
+    # Give part 11 the leftover so the eleven parts sum to a whole image.
+    leftover = jwud_module.WUD_IMAGE_SIZE - 10 * jwud_module.WUD_SPLIT_PART_SIZE
+    with (tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 11)).open("wb") as fh:
+        fh.truncate(leftover)
+
+    assert jwud_module.split_set_is_complete(str(primary)) is False
+    assert service.output_stem(str(primary)) == "game_part1"
+
+
+def test_split_members_are_excluded_from_the_metadata_scan(tmp_path):
+    """`.wud` is a produced output, so the DAT walk would hash every 2 GiB part.
+
+    A part is a slice of a disc image and can never match a DAT, so the whole
+    ~25 GB set would be read for nothing. A whole-image `.wud` (what a decompress
+    job writes) stays scannable.
+    """
+    for index in range(1, jwud_module.WUD_SPLIT_MAX_PARTS + 1):
+        assert tool.scannable_path(
+            str(tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % index)),
+        ) is False
+    assert tool.scannable_path(str(tmp_path / "game.wud")) is True
+    assert tool.scannable_path(str(tmp_path / "game.wux")) is True
+    # Name math only — it runs once per candidate across the whole library, so
+    # it must not stat anything (nothing above exists on disk).
+    assert not any(p.exists() for p in tmp_path.iterdir())
 
 
 # --- verification toggle -----------------------------------------------------

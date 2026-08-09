@@ -281,6 +281,12 @@ async def scan_metadata_task(
                         real, treat_archives=False,
                     ):
                         continue
+                    # Per-file veto on top of the type filter: a name a tool
+                    # knows is a *slice* of an artifact rather than one itself
+                    # (jwud's game_partN.wud, twelve 2 GiB pieces of one disc)
+                    # can never match a DAT, so hashing it is pure waste.
+                    if not registry.scannable_path(real):
+                        continue
                     seen.add(real)
                     paths.append(real)
         return paths

@@ -192,6 +192,17 @@ class ToolRegistry:
             set().union(*(t.output_extensions for t in self._tools.values()))
         ))
 
+    def scannable_path(self, path: str) -> bool:
+        """Whether the metadata scan should read this concrete path.
+
+        The per-file companion to :meth:`scannable_extensions`, which selects
+        the walk by type only. A single tool vetoing the path drops it: a file
+        that some tool knows is not a standalone artifact cannot match a DAT
+        whatever the other tools think. Pure name math — it runs once per
+        candidate across the whole library.
+        """
+        return all(t.scannable_path(path) for t in self._tools.values())
+
     def scannable_extensions(self) -> tuple[str, ...]:
         """Extensions the library metadata scan should walk for.
 

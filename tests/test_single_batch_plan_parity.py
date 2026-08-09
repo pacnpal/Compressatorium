@@ -115,6 +115,19 @@ def _cases():
         path.write_bytes(b"data")
         return str(path)
 
+    def _symlink_escape(tmp_path: Path, name: str) -> str:
+        """A companion-named symlink pointing at a real file outside the volume.
+
+        The target is under the pytest tmp root but *outside* the configured
+        volume the parity fixture mounts, which is the boundary the route
+        enforces.
+        """
+        outside = tmp_path.parent / f"outside-{name}"
+        outside.write_bytes(b"secret")
+        link = tmp_path / name
+        link.symlink_to(outside)
+        return str(link)
+
     return [
         # --- acceptances (single creates a job; batch enqueues a spec) ---
         (
@@ -251,6 +264,20 @@ def _cases():
             lambda t: (
                 write(t, "game_part1.wud"),
                 write(t, "game_part2.wud"),
+            )[1],
+            ConversionMode.JWUD_COMPRESS,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "jwud_symlinked_companion_reject",  # SOURCE_COMPANION_UNSAFE
+            # JWUDTool opens the sibling parts itself, so a planted symlink
+            # would have it read outside the configured volumes. Only the
+            # submitted path passes the route's containment check, so the
+            # companions have to be checked here or nowhere.
+            lambda t: (
+                _symlink_escape(t, "game_part2.wud"),
+                write(t, "game_part1.wud"),
             )[1],
             ConversionMode.JWUD_COMPRESS,
             DuplicateAction.SKIP,

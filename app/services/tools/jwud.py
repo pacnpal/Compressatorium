@@ -18,6 +18,7 @@ from services.jwudtool import (
     JWUD_OUTPUT_FORMATS,
     is_split_secondary,
     jwudtool_service,
+    split_part_index,
     split_set_parts,
     verification_enabled,
 )
@@ -88,6 +89,15 @@ class JwudTool(BaseTool):
         if is_split_secondary(path):
             return False
         return super().converts_path(path)
+
+    def scannable_path(self, path: str) -> bool:
+        # `.wud` is a produced output (decompress writes one), so the DAT-match
+        # walk picks up every `game_partN.wud` of a split dump too — twelve 2 GiB
+        # files it would SHA1 in full, ~25 GB of reads per set, to match nothing:
+        # a part is a slice of a disc image, never a disc image. The whole-image
+        # `.wud` a decompress job writes is named after its source and so never
+        # collides with the part template.
+        return split_part_index(path) is None
 
     def source_companions(self, path: str) -> list[str]:
         # Parts 2…N of a split set, so delete-on-verify takes the whole source

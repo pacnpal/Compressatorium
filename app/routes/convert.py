@@ -345,6 +345,7 @@ class SkipReason(Enum):
     PS3_OUTPUT_INSIDE_SOURCE = "ps3_output_inside_source"
     PS3_OUTPUT_OUTSIDE_VOLUMES = "ps3_output_outside_volumes"
     PS3_FOLDER_UNSAFE = "ps3_folder_unsafe"
+    SOURCE_COMPANION_UNSAFE = "source_companion_unsafe"
 
 
 class SkipFile(Exception):  # noqa: N818 - control-flow signal, not an error
@@ -461,6 +462,12 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
     SkipReason.PS3_FOLDER_UNSAFE: (
         400,
         "PS3 folder contains symlinks or non-regular entries and cannot be packed safely",
+    ),
+    SkipReason.SOURCE_COMPANION_UNSAFE: (
+        400,
+        "A companion file this source consumes is a symlink or resolves outside "
+        "the configured volumes (for a split Wii U dump, one of the other "
+        "game_partN.wud files)",
     ),
 }
 
@@ -597,6 +604,25 @@ async def _plan_directory_job(
     )
 
 
+def _companions_are_safe(file_path: str) -> bool:
+    """Whether every sibling input this source consumes stays inside the volumes.
+
+    `source_companions` is name-derived, so a companion can be anything the
+    filesystem puts under that name — including a symlink out of the library.
+    Rejects a symlinked companion outright rather than following it: the
+    converter opens these files itself, so the only place to stop it is before
+    the job starts. Blocking I/O (lstat + realpath per companion); call it off
+    the event loop.
+    """
+    for companion in registry.source_companions(file_path):
+        if os.path.islink(companion):
+            return False
+        real = os.path.realpath(companion)
+        if not is_within_configured_volumes(real, treat_archives=False):
+            return False
+    return True
+
+
 async def plan_job(
     file_path: str,
     *,
@@ -710,6 +736,17 @@ async def plan_job(
             registry.for_mode(mode).converts_path, file_path,
         ):
             raise SkipFile(SkipReason.SOURCE_NOT_INDEPENDENTLY_CONVERTIBLE)
+
+    # A multi-file source drags in siblings the request never named, and the
+    # converter opens them itself — JNUSLib enumerates a split set's parts from
+    # part 1 rather than taking a list from us. So the volume boundary the route
+    # enforced on `file_path` has to be enforced on the companions too, or a
+    # planted `game_part2.wud` symlink would have the tool read a file outside
+    # the configured volumes and fold its bytes into the output. Registry-driven
+    # and a no-op for the eight single-file tools (`source_companions` is `[]`).
+    # Off the event loop: it stats and resolves each companion.
+    if not await run_in_threadpool(_companions_are_safe, file_path):
+        raise SkipFile(SkipReason.SOURCE_COMPANION_UNSAFE)
 
     if mode == "romz_extract":
         # romz-specific: validate the archive is a real single-ROM archive
