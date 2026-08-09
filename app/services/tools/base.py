@@ -182,6 +182,19 @@ class ToolPlugin(Protocol):
         override must list paths, never remove them.
         """
 
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        """Bytes this mode will write for ``input_path``, if cheaply knowable.
+
+        Only for *preflight sizing* — the chain's disk-headroom check, which
+        must hold source + full intermediate + partial final at once and cannot
+        estimate the intermediate from a ratio when a container's shrink factor
+        varies by an order of magnitude (a scrubbed Wii NKit, a highly
+        compressed CSO). Return ``None`` when the answer isn't in a header the
+        tool can read for free; callers fall back to ``ChainStep.output_ratio``.
+        Never a correctness input, so an unreadable file is ``None``, not an
+        error. Blocking (a small header read) — call it off the event loop.
+        """
+
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         """Sibling output paths this mode writes beside ``output_path``.
 
@@ -264,6 +277,12 @@ class BaseTool:
         # Default: nothing to check. Tools gated on a user-supplied secret or
         # an optional binary override this (see nsz / prod.keys).
         return True
+
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        # Default: unknown. Tools whose source header states the output size
+        # (maxcso's CSO/ZSO/DAX, nkit2iso's NKit) override it so the chain
+        # preflight sizes the intermediate exactly instead of by ratio.
+        return None
 
     async def post_convert(
         self, input_path: str, output_path: str, mode: str,

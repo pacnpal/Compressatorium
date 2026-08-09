@@ -169,6 +169,13 @@ def _cases():
             DuplicateAction.SKIP,
             "accept",
         ),
+        (
+            "nkit_to_rvz_accept",  # the chain takes the same NKit sources
+            lambda t: write(t, "game.nkit.iso"),
+            ConversionMode.NKIT_TO_RVZ,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
         # --- rejections / skips ---
         (
             "createcd_chd_reject",  # CREATE_REQUIRES_NON_CHD
@@ -195,6 +202,13 @@ def _cases():
             "dolphin_rvz_bad_ext_reject",  # DOLPHIN_BAD_EXTENSION
             lambda t: write(t, "game.txt"),
             ConversionMode.DOLPHIN_RVZ,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "nkit_to_rvz_bad_ext_reject",  # CHAIN_BAD_EXTENSION
+            lambda t: write(t, "game.iso"),
+            ConversionMode.NKIT_TO_RVZ,
             DuplicateAction.SKIP,
             "reject",
         ),

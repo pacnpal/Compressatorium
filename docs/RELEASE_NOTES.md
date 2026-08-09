@@ -37,6 +37,27 @@ and #179, part of the #177 tech-debt epic).
   New env vars: `NKIT2ISO_PATH`, `NKIT2ISO_RECOVERY`, plus the usual
   `COMPRESSATORIUM_NKIT2ISO_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` overrides.
 
+- **NKit info (`GET /api/nkit-info`).** nkit2iso has no `info` subcommand, so
+  this reads the NKit/disc header directly — the same one the binary reads —
+  and reports the console (GameCube or Wii), game ID and title, disc number and
+  version, the size the restored ISO will occupy, the CRC32 the restore is
+  checked against, and the shrunk-to-original ratio. Worth a look before
+  spending a restore on a multi-gigabyte image. A `.nkit.gcz` is handled by
+  inflating a single zlib block to reach the header. A file named `.nkit.iso`
+  whose bytes carry no NKit marker reports 422, not 500.
+
+- **New one-step pipeline: `nkit_to_rvz` (NKit → ISO → RVZ).** The second
+  `ChainSpec`, alongside `cso_to_chd`. NKit is a shrink format no emulator
+  reads, so the restored ISO is nearly always a stepping stone to RVZ — which
+  Dolphin reads natively and which compresses better than NKit anyway. Chaining
+  keeps the full-size ISO in a scratch directory instead of the library. Unlike
+  the plain restore this **does** support delete-on-verify, because its product
+  is a `.rvz` Dolphin can verify. The final RVZ uses dolphin's defaults; run the
+  two steps as separate jobs to pick a codec and level (the RVZ codec guards in
+  `_validate_request_compression` key on `spec.tool_id == "dolphin"`, and making
+  them chain-aware would mean reading `ChainSpec.steps` from the route, which
+  the design keeps exclusive to `ChainTool`).
+
 - **Two per-tool branches on shared paths became plugin hooks
   (`overwrite_targets`, `is_ready`).** Both were single-tool special cases
   sitting on code every tool runs through, so a *second* tool of the same shape
@@ -143,6 +164,26 @@ and #179, part of the #177 tech-debt epic).
   owners — the same way a raw `.iso` is already claimed by chdman, dolphin and
   cso — rather than displacing them. `tests/test_compound_extension_matching.py`
   pins both halves.
+
+  Two consumers needed a matching tweak. On the frontend,
+  `registry.toolsForSourcePath` / `infoToolsForPath` now rank claiming tools by
+  **matched-extension length** instead of declaration order: the Info modal keeps
+  the first `getInfo()` that returns, and Dolphin's header reader *succeeds* on an
+  NKit image (it carries a genuine GC/Wii disc header), so without the ranking a
+  `.nkit.iso` would have been described as an ordinary disc. And `ChainTool` now
+  names its product from the **first** step's stem plus the chain's own
+  `output_ext` rather than delegating to the last step's tool, which would have
+  produced `Game.nkit.rvz`; the result is identical for `cso_to_chd`.
+
+- **`ToolPlugin.expected_output_size(input_path, mode)`.** `ChainTool`'s
+  disk-headroom preflight imported `services.maxcso.uncompressed_iso_size`
+  directly — a single-tool special case on code every chain runs through, the
+  same shape as the `overwrite_targets` / `is_ready` branches removed earlier, so
+  a second chain starting with a different tool would silently fall back to a
+  ratio. The preflight now asks the first step's plugin. `BaseTool` returns
+  `None` (fall back to `ChainStep.output_ratio`); `MaxcsoTool` answers for
+  `cso_decompress`, `Nkit2IsoTool` from the NKit header. Preflight-only, never a
+  correctness input, so an unreadable file is `None` rather than an error.
 
 - **"Adding a tool" guide brought back in sync with the code.**
   `docs/ADDING_PLATFORMS_AND_TOOLS.md` had drifted behind the Phase 7/9

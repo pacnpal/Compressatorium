@@ -14,7 +14,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 * **Existing-output detection** with skip, rename, or overwrite.
 * **Delete-on-verify.** Optionally remove the source after a conversion verifies. Off by default.
 * **Progress tracking** through a live job queue.
-* **File info** for CHD, Dolphin, 3DS, Switch, CSO, and handheld ROM files.
+* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, and NKit files.
 
 ### Supported Conversions
 
@@ -27,7 +27,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 | **CSO** | PSP / PS2 game images | .iso, .cso, .zso, .dax | .cso, .zso, .dax, .iso, .chd | Effort preset (Fast/Default/Max); the `cso_to_chd` chain ignores it and uses chdman defaults | None | `maxcso` (+ chdman for `cso_to_chd`) |
 | **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
-| **NKit** | NKit-shrunk GameCube / Wii discs | .nkit.iso, .nkit.gcz | .iso | None (fixed) | None | `nkit2iso` |
+| **NKit** | NKit-shrunk GameCube / Wii discs | .nkit.iso, .nkit.gcz | .iso, .rvz (via the `nkit_to_rvz` chain) | None (fixed) | None | `nkit2iso` (+ dolphin-tool for `nkit_to_rvz`) |
 
 Most conversions above are lossless and fully reversible, including **3DS**, which
 now decompresses back to the original ROM as well. This uses
@@ -52,12 +52,14 @@ delete-on-verify here trades the compressed source for a CHD. See
 
 **NKit** is one-directional for the opposite reason: this app never *writes* NKit,
 it only restores it. `nkit_restore` rebuilds the original, bit-exact `.iso`, which
-you can then hand to Dolphin or CHDMAN like any other disc image. See
+you can then hand to Dolphin or CHDMAN like any other disc image — or use the
+one-step `nkit_to_rvz` chain, which restores and compresses to RVZ in a single job
+so the full-size ISO never lands in your library. See
 [NKit Support](#nkit-support-nkit--iso).
 
 Each tool's full mode list (e.g. CHDMAN's `createcd`/`extractcd`, CSO's
 `cso2_compress`, the ROM packer's `romz_7z`/`romz_zip`/`romz_extract`, the PS3
-packer's `folder_to_iso`, and NKit's `nkit_restore`) is in
+packer's `folder_to_iso`, and NKit's `nkit_restore`/`nkit_to_rvz`) is in
 [Supported Operations](#supported-operations).
 
 > **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, Switch dumps, and NKit images. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
@@ -872,13 +874,28 @@ This is a one-way tool: Compressatorium never *writes* NKit. Once restored, the
 
 ### How to Use
 
-Select **NKit** as the primary tool, pick a `.nkit.iso` or `.nkit.gcz`, and run the
-one mode, `nkit_restore`. The output is `<name>.iso` next to the source, or in a
-custom output directory. Members inside a ZIP/7z/RAR work too — browse in and
-convert the member directly.
+Select **NKit** as the primary tool and pick a `.nkit.iso` or `.nkit.gcz`. There
+are two modes:
+
+- **`nkit_restore`** writes `<name>.iso` next to the source (or in a custom
+  output directory).
+- **`nkit_to_rvz`** goes straight to `<name>.rvz` in one job: nkit2iso restores
+  into a scratch directory and dolphin-tool compresses that to RVZ, so the
+  full-size ISO never lands in your library. This is usually what you want —
+  NKit is a shrink format no emulator reads, and RVZ is both readable by Dolphin
+  and smaller than NKit. The final RVZ uses dolphin's default compression; run
+  the two steps as separate jobs if you want to pick a codec and level.
+
+Members inside a ZIP/7z/RAR work for both modes — browse in and convert the
+member directly.
 
 A `.nkit.gcz` is a GCZ-compressed NKit stream; nkit2iso inflates it on the fly, so
-both source forms produce the same `.iso`.
+both source forms produce the same output.
+
+**Info** reads the NKit header directly (no subprocess) and reports which console
+the disc is for, its game ID and title, the size the restored ISO will occupy, and
+the CRC32 the restore is checked against — worth a look before spending a restore
+on a multi-gigabyte image.
 
 ### Notes
 
@@ -886,10 +903,14 @@ both source forms produce the same `.iso`.
   suffix, so a plain `.iso` or `.gcz` is never offered to this tool, and an NKit
   image is still visible to CHDMAN/Dolphin/CSO (which own the generic tails) if
   you deliberately want one of those instead.
-- **No verify or delete-on-verify.** nkit2iso has no verify subcommand: integrity
-  is the header CRC32 it checks inline during the restore, so a completed job *is*
-  the verification and there is nothing to re-run afterwards. For the same reason
-  the source is never deleted automatically.
+- **No verify.** nkit2iso has no verify subcommand: integrity is the header CRC32
+  it checks inline during the restore, so a completed job *is* the verification
+  and there is nothing to re-run afterwards. The tool also deliberately does not
+  claim `.iso` as a verify extension — verify routing picks the first tool
+  matching an extension, so claiming it would hijack the Verify action for every
+  CD/DVD ISO in a library (the same reason Dolphin keeps `.iso` off its verify
+  list). Consequently `nkit_restore` offers no delete-on-verify. **`nkit_to_rvz`
+  does**, because its product is a `.rvz` Dolphin can verify.
 - **Removed Wii update partitions.** Some Wii images were shrunk by dropping the
   update (system-menu/IOS) partition, whose data is not in the file and cannot be
   regenerated. By default (`NKIT2ISO_RECOVERY=none`) that region is zero-filled,
@@ -914,10 +935,10 @@ both source forms produce the same `.iso`.
 
 ### REST API Endpoints
 
-- `POST /api/jobs` or `POST /api/jobs/batch` - Queue an NKit restore. Use `mode: "nkit_restore"` with the `.nkit.iso`/`.nkit.gcz` as the input path (`file_path` for a single job, `file_paths` for a batch).
+- `POST /api/jobs` or `POST /api/jobs/batch` - Queue an NKit job. Use `mode: "nkit_restore"` (→ `.iso`) or `mode: "nkit_to_rvz"` (→ `.rvz`) with the `.nkit.iso`/`.nkit.gcz` as the input path (`file_path` for a single job, `file_paths` for a batch).
+- `GET /api/nkit-info?path=<file>` - NKit header details: platform, game ID, title, disc number/version, restored size, stored CRC32, and the shrunk-to-original ratio.
 
-There is no info or verify endpoint for this tool, since nkit2iso has no native
-info or verify subcommand.
+There is no verify endpoint for this tool, for the reason in the notes above.
 
 ---
 
@@ -1022,6 +1043,7 @@ All actions are queued and processed by the job queue (FIFO). The queue is the o
 
 **NKit (GameCube/Wii)**
 - `nkit_restore` (.nkit.iso / .nkit.gcz → the original full-size `.iso`)
+- `nkit_to_rvz` (.nkit.iso / .nkit.gcz → .rvz, one-step chain through nkit2iso + dolphin-tool)
 
 Notes:
 - Compression settings apply to CHD **create**/**copy**, Dolphin RVZ/WIA, Switch (`nsz_compress`), the CSO/CSO v2/ZSO/DAX compress modes, and the handheld ROM compress modes (`romz_7z`/`romz_zip`) — the last two take an effort preset. Other modes ignore them.
@@ -1353,6 +1375,7 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.7z`, `.zip` - Handheld ROM archives (7z; `romz_extract` restores the original `.gb`/`.gbc`/`.gba`/`.nds`)
 - `.iso` (and a split `.iso.0`/`.iso.1`/… set on FAT32) - PS3 ISO packed from a decrypted folder (makeps3iso)
 - `.iso` - the full-size GameCube/Wii disc image restored from an NKit source (nkit2iso)
+- `.rvz` - a GameCube/Wii disc restored from NKit and compressed in one job (the `nkit_to_rvz` chain)
 
 ---
 

@@ -55,6 +55,7 @@ class ConversionMode(str, Enum):
     ROMZ_EXTRACT = "romz_extract"
     FOLDER_TO_ISO = "folder_to_iso"
     NKIT_RESTORE = "nkit_restore"
+    NKIT_TO_RVZ = "nkit_to_rvz"
     METADATA_SCAN = "metadata_scan"
     DAT_MATCH = "dat_match"
 
@@ -288,6 +289,25 @@ class Ps3IsoInfo(BasicFileInfo):
     """Information about a decrypted PS3 disc/JB folder (makeps3iso source)."""
     title: str | None = None
     title_id: str | None = None
+
+
+class NkitInfo(BasicFileInfo):
+    """Information about an NKit-shrunk GameCube/Wii image (nkit2iso source).
+
+    Everything below the shared fields comes from the NKit/disc header the
+    binary itself reads: which console the disc is for, how it identifies
+    itself, how big the restored ISO will be, and the CRC32 the restore is
+    checked against.
+    """
+    platform: str | None = None          # "GameCube" | "Wii"
+    game_id: str | None = None           # 6-char game + maker code, e.g. GALE01
+    title: str | None = None
+    disc_number: int | None = None
+    disc_version: int | None = None
+    restored_size: int | None = None     # bytes the restored .iso will occupy
+    restored_size_display: str | None = None
+    crc32: str | None = None             # of the ORIGINAL image, stored by NKit
+    ratio: str | None = None             # shrunk size as a % of the original
 
 
 class LayoutPreferences(BaseModel):

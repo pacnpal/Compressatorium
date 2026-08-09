@@ -51,7 +51,7 @@ _COMPARED_FIELDS = (
 # owner intentionally differs from the backend. `cso_to_chd` is the synthetic
 # chain mode: owned by the `chain` tool on the backend, grouped under `cso` in
 # the UI.
-_TOOL_ID_EXCEPTIONS = frozenset({"cso_to_chd"})
+_TOOL_ID_EXCEPTIONS = frozenset({"cso_to_chd", "nkit_to_rvz"})
 
 
 def _find_node() -> str | None:

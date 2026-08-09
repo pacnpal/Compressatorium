@@ -17,6 +17,8 @@ import asyncio
 import contextlib
 import os
 import re
+import struct
+import zlib
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from services.subprocess_runner import (
     SubprocessRunner,
     ioprio_prefix,
 )
+from utils.path_utils import match_extension
 
 # Compound source extensions: the meaningful part is ``.nkit``, but the
 # container it rides in decides how nkit2iso reads it (a plain nkit byte stream
@@ -52,7 +55,125 @@ _PROGRESS_RE = re.compile(r"^(\d{1,3})%$")
 # rather than reporting a bare "complete".
 _NOT_EXACT_MARKER = "CRC32 check skipped"
 
+# --- NKit / GameCube-Wii disc header -------------------------------------
+#
+# Reading the header is NOT a reimplementation of the restore: it is the same
+# documented disc header every GC/Wii tool reads, plus NKit's own 0x200 metadata
+# window, and the app already does this shape of thing elsewhere (the Z3DS
+# container header in z3ds_compress, PARAM.SFO in ps3.py, disc serials in
+# disc_id.py). It buys the Info panel real answers — GameCube vs Wii, the game
+# ID and title, and how big the restored ISO will be — instead of a bare file
+# size, and it gives the chain preflight a true intermediate size rather than a
+# guessed ratio.
+_DISC_HEADER_SIZE = 0x440       # what nkit2iso itself reads before deciding
+_NKIT_MARKER = b"NKIT v01"      # at 0x200, the "this really is NKit" proof
+_WII_MAGIC = 0x5D1C9EA3         # be32 at 0x18
+_GC_MAGIC = 0xC2339F3D          # be32 at 0x1C
+_GCZ_MAGIC = 0xB10BC001         # le32 at 0 of a .nkit.gcz container
+
+# Dolphin GCZ container: a 32-byte header, then one u64 pointer per block, then
+# one u32 Adler32 per block, then the block data. Only the FIRST block is ever
+# inflated here — it is 16 KiB or larger, so it always covers the 0x440-byte
+# disc header we need.
+_GCZ_HEADER = struct.Struct("<IIQQII")  # magic, sub_type, comp_size, data_size,
+#                                          block_size, num_blocks
+
 logger = get_logger("nkit2iso")
+
+
+class NkitHeaderError(ValueError):
+    """``path`` is not a readable NKit v01 GameCube/Wii image."""
+
+
+def _format_size(size: int) -> str:
+    """MB/GB display string, matching the other tools' info payloads."""
+    size_mb = size / (1024 * 1024)
+    return f"{size_mb:.2f} MB" if size_mb < 1024 else f"{size_mb / 1024:.2f} GB"
+
+
+def _gcz_first_block(handle) -> bytes:
+    """Inflate the first block of a Dolphin GCZ container."""
+    raw = handle.read(_GCZ_HEADER.size)
+    if len(raw) < _GCZ_HEADER.size:
+        raise NkitHeaderError("Truncated GCZ header")
+    magic, _sub_type, comp_size, data_size, block_size, num_blocks = (
+        _GCZ_HEADER.unpack(raw)
+    )
+    if magic != _GCZ_MAGIC or not block_size or not num_blocks:
+        raise NkitHeaderError("Invalid GCZ header")
+
+    pointers = handle.read(8 * num_blocks)
+    if len(pointers) < 8 * min(num_blocks, 2) or len(pointers) < 8:
+        raise NkitHeaderError("Truncated GCZ block table")
+    first = struct.unpack_from("<Q", pointers, 0)[0]
+    stored_raw = bool(first & (1 << 63))
+    start = first & ~(1 << 63)
+    # The next pointer (or the total compressed size for a single-block image)
+    # bounds this block's stored bytes.
+    end = comp_size
+    if num_blocks > 1 and len(pointers) >= 16:
+        end = struct.unpack_from("<Q", pointers, 8)[0] & ~(1 << 63)
+    if end <= start:
+        raise NkitHeaderError("Invalid GCZ block table")
+
+    data_offset = _GCZ_HEADER.size + 8 * num_blocks + 4 * num_blocks
+    handle.seek(data_offset + start)
+    stored = handle.read(end - start)
+    # Every block inflates to block_size except a truncated final block.
+    want = min(block_size, data_size)
+    if stored_raw:
+        return stored[:want]
+    try:
+        return zlib.decompressobj().decompress(stored, want)
+    except zlib.error as exc:
+        raise NkitHeaderError(f"Corrupt GCZ block: {exc}") from exc
+
+
+def read_nkit_header(path: str) -> dict:
+    """Parse the NKit/disc header of ``path``.
+
+    Blocking (one small read, plus a single zlib block for a ``.nkit.gcz``);
+    call it off the event loop. Raises :class:`NkitHeaderError` when the file
+    is not an NKit v01 image — which is also the honest answer for a plain
+    ``.iso`` someone renamed.
+    """
+    with open(path, "rb") as handle:
+        gcz = handle.read(4) == struct.pack("<I", _GCZ_MAGIC)
+        handle.seek(0)
+        if gcz:
+            head = _gcz_first_block(handle)[:_DISC_HEADER_SIZE]
+        else:
+            head = handle.read(_DISC_HEADER_SIZE)
+
+    if len(head) < _DISC_HEADER_SIZE:
+        raise NkitHeaderError("File is too small to hold a disc header")
+    if head[0x200:0x208] != _NKIT_MARKER:
+        raise NkitHeaderError(
+            "Not an NKit v01 image (marker missing at 0x200) — "
+            "is it already a plain ISO?"
+        )
+
+    wii = struct.unpack_from(">I", head, 0x18)[0] == _WII_MAGIC
+    gamecube = struct.unpack_from(">I", head, 0x1C)[0] == _GC_MAGIC
+    if not (wii or gamecube):
+        raise NkitHeaderError("Not a GameCube or Wii disc image")
+
+    # Wii stores the image size in 4-byte units; GameCube stores plain bytes.
+    raw_size = struct.unpack_from(">I", head, 0x210)[0]
+    restored_size = raw_size * 4 if wii else raw_size
+
+    return {
+        "platform": "Wii" if wii else "GameCube",
+        "game_id": head[0x00:0x06].decode("ascii", errors="replace").strip("\x00"),
+        "title": head[0x20:0x60].decode("ascii", errors="replace").split("\x00")[0].strip(),
+        "disc_number": head[0x06],
+        "disc_version": head[0x07],
+        "restored_size": restored_size,
+        # The CRC32 of the ORIGINAL image, which nkit2iso checks the restore
+        # against. Stored, not computed — it costs nothing to surface.
+        "crc32": f"{struct.unpack_from('>I', head, 0x208)[0]:08X}",
+        "container": "GCZ (zlib block container)" if gcz else "NKit stream",
+    }
 
 
 class Nkit2IsoService:
@@ -145,6 +266,60 @@ class Nkit2IsoService:
         return self.get_output_path(
             input_path, output_dir, treat_as_stem=treat_as_stem,
         )
+
+    @staticmethod
+    def restored_size(path: str) -> int | None:
+        """Size of the ISO this source will restore to, or ``None`` if unknown.
+
+        Read from the NKit header rather than guessed from a ratio: NKit shrink
+        ratios vary enormously (a scrubbed Wii disc can be a twentieth of its
+        restored size), so a ratio-based disk preflight would badly under-count.
+        Returns ``None`` on any unreadable/!NKit input so callers fall back.
+        """
+        try:
+            size = read_nkit_header(path).get("restored_size") or 0
+        except (NkitHeaderError, OSError):
+            return None
+        return size or None
+
+    def info(self, file_path: str) -> dict:
+        """Describe an NKit source: what disc it is and what it restores to.
+
+        Synchronous (small header read); the plugin threadpools it. nkit2iso
+        has no ``info`` subcommand, so this reads the header directly — the same
+        one the binary reads — rather than shelling out.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        file_size = os.path.getsize(file_path)
+        header = read_nkit_header(file_path)
+        restored = header["restored_size"]
+        # Percentage of the original the shrunk file occupies — the number a
+        # body actually wants when deciding whether to restore.
+        ratio = f"{file_size / restored * 100:.1f}%" if restored else None
+
+        return {
+            "file": file_path,
+            "size": file_size,
+            "size_display": _format_size(file_size),
+            "format": f"NKit v01 ({header['platform']})",
+            "extension": (
+                match_extension(file_path, NKIT2ISO_CONVERTIBLE_EXTENSIONS)
+                or Path(file_path).suffix.lower()
+            ),
+            "compressed": True,
+            "compression_type": header["container"],
+            "platform": header["platform"],
+            "game_id": header["game_id"] or None,
+            "title": header["title"] or None,
+            "disc_number": header["disc_number"],
+            "disc_version": header["disc_version"],
+            "restored_size": restored or None,
+            "restored_size_display": _format_size(restored) if restored else None,
+            "crc32": header["crc32"],
+            "ratio": ratio,
+        }
 
     @staticmethod
     def _parse_progress(line: str) -> int | None:

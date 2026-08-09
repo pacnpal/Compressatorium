@@ -67,6 +67,10 @@ export const MODE_BLURBS = {
   nkit_restore:
     'Rebuild the full GameCube/Wii ISO from an NKit-shrunk .nkit.iso/.nkit.gcz. '
     + 'No settings; the result is CRC32-checked against the NKit header.',
+  nkit_to_rvz:
+    'Restore an NKit image and compress it straight to RVZ in one job (nkit2iso '
+    + 'to a temp ISO, then dolphin-tool). The full-size ISO never lands in your '
+    + 'library. Uses dolphin default compression.',
   // PS3
   folder_to_iso:
     'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle '

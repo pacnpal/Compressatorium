@@ -17,6 +17,7 @@ from models import (
     CsoInfo,
     DolphinDiscInfo,
     MetadataBatchRequest,
+    NkitInfo,
     NszInfo,
     RomzInfo,
     Z3DSInfo,
@@ -41,6 +42,11 @@ from services.maxcso import (
     MAXCSO_DECOMPRESS_EXTENSIONS,
     maxcso_service,
 )
+from services.nkit2iso import (
+    NKIT2ISO_CONVERTIBLE_EXTENSIONS,
+    NkitHeaderError,
+    nkit2iso_service,
+)
 from services.nsz import (
     NSZ_COMPRESS_EXTENSIONS,
     NSZ_DECOMPRESS_EXTENSIONS,
@@ -58,7 +64,7 @@ from services.z3ds_compress import (
 )
 from services.verification_store import verification_store
 from sse_starlette.sse import EventSourceResponse
-from utils.path_utils import is_within_configured_volumes
+from utils.path_utils import is_within_configured_volumes, match_extension
 
 DOLPHIN_INFO_EXTENSIONS = DOLPHIN_CONVERTIBLE_EXTENSIONS
 
@@ -555,6 +561,14 @@ def _is_romz_info_file(path: str) -> bool:
     return ext in ROMZ_INFO_EXTENSIONS
 
 
+# NKit sources only: this endpoint describes a *shrunk* image, and the restored
+# .iso it produces is an ordinary disc image other tools already report on. The
+# extensions are compound, so this uses the shared suffix match rather than
+# os.path.splitext (which would only ever see the generic ".iso"/".gcz").
+def _is_nkit_info_file(path: str) -> bool:
+    return match_extension(path, NKIT2ISO_CONVERTIBLE_EXTENSIONS) is not None
+
+
 @router.get("/info", response_model=CHDInfo)
 async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
     """Get information about a CHD file (cached with mtime-based invalidation)."""
@@ -841,6 +855,49 @@ async def get_z3ds_info(
             status_code=500,
             detail=f"Failed to read 3DS ROM info: {e!s}",
         ) from None
+
+
+@router.get("/nkit-info", response_model=NkitInfo)
+async def get_nkit_info(
+    path: str = Query(..., description="Path to an NKit-shrunk GC/Wii image"),
+):
+    """Describe an NKit image: which disc it is and what it restores to.
+
+    Read straight from the NKit/disc header (no subprocess — nkit2iso has no
+    ``info`` subcommand), so it answers the questions worth asking *before*
+    spending a restore: GameCube or Wii, which game, how big the output will be,
+    and the CRC32 the restore will be checked against.
+    """
+    if not await run_in_threadpool(
+        is_within_configured_volumes, path, treat_archives=False,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path outside configured volumes",
+        )
+    if not await run_in_threadpool(os.path.isfile, path):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not _is_nkit_info_file(path):
+        raise HTTPException(
+            status_code=400,
+            detail="Not an NKit-shrunk GameCube/Wii image (.nkit.iso, .nkit.gcz)",
+        )
+
+    try:
+        info = await run_in_threadpool(nkit2iso_service.info, path)
+    except NkitHeaderError as e:
+        # The name says .nkit.iso but the bytes disagree — a client error about
+        # the file, not a server fault, so 422 rather than 500.
+        raise HTTPException(status_code=422, detail=str(e)) from None
+    except Exception as e:
+        # Broad by design at the file-read boundary (OSError, struct/zlib
+        # errors, ...); logged here so the 500 is traceable.
+        logger.exception("Failed to read NKit info for %s: %s", path, e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read NKit info: {e!s}",
+        ) from None
+    return registry.get("nkit").info_model(info, path)
 
 
 @router.get("/cso-info", response_model=CsoInfo)

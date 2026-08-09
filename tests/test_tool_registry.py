@@ -57,7 +57,7 @@ CONVERSION_MODES = [m for m in ConversionMode if m not in EXTERNAL_MODES]
 # Composite/pipeline modes (tool_id="chain") are a newer construct that
 # orchestrates several single-tool modes; they predate neither the legacy ladder
 # below nor its prefix rules, so they're enumerated explicitly.
-COMPOSITE_MODES = {"cso_to_chd"}
+COMPOSITE_MODES = {"cso_to_chd", "nkit_to_rvz"}
 
 
 def _legacy_tool_for_mode(mode: str) -> str:
@@ -83,7 +83,7 @@ def _legacy_tool_for_mode(mode: str) -> str:
 
 def test_every_conversion_mode_resolves_to_exactly_one_tool():
     resolved = {m.value: registry.for_mode(m.value).id for m in CONVERSION_MODES}
-    assert len(resolved) == 30
+    assert len(resolved) == 31
     # Each registered mode is owned by exactly one tool (no duplicates).
     assert sorted(s.mode for s in registry.mode_specs()) == sorted(resolved)
 
@@ -216,13 +216,16 @@ def test_tools_for_input_representative():
     # Compound extensions: nkit2iso declares `.nkit.iso`/`.nkit.gcz`, so an NKit
     # image adds it to (rather than displaces) the tools that own the generic
     # `.iso`/`.gcz` tail, and a plain `.iso`/`.gcz` never picks nkit up.
+    # `chain` is in both lists because nkit_to_rvz takes the same NKit sources.
     assert sorted(t.id for t in registry.tools_for_input("game.nkit.iso")) == [
+        "chain",
         "chdman",
         "cso",
         "dolphin",
         "nkit",
     ]
     assert sorted(t.id for t in registry.tools_for_input("game.nkit.gcz")) == [
+        "chain",
         "dolphin",
         "nkit",
     ]

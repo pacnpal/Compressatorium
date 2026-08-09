@@ -1,16 +1,24 @@
 """Nkit2IsoTool, thin plugin wrapper delegating to ``nkit2iso_service``.
 
-Registers no info or verify routes. nkit2iso has no info or verify subcommand:
-integrity is the header CRC32 the binary checks inline during the restore, so a
-completed job *is* the verification and there is nothing to re-run against a
-finished ``.iso``. ``makeps3iso`` is the precedent for a route-less tool.
+Registers an **info** route but no **verify** one, which is not an oversight:
+
+* Info is real and free — the NKit header names the console, the game and the
+  size the restore will produce, all from one small read.
+* Verify is deliberately absent. nkit2iso has no verify subcommand (integrity
+  is the header CRC32 it checks inline, so a completed job *is* the
+  verification), and claiming ``.iso`` as a verify extension would be actively
+  harmful: ``tool_for_verify`` returns the *first* tool matching an extension,
+  so every CD/DVD ISO in a library would start routing its Verify action here.
+  That is the same trap Dolphin documents when it keeps ``.iso`` out of
+  ``DOLPHIN_VERIFY_EXTS``. No verify also means no delete-on-verify.
 """
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
 
-from models import OutputStatus
+from fastapi.concurrency import run_in_threadpool
+from models import NkitInfo, OutputStatus
 from services.lock_manager import lock_manager
 from services.nkit2iso import (
     NKIT2ISO_CONVERTIBLE_EXTENSIONS,
@@ -95,6 +103,28 @@ class Nkit2IsoTool(BaseTool):
             input_path, output_path, mode,
             compression=compression, cancel_event=cancel_event,
         )
+
+    async def info(self, path: str) -> dict:
+        return await run_in_threadpool(self._service.info, path)
+
+    def info_model(self, raw: dict, path: str) -> NkitInfo:
+        return NkitInfo(
+            **self._basic_info_fields(raw),
+            platform=raw.get("platform"),
+            game_id=raw.get("game_id"),
+            title=raw.get("title"),
+            disc_number=raw.get("disc_number"),
+            disc_version=raw.get("disc_version"),
+            restored_size=raw.get("restored_size"),
+            restored_size_display=raw.get("restored_size_display"),
+            crc32=raw.get("crc32"),
+            ratio=raw.get("ratio"),
+        )
+
+    def expected_output_size(self, input_path: str, mode: str) -> int | None:
+        # The NKit header carries the restored image's exact size, so a chain
+        # preflight never has to guess it from a shrink ratio.
+        return self._service.restored_size(input_path)
 
     def active_pids(self) -> list[int]:
         return self._service.active_pids()

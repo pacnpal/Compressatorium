@@ -9,6 +9,8 @@ cleanup, and the registry/listing wiring.
 from __future__ import annotations
 
 import asyncio
+import struct
+import zlib
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,9 @@ from app.routes import files as files_routes
 from app.services.nkit2iso import (
     NKIT2ISO_CONVERTIBLE_EXTENSIONS,
     ConversionCancelled,
+    NkitHeaderError,
     nkit2iso_service,
+    read_nkit_header,
 )
 from app.services.tools import registry
 
@@ -310,3 +314,122 @@ async def test_list_files_annotates_nkit_source_and_output_badge(
 
     # No verify/info affordance: nkit2iso has no verify subcommand.
     assert "nkit" not in by_name["Restored.iso"].verifiable_by
+
+
+# --------------------------------------------------------------------------- #
+# NKit header parsing / info
+# --------------------------------------------------------------------------- #
+
+
+def _disc_header(*, wii: bool, game_id=b"GALE01", title=b"Melee",
+                 crc=0x099E2C6D, size_field=0x1D26_0000, marker=b"NKIT v01",
+                 disc_no=0, version=2) -> bytes:
+    """A synthetic 0x440 GC/Wii disc header carrying NKit's metadata window."""
+    head = bytearray(b"\x00" * 0x440)
+    head[0x00:0x06] = game_id
+    head[0x06] = disc_no
+    head[0x07] = version
+    struct.pack_into(">I", head, 0x18, 0x5D1C9EA3 if wii else 0)
+    struct.pack_into(">I", head, 0x1C, 0 if wii else 0xC2339F3D)
+    head[0x20:0x20 + len(title)] = title
+    head[0x200:0x200 + len(marker)] = marker
+    struct.pack_into(">I", head, 0x208, crc)
+    struct.pack_into(">I", head, 0x210, size_field)
+    return bytes(head)
+
+
+def _gcz_wrap(payload: bytes, *, block_size=0x8000) -> bytes:
+    """Wrap ``payload`` in a single-block Dolphin GCZ container."""
+    body = zlib.compress(payload.ljust(block_size, b"\x00"))
+    header = struct.pack(
+        "<IIQQII", 0xB10BC001, 0, len(body), block_size, block_size, 1,
+    )
+    return header + struct.pack("<Q", 0) + struct.pack("<I", 0) + body
+
+
+def test_read_header_gamecube(tmp_path):
+    src = tmp_path / "Melee.nkit.iso"
+    src.write_bytes(_disc_header(wii=False) + b"\x00" * 64)
+
+    header = read_nkit_header(str(src))
+    assert header["platform"] == "GameCube"
+    assert header["game_id"] == "GALE01"
+    assert header["title"] == "Melee"
+    assert header["crc32"] == "099E2C6D"
+    assert header["disc_version"] == 2
+    # GameCube stores the image size in plain bytes.
+    assert header["restored_size"] == 0x1D26_0000
+    assert header["container"] == "NKit stream"
+
+
+def test_read_header_wii_scales_size_by_four(tmp_path):
+    src = tmp_path / "Galaxy.nkit.iso"
+    src.write_bytes(_disc_header(wii=True, size_field=0x1000) + b"\x00" * 64)
+
+    header = read_nkit_header(str(src))
+    assert header["platform"] == "Wii"
+    # Wii stores the size in 4-byte units — the classic way to get this wrong.
+    assert header["restored_size"] == 0x1000 * 4
+
+
+def test_read_header_through_a_gcz_container(tmp_path):
+    src = tmp_path / "Melee.nkit.gcz"
+    src.write_bytes(_gcz_wrap(_disc_header(wii=False)))
+
+    header = read_nkit_header(str(src))
+    assert header["platform"] == "GameCube"
+    assert header["game_id"] == "GALE01"
+    assert header["container"] == "GCZ (zlib block container)"
+
+
+def test_read_header_rejects_a_plain_iso(tmp_path):
+    # A GC disc header with no NKit marker: a plain ISO someone renamed.
+    src = tmp_path / "Melee.nkit.iso"
+    src.write_bytes(_disc_header(wii=False, marker=b"\x00" * 8))
+    with pytest.raises(NkitHeaderError, match="already a plain ISO"):
+        read_nkit_header(str(src))
+
+
+def test_read_header_rejects_a_non_disc_file(tmp_path):
+    src = tmp_path / "junk.nkit.iso"
+    src.write_bytes(b"\x00" * 0x100)
+    with pytest.raises(NkitHeaderError, match="too small"):
+        read_nkit_header(str(src))
+
+
+def test_info_reports_the_restore_target(tmp_path):
+    src = tmp_path / "Melee.nkit.iso"
+    body = _disc_header(wii=False, size_field=1_000_000) + b"\x00" * 1000
+    src.write_bytes(body)
+
+    info = nkit2iso_service.info(str(src))
+    assert info["platform"] == "GameCube"
+    assert info["restored_size"] == 1_000_000
+    assert info["restored_size_display"] == "0.95 MB"
+    assert info["crc32"] == "099E2C6D"
+    # The compound extension, not the generic `.iso` tail.
+    assert info["extension"] == ".nkit.iso"
+    assert info["compressed"] is True
+    assert info["ratio"] == f"{len(body) / 1_000_000 * 100:.1f}%"
+
+    model = registry.get("nkit").info_model(info, str(src))
+    assert model.platform == "GameCube"
+    assert model.game_id == "GALE01"
+    assert model.crc32 == "099E2C6D"
+    assert model.restored_size == 1_000_000
+
+
+def test_restored_size_is_none_for_an_unreadable_source(tmp_path):
+    # Feeds the chain preflight, which must degrade to a ratio, never raise.
+    assert nkit2iso_service.restored_size(str(tmp_path / "absent.nkit.iso")) is None
+    plain = tmp_path / "plain.nkit.iso"
+    plain.write_bytes(b"\x00" * 0x500)
+    assert nkit2iso_service.restored_size(str(plain)) is None
+
+
+def test_expected_output_size_feeds_the_chain_preflight(tmp_path):
+    src = tmp_path / "Melee.nkit.iso"
+    src.write_bytes(_disc_header(wii=False, size_field=4_000_000))
+    assert registry.get("nkit").expected_output_size(
+        str(src), "nkit_restore",
+    ) == 4_000_000

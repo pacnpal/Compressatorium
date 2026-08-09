@@ -533,6 +533,47 @@ sits **above** the plugin contract rather than rewriting it.
 New chained conversions (xci→nsp, wud→wua, a future folder→iso→chd) are a new
 `ChainSpec` row + its component modes — no new machinery.
 
+#### `expected_output_size`: preflight sizing without a tool-specific import
+
+`ChainTool._preflight_headroom` has to bound three things at once (source, full
+intermediate, partial final) before it starts, and `ChainStep.output_ratio` is
+too blunt for it: a heavily compressed `.cso` or a scrubbed `.nkit.iso` can be
+an order of magnitude smaller than the `.iso` its step will write, so a ratio on
+the input size under-counts badly and the preflight passes on a volume that then
+fills up mid-job.
+
+It used to solve that by importing `services.maxcso.uncompressed_iso_size`
+directly — a single-tool special case sitting on code every chain runs through,
+the same shape as the `overwrite_targets` / `is_ready` branches removed earlier.
+A second chain whose first step was a different tool would silently get the
+ratio fallback with no way to do better.
+
+The contract now carries it:
+
+```python
+def expected_output_size(self, input_path: str, mode: str) -> int | None:
+    """Bytes this mode will write, if cheaply knowable from a header."""
+```
+
+`BaseTool` returns `None` (fall back to `output_ratio`). `MaxcsoTool` returns
+`uncompressed_iso_size` for `cso_decompress`; `Nkit2IsoTool` returns the image
+size the NKit header states. `ChainTool` asks `steps[0]`'s tool and never names
+a tool itself. It is **preflight only** — never a correctness input — so an
+unreadable file is `None`, not an error. Blocking (a small header read), so call
+it off the event loop.
+
+#### A chain's output name comes from its FIRST step
+
+`ChainTool.output_path` used to delegate to the *last* step's tool, which is
+correct only while every chain source has a plain single suffix. The first step
+is the one that owns the input, so only its tool knows how to strip the source
+name: `nkit_restore` must drop a whole compound `.nkit.iso`, where dolphin (the
+final step of `nkit_to_rvz`) would leave `Game.nkit.rvz`. The rule is now "the
+first step's own output path, with the chain's declared `output_ext` swapped
+in", which is identical to the old behaviour for `cso_to_chd` (`Game.cso` ->
+`Game.iso` -> `Game.chd`). `detect_output` and the scratch intermediate's name
+follow the same rule.
+
 ### 3.3.4 Directory inputs (`InputKind`, `accepts_directory`)
 
 Every input seam keys off `Path(filename).suffix`; a folder has none. For
@@ -984,6 +1025,18 @@ Two consumer-side notes keep the gate airtight:
   single-ROM archive (a mid-conversion placeholder still badges as
   in-progress). A coincidental multi-file `Game.gba.7z` thus never enters
   `outputs`, so the verify-from-output flow can't offer romz Verify on it.
+
+#### Source-tool ordering is most-specific-first
+
+`registry.toolsForSourcePath` / `infoToolsForPath` rank claiming tools by the
+**length of the matched `sourceExts` entry**, not declaration order. The Info
+modal walks that list and keeps the first `getInfo()` that returns, so with a
+plain order a `.nkit.iso` would reach Dolphin's header reader first — and that
+reader *succeeds*, because an NKit image carries a genuine GC/Wii disc header,
+reporting the shrunk file as if it were an ordinary disc. Ranking the compound
+claim above the generic tail it shares (`.iso`) puts the tool that actually
+understands the container first. This mirrors the backend's longest-match
+`match_extension` (§3.4).
 
 ### 3.7 Frontend descriptor (`src/lib/tools/registry.js`)
 

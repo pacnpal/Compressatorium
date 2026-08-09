@@ -59,4 +59,8 @@ def test_every_other_tool_declares_only_single_component_extensions():
         for ext in tool.input_extensions | tool.output_extensions
         if ext.count(".") > 1
     }
-    assert compound == {("nkit", ".nkit.iso"), ("nkit", ".nkit.gcz")}
+    assert compound == {
+        ("nkit", ".nkit.iso"), ("nkit", ".nkit.gcz"),
+        # The nkit_to_rvz chain declares step 1's inputs as its own.
+        ("chain", ".nkit.iso"), ("chain", ".nkit.gcz"),
+    }

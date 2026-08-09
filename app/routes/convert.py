@@ -408,7 +408,8 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
     ),
     SkipReason.CHAIN_BAD_EXTENSION: (
         400,
-        "cso_to_chd requires a .cso/.zso/.dax source",
+        "cso_to_chd requires a .cso/.zso/.dax source; "
+        "nkit_to_rvz requires an NKit image (.nkit.iso, .nkit.gcz)",
     ),
     SkipReason.PS3_FOLDER_INVALID: (
         400,

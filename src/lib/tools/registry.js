@@ -529,8 +529,8 @@ export const TOOLS = [
     verifyPrefix: '',
     sourceExts: NKIT_SOURCE_EXTS,
     verifyExts: NKIT_VERIFY_EXTS,
-    modeGroups: ['nkit'],
-    groups: { nkit: 'NKit → ISO' },
+    modeGroups: ['nkit', 'chain'],
+    groups: { nkit: 'NKit → ISO', chain: 'One-step pipeline' },
     defaultMode: 'nkit_restore',
     glyph: 'NKT',
     accent: 'var(--badge-dvd)',
@@ -545,15 +545,30 @@ export const TOOLS = [
         // No delete-on-verify: this tool declares no verifyExts, so the
         // restored .iso can't be confirmed before dropping the source.
         supportsDeleteOnVerify: false, allowsArchiveInput: true },
+      // Composite pipeline (nkit2iso restore -> dolphin_rvz). The .rvz is
+      // verified/badged by the Dolphin tool entry, and the full-size ISO stays
+      // in a scratch dir instead of landing in the library. The final RVZ uses
+      // dolphin's default compression, so no codec picker is shown here.
+      { mode: 'nkit_to_rvz', kind: 'compress', label: 'Convert to RVZ (→ ISO → RVZ)',
+        group: 'chain',
+        outputExt: '.rvz', inputExtensions: NKIT_SOURCE_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        // The .rvz IS verifiable (Dolphin claims it), so the NKit source can be
+        // dropped against a confirmed output — unlike the plain restore.
+        supportsDeleteOnVerify: true, allowsArchiveInput: true },
     ],
-    // No Info/Verify routes; left undefined so infoToolsForPath /
-    // toolForVerifyPath skip this tool.
-    getInfo: undefined,
+    // Info reads the NKit header (console, game, restored size, CRC32). No
+    // verify: nkit2iso has none, and claiming `.iso` would hijack every CD/DVD
+    // ISO's Verify action — the same trap DOLPHIN_VERIFY_EXTS documents.
+    getInfo: (path) => api.getNkitInfo(path),
     verify: undefined,
     verifyBatch: undefined,
     // Compound extension: strip the whole ".nkit.iso" / ".nkit.gcz", not just
     // the trailing suffix, or the "product" would be the source path itself.
-    productPath: (path) => (path ?? '').replace(/\.nkit\.(iso|gcz)$/i, '.iso'),
+    // `mode` picks the chain's .rvz over the plain restore's .iso.
+    productPath: (path, mode = 'nkit_restore') => (path ?? '').replace(
+      /\.nkit\.(iso|gcz)$/i, mode === 'nkit_to_rvz' ? '.rvz' : '.iso',
+    ),
   },
 ];
 
@@ -563,9 +578,39 @@ const byMode = new Map(
 );
 
 function endsWithAny(path, exts) {
-  if (!path) return false;
+  return matchedExtLength(path, exts) > 0;
+}
+
+/**
+ * Length of the LONGEST extension in `exts` that `path` ends with, else 0.
+ * Mirrors the backend's `utils.path_utils.match_extension`, and the length is
+ * what lets callers rank a compound claim (`.nkit.iso`) above the generic tail
+ * (`.iso`) that other tools own.
+ */
+function matchedExtLength(path, exts) {
+  if (!path) return 0;
   const lower = path.toLowerCase();
-  return exts.some((ext) => lower.endsWith(ext));
+  let best = 0;
+  for (const ext of exts) {
+    if (lower.endsWith(ext) && ext.length > best) best = ext.length;
+  }
+  return best;
+}
+
+/**
+ * Tools claiming `path` as a source, MOST SPECIFIC first (declared order
+ * breaks ties). An NKit image is claimed by `nkit` via the compound
+ * `.nkit.iso` and by chdman / Dolphin / CSO via the plain `.iso` tail; the
+ * specific claim has to win, or the Info modal walks the generic tools first
+ * and Dolphin's header reader "succeeds" on an NKit file (it has a real GC/Wii
+ * disc header) and reports the shrunk image as if it were a plain disc.
+ */
+function sourceToolsBySpecificity(path) {
+  return TOOLS
+    .map((t) => ({ t, n: matchedExtLength(path, t.sourceExts) }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .map((x) => x.t);
 }
 
 /** Verify-class tool whose verifyExts match the path (extension only). */
@@ -623,25 +668,27 @@ export const registry = {
     return tool;
   },
 
-  /** Tools whose source extensions match the given path (convertible sources). */
-  toolsForSourcePath: (path) => TOOLS.filter((t) => endsWithAny(path, t.sourceExts)),
+  /** Tools whose source extensions match the given path (convertible sources),
+   *  most-specific claim first — see `sourceToolsBySpecificity`. */
+  toolsForSourcePath: (path) => sourceToolsBySpecificity(path),
 
   /**
    * Info-capable tools for a path, richest-first, deduped by id. A path
    * can be claimed by more than one tool (a raw .iso is both a chdman
    * create source and a Dolphin disc) and only one actually reads it, so
    * callers try these in order and keep the first getInfo() that returns.
-   * Order: the verify-path owner, then any source-claiming tool. Tools
-   * without a getInfo binding are skipped.
+   * Order: the verify-path owner, then source-claiming tools most-specific
+   * first. Tools without a getInfo binding are skipped.
    */
   infoToolsForPath: (path) => {
     if (!path) return [];
-    // Verify-path owner first, then every source-claiming tool, in
-    // declared order. Dedup by reference (same TOOLS objects) and skip
-    // tools without a getInfo binding.
+    // Verify-path owner first, then every source-claiming tool, most specific
+    // claim first (so `.nkit.iso` reaches NKit before the `.iso` owners, whose
+    // readers can plausibly "succeed" on it and report the wrong thing).
+    // Dedup by reference (same TOOLS objects) and skip tools without getInfo.
     const ordered = [
       TOOLS.find((t) => endsWithAny(path, t.verifyExts)),
-      ...TOOLS.filter((t) => endsWithAny(path, t.sourceExts)),
+      ...sourceToolsBySpecificity(path),
     ];
     const out = [];
     for (const t of ordered) {
