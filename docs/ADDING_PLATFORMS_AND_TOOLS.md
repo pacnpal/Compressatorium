@@ -345,7 +345,7 @@ the non-obvious rows is in §8 to §14.
 | # | File | What it enforces | Action |
 |---|------|------------------|--------|
 | 28 | *(no workflow file)* — **Codacy** runs as a GitHub App checks integration ("Codacy Static Code Analysis"), configured in the Codacy UI plus the in-repo config in rows 33–39. There is **no** `.github/workflows/codacy.yml`. | ruff, eslint, pylint, bandit, etc. | New code must pass; see §11 |
-| 29 | `.github/workflows/codeql.yml` | Push/PR/weekly CodeQL for Python, JS/TS **and** GitHub Actions. | Auto-covers new code |
+| 29 | `.github/workflows/codeql.yml` | Push/PR/weekly CodeQL. Its matrix is exactly two languages: `python` and `javascript-typescript`. (PRs also show an `Analyze (actions)` job — that one is configured in the repo's code-scanning settings, not in this file, so don't edit this matrix expecting to change it.) | Auto-covers new code |
 | 30 | `.github/workflows/docker-image.yml` | On release: hadolint, multi-arch build, Trivy scan, SBOM/attestation. | Dockerfile must pass hadolint; see §8/§10 |
 | 31 | `.github/workflows/label.yml` + `.github/labeler.yml` | PR auto-labeling by path. | Add a path glob if you want a label |
 | 31a | `.github/workflows/screenshots.yml` | **Take screenshots**: rebuilds the README/docs captures from `shots.yml` and commits them. | See §3.6 item 49 |
@@ -928,20 +928,10 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
   glyph: 'NSW',                           // 2-3 char affordance for sidebar / dashboard
   accent: 'var(--badge-dat-match)',       // CSS color or token
 
-  // --- compression UI (the whole block is optional) ---
-  // Omit ALL of it for a fixed compressor whose modes set
-  // supportsCompression: false and supportsCompressionLevel: false — the
-  // block and the per-mode flags must agree, or the UI offers a control the
-  // backend ignores. z3ds is the fixed-compressor example (compressionStyle:
-  // 'none', no codecs, no range).
-  // 'none' | 'multi' (chdman: comma-joined codec list) | 'single-with-level'
-  compressionStyle: 'single-with-level',
-  compressionCodecs: [/* { value, label, hint } */],
-  compressionLevelRange: { min: 1, max: 22, default: 18 },
-  // Seed for the initial selection AND what the shared "Reset to default"
-  // button restores. Read by conversion.svelte.js — declaring it here is the
-  // whole wiring; there is no per-tool branch in the store.
-  defaultCompression: ['solid'],
+  // nszip is a FIXED compressor: no codec dropdown, no level slider, so it
+  // declares no compression fields at all. To expose compression controls,
+  // see "Compression UI fields" right after this block.
+  compressionStyle: 'none',
 
   modes: [
     { mode: 'nszip_compress', kind: 'compress', label: 'Compress to NSZ/XCZ',
@@ -949,10 +939,8 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
       outputExt: null,                    // mapped from input extension
       inputExtensions: ['.nsp', '.xci'],
       // inputKinds: ['directory'],       // only for a folder-input mode
-      supportsCompression: false,         // no codec dropdown...
-      supportsCompressionLevel: true,     // ...but the level slider is live,
-                                          // which is what earns the
-                                          // compressionLevelRange above
+      supportsCompression: false,         // must match the ModeSpec in §5.3
+      supportsCompressionLevel: false,    // ditto — parity is enforced by tests
       supportsDeleteOnVerify: true,
       allowsArchiveInput: false,
       // supportsSplit: true,             // frontend-only capability flag;
@@ -968,6 +956,33 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
   productPath: (path) => path.replace(/\.nsp$/i, '.nsz').replace(/\.xci$/i, '.xcz'),
 },
 ```
+
+#### Compression UI fields
+
+The example above is a **fixed compressor** and declares none of these. Add them
+only when your tool really exposes compression choices:
+
+| Field | Meaning |
+|-------|---------|
+| `compressionStyle` | `'none'` / `'multi'` (chdman: a comma-joined codec list) / `'single-with-level'` (one codec + a numeric level). Drives which picker `CompressionPicker.svelte` renders. |
+| `compressionCodecs` | `[{ value, label, hint }]` for the dropdown. |
+| `compressionLevelRange` | `{ min, max, default }` for the slider. Falls back to `DEFAULT_COMPRESSION_LEVEL_RANGE` when absent. |
+| `defaultCompression` | The initial selection **and** what the shared "Reset to default" button restores. Read by `conversion.svelte.js` — declaring it here is the whole wiring; there is no per-tool branch in the store. |
+
+**Two invariants, both enforced by tests — get them wrong and CI fails:**
+
+1. **Frontend and backend flags must match.**
+   `tests/test_frontend_parity_186.py` compares each mode's
+   `supportsCompression` / `supportsCompressionLevel` against the Python
+   `ModeSpec`'s `supports_compression` / `supports_compression_level`. Flip a
+   flag in one registry and you must flip it in the other.
+2. **The declared flags must match what the service actually does.** Turning on
+   `supportsCompressionLevel` gives the user a slider whose value arrives as
+   `compression` in `convert()`; if your `_build_command` ignores it, the
+   control is a lie. Wire the flag and the command together.
+
+Live references: `chdman` (`'multi'`), `dolphin` and `nsz`
+(`'single-with-level'`), `z3ds` (`'none'`).
 
 The `ToolDescriptor` / `ModeEntry` JSDoc typedefs at the top of `registry.js`
 are the authoritative schema — read them before adding an entry. Two shapes
@@ -1305,7 +1320,7 @@ The same file handles **PUID/PGID remap** and the privilege drop to `converter`
 |----------|---------|-------------------------|
 | `docker-image.yml` | **release published** | Builds/pushes multi-arch image to Docker Hub + GHCR, runs **hadolint** (Dockerfile must pass), **Trivy** CRITICAL/HIGH scan (a vulnerable new dep can fail this), generates SBOM + provenance attestation, and **publishes `README.md` as the Docker Hub description**. Also syncs `package.json` from the release tag. |
 | *Codacy* — **not a workflow** | PR | Runs as a GitHub App check ("Codacy Static Code Analysis"): ruff, eslint, pylint, bandit, etc. New Python/JS must lint clean. Honors `pyproject.toml`, `.pylintrc`, `eslint.config.js`, `.codacy.yml`. Configured in the Codacy UI — there is no `.github/workflows/codacy.yml` to edit. |
-| `codeql.yml` | push, PR, weekly | CodeQL SAST for **python**, **javascript-typescript** and **actions**. New code is scanned automatically, no config change, but don't introduce flagged patterns (for example command injection, another reason for the no-`shell=True` rule). |
+| `codeql.yml` | push, PR, weekly | CodeQL SAST. The matrix in this file is **python** and **javascript-typescript** only; the `Analyze (actions)` job you'll also see on PRs comes from the repo's code-scanning settings, not from here. New code is scanned automatically, no config change, but don't introduce flagged patterns (for example command injection, another reason for the no-`shell=True` rule). |
 | `label.yml` + `labeler.yml` | PR | Path-based auto-labels. Add a glob if you want your area labeled. |
 | `screenshots.yml` | push / manual | **Take screenshots**: rebuilds the README/docs captures from `shots.yml` and commits them. Relevant whenever your tool changes the UI. |
 | `stale.yml` | schedule | Marks stale issues/PRs. Irrelevant. |
