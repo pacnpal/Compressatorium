@@ -25,9 +25,13 @@ This keeps them in sync with the current UI and its light/dark themes.
    (`oxipng -o 4 -i 0 --strip safe`).
 5. Commits any changes under `docs/screenshots/`.
 
-It runs on manual dispatch and on pushes that touch the UI (see the workflow's
-`paths:` list). Changes under `docs/screenshots/**` are deliberately not a
-trigger, so the commit the workflow makes cannot trigger itself.
+It runs on manual dispatch and on branch pushes that touch the UI (see the
+workflow's `paths:` list). Changes under `docs/screenshots/**` are deliberately
+not a trigger, so the commit the workflow makes cannot trigger itself. Tag
+pushes don't trigger it, and the commit job skips any run not on a branch (such
+as a manual dispatch from a tag): a tag checkout is a detached HEAD, so there is
+no branch to rebase onto and push the screenshot commit to — that run's
+screenshots stay available as the workflow's `screenshots` artifact instead.
 
 ## Running it locally
 
