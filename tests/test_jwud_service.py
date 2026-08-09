@@ -626,3 +626,20 @@ async def test_convert_still_fails_on_an_invalid_verification_result(
                 str(source), str(tmp_path / "game.wud"), "jwud_decompress",
             ),
         )
+
+
+def test_orphan_split_part_keeps_its_own_stem(tmp_path):
+    """An orphan part must not plan the whole-set output name.
+
+    `is_split_secondary` deliberately leaves a stray game_part7.wud convertible
+    so JWUDTool can reject it — but if it planned `game.wux`, an overwrite job
+    would unlink an unrelated finished image before that failure.
+    """
+    assert service.output_stem("/data/game_part7.wud") == "game_part7"
+    assert service.get_output_path_for_mode(
+        "jwud_compress", "/data/game_part7.wud",
+    ) == "/data/game_part7.wux"
+    # Part 1 still names the product after the disc.
+    assert service.get_output_path_for_mode(
+        "jwud_compress", "/data/game_part1.wud",
+    ) == "/data/game.wux"

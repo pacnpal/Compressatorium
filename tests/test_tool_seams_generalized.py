@@ -421,3 +421,25 @@ def test_delete_plan_is_unchanged_for_an_ordinary_source(tmp_path):
     plan = build_delete_plan(str(plain))
 
     assert plan["delete_paths"] == [str(plain)]
+
+
+# --- delete_on_verify_is_safe -------------------------------------------------
+
+def test_delete_on_verify_is_safe_defaults_to_true():
+    # Every tool whose verify() reads the whole output keeps the pre-hook
+    # behavior, so nothing but jwud changes.
+    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz"):
+        tool = registry.get(tool_id)
+        mode = tool.modes[0].mode
+        assert tool.delete_on_verify_is_safe(mode, None) is True
+        assert tool.delete_on_verify_is_safe(mode, "anything") is True
+
+
+def test_jwud_delete_on_verify_tracks_the_verification_choice():
+    """jwud's verify() is structural, so deletion leans on the conversion-time
+    byte-for-byte comparison — which -noVerify turns off."""
+    tool = registry.get("jwud")
+
+    assert tool.delete_on_verify_is_safe("jwud_compress", None) is True
+    assert tool.delete_on_verify_is_safe("jwud_compress", "verify") is True
+    assert tool.delete_on_verify_is_safe("jwud_compress", "noverify") is False

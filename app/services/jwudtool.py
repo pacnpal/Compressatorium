@@ -310,7 +310,12 @@ class JwudToolService:
         duplicate-check probe.
         """
         stem = Path(input_path).stem
-        if split_part_index(input_path) is not None:
+        # ONLY part 1 renames: it is the member that stands for the whole set.
+        # A stray game_part7.wud with no part 1 beside it stays convertible (so
+        # JWUDTool can reject it with its own size complaint) — but it must keep
+        # its own stem, or an overwrite job would plan `game.wux` and could
+        # unlink an unrelated finished image before failing.
+        if split_part_index(input_path) == 1:
             return stem.rsplit("_part", 1)[0]
         return stem
 

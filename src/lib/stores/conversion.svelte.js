@@ -137,7 +137,18 @@ class ConversionStore {
       );
     }
     if (entry.type === 'directory') return false;
-    return this.allowsInput(entry.path);
+    if (!this.allowsInput(entry.path)) return false;
+    // The extension match stays the source of truth (it encodes the mode's
+    // declared inputs); the listing's `convertible_by` may only NARROW it, the
+    // same rule `registry.verifyToolForPath` applies on the verify side. This is
+    // what keeps the non-primary members of a multi-file source unselectable —
+    // a split Wii U dump's game_part2.wud is a .wud by extension, but only
+    // game_part1.wud drives the set, and plan_job rejects the rest.
+    if (Array.isArray(entry.convertible_by)
+        && !entry.convertible_by.includes(this.currentTool?.id)) {
+      return false;
+    }
+    return true;
   }
 
   /**

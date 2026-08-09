@@ -899,7 +899,10 @@ archive.
   alone. A mismatch fails the job rather than leaving a bad image in place. The
   tool picker's dropdown trades that guarantee for speed: **Skip verification**
   passes `-noVerify` and roughly halves the runtime. (The dropdown sits where
-  other tools put their codec because WUX has no codec to choose.)
+  other tools put their codec because WUX has no codec to choose.) It cannot be
+  combined with delete-on-verify: this tool's own verify checks the container's
+  structure, not its contents, so deleting a 25 GB source would rest on nothing
+  having compared the two images. That combination is rejected with a 400.
 - **Progress covers both phases.** With verification on, the conversion runs
   1–50 % on the bar and the verification 51–99 %; with it off the conversion
   gets the whole 1–99 %.
@@ -914,8 +917,11 @@ archive.
 - **Split dumps are supported.** wudump writes `game_part1.wud` …
   `game_part12.wud` (eleven 2 GiB parts plus a smaller twelfth), and JWUDTool
   joins them when you select part 1. Only part 1 is offered as a source — the
-  other parts stay listed, so you can see and delete them, but aren't
-  convertible on their own, since a part is not a disc image. The product is
+  other parts stay listed, so you can see and delete them, but they can't be
+  selected or queued (the API rejects them too), since a part is not a disc
+  image. A stray part with no `game_part1.wud` beside it is left alone and
+  keeps its own name, so it fails with JWUDTool's size complaint rather than
+  planning the whole set's output. The product is
   named after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify
   removes the **whole set** rather than orphaning the eleven parts it didn't
   name. The names are matched exactly as JNUSLib defines them, so a renamed set

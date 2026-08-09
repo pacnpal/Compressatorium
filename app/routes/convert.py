@@ -105,12 +105,31 @@ _DELETE_ON_VERIFY_UNSUPPORTED_DETAIL = (
 )
 
 
-def _validate_request_compression(spec, mode: str, compression: str | None) -> None:
+def _validate_request_compression(
+    spec, mode: str, compression: str | None, delete_on_verify: bool = False,
+) -> None:
     """Reject a compression request a mode can't honor (shared by single + batch).
 
     Raises ``HTTPException(400)`` with the mode-specific message; a no-op when no
     compression was requested or the mode accepts it.
     """
+    # Delete-on-verify removes the source once verify() passes, which assumes
+    # verify() is a real content check. For most tools it is; jwud's is a
+    # structural WUX walk backed by JWUDTool's byte-for-byte comparison during
+    # the conversion, and the job can turn that comparison off. The plugin
+    # decides (default True), so this is a registry lookup, not a tool branch.
+    if delete_on_verify and not registry.for_mode(mode).delete_on_verify_is_safe(
+        mode, compression,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Delete sources after verification cannot be combined with "
+                "skipping verification: nothing would compare the output against "
+                "the source before the source is deleted"
+            ),
+        )
+
     if not compression:
         return
     if spec.tool_id == "chdman" and spec.kind == ModeKind.EXTRACT:
@@ -302,6 +321,7 @@ class SkipReason(Enum):
     ROMZ_BAD_EXTENSION = "romz_bad_extension"
     ROMZ_INVALID_ARCHIVE = "romz_invalid_archive"
     JWUD_BAD_EXTENSION = "jwud_bad_extension"
+    SOURCE_NOT_INDEPENDENTLY_CONVERTIBLE = "source_not_independently_convertible"
     DOLPHIN_SAME_PATH = "dolphin_same_path"
     CHAIN_BAD_EXTENSION = "chain_bad_extension"
     PS3_FOLDER_INVALID = "ps3_folder_invalid"
@@ -385,6 +405,12 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
         400,
         "jwud_compress requires a Wii U disc image (.wud); "
         "jwud_decompress requires a compressed image (.wux)",
+    ),
+    SkipReason.SOURCE_NOT_INDEPENDENTLY_CONVERTIBLE: (
+        400,
+        "File is one part of a multi-file source and cannot be converted on its "
+        "own; select the set's primary file instead (for a split Wii U dump, "
+        "that is game_part1.wud)",
     ),
     SkipReason.DOLPHIN_SAME_PATH: (
         400,
@@ -650,6 +676,20 @@ async def plan_job(
         if ext not in spec.input_extensions:
             raise SkipFile(bad_ext_reason)
 
+        # Per-file refinement of the same gate: `converts_path` defaults to the
+        # very extension match above, so this is a no-op for every tool whose
+        # source is one file. A tool whose source is a *set* (jwud's split Wii U
+        # dumps) accepts only the primary member, so the others are rejected
+        # here rather than queued into a job that can only fail. Scoped to the
+        # tools that opted into the generic gate: chdman drops `.chd` from its
+        # `input_extensions` and validates by `.chd` presence above, so the
+        # default extension-match refinement does not describe it. Runs off the
+        # event loop — the probe stats the sibling primary.
+        if not await run_in_threadpool(
+            registry.for_mode(mode).converts_path, file_path,
+        ):
+            raise SkipFile(SkipReason.SOURCE_NOT_INDEPENDENTLY_CONVERTIBLE)
+
     if mode == "romz_extract":
         # romz-specific: validate the archive is a real single-ROM archive
         # BEFORE planning an output / allowing overwrite. get_output_path_for_mode
@@ -847,7 +887,7 @@ async def create_job(request: JobCreateRequest):
     mode = request.mode.value
     output_dir = normalize_output_dir(request.output_dir)
     spec = registry.spec(mode)
-    _validate_request_compression(spec, mode, compression)
+    _validate_request_compression(spec, mode, compression, request.delete_on_verify)
     _validate_delete_on_verify(spec, request.delete_on_verify)
     if not is_within_configured_volumes(request.file_path):
         raise HTTPException(
@@ -923,7 +963,7 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
     mode = request.mode.value
     spec = registry.spec(mode)
     output_dir = normalize_output_dir(request.output_dir)
-    _validate_request_compression(spec, mode, compression)
+    _validate_request_compression(spec, mode, compression, request.delete_on_verify)
     _validate_delete_on_verify(spec, request.delete_on_verify)
     if request.delete_on_verify:
         disallowed_archives = get_disallowed_archive_paths(request.file_paths)

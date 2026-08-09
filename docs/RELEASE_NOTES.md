@@ -39,6 +39,16 @@ and #179, part of the #177 tech-debt epic).
   after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify takes
   the whole set instead of orphaning eleven parts.
 
+  **Delete-on-verify is guarded per job (`delete_on_verify_is_safe`).** A third
+  input-side hook, because the verification toggle below would otherwise create
+  a footgun: jwud's `verify()` walks the WUX container's structure (the format
+  has no content checksums), so what justifies deleting a 25 GB source is
+  JWUDTool's byte-for-byte comparison during the conversion — and `-noVerify`
+  turns that off. `ModeSpec.supports_delete_on_verify` only knows about the
+  mode, so the plugin now answers the per-job question too (default `True`, so
+  no other tool changes) and the shared request validator rejects the
+  combination for single and batch alike.
+
   **The verification pass is now a choice.** It stays on by default, but the
   tool picker's dropdown — where other tools put their codec, since WUX has none
   — offers **Skip verification**, which passes `-noVerify` and roughly halves the

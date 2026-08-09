@@ -981,6 +981,27 @@ Both hooks may touch the disk (they look for the sibling primary / enumerate the
 set), so they run in the `files.py` threadpool scan and inside
 `build_delete_plan`, never on the event loop.
 
+#### Per-job delete-on-verify guard (`delete_on_verify_is_safe`)
+
+`ModeSpec.supports_delete_on_verify` answers "can this *mode* offer it?", which
+was enough while every tool's `verify()` read the whole output. jwud breaks that
+assumption: WUX carries no content checksums, so its verify walks the container's
+structure, and what actually justifies deleting a 25 GB source is JWUDTool's
+byte-for-byte comparison *during* the conversion — which the job can switch off
+with `-noVerify`. The two settings together would delete the only copy of a disc
+image on the strength of a geometry check.
+
+`ToolPlugin.delete_on_verify_is_safe(mode, compression)` answers the narrower
+"can this *job* offer it?". `BaseTool` returns `True`, so every other tool is
+unchanged; `JwudTool` returns whether the job kept verification on.
+`routes/convert.py::_validate_request_compression` — already the shared
+request-level validator for both the single and batch endpoints — rejects the
+unsafe combination with a 400, so the two paths can't drift.
+
+It lives on the plugin rather than as a `spec.tool_id == "jwud"` branch for the
+same reason `is_ready` did: a second tool whose verify is weaker than its
+conversion-time check would otherwise silently inherit "safe".
+
 > **Not yet folded in: `.cue`/`.gdi` tracks.** `build_delete_plan` still parses
 > those out of the file's *contents*, with its own unsafe-reference handling
 > (absolute paths, refs escaping the source directory) that the naming-derived

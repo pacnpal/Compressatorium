@@ -94,6 +94,22 @@ class ToolPlugin(Protocol):
         threadpool scan.
         """
 
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool:
+        """Whether deleting the source after ``verify()`` is safe for this job.
+
+        ``ModeSpec.supports_delete_on_verify`` says the *mode* can offer it;
+        this says the *job* can, given its settings. It exists because a tool's
+        verify step is not always a full content check: jwud's is a structural
+        WUX walk (the format carries no checksums), which is only backed by a
+        real byte-for-byte comparison because JWUDTool runs one during the
+        conversion — and the job can turn that off with ``-noVerify``. Deleting
+        a 25 GB source on the strength of a geometry check alone would risk the
+        only copy, so jwud returns ``False`` for that combination and the route
+        rejects it.
+
+        Default ``True``: every other tool's verify reads the whole output.
+        """
+
     def source_companions(self, path: str) -> list[str]:
         """Sibling files this input consumes *besides* ``path`` itself.
 
@@ -287,6 +303,12 @@ class BaseTool:
     def source_companions(self, path: str) -> list[str]:
         # Default: a single-file source consumes nothing else.
         return []
+
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool:
+        # Default: this tool's verify() reads the whole output, so passing it
+        # is enough to justify removing the source. Only a tool whose verify
+        # is weaker than its conversion-time check (jwud) overrides this.
+        return True
 
     def verifies_path(self, path: str) -> bool:
         # Default: a plain extension match. Tools that over-claim a container

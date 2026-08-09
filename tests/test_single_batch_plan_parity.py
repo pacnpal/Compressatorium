@@ -55,13 +55,15 @@ def _parity_env(tmp_path: Path, monkeypatch):
     }
 
 
-async def _run_single(env, *, file_path, mode, duplicate_action, delete_on_verify):
+async def _run_single(env, *, file_path, mode, duplicate_action, delete_on_verify,
+                      compression=None):
     env["single_mock"].reset_mock()
     request = JobCreateRequest(
         file_path=file_path,
         mode=mode,
         duplicate_action=duplicate_action,
         delete_on_verify=delete_on_verify,
+        compression=compression,
     )
     try:
         await convert_routes.create_job(request)
@@ -74,13 +76,15 @@ async def _run_single(env, *, file_path, mode, duplicate_action, delete_on_verif
     }
 
 
-async def _run_batch(env, *, file_path, mode, duplicate_action, delete_on_verify):
+async def _run_batch(env, *, file_path, mode, duplicate_action, delete_on_verify,
+                     compression=None):
     env["captured"].clear()
     request = BatchJobCreateRequest(
         file_paths=[file_path],
         mode=mode,
         duplicate_action=duplicate_action,
         delete_on_verify=delete_on_verify,
+        compression=compression,
     )
     try:
         await convert_routes.create_batch_jobs(request)
@@ -204,6 +208,33 @@ def _cases():
             ConversionMode.Z3DS_COMPRESS,
             DuplicateAction.SKIP,
             "reject",
+        ),
+        (
+            "jwud_split_secondary_reject",  # SOURCE_NOT_INDEPENDENTLY_CONVERTIBLE
+            lambda t: (
+                write(t, "game_part1.wud"),
+                write(t, "game_part2.wud"),
+            )[1],
+            ConversionMode.JWUD_COMPRESS,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "jwud_split_primary_accept",  # part 1 drives the whole set
+            lambda t: (
+                write(t, "game_part2.wud"),
+                write(t, "game_part1.wud"),
+            )[1],
+            ConversionMode.JWUD_COMPRESS,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "jwud_orphan_part_accept",  # no part 1 beside it: left for the tool
+            lambda t: write(t, "game_part7.wud"),
+            ConversionMode.JWUD_COMPRESS,
+            DuplicateAction.SKIP,
+            "accept",
         ),
         (
             "jwud_bad_ext_reject",  # JWUD_BAD_EXTENSION
@@ -459,3 +490,46 @@ async def test_romz_extract_invalid_archive_rejected_before_overwrite(parity_env
     parity_env["single_mock"].assert_not_called()
     # The unrelated sibling was never planned for overwrite/deletion.
     assert sibling.read_bytes() == b"PRECIOUS"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compression", ["noverify", "noverify:1"])
+async def test_delete_on_verify_rejects_skipped_verification(parity_env, compression):
+    """jwud's verify() is structural, so deleting the source leans on JWUDTool's
+    conversion-time byte-for-byte comparison. A job that turns that comparison
+    off must not also delete the only copy of a 25 GB image."""
+    source = parity_env["tmp_path"] / "game.wud"
+    source.write_bytes(b"image")
+
+    for runner in (_run_single, _run_batch):
+        result = await runner(
+            parity_env,
+            file_path=str(source),
+            mode=ConversionMode.JWUD_COMPRESS,
+            duplicate_action=DuplicateAction.SKIP,
+            delete_on_verify=True,
+            compression=compression,
+        )
+        assert result["status"] == 400, result
+        assert "skipping verification" in result["detail"]
+
+
+@pytest.mark.asyncio
+async def test_delete_on_verify_allows_the_verified_default(parity_env):
+    """The same request with verification left on is accepted by both paths."""
+    source = parity_env["tmp_path"] / "game.wud"
+    source.write_bytes(b"image")
+
+    kwargs = {
+        "file_path": str(source),
+        "mode": ConversionMode.JWUD_COMPRESS,
+        "duplicate_action": DuplicateAction.SKIP,
+        "delete_on_verify": True,
+        "compression": "verify",
+    }
+    single = await _run_single(parity_env, **kwargs)
+    batch = await _run_batch(parity_env, **kwargs)
+
+    assert "status" not in single, single
+    assert "skipped" not in batch, batch
+    assert single["output_path"] == batch["output_path"]

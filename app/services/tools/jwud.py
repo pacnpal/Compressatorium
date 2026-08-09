@@ -19,6 +19,7 @@ from services.jwudtool import (
     is_split_secondary,
     jwudtool_service,
     split_set_parts,
+    verification_enabled,
 )
 from services.lock_manager import lock_manager
 
@@ -92,6 +93,15 @@ class JwudTool(BaseTool):
         # Parts 2…N of a split set, so delete-on-verify takes the whole source
         # instead of orphaning ~23 GB of parts it never named.
         return split_set_parts(path)
+
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool:
+        # Our verify() walks the WUX container's structure; the format carries
+        # no content checksums, so it can prove the geometry is intact but not
+        # that the stored sectors match the disc. What makes delete-on-verify
+        # safe is JWUDTool's byte-for-byte comparison *during* the conversion —
+        # so if the job passed -noVerify, nothing ever compared the two images
+        # and deleting the source would risk the only copy.
+        return verification_enabled(compression)
 
     def detect_output(self, input_path: str) -> OutputStatus | None:
         # Compress direction only: badge "the .wux already exists" next to a
