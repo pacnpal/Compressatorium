@@ -73,6 +73,9 @@ MATRIX = [
     # the FIRST step's stem, so the compound suffix is stripped here too.
     (".nkit.iso", ConversionMode.NKIT_TO_RVZ, ".rvz"),
     (".nkit.gcz", ConversionMode.NKIT_TO_RVZ, ".rvz"),
+    # Wii U: both directions map on the member's own extension, like z3ds/nsz.
+    (".wud", ConversionMode.JWUD_COMPRESS, ".wux"),
+    (".wux", ConversionMode.JWUD_DECOMPRESS, ".wud"),
 ]
 
 

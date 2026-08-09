@@ -319,8 +319,9 @@ class BaseTool:
 ### 3.3 `runner.py`: shared subprocess orchestration
 
 This collapses the ~150 near-identical lines that were duplicated in every
-tool's `convert()`. All seven conversion tools now delegate their streaming loop
-here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso` directly, and
+tool's `convert()`. All nine conversion tools now delegate their streaming loop
+here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso`, `nkit2iso`, `jwudtool`
+directly, and
 `z3ds_compress`, `maxcso`, `nsz` via the size-based-progress seam below (their
 CLIs print no parseable percent, so the growing output file is the progress
 signal).
@@ -1045,6 +1046,100 @@ Two consumer-side notes keep the gate airtight:
   in-progress). A coincidental multi-file `Game.gba.7z` thus never enters
   `outputs`, so the verify-from-output flow can't offer romz Verify on it.
 
+#### Multi-file sources (`converts_path` / `source_companions`)
+
+The two hooks above describe the *output* side per-file. `jwud` needed the same
+treatment on the **input** side, because a split Wii U dump is one disc image
+spread over twelve files: JNUSLib's `WUDDiscReaderSplitted` reads
+`game_part1.wud` … `game_part12.wud` (11 parts of exactly 2 GiB plus a
+1,402,994,688-byte twelfth) and joins them when you hand it part 1. Two shared
+paths assumed a source is exactly one file, and both got it wrong for a set:
+
+- **The listing** derived `convertible_by` from `ext in tool.input_extensions`,
+  so all twelve parts were offered as sources. Eleven of them can only fail —
+  a part on its own is not a disc image.
+- **The delete planner** (`utils/delete_plan.py`) collected the source plus, for
+  a `.cue`/`.gdi`, its parsed track files. A verified conversion with
+  delete-on-verify would therefore remove the part the job named and orphan the
+  other eleven — ~23 GB of silent leftovers.
+
+`ToolPlugin.converts_path(path) -> bool` is the input-side mirror of
+`verifies_path`: `BaseTool` defaults it to the plain `input_extensions` match
+(so the seven pre-existing tools are unchanged), and `JwudTool` returns `False`
+for a secondary part that has its primary beside it. The registry exposes
+`tools_converting_path(path)` next to `tools_verifying_path`, and
+`routes/files.py` feeds it into the same tool-neutral `FileEntry.convertible_by`
+list — so the secondary parts stay **visible** (you can still see and delete
+them) but are never offered for conversion, the same shape as the
+visible-but-not-convertible archive members in §17.5 of the adding-a-tool guide.
+
+`ToolPlugin.source_companions(path) -> list[str]` is the input-side mirror of
+`companion_outputs`: the sibling files this input also consumes, never including
+`path` itself, `[]` by default. `build_delete_plan` adds
+`registry.source_companions(source)` to its delete set, so removing a split
+source takes the whole set. A gap in the set truncates it — JNUSLib reads the
+parts in order, so a set missing part 3 is broken rather than an 11-part set,
+and the stragglers must not be reported as belonging to a usable source.
+
+Both hooks may touch the disk (they look for the sibling primary / enumerate the
+set), so they run in the `files.py` threadpool scan and inside
+`build_delete_plan`, never on the event loop.
+
+**Naming the set's product is a third disk-reading decision.** Part 1 of a set
+produces `game.wux`, not `game_part1.wux` — the parts are one image and the part
+number is meaningless once they're joined. But that rewrite is only correct when
+the set can actually *be* joined, so `JwudToolService.output_stem` gates it on
+`split_set_is_complete()`: parts 1…N present with no gap **and** summing to
+exactly `WUD_IMAGE_SIZE`, which is what JNUSLib itself requires. A half-finished
+dump, a set with a hole in it, an orphan part, and an archive member (whose
+synthesised path has no set behind it on disk) all keep their own stem. The
+reason is `allow_overwrite`: an input that claims `game.wux` but cannot produce
+it would let the worker unlink an unrelated finished image *before* JWUDTool
+failed.
+
+Disk state answers that for a real path, but an **archive member's path is
+synthesised** — the location it would occupy once extracted — so reading its
+directory reads someone else's files. `ToolPlugin.detect_output` therefore takes
+`from_archive` (default `False`), the listing-side counterpart of the
+`treat_as_stem` `plan_job` already passes for the same member;
+`_detect_archive_member_outputs` sets it and `JwudTool` forwards it to
+`output_path`. The other seven tools ignore it, because they swap a suffix and a
+synthesised path resolves like a real one. It lives on the seam rather than in
+jwud because the property is general: extraction hands over one member and never
+its siblings, so a member can only ever produce a single-file output — a future
+tool whose output name depends on its input's neighbours would otherwise inherit
+the wrong answer silently. Without it, an archive holding `game_part1.wud` next
+to a genuinely extracted set badges the set's `game.wux` while the planner
+targets `game_part1.wux`.
+
+#### Per-job delete-on-verify guard (`delete_on_verify_is_safe`)
+
+`ModeSpec.supports_delete_on_verify` answers "can this *mode* offer it?", which
+was enough while every tool's `verify()` read the whole output. jwud breaks that
+assumption: WUX carries no content checksums, so its verify walks the container's
+structure, and what actually justifies deleting a 25 GB source is JWUDTool's
+byte-for-byte comparison *during* the conversion — which the job can switch off
+with `-noVerify`. The two settings together would delete the only copy of a disc
+image on the strength of a geometry check.
+
+`ToolPlugin.delete_on_verify_is_safe(mode, compression)` answers the narrower
+"can this *job* offer it?". `BaseTool` returns `True`, so every other tool is
+unchanged; `JwudTool` returns whether the job kept verification on.
+`routes/convert.py::_validate_request_compression` — already the shared
+request-level validator for both the single and batch endpoints — rejects the
+unsafe combination with a 400, so the two paths can't drift.
+
+It lives on the plugin rather than as a `spec.tool_id == "jwud"` branch for the
+same reason `is_ready` did: a second tool whose verify is weaker than its
+conversion-time check would otherwise silently inherit "safe".
+
+> **Not yet folded in: `.cue`/`.gdi` tracks.** `build_delete_plan` still parses
+> those out of the file's *contents*, with its own unsafe-reference handling
+> (absolute paths, refs escaping the source directory) that the naming-derived
+> hook has no equivalent for. Routing chdman's track files through
+> `source_companions` is the obvious next consolidation, but it would move that
+> security surface — and the `unsafe_paths` wire strings tests pin — so it is
+> deliberately left for its own change.
 #### Source-tool ordering is most-specific-first
 
 `registry.toolsForSourcePath` / `infoToolsForPath` rank claiming tools by the

@@ -63,6 +63,12 @@ const ROMZ_COMPRESS_EXTS = ['.gb', '.gbc', '.gba', '.nds'];
 const ROMZ_VERIFY_EXTS = ['.7z', '.zip'];
 const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 
+// Wii U (JWUDTool). Compress takes the raw .wud dump; decompress takes the
+// .wux container. Both directions are "sources" depending on the chosen mode.
+const JWUD_COMPRESS_EXTS = ['.wud'];
+const JWUD_VERIFY_EXTS = ['.wux'];
+const JWUD_SOURCE_EXTS = [...JWUD_COMPRESS_EXTS, ...JWUD_VERIFY_EXTS];
+
 // makeps3iso (PS3 folder -> ISO). The unit of work is a DIRECTORY, not a file
 // with a suffix, so it declares no source/verify extensions; the mode carries
 // `inputKinds: ['directory']` and selection runs through the backend's
@@ -574,6 +580,52 @@ export const TOOLS = [
     productPath: (path, mode = 'nkit_restore') => (path ?? '').replace(
       /\.nkit\.(iso|gcz)$/i, mode === 'nkit_to_rvz' ? '.rvz' : '.iso',
     ),
+  },
+  {
+    id: 'jwud',
+    defaultCompression: ['verify'],
+    label: 'Wii U',
+    hint: 'Compress and decompress Wii U disc images (WUD ↔ WUX). No keys needed.',
+    verifyPrefix: 'jwud',
+    sourceExts: JWUD_SOURCE_EXTS,
+    verifyExts: JWUD_VERIFY_EXTS,
+    modeGroups: ['jwud'],
+    groups: { jwud: 'Wii U' },
+    defaultMode: 'jwud_compress',
+    glyph: 'WUD',
+    accent: 'var(--badge-wiiu)',
+    // WUX is a fixed sector-dedup format, so there is no codec and no level.
+    // The dropdown carries JWUDTool's own verification pass instead — the same
+    // way nsz's carries solid/block rather than a codec. 'single-with-level'
+    // renders just the dropdown because both modes set
+    // supportsCompressionLevel: false.
+    compressionCodecs: [
+      { value: 'verify', label: 'Verify against source',
+        hint: 'JWUDTool re-reads both images and compares them byte for byte. Doubles the runtime.' },
+      { value: 'noverify', label: 'Skip verification (faster)',
+        hint: 'Passes -noVerify: about half the runtime, but the result is not checked against the source.' },
+    ],
+    compressionStyle: 'single-with-level',
+    modes: [
+      { mode: 'jwud_compress', kind: 'compress', label: 'Compress Wii U (WUD → WUX)',
+        group: 'jwud',
+        outputExt: '.wux', inputExtensions: JWUD_COMPRESS_EXTS,
+        supportsCompression: true, supportsCompressionLevel: false,
+        supportsDeleteOnVerify: true, allowsArchiveInput: true },
+      { mode: 'jwud_decompress', kind: 'extract', label: 'Decompress Wii U (WUX → WUD)',
+        group: 'jwud',
+        outputExt: '.wud', inputExtensions: JWUD_VERIFY_EXTS,
+        supportsCompression: true, supportsCompressionLevel: false,
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
+    ],
+    getInfo: (path) => api.getJwudInfo(path),
+    verify: (path, opts) => api.verifyJwud(path, opts),
+    verifyBatch: (paths, opts) => api.verifyBatchJwud(paths, opts),
+    productPath: (path) => {
+      if (/\.wud$/i.test(path)) return swapExt(path, '.wux');
+      if (/\.wux$/i.test(path)) return swapExt(path, '.wud');
+      return path;
+    },
   },
 ];
 

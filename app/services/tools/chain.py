@@ -164,7 +164,9 @@ class ChainTool(BaseTool):
         # tool-written file, not a user-named one), so with_suffix is safe here.
         return str(Path(intermediate).with_suffix(spec.output_ext))
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         """Badge the source when the chain's own product already exists.
 
         Resolved per chain spec rather than against a literal ``.chd``: the

@@ -61,6 +61,12 @@
       blurb: 'NKit-shrunk GameCube and Wii images back to a plain, full-size .iso, using nkit2iso. NKit shrinks a disc by dropping everything a program can recreate — the junk padding, the gaps, and for Wii the encryption and hash tree — so restoring means rebuilding all of it and checking the result against the CRC32 stored in the NKit header. There are no per-job settings to choose, and the output is bit-exact and CRC32-verified — except for one case: a Wii image whose update partition was removed at shrink time has no way back to bit-exact, because that data is not in the file. By default that region is zero-filled and the CRC32 check is skipped, so the ISO is playable but not redump-verifiable, and the job says so plainly. One direction only: this app never writes NKit. There is also a one-step Convert to RVZ mode (nkit_to_rvz) that restores and compresses in a single job, keeping the full-size ISO in a scratch directory instead of your library — usually what you want, since no emulator reads NKit and Dolphin reads RVZ natively. Info reads the NKit header, so you can see the console, game and restored size before spending the restore. Set NKIT2ISO_RECOVERY=download if you want the tool to fetch the publicly archived recovery partition for those images instead and get a bit-exact, redump-verified restore — the only case where it uses the network.',
       io: '.nkit.iso / .nkit.gcz  →  .iso  (or  →  .rvz  in one step)',
     },
+    {
+      glyph: 'WUD',
+      name: 'Wii U',
+      blurb: 'Wii U disc dumps to WUX and back, using JWUDTool. Every Wii U disc image is exactly 25 GB regardless of how much of it the game uses, so WUX deduplicates the repeated sectors and typically lands a fraction of that; Cemu reads the .wux directly. Lossless and fully reversible. No keys needed either — this only repacks the image, it never decrypts it, so a WUX stays as encrypted as the WUD it came from. JWUDTool compares the result against the source byte for byte before the job reports success, which is why a compress job takes about twice as long as the write itself; the dropdown can turn that off if you want the speed instead. Split dumps from wudump (game_part1.wud through game_part12.wud) work too — pick part 1 and the whole set converts as one image.',
+      io: '.wud  ↔  .wux',
+    },
   ];
 
   // Per-tool mode reference. Generated from the registry (one section per

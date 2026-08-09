@@ -2,11 +2,11 @@
 
 > **Fork notice:** This is a fork of MarcTV's Docker CHD Converter. It adds a Web UI and more conversion tools on top of the original CLI converter. Thanks to [MarcTV](https://github.com/MarcTV) for the original.
 
-A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), **makeps3iso** (PS3 decrypted folder → ISO), and **nkit2iso** (NKit-shrunk GameCube/Wii image → ISO). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
+A game image converter that wraps nine tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), **makeps3iso** (PS3 decrypted folder → ISO), **nkit2iso** (NKit-shrunk GameCube/Wii image → ISO), and **JWUDTool** (Wii U WUD ↔ WUX). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
 
 ## Features
 
-* **Eight tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), PS3 ISO (a decrypted PS3 folder packed to `.iso`), or NKit (an NKit-shrunk GameCube/Wii image restored to a full `.iso`), chosen per job.
+* **Nine tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), PS3 ISO (a decrypted PS3 folder packed to `.iso`), NKit (an NKit-shrunk GameCube/Wii image restored to a full `.iso`), or Wii U (WUD ↔ WUX), chosen per job.
 * **Web UI** for browsing files and converting them. The tool picker filters the whole interface down to the tool you chose.
 * **Nested directories and archives.** Browse subfolders and look inside ZIP, 7z, and RAR archives.
 * **Multiple volume mounts** so you can keep separate game libraries separate.
@@ -14,7 +14,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 * **Existing-output detection** with skip, rename, or overwrite.
 * **Delete-on-verify.** Optionally remove the source after a conversion verifies. Off by default.
 * **Progress tracking** through a live job queue.
-* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, and NKit files.
+* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, NKit, and Wii U files.
 
 ### Supported Conversions
 
@@ -27,6 +27,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 | **CSO** | PSP / PS2 game images | .iso, .cso, .zso, .dax | .cso, .zso, .dax, .iso, .chd | Effort preset (Fast/Default/Max); the `cso_to_chd` chain ignores it and uses chdman defaults | None | `maxcso` (+ chdman for `cso_to_chd`) |
 | **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
+| **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed); a verify-after-conversion toggle | None | `JWUDTool` (Java) |
 | **NKit** | NKit-shrunk GameCube / Wii discs | .nkit.iso, .nkit.gcz | .iso, .rvz (via the `nkit_to_rvz` chain) | None (fixed) | None | `nkit2iso` (+ dolphin-tool for `nkit_to_rvz`) |
 
 Most conversions above are lossless and fully reversible, including **3DS**, which
@@ -59,6 +60,7 @@ one-step `nkit_to_rvz` chain, which restores and compresses to RVZ in a single j
 so the full-size ISO never lands in your library. See
 [NKit Support](#nkit-support-nkit--iso).
 
+> **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, Switch dumps, and Wii U images. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
 Each tool's full mode list (e.g. CHDMAN's `createcd`/`extractcd`, CSO's
 `cso2_compress`, the ROM packer's `romz_7z`/`romz_zip`/`romz_extract`, the PS3
 packer's `folder_to_iso`, and NKit's `nkit_restore`/`nkit_to_rvz`) is in
@@ -146,6 +148,7 @@ When you open the Web UI, you'll see the tool options at the top:
 * **CSO** - For compressing/decompressing PSP/PS2 ISO images to CSO/ZSO (and a one-step CSO → CHD chain)
 * **Handheld ROM** - For compressing/extracting GB/GBC/GBA/DS ROM dumps to .7z/.zip archives
 * **PS3 ISO** - For packing a decrypted PS3 folder into a `.iso` RPCS3 can mount
+* **Wii U** - For compressing Wii U disc images to `.wux` and back
 
 **Choose the tool that matches your files.** The interface then shows only the modes and file types that tool can use.
 
@@ -395,6 +398,12 @@ A three-pane layout: navigation and tool picker on the left, the volume and file
 | Light | Dark |
 |-------|------|
 | ![3DS tool, light](docs/screenshots/workspace-3ds-light.png) | ![3DS tool, dark](docs/screenshots/workspace-3ds-dark.png) |
+
+**Wii U.** Compress `.wud` disc images to `.wux` with JWUDTool, and back again.
+
+| Light | Dark |
+|-------|------|
+| ![Wii U tool, light](docs/screenshots/workspace-wiiu-light.png) | ![Wii U tool, dark](docs/screenshots/workspace-wiiu-dark.png) |
 
 #### Dashboard
 
@@ -859,6 +868,98 @@ verify.
 
 ---
 
+## Wii U Support (WUD ↔ WUX)
+
+The Wii U tool converts a disc image between the raw `.wud` dump and the
+compressed `.wux` container, using [JWUDTool](https://www.gamebrew.org/wiki/JWUDTool_Wii_U)
+([source](https://github.com/Maschell/JWUDTool)). Lossless and fully reversible,
+with nothing to configure.
+
+Every Wii U disc image is exactly 25,025,314,816 bytes (about 23 GiB) no matter
+how much of the disc the game actually uses, so the padding compresses
+dramatically: WUX deduplicates repeated 32 KiB sectors and stores each distinct
+one once. Cemu reads a `.wux` directly, so the compressed file plays without a
+separate decompress step.
+
+**No keys.** This only repacks the image; it never decrypts it. A `.wux` carries
+exactly the same encrypted content as the `.wud` it came from, so no common key
+or title key is involved and none ships with this app. (JWUDTool's decrypt and
+extract features do need your own keys — they are out of scope here.)
+
+### How to Use
+
+Select **Wii U** as the primary tool, pick a `.wud` (or a `.wux` to go back), and
+run `jwud_compress` / `jwud_decompress`. The output is `<name>.wux` / `<name>.wud`
+next to the source, or in a custom output directory. The general workflow (queue,
+duplicate handling, delete-on-verify) is in the [Usage Guide](#usage-guide).
+
+### Supported File Formats
+
+| Direction | Input | Output |
+|-----------|-------|--------|
+| Compress  | `.wud` | `.wux` |
+| Decompress | `.wux` | `.wud` |
+
+Both directions can also read their input straight out of a ZIP, 7z, or RAR
+archive.
+
+### Technical Details
+
+- **Every conversion is verified against its source by default.** JWUDTool
+  re-reads both images and compares them byte for byte before the job reports
+  success, so a compress job takes roughly twice as long as writing the output
+  alone. A mismatch fails the job rather than leaving a bad image in place. The
+  tool picker's dropdown trades that guarantee for speed: **Skip verification**
+  passes `-noVerify` and roughly halves the runtime. (The dropdown sits where
+  other tools put their codec because WUX has no codec to choose.) It cannot be
+  combined with delete-on-verify: this tool's own verify checks the container's
+  structure, not its contents, so deleting a 25 GB source would rest on nothing
+  having compared the two images. That combination is rejected with a 400.
+- **Progress covers both phases.** With verification on, the conversion runs
+  1–50 % on the bar and the verification 51–99 %; with it off the conversion
+  gets the whole 1–99 %.
+- **Verify** checks the `.wux` container structurally: the header magic and
+  fields, then every sector-index entry against the file's real length. That is
+  what catches a truncated copy or a corrupt index table, and it is as deep as
+  the format allows — WUX stores no content checksums. Only `.wux` is verifiable;
+  a raw `.wud` is 25 GB of bytes with nothing to check against, which is why
+  delete-on-verify is offered on compress but not on decompress.
+- **Info** reads the WUX header, so it reports the original image size and the
+  resulting ratio alongside the usual file details.
+- **Split dumps are supported.** wudump writes `game_part1.wud` …
+  `game_part12.wud` (eleven 2 GiB parts plus a smaller twelfth), and JWUDTool
+  joins them when you select part 1. Only part 1 is offered as a source — the
+  other parts stay listed, so you can see and delete them, but they can't be
+  selected or queued (the API rejects them too), since a part is not a disc
+  image — though the row can still be ticked in the file list, so the rejection
+  arrives on submit rather than greying the checkbox out. A stray part with no
+  `game_part1.wud` beside it is left alone and keeps its own name, so it fails
+  with JWUDTool's size complaint rather than planning the whole set's output.
+  While a split conversion is running, the other parts count as in use, so they
+  can't be renamed or deleted out from under it. A **complete** set's product is
+  named after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify
+  removes the **whole set** rather than orphaning the eleven parts it didn't
+  name. "Complete" is measured: the parts must run 1…N with no gap and add up to
+  exactly one disc image, the same thing JWUDTool requires before it will join
+  them. A half-copied dump keeps its part name, so a failed conversion can never
+  cost you an unrelated `game.wux` that was already there.
+  The names are matched exactly as JNUSLib defines them, so a renamed set
+  (`MyGame_part1.wud`) reads as an ordinary image. A split set can't be
+  converted from inside an archive — the sibling parts aren't extracted with the
+  member — so an archived part keeps its own name and fails with JWUDTool's own
+  size complaint, rather than claiming the whole set's output name.
+- **Disk space.** Decompressing always writes a full ~23 GiB image, and the
+  conversion runs in a temp directory next to the destination before being moved
+  into place, so the output volume needs room for the finished file.
+- JWUDTool is a Java program (GPL-3.0). The image installs a headless JRE and the
+  pinned upstream release jar, behind a `/usr/local/bin/jwudtool` launcher; it is
+  architecture-independent, so it works on both `linux/amd64` and `linux/arm64`.
+
+### Wii U Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher |
 ## NKit Support (.nkit → .iso)
 
 The NKit tool restores an NKit-shrunk GameCube or Wii disc image back to a plain,
@@ -949,6 +1050,11 @@ on a multi-gigabyte image.
 
 ### REST API Endpoints
 
+- `GET /api/jwud-info?path=<path>` - Wii U image info (format, size, and for a `.wux` its original size and ratio)
+- `GET /api/jwud-verify?path=<path>` - Verify a `.wux` container
+- `GET /api/jwud-verify/events?path=<path>` - Streaming verification (SSE)
+- `POST /api/jwud-verify-batch/events` - Batch verification (SSE)
+- `POST /api/jobs` or `POST /api/jobs/batch` - Queue a job with `mode: "jwud_compress"` or `"jwud_decompress"`
 - `POST /api/jobs` or `POST /api/jobs/batch` - Queue an NKit job. Use `mode: "nkit_restore"` (→ `.iso`) or `mode: "nkit_to_rvz"` (→ `.rvz`) with the `.nkit.iso`/`.nkit.gcz` as the input path (`file_path` for a single job, `file_paths` for a batch).
 - `GET /api/nkit-info?path=<file>` - NKit header details: platform, game ID, title, disc number/version, restored size, stored CRC32, and the shrunk-to-original ratio.
 
@@ -1055,6 +1161,8 @@ All actions are queued and processed by the job queue (FIFO). The queue is the o
 **PS3 ISO (decrypted folder)**
 - `folder_to_iso` (a folder containing `PS3_GAME/` → `<folder>.iso`, with an optional `-s` 4 GB FAT32 split)
 
+**Wii U**
+- `jwud_compress` (.wud → .wux), `jwud_decompress` (.wux → .wud)
 **NKit (GameCube/Wii)**
 - `nkit_restore` (.nkit.iso / .nkit.gcz → the original full-size `.iso`)
 - `nkit_to_rvz` (.nkit.iso / .nkit.gcz → .rvz, one-step chain through nkit2iso + dolphin-tool)
@@ -1064,6 +1172,8 @@ Notes:
 - Extract/decompress operations ignore compression settings.
 - `extractcd` produces both `.cue` and `.bin` outputs.
 - Dolphin GCZ/ISO outputs ignore compression selection.
+- 3DS and Wii U compression use fixed settings (no user configuration needed).
+- Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, CSO, and Wii U), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
 - 3DS compression uses fixed settings (no user configuration needed).
 - Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, CSO, and NKit), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
 
@@ -1167,6 +1277,15 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | GET | `/api/cso-verify/events` | SSE stream for CSO verification progress |
 | POST | `/api/cso-verify-batch/events` | SSE stream for batch CSO verification |
 
+### Wii U Info & Verification
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/jwud-info` | Get Wii U `.wud`/`.wux` metadata (plus the WUX ratio) |
+| GET | `/api/jwud-verify` | Verify a `.wux` container's integrity |
+| GET | `/api/jwud-verify/events` | SSE stream for Wii U verification progress |
+| POST | `/api/jwud-verify-batch/events` | SSE stream for batch Wii U verification |
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1199,6 +1318,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `NKIT2ISO_RECOVERY` | `none` | What nkit2iso does with a Wii image whose update partition was removed: `none` zero-fills it (offline; playable but not redump-verifiable), `download` fetches the archived recovery partition for a bit-exact restore. `download` is the only path on which the tool uses the network. |
 | `NSZ_PATH` | `nsz` | Path to the nsz binary (Nintendo Switch); resolved on PATH by default |
 | `SEVENZIP_PATH` | `7z` | Path to the 7z binary (handheld ROM archives); resolved on PATH by default (set an absolute path or `7zz` if your distro ships the newer `7zip` package) |
+| `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher (Wii U WUD ↔ WUX); the image ships a launcher that execs the bundled jar with a headless JRE |
 | `MAX_CONCURRENT_JOBS` | `1` | Maximum parallel conversion jobs (`1` = serial queue processing) |
 | `MAX_QUEUE_DEPTH` | `0` | Max queued+processing conversion jobs before create endpoints return `429` (0 disables) |
 | `COMPRESSATORIUM_CHAIN_DISK_MARGIN_MB` | `512` | Free-space margin in MB the `cso_to_chd` chain keeps beyond the room needed for the temporary `.iso` plus the final `.chd`. A job is rejected when free space is below `required + margin`, so a bigger margin is stricter. If a valid chain job is wrongly rejected for headroom, lower this or free up space (or point `CHD_TEMP_DIR` / the output at a roomier volume). |
@@ -1212,7 +1332,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for every tool (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |
 | `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` | `60` | Timeout in seconds for `info`/`header` subprocesses, used by chdman and Dolphin (nsz/3DS read info from the filesystem, so it doesn't apply to them). 0 disables. Legacy alias: `CHD_INFO_TIMEOUT`. |
 | `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `0` | Timeout in seconds for verify runs across all tools (0 disables). Legacy alias: `CHD_VERIFY_TIMEOUT`. |
-| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), `MAKEPS3ISO`, or `NKIT2ISO` (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO` and `NKIT2ISO` take the `_NICE`/`_IOPRIO_*` knobs but have no `_VERIFY_TIMEOUT`, since neither tool has a verify step. |
+| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), `MAKEPS3ISO`, `NKIT2ISO`, or `JWUD` (Wii U) (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO`, `NKIT2ISO` and `JWUD` take the `_NICE`/`_IOPRIO_*` knobs but have no `_VERIFY_TIMEOUT`: neither makeps3iso nor nkit2iso has a verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
 | `COMPRESSATORIUM_<TOOL>_INFO_TIMEOUT` | (shared default) | Optional per-tool info-timeout override, only for `<TOOL>` = `CHDMAN` or `DOLPHIN_TOOL` (the only tools whose `info` runs a subprocess); falls back to the shared `COMPRESSATORIUM_TOOL_INFO_TIMEOUT`. |
 | `CHD_ARCHIVE_MAX_ENTRIES` | `5000` | Max archive members to list (0 disables limit) |
 | `CHD_ARCHIVE_MAX_MEMBER_SIZE` | `0` | Max size in bytes per archive member (0 disables limit) |
@@ -1373,6 +1493,8 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.zcci`, `.zcia`, `.z3ds`, `.zcxi`, `.z3dsx` - compressed 3DS ROMs (3DS decompression)
 - `.cso`, `.zso`, `.dax` - PSP/PS2 compressed ISO images (CSO decompression, or `cso_to_chd` to a `.chd`)
 - `.gb`, `.gbc`, `.gba`, `.nds` - Game Boy / GBC / GBA / DS ROMs (handheld ROM compression)
+- `.wud` - Wii U disc images (Wii U compression)
+- `.wux` - compressed Wii U disc images (Wii U decompression)
 - A decrypted PS3 folder (one containing a `PS3_GAME/` directory) - packed to `.iso` (PS3 ISO tool; the input is a folder, not a file)
 - `.nkit.iso`, `.nkit.gcz` - NKit-shrunk GameCube/Wii disc images (NKit restore). These are matched on the whole compound extension, so a plain `.iso`/`.gcz` is never mistaken for one
 
@@ -1388,6 +1510,7 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.cso`, `.zso`, `.dax` - Compressed PSP/PS2 ISO images (maxcso; `.cso` covers CSO v1 and v2)
 - `.7z`, `.zip` - Handheld ROM archives (7z; `romz_extract` restores the original `.gb`/`.gbc`/`.gba`/`.nds`)
 - `.iso` (and a split `.iso.0`/`.iso.1`/… set on FAT32) - PS3 ISO packed from a decrypted folder (makeps3iso)
+- `.wux` - Compressed Wii U disc images (JWUDTool; `jwud_decompress` restores the original `.wud`)
 - `.iso` - the full-size GameCube/Wii disc image restored from an NKit source (nkit2iso)
 - `.rvz` - a GameCube/Wii disc restored from NKit and compressed in one job (the `nkit_to_rvz` chain)
 

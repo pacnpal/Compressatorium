@@ -7,7 +7,7 @@ vertical slice, from the binary in the Docker image, through the Python service
 and tool plugin, the job pipeline, the FastAPI routes, and finally the Svelte
 web UI, and shows how to add a tool and a platform in tandem.
 
-It is written against the codebase as it stands today, with eight real tools
+It is written against the codebase as it stands today, with nine real tools
 plus one synthetic pipeline tool already wired up:
 
 | Tool id | Binary | Service module | Plugin | Handles |
@@ -20,11 +20,12 @@ plus one synthetic pipeline tool already wired up:
 | **`romz`** | `p7zip-full` (`7z` on PATH) | `app/services/romz.py` | `app/services/tools/romz.py` | Handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` to/from `.7z`/`.zip` |
 | **`makeps3iso`** | built from source (`/usr/local/bin/makeps3iso`) | `app/services/makeps3iso.py` | `app/services/tools/makeps3iso.py` | A decrypted PS3 folder (`PS3_GAME/` layout) packed to `.iso` — **directory input** |
 | **`nkit`** | built from source, Go (`/usr/local/bin/nkit2iso`) | `app/services/nkit2iso.py` | `app/services/tools/nkit2iso.py` | NKit-shrunk GameCube/Wii `.nkit.iso`/`.nkit.gcz` restored to `.iso` — **compound extensions**, info route but no verify |
+| **`jwud`** | JWUDTool release jar + JRE (`/usr/local/bin/jwudtool`) | `app/services/jwudtool.py` | `app/services/tools/jwud.py` | Wii U disc images `.wud` to/from `.wux` — **multi-file source** (a split dump) |
 | **`chain`** | *(none — drives the tools above)* | *(none)* | `app/services/tools/chain.py` | Composite `cso_to_chd` (`.cso/.zso/.dax` → `.iso` → `.chd`) and `nkit_to_rvz` (`.nkit.iso/.nkit.gcz` → `.iso` → `.rvz`), each one job |
 
 Note the **tool id is not always the binary name**: maxcso registers as `cso`,
-7z registers as `romz`, nkit2iso registers as `nkit`. The id is what the
-registry, the API and the frontend key on; use it consistently.
+7z registers as `romz`, nkit2iso as `nkit`, JWUDTool as `jwud`. The id is what
+the registry, the API and the frontend key on; use it consistently.
 
 Extensions are matched as **suffixes**, so a tool can declare a *compound*
 extension: `nkit` declares `.nkit.iso` even though `Path.suffix` would only ever
@@ -137,11 +138,11 @@ Two supporting layers:
 - **`app/models.py`** holds the `ConversionMode` enum (every mode string lives
   here), the `InputKind` enum, the `OutputStatus` / `FileEntry` listing models,
   and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`,
-  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`, `NkitInfo`).
+  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`, `NkitInfo`, `JwudInfo`).
 - **`app/config.py`** `Settings` holds the binary path for each tool
   (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`, `nsz_path`,
-  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`, `nkit2iso_path`) plus the
-  shared and per-tool nice/ioprio/timeout policy knobs.
+  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`, `nkit2iso_path`,
+  `jwudtool_path`) plus the shared and per-tool nice/ioprio/timeout policy knobs.
 
 ### The tool registry
 
@@ -164,14 +165,15 @@ Two supporting layers:
   `output_extensions()`, and `scannable_extensions()` (which drives the library
   scan / DAT-match discovery).
 - **`chdman.py` / `dolphin.py` / `z3ds.py` / `nsz.py` / `maxcso.py` / `romz.py` /
-  `makeps3iso.py` / `nkit2iso.py`** are the eight real plugins. Each is a thin
-  `BaseTool` subclass that holds `ModeSpec` rows and delegates the real work to
-  the underlying service singleton (`makeps3iso.py` is the directory-input one,
-  see §3.3.4 of the design doc; `nkit2iso.py` is the compound-extension one,
-  see §18). **`chain.py`** is the ninth registration: a synthetic `ChainTool`
-  with no binary and no service, which drives the others through the registry
-  (design doc §3.3.3).
-- **`__init__.py`** builds the `registry` singleton and registers all nine.
+  `makeps3iso.py` / `nkit2iso.py` / `jwud.py`** are the nine real plugins. Each is
+  a thin `BaseTool` subclass that holds `ModeSpec` rows and delegates the real
+  work to the underlying service singleton (`makeps3iso.py` is the
+  directory-input one, see §3.3.4 of the design doc; `nkit2iso.py` is the
+  compound-extension one, see §18; `jwud.py` is the multi-file-source one).
+  **`chain.py`** is the tenth registration: a synthetic `ChainTool` with no
+  binary and no service, which drives the others through the registry (design
+  doc §3.3.3).
+- **`__init__.py`** builds the `registry` singleton and registers all ten.
   This is the single wiring point. Order matters at the end: `ChainTool` takes
   the registry itself and must register *after* the component tools it drives.
 
@@ -224,7 +226,10 @@ A plugin subclasses `BaseTool` and provides:
 | `companion_outputs(output_path, mode)` | sibling paths this mode writes *besides* `output_path` (never including it). `BaseTool` derives them from `ModeSpec.companion_exts` as pure path math; override only when the set is dynamic (makeps3iso's size-dependent split parts). |
 | `overwrite_targets(output_path, mode)` | every path an authorized overwrite must sweep, primary **first**. A superset of `companion_outputs`: it includes the primary, and it covers artifacts only a *failed* run leaves (an interrupted makeps3iso `-s` build leaves the base *and* numbered parts, which never coexist on success — so `companion_outputs`, describing a finished output, under-reports). Enumeration only; the pipeline validates and unlinks. Default = primary + companions. |
 | `is_ready()` | **async.** Whether the tool's runtime prerequisites are met. `False` ⇒ `GET /api/tools` reports it unavailable and the frontend hides it, instead of offering jobs that can only fail. Default `True`; override for a tool gated on an operator-supplied secret or an optional binary (`NszTool` → `prod.keys`). Threadpool anything that touches disk. |
-| `detect_output(input_path)` | optional, returns an `OutputStatus` so the file list can badge "output already exists". May content-validate the candidate before claiming it: `romz` only reports a `.7z`/`.zip` sibling as its output when it's a genuine single-ROM archive (not just any file matching the `Game.gba.7z` naming), so the badge and the source row's verify-from-output flow track real outputs. |
+| `detect_output(input_path, *, from_archive=False)` | optional, returns an `OutputStatus` so the file list can badge "output already exists". May content-validate the candidate before claiming it: `romz` only reports a `.7z`/`.zip` sibling as its output when it's a genuine single-ROM archive (not just any file matching the `Game.gba.7z` naming), so the badge and the source row's verify-from-output flow track real outputs. `from_archive` marks `input_path` as the *synthesised* location an archive member would occupy once extracted — the listing-side counterpart of the `treat_as_stem` `plan_job` passes for the same member. Ignore it unless your output *name* depends on the input's neighbours: extraction hands over one member and never its siblings, so a member can only produce a single-file output (`jwud` forwards it, so a member named `game_part1.wud` doesn't badge a real split set's `game.wux`). |
+| `converts_path(path)` | optional per-file refinement of `input_extensions` — the input-side mirror of `verifies_path`. Default is the plain extension match; override when your source is really a *set* of files so only the primary is offered (`jwud` hides the secondary members of a split `game_part1.wud` … `game_part12.wud` dump, which stay listed but non-convertible). Drives `FileEntry.convertible_by`. May do disk I/O — it runs inside the threadpool scan. |
+| `delete_on_verify_is_safe(mode, compression)` | optional per-job guard on delete-on-verify. `ModeSpec.supports_delete_on_verify` says the *mode* offers it; this says the *job* may, given its settings. Default `True` (your `verify()` reads the whole output). Override when a job setting can weaken the guarantee — `jwud` returns `False` for `-noVerify`, because its verify is a structural WUX walk backed by JWUDTool's conversion-time byte-for-byte comparison. `routes/convert.py` rejects the combination for single and batch alike. |
+| `source_companions(path)` | optional sibling *input* files this source also consumes, never including `path` — the input-side mirror of `companion_outputs`. Default `[]`. `utils/delete_plan.build_delete_plan` adds them, so delete-on-verify removes a multi-file source whole instead of orphaning the parts the job didn't name. (`.cue`/`.gdi` tracks are still parsed from file *contents* in `delete_plan.py` rather than routed through this hook — see the design doc.) |
 | `verifies_path(path)` | optional per-file refinement of `verify_extensions`. Default (in `BaseTool`) is a plain extension match; override when your tool claims a broad container extension but only handles a subset (`romz` claims `.7z`/`.zip` yet only verifies single-ROM archives). `routes/files.py` materializes the result into `FileEntry.verifiable_by`, which the frontend gates the Verify/Info row-actions on. May do disk I/O — it runs inside the threadpool scan. |
 | `active_pids()` | PIDs for the debug heartbeat |
 | `post_convert(input_path, output_path, mode)` | optional hook, default no-op |
@@ -234,8 +239,9 @@ A plugin subclasses `BaseTool` and provides:
 `BaseTool` fills in `input_extensions` (the union of every mode's
 `input_extensions`), `spec(mode)`, no-op `detect_output` / `post_convert`,
 `accepts_directory` (`False`), `is_ready` (`True`), `companion_outputs` (from
-`companion_exts`), `overwrite_targets` (primary + companions), the
-extension-match `verifies_path` default, and the `embedded_hashes` default
+`companion_exts`), `overwrite_targets` (primary + companions), `source_companions`
+(`[]`), the extension-match `verifies_path` / `converts_path` defaults, and the
+`embedded_hashes` default
 (`[]`, `embedded_hash_is_exhaustive=False`), so a real plugin only overrides
 what differs. See `app/services/tools/z3ds.py` for the smallest complete
 example (~130 lines, mostly delegation). For one-shot
@@ -529,7 +535,7 @@ list. The `zstd` CLI is already installed (z3ds's `verify_stream` shells out to
 
 Add next to the other tool paths (`chdman_path`, `dolphin_tool_path`,
 `z3ds_compressor_path`, `nsz_path`, `maxcso_path`, `sevenzip_path`,
-`makeps3iso_path`):
+`makeps3iso_path`, `jwudtool_path`):
 
 ```python
 nszip_path: str = Field(
@@ -1131,6 +1137,11 @@ PLUGIN (app/services/tools/<tool>.py)
 [ ] optional: detect_output() for "output exists" badges
 [ ] optional: verifies_path() to refine verify_extensions per-file when the
     tool over-claims a container extension (drives FileEntry.verifiable_by)
+[ ] optional: converts_path() / source_companions() when your source is a SET of
+    files (a split dump) — the first keeps the non-primary members visible but
+    non-convertible, the second makes delete-on-verify take the whole set
+[ ] optional: delete_on_verify_is_safe() when a job setting can weaken your
+    verify (jwud's -noVerify) — the route then rejects that combination
 [ ] optional: embedded_hashes()/embedded_hash_is_exhaustive for the DAT-match
     fast path (default falls back to file-level SHA1)
 [ ] optional: companion_exts (or override companion_outputs) if the mode writes
@@ -1233,6 +1244,7 @@ have solved the awkward part.
 | …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. Override `overwrite_targets()` too, so an authorized overwrite sweeps your artifacts rather than makeps3iso's split parts (§5.6). |
 | …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
+| …ships as a prebuilt release artifact that needs an interpreter (a .jar, a script) | **jwud** (JWUDTool) | A pinned, SHA256-checked release download plus a `/usr/local/bin/<tool>` launcher that `exec`s the interpreter (so the tracked PID is the real process), no builder stage, and `is_ready()` hiding the tool when the launcher is absent. Also the reference for a CLI that writes into an *output folder* under a name of its own choosing, one that **exits 0 on failure** (`require_output` plus a stdout marker scan), and the only **multi-file source** (`converts_path` / `source_companions` for a split `game_part1.wud` dump). |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
 | …has a **compound** extension, or info-but-no-verify | **nkit** (`services/nkit2iso.py` + `tools/nkit2iso.py`) | Declaring `.nkit.iso`/`.nkit.gcz` against the shared suffix match (§18), a Go builder stage in the Dockerfile, a one-direction tool that registers an info route but `verify_extensions = frozenset()` (claiming a *shared* extension like `.iso` for verify would hijack every other tool's rows — see the plugin docstring), an `info()` that parses a header in Python because the binary has no info subcommand, and a service that rewrites the runner's terminal message when the tool reports a caveat. |
 
@@ -1518,6 +1530,7 @@ entrypoint.sh                       (optional) CLI-mode loop for .nsp/.xci
 app/config.py                       nszip_path Field (NSZIP_PATH)
 app/services/nszip.py               NszipService + NSZIP_CONVERTIBLE_EXTENSIONS + singleton
 app/services/tools/nszip.py         NszipTool plugin (BaseTool + ModeSpec rows)
+app/utils/delete_plan.py            NOTHING (registry-driven source_companions)
 app/services/tools/__init__.py      registry.register(NszipTool(settings.nszip_path))
 app/models.py                       ConversionMode.NSZIP_COMPRESS; NszipInfo  (FileEntry: nothing)
 app/routes/convert.py               SkipReason + _SKIP_HTTP entry + _BAD_EXTENSION_REASON entry

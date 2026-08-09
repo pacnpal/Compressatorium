@@ -151,6 +151,7 @@ Volume behavior:
 | `MAXCSO_PATH` | `/usr/local/bin/maxcso` | Path to maxcso binary (PSP/PS2 CSO/CSO v2/ZSO/DAX) |
 | `SEVENZIP_PATH` | `7z` | Path to the 7z binary (handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` ↔ `.7z`/`.zip`). Ships via `p7zip-full`; set to `7zz` on distros that provide the newer `7zip` package |
 | `MAKEPS3ISO_PATH` | `/usr/local/bin/makeps3iso` | Path to the makeps3iso binary (PS3 decrypted folder → ISO) |
+| `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher (Wii U `.wud` ↔ `.wux`). The image ships a launcher that execs the bundled jar with a headless JRE |
 | `NKIT2ISO_PATH` | `/usr/local/bin/nkit2iso` | Path to the nkit2iso binary (NKit-shrunk GameCube/Wii image → ISO) |
 | `NKIT2ISO_RECOVERY` | `none` | What nkit2iso does with a Wii image whose update partition was removed: `none` zero-fills it (fully offline; playable but not redump-verifiable), `download` fetches the publicly archived recovery partition for a bit-exact restore. `download` is the only path on which the tool uses the network. |
 | `SWITCH_KEYS` | *(unset)* | Directory holding your own Switch `prod.keys`. Source of truth for Switch (nsz); mount it read-only. When unset, the app best-effort checks `~/.switch` and your mounted volumes. No keys ship with the image. |
@@ -162,7 +163,7 @@ Volume behavior:
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for all tools (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |
 | `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` | `60` | Timeout in seconds for `info`/`header` subprocesses (chdman and Dolphin; nsz/3DS read info from the filesystem). 0 disables. Legacy alias: `CHD_INFO_TIMEOUT`. |
 | `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `0` | Timeout in seconds for verify runs across all tools (0 disables). Legacy alias: `CHD_VERIFY_TIMEOUT`. |
-| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | *(shared default)* | Optional per-tool overrides (`<TOOL>` = `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ`, `MAKEPS3ISO`, `NKIT2ISO`) that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `MAKEPS3ISO` and `NKIT2ISO` have no `_VERIFY_TIMEOUT`, since neither tool has a verify step. |
+| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | *(shared default)* | Optional per-tool overrides (`<TOOL>` = `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ`, `MAKEPS3ISO`, `NKIT2ISO`, `JWUD`) that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `MAKEPS3ISO`, `NKIT2ISO` and `JWUD` have no `_VERIFY_TIMEOUT`: neither makeps3iso nor nkit2iso has a verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
 | `COMPRESSATORIUM_<TOOL>_INFO_TIMEOUT` | *(shared default)* | Optional per-tool info-timeout override, only for `<TOOL>` = `CHDMAN` or `DOLPHIN_TOOL` (the only tools whose `info` runs a subprocess). |
 | `CHD_ARCHIVE_MAX_ENTRIES` | `5000` | Max archive members to list (0 disables limit) |
 | `CHD_ARCHIVE_MAX_MEMBER_SIZE` | `0` | Max size in bytes per archive member (0 disables limit) |

@@ -68,7 +68,9 @@ class Z3dsTool(BaseTool):
         super().__init__(binary_path)
         self._service = z3ds_compress_service
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         # Compress direction only: badge "the .zcci/.z3ds/... already exists"
         # next to a raw ROM source. Decompress-direction badging is out of scope
         # (mirrors maxcso); the job pipeline's check_output_conflicts still

@@ -49,7 +49,7 @@ The frontend is a Svelte 5 + Vite single-page app under `src/` (see README, "Fro
 
 - Mode dropdown: `panels/ModeSelect.svelte`. Options come from `registry.modesByGroup(toolId)`, so adding a mode means editing `registry.js` and nothing else.
 - Compression UI: `panels/CompressionPicker.svelte`. The style comes from `tool.compressionStyle` (`'multi'` / `'single-with-level'` / `'none'`), codecs from `tool.compressionCodecs`, and the level range from `tool.compressionLevelRange`.
-- Output dir, delete-on-verify, submit: `panels/ConvertPanel.svelte`. Delete-on-verify blocks submit when any selected source is unverified, the same invariant the backend enforces.
+- Output dir, delete-on-verify, submit: `panels/ConvertPanel.svelte`. Delete-on-verify runs against the *newly written output* — the job verifies it and only deletes the sources once it passes — so sources are never pre-filtered by verification state here. The checkbox is offered per mode (`ModeSpec.supports_delete_on_verify`) and per job (`ToolPlugin.delete_on_verify_is_safe`), both of which the backend re-checks.
 
 Production-style run (FastAPI serves the prebuilt SPA):
 

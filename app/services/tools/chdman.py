@@ -130,7 +130,9 @@ class ChdmanTool(BaseTool):
     def input_extensions(self) -> frozenset[str]:
         return frozenset(CHDMAN_CONVERTIBLE_EXTENSIONS)
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         if Path(input_path).suffix.lower() not in self.input_extensions:
             return None
         candidate = str(Path(input_path).with_suffix(".chd"))

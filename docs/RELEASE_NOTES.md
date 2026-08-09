@@ -7,6 +7,92 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
+  `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
+  how much of the disc a game uses, so the padding compresses dramatically: WUX
+  deduplicates repeated 32 KiB sectors and stores each distinct one once, and
+  Cemu reads the result directly. Two modes, `jwud_compress` and
+  `jwud_decompress`, both lossless, reversible, and with nothing to configure.
+
+  **No keys.** This only repacks the image, it never decrypts it — a `.wux`
+  carries exactly the same encrypted content as the `.wud` it came from, so no
+  common key or title key is involved and none ships with the app. (JWUDTool's
+  decrypt/extract features do need your own keys; they are out of scope here.)
+
+  Every conversion is verified against its source: JWUDTool's own pass re-reads
+  both images and compares them byte for byte before the job reports success, so
+  a compress job takes about twice as long as writing the output alone and a
+  mismatch fails the job instead of leaving a bad image in place. The progress
+  bar covers both phases (conversion 1–50 %, verification 51–99 %).
+
+  The `/api/jwud-verify` endpoints check a `.wux` structurally — header magic and
+  fields, then every sector-index entry against the file's real length — which
+  catches a truncated copy or a corrupt index table, and is as deep as the format
+  allows since WUX stores no content checksums. Both header size fields are
+  pinned to the format's only real values (a 32 KiB sector and a whole disc
+  image) rather than merely sanity-checked, since the index table's size scales
+  inversely with the declared sector size — so no file, however crafted, can
+  dictate how much work a verification does. Only `.wux` is verifiable, so
+  delete-on-verify is offered on compress but not on decompress. `/api/jwud-info`
+  reads the same header, reporting the original image size and the ratio.
+
+  **Split dumps work too.** wudump writes `game_part1.wud` … `game_part12.wud`
+  and JWUDTool joins them when you pick part 1. Only part 1 is offered as a
+  source; the rest stay listed (so you can see and delete them) but aren't
+  convertible alone, since a part is not a disc image. A *complete* set's
+  product is named after the disc (`game.wux`, not `game_part1.wux`), and
+  delete-on-verify takes the whole set instead of orphaning eleven parts. A
+  half-copied set, one with a gap, an orphan part and an archived part all keep
+  their own name — none of them can produce the disc, so none of them may claim
+  its output and risk overwriting an unrelated finished image. Output detection
+  gained a matching `from_archive` flag (`ToolPlugin.detect_output`), so an
+  archive member is never mistaken for a real file with real neighbours; the
+  seven pre-existing tools ignore it.
+
+  **Delete-on-verify is guarded per job (`delete_on_verify_is_safe`).** A third
+  input-side hook, because the verification toggle below would otherwise create
+  a footgun: jwud's `verify()` walks the WUX container's structure (the format
+  has no content checksums), so what justifies deleting a 25 GB source is
+  JWUDTool's byte-for-byte comparison during the conversion — and `-noVerify`
+  turns that off. `ModeSpec.supports_delete_on_verify` only knows about the
+  mode, so the plugin now answers the per-job question too (default `True`, so
+  no other tool changes) and the shared request validator rejects the
+  combination for single and batch alike.
+
+  The set is protected end to end: `source_companions` also feeds
+  `JobManager._track_candidate_paths`, so renaming or deleting part 5 while the
+  conversion is running is refused like any other in-use path (that helper's
+  hard-coded `.cue`/`.gdi` gate is now registry-driven for the non-track case).
+
+  **The verification pass is now a choice.** It stays on by default, but the
+  tool picker's dropdown — where other tools put their codec, since WUX has none
+  — offers **Skip verification**, which passes `-noVerify` and roughly halves the
+  runtime.
+
+  Both directions also accept a member straight out of a ZIP/7z/RAR. New env var:
+  `JWUDTOOL_PATH` (default `/usr/local/bin/jwudtool`). JWUDTool is a Java program,
+  so the image now installs a headless JRE plus the pinned, SHA256-checked
+  upstream release jar behind a small launcher; the jar is architecture-
+  independent, so both `linux/amd64` and `linux/arm64` are covered. The tool
+  hides itself in the UI (via the `is_ready()` hook) when no launcher is present,
+  which is what a local checkout without Java sees.
+
+- **Two more shared paths that assumed a source is one file became plugin hooks
+  (`converts_path`, `source_companions`).** A split Wii U dump is one disc image
+  over twelve files, which broke both: the listing offered all twelve as sources
+  (eleven of which can only fail), and delete-on-verify removed the part the job
+  named while orphaning the rest — about 23 GB of silent leftovers.
+
+  `ToolPlugin.converts_path(path)` is the input-side mirror of `verifies_path`
+  (default: the plain `input_extensions` match, so the seven existing tools are
+  unchanged), read by `routes/files.py` into the same tool-neutral
+  `FileEntry.convertible_by`. `ToolPlugin.source_companions(path)` is the
+  input-side mirror of `companion_outputs` (default `[]`), read by
+  `utils/delete_plan.build_delete_plan`. The registry gained
+  `tools_converting_path()` and `source_companions()` alongside the existing
+  verify-side pair. `.cue`/`.gdi` track files still go through delete_plan's own
+  content parser rather than the new hook — folding those in would move their
+  unsafe-reference handling, so it is left for its own change.
 - **New tool: NKit → ISO (`nkit2iso`).** Restores an NKit-shrunk GameCube or Wii
   disc image (`.nkit.iso`, `.nkit.gcz`) back to a plain, full-size `.iso`, using
   [nkit2iso](https://github.com/DonMikone/nkit2iso) (MIT, a static Go binary

@@ -65,11 +65,21 @@ class ToolPlugin(Protocol):
     ) -> str:
         """Resolve the output path for a conversion."""
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         """Detect an existing sibling output this tool could produce.
 
         Returns ``None`` when the tool cannot produce an output for this
         input or no output is present (neither finished nor mid-conversion).
+
+        ``from_archive`` marks a *synthesised* path: the location an archive
+        member would occupy once extracted, which does not exist yet. It is the
+        same distinction ``output_path``'s ``treat_as_stem`` draws, and it
+        matters wherever a tool's output name depends on the input's
+        surroundings rather than on the input alone — a member never brings its
+        siblings with it, so it can only ever produce a single-file output. Most
+        tools swap a suffix and can ignore it.
         """
 
     def accepts_directory(self, path: str) -> bool:
@@ -79,6 +89,54 @@ class ToolPlugin(Protocol):
         ``False``; a tool with an ``InputKind.DIRECTORY`` mode (makeps3iso
         folder->iso) overrides this to run its source-layout detector. May do
         disk I/O — call it off the event loop.
+        """
+
+    def converts_path(self, path: str) -> bool:
+        """Whether this tool can convert a concrete file *on its own*.
+
+        The input-side mirror of ``verifies_path``: the default is the shared
+        whole-filename match against ``input_extensions`` (so a compound
+        extension resolves), but a tool whose source is really a
+        *set* of files overrides it so only the primary member is offered.
+        JWUDTool's split Wii U dumps are the case — ``game_part1.wud`` through
+        ``game_part12.wud`` are one disc image, and selecting part 7 alone can
+        only fail. Listing code calls it so ``FileEntry.convertible_by`` marks
+        the secondary members non-convertible while leaving them visible.
+        May do disk I/O (it looks for the sibling primary) — it runs inside the
+        threadpool scan.
+        """
+
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool:
+        """Whether deleting the source after ``verify()`` is safe for this job.
+
+        ``ModeSpec.supports_delete_on_verify`` says the *mode* can offer it;
+        this says the *job* can, given its settings. It exists because a tool's
+        verify step is not always a full content check: jwud's is a structural
+        WUX walk (the format carries no checksums), which is only backed by a
+        real byte-for-byte comparison because JWUDTool runs one during the
+        conversion — and the job can turn that off with ``-noVerify``. Deleting
+        a 25 GB source on the strength of a geometry check alone would risk the
+        only copy, so jwud returns ``False`` for that combination and the route
+        rejects it.
+
+        Default ``True``: every other tool's verify reads the whole output.
+        """
+
+    def source_companions(self, path: str) -> list[str]:
+        """Sibling files this input consumes *besides* ``path`` itself.
+
+        The input-side mirror of ``companion_outputs``: a source that is really
+        several files on disk (a split Wii U dump's ``game_part2.wud`` …
+        ``game_part12.wud``) reports the rest of the set here, so
+        delete-on-verify removes the whole source rather than orphaning the
+        parts it didn't name. ``path`` itself is never included, and a tool
+        whose inputs are single files returns ``[]``.
+
+        Note ``.cue``/``.gdi`` track files are *not* routed through this hook
+        today: they're parsed out of the file's contents by
+        ``utils.delete_plan``, with its own unsafe-reference handling, rather
+        than derived from naming. Folding those into this seam is the obvious
+        next consolidation.
         """
 
     def verifies_path(self, path: str) -> bool:
@@ -253,12 +311,32 @@ class BaseTool:
             "compression_type": raw.get("compression_type"),
         }
 
-    def detect_output(self, input_path: str) -> OutputStatus | None:
+    def detect_output(
+        self, input_path: str, *, from_archive: bool = False,
+    ) -> OutputStatus | None:
         return None
 
     def accepts_directory(self, path: str) -> bool:
         # Default: file-only tool. Directory-input tools (makeps3iso) override.
         return False
+
+    def converts_path(self, path: str) -> bool:
+        # Default: the same whole-filename `input_extensions` match the listing
+        # used before this hook existed, so a compound extension still resolves
+        # (nkit2iso's .nkit.iso, whose Path.suffix is the generic .iso). Tools
+        # whose source is a *set* of files (jwud's split Wii U dumps) override it
+        # so only the primary is offered; every other tool inherits the match.
+        return match_extension(path, self.input_extensions) is not None
+
+    def source_companions(self, path: str) -> list[str]:
+        # Default: a single-file source consumes nothing else.
+        return []
+
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool:
+        # Default: this tool's verify() reads the whole output, so passing it
+        # is enough to justify removing the source. Only a tool whose verify
+        # is weaker than its conversion-time check (jwud) overrides this.
+        return True
 
     def verifies_path(self, path: str) -> bool:
         # Default: a declared-extension match (suffix-based, so a compound

@@ -320,6 +320,11 @@ export const api = {
     return fetchJson(buildApiUrl('/nkit-info', params), undefined, 'Failed to get NKit info');
   },
 
+  getJwudInfo(path) {
+    const params = new URLSearchParams({ path });
+    return fetchJson(buildApiUrl('/jwud-info', params), undefined, 'Failed to get Wii U image info');
+  },
+
   // Which tools the UI should show. Switch is reported unavailable when no
   // prod.keys are configured, so the sidebar can hide it entirely.
   getTools() {
@@ -393,6 +398,17 @@ export const api = {
     return fetchJson(buildApiUrl('/romz-verify', params), undefined, 'Failed to verify ROM archive');
   },
 
+  verifyJwud(path, { onProgress } = {}) {
+    if (onProgress) {
+      const params = new URLSearchParams({ path });
+      return verifyEventSource(buildApiUrl('/jwud-verify/events', params), onProgress, {
+        failureFallback: 'Wii U verification failed',
+      });
+    }
+    const params = new URLSearchParams({ path });
+    return fetchJson(buildApiUrl('/jwud-verify', params), undefined, 'Failed to verify Wii U image');
+  },
+
   getVerifiedCHDs: () =>
     fetchJson(`${API_BASE}/verified`, undefined, 'Failed to fetch verified CHDs'),
 
@@ -419,6 +435,10 @@ export const api = {
 
   verifyBatchRomz(paths, opts) {
     return runBatchVerify(`${API_BASE}/romz-verify-batch/events`, paths, opts);
+  },
+
+  verifyBatchJwud(paths, opts) {
+    return runBatchVerify(`${API_BASE}/jwud-verify-batch/events`, paths, opts);
   },
 
   // ─── CHD metadata cache ───────────────────────────────────────────────

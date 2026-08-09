@@ -30,7 +30,7 @@ CONVERSION_MODES = [
 # Tools whose service singleton is monkeypatched below. Kept in one place so
 # the two parity tests can't drift apart.
 _PATCHED_TOOLS = (
-    "chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso", "nkit",
+    "chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso", "nkit", "jwud",
 )
 
 # Modes whose tool exposes a verify at all. nkit2iso has no verify subcommand —
@@ -67,6 +67,8 @@ def _legacy_dispatch_id(mode: str) -> str:
         return "romz"
     if mode.startswith("nkit_"):
         return "nkit"
+    if mode.startswith("jwud_"):
+        return "jwud"
     return "chdman"
 
 

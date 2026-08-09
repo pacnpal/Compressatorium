@@ -186,6 +186,14 @@ ARG MAME_TOOLS_VERSION="0.285+dfsg1-1"
 ARG MAME_TOOLS_SHA256_AMD64="d99e82887aab57d9a66b2f1ffd80210aabeb064808a6d05f69af1584049fd195"
 ARG MAME_TOOLS_SHA256_ARM64="6388bff0f6242dfd3a09c63c6e25ab94e0a64fe7cf2b3b0170f89ff7c13340a8"
 
+# JWUDTool (Wii U .wud <-> .wux), GPL-3.0. Shipped as the upstream release jar
+# rather than built from source: it is a Maven/Java project whose only artifact
+# is an architecture-independent fat jar, so one pinned download serves both
+# amd64 and arm64 and no builder stage is needed. Pinned to the 0.4 release
+# asset and checked by SHA256, like the mame-tools deb above.
+ARG JWUDTOOL_URL="https://github.com/Maschell/JWUDTool/releases/download/0.4/JWUDTool-0.4.jar"
+ARG JWUDTOOL_SHA256="5654889d722ea673c3582b620d866197115307914f93ad326a8f658e4d88ae83"
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install system dependencies, pinned mame-tools, create wrapper script, and prepare venv
@@ -204,6 +212,7 @@ RUN apt-get update -o Acquire::Retries=3 && \
       util-linux \
       unrar-free \
       p7zip-full \
+      default-jre-headless \
       wget \
       unzip \
       zstd \
@@ -263,6 +272,21 @@ COPY --from=maxcso-builder /tmp/maxcso/maxcso /usr/local/bin/maxcso
 # Install makeps3iso from its builder stage (decrypted PS3 folder -> .iso).
 # GPL-3.0, shipped unmodified as a standalone binary (see the builder stage).
 COPY --from=makeps3iso-builder /tmp/ps3iso-utils/makeps3iso/makeps3iso /usr/local/bin/makeps3iso
+
+# Install JWUDTool (Wii U .wud <-> .wux) and a launcher that execs it, so the
+# app spawns one process it can signal/track like any other tool binary (the
+# `exec` matters: without it the shell, not the JVM, would be the tracked PID).
+# MaxRAMPercentage replaces the JVM's 25 %-of-RAM default heap, which is tight
+# for the ~760k-entry sector-hash map a full disc build allocates.
+RUN wget -q "${JWUDTOOL_URL}" -O /tmp/jwudtool.jar && \
+    echo "${JWUDTOOL_SHA256}  /tmp/jwudtool.jar" | sha256sum -c - && \
+    mkdir -p /usr/local/share/jwudtool && \
+    mv /tmp/jwudtool.jar /usr/local/share/jwudtool/JWUDTool.jar && \
+    chmod 644 /usr/local/share/jwudtool/JWUDTool.jar && \
+    printf '#!/bin/sh\nexec java -XX:MaxRAMPercentage=75.0 -jar /usr/local/share/jwudtool/JWUDTool.jar "$@"\n' \
+      > /usr/local/bin/jwudtool && \
+    chmod +x /usr/local/bin/jwudtool && \
+    jwudtool -help > /dev/null
 
 # Install nkit2iso from its builder stage (NKit-shrunk GC/Wii image -> .iso).
 # MIT, statically linked (CGO_ENABLED=0), so it needs no extra runtime libs.

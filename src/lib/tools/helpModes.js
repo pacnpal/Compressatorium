@@ -63,6 +63,17 @@ export const MODE_BLURBS = {
     + 'Pick an effort preset (Fast/Default/Max).',
   romz_zip: 'Compress to a .zip archive (broadest compatibility). Same effort presets.',
   romz_extract: 'Extract the ROM back out of a .7z/.zip archive.',
+  // Wii U
+  jwud_compress:
+    'Pack a 25 GB Wii U disc dump into a .wux, which deduplicates the repeated '
+    + 'sectors. No codec to pick; the dropdown chooses whether JWUDTool compares '
+    + 'the result against the source before the job finishes (on by default, and '
+    + 'about half the runtime with it off). Select part 1 of a split dump to '
+    + 'convert the whole set.',
+  jwud_decompress:
+    'Restore the original .wud from a .wux, byte for byte. Same verification '
+    + 'choice as the compress direction.',
+
   // NKit
   nkit_restore:
     'Rebuild the full GameCube/Wii ISO from an NKit-shrunk .nkit.iso/.nkit.gcz. '

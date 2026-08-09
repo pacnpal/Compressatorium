@@ -101,6 +101,12 @@ jobs:
           export CHD_DATA_DIR="$RUNNER_TEMP/data"
           export CHD_TEMP_DIR="$RUNNER_TEMP/data/temp"
           export PYTHONPATH="$PWD/app"
+          # The Wii U tool hides itself when no JWUDTool launcher is present
+          # (JwudTool.is_ready), which would send #/workspace/jwud to whichever
+          # tool IS available and quietly capture the wrong workspace. The
+          # screenshot run never starts a job, so a no-op executable is enough to
+          # keep the tool visible for the capture.
+          export JWUDTOOL_PATH=/bin/true
           mkdir -p "$CHD_DATA_DIR" "$CHD_TEMP_DIR"
           python -m uvicorn main:app --host 127.0.0.1 --port 8099 > "$RUNNER_TEMP/server.log" 2>&1 &
           for i in $(seq 1 30); do

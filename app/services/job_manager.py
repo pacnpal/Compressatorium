@@ -679,21 +679,37 @@ class JobManager:
         task.add_done_callback(self._background_tasks.discard)
 
     def _track_candidate_paths(self, file_path: str) -> List[str]:
+        """Sibling *input* files an active job also reads, so rename/delete
+        can't pull one out from under a running conversion.
+
+        Two sources, because the two kinds of multi-file input are described
+        differently: ``.cue``/``.gdi`` track files are parsed out of the file's
+        contents (``build_delete_plan``), while a tool whose source is a *set*
+        declares its members through the registry (``source_companions`` — a
+        split Wii U dump's ``game_part2.wud`` … ``game_part12.wud``). Without
+        the second, deleting or renaming part 5 mid-run would fail a conversion
+        that may already have cleared an existing output for overwrite.
+
+        Stays cheap: this helper is called synchronously from async route code,
+        and ``source_companions`` is pure name math for every tool that has none.
+        """
         if "::" in file_path:
-            return []
-        ext = Path(file_path).suffix.lower()
-        if ext not in {".cue", ".gdi"}:
             return []
         if not os.path.isfile(file_path):
             return []
-        try:
-            plan = build_delete_plan(file_path)
-        except Exception:
-            return []
+        ext = Path(file_path).suffix.lower()
+        if ext in {".cue", ".gdi"}:
+            try:
+                # Already includes source_companions; one call covers both.
+                candidates = build_delete_plan(file_path).get("delete_paths", [])
+            except Exception:
+                return []
+        else:
+            candidates = registry.source_companions(file_path)
         source_real = os.path.realpath(file_path)
         tracks = []
-        for path in plan.get("delete_paths", []):
-            if path == source_real:
+        for path in candidates:
+            if os.path.realpath(path) == source_real:
                 continue
             if os.path.exists(path):
                 tracks.append(path)

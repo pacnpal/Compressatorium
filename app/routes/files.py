@@ -111,6 +111,8 @@ def _fold_split_iso_entries(entries: list[FileEntry]) -> list[FileEntry]:
 
 def _detect_file_outputs(
     item_path: str,
+    *,
+    from_archive: bool = False,
 ) -> tuple[list[str], list[OutputStatus], dict[str, OutputStatus]]:
     """Drive convertibility + output detection off the tool registry.
 
@@ -122,14 +124,22 @@ def _detect_file_outputs(
     pre-computed ``Path.suffix``, so a tool declaring a compound extension
     (nkit2iso's ``.nkit.iso``) is recognised — see
     ``utils.path_utils.match_extension``.
+
+    ``from_archive`` marks ``item_path`` as the synthesised location an archive
+    member would occupy rather than a real file, and is forwarded to each
+    tool's ``detect_output``.
     """
     convertible_by: list[str] = []
     outputs: list[OutputStatus] = []
     by_tool: dict[str, OutputStatus] = {}
     for tool in registry.all():
-        if match_extension(item_path, tool.input_extensions) is not None:
+        # ``converts_path`` defaults to that same whole-filename match; a tool
+        # whose source is a *set* of files narrows it per-file (jwud leaves the
+        # secondary members of a split Wii U dump visible but non-convertible,
+        # since only game_part1.wud drives the set).
+        if tool.converts_path(item_path):
             convertible_by.append(tool.id)
-        status = tool.detect_output(item_path)
+        status = tool.detect_output(item_path, from_archive=from_archive)
         if status is not None:
             outputs.append(status)
             by_tool[tool.id] = status
@@ -171,6 +181,14 @@ def _detect_archive_member_outputs(
     job pipeline — which extracts the member into the archive's directory before
     converting — and means any newly registered archive-aware tool surfaces in
     the browse/search views without another CHD-style special case.
+
+    The path is synthetic, so detection is told so (``from_archive=True``, the
+    listing-side counterpart of the ``treat_as_stem=True`` ``plan_job`` passes
+    for the same member). Without it a tool whose output name depends on the
+    input's *neighbours* would read this directory's real contents as if they
+    belonged to the member: a jwud member named ``game_part1.wud`` beside a
+    genuine extracted split set would badge the set's ``game.wux`` while the
+    planner targeted ``game_part1.wux``.
     """
     output_stem = (
         entry.get("output_stem") or Path(entry["internal_path"]).stem
@@ -182,9 +200,10 @@ def _detect_archive_member_outputs(
     synthetic_input = os.path.join(
         archive_dir, archive_service._output_name_for_member(entry["internal_path"]),
     )
-    _, outputs, by_tool = _detect_file_outputs(synthetic_input)
-    # `_detect_file_outputs` derives convertibility from `input_extensions`
-    # alone — but a member is only convertible in *place* when a tool can accept
+    _, outputs, by_tool = _detect_file_outputs(synthetic_input, from_archive=True)
+    # `_detect_file_outputs` derives convertibility from each tool's
+    # `converts_path` — but a member is only convertible in *place* when a tool
+    # can accept
     # it straight from an archive. Re-derive against `allows_archive_input` so a
     # listing-only member (a romz ROM) is shown without offering a conversion
     # `plan_job` would reject (ARCHIVE_INPUT_NOT_ALLOWED).
