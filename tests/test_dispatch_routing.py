@@ -36,6 +36,13 @@ _PATCHED_TOOLS = (
 # integrity is the NKit header CRC32 its restore checks inline — so its plugin
 # defines no ``verify`` and there is no dispatch to assert. Derived rather than
 # listed so a tool that later grows one is covered automatically.
+#
+# The predicate is deliberately "has a verify method", NOT "has verify_extensions":
+# makeps3iso exposes a real verify (a PARAM.SFO readback) while registering no
+# verify ROUTE, so its verify_extensions are empty and the narrower predicate
+# would silently drop folder_to_iso from this parity matrix.
+# ``BaseTool`` defines no ``verify``, so nothing inherits one by accident —
+# ``test_verify_modes_covers_every_verifying_tool`` pins both halves.
 VERIFY_MODES = [
     m for m in CONVERSION_MODES if hasattr(registry.for_mode(m), "verify")
 ]
@@ -140,3 +147,29 @@ def test_chain_verify_delegates_to_final_step_tool(monkeypatch):
 
     assert result == {"valid": True, "message": "ok"}
     assert called["id"] == "chdman"
+
+
+def test_verify_modes_covers_every_verifying_tool():
+    """The VERIFY_MODES filter must not silently shrink.
+
+    It is derived, so a wrong predicate degrades to "fewer modes asserted"
+    rather than a failure. Two things are pinned here: ``BaseTool`` grows no
+    ``verify`` (which would sweep non-verifying tools like nkit back in), and
+    makeps3iso — whose verify exists but registers no route, so it has empty
+    ``verify_extensions`` — stays covered.
+    """
+    from app.services.tools.base import BaseTool
+
+    assert "verify" not in BaseTool.__dict__, (
+        "BaseTool grew a default verify(); the hasattr filter now sweeps in "
+        "tools that cannot verify (e.g. nkit). Switch to an explicit capability."
+    )
+    covered = set(VERIFY_MODES)
+    assert "folder_to_iso" in covered, (
+        "makeps3iso verifies (PARAM.SFO readback) but registers no verify route, "
+        "so a verify_extensions-based filter would drop it from this matrix"
+    )
+    assert not registry.get("makeps3iso").verify_extensions
+    # ...and the tool that genuinely cannot verify stays out.
+    assert "nkit_restore" not in covered
+    assert not hasattr(registry.get("nkit"), "verify")

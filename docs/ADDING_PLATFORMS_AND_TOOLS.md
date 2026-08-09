@@ -137,11 +137,11 @@ Two supporting layers:
 - **`app/models.py`** holds the `ConversionMode` enum (every mode string lives
   here), the `InputKind` enum, the `OutputStatus` / `FileEntry` listing models,
   and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`,
-  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`).
+  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`, `NkitInfo`).
 - **`app/config.py`** `Settings` holds the binary path for each tool
   (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`, `nsz_path`,
-  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`) plus the shared and
-  per-tool nice/ioprio/timeout policy knobs.
+  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`, `nkit2iso_path`) plus the
+  shared and per-tool nice/ioprio/timeout policy knobs.
 
 ### The tool registry
 
@@ -158,19 +158,20 @@ Two supporting layers:
 - **`registry.py`** defines `ToolRegistry`, the lookup object. It indexes tools
   by id and by mode and answers `all()`, `get(tool_id)`, `for_mode(mode)`,
   `spec(mode)`, `mode_specs()`, `convertible_extensions()`,
-  `archive_input_extensions()`, `tools_accepting_archive_member(ext)`,
+  `archive_input_extensions()`, `tools_accepting_archive_member(member)`,
   `tools_for_input(filename)`, `tools_for_directory(path)`,
   `tool_for_verify(path)`, `tools_verifying_path(path)`, `verify_extensions()`,
   `output_extensions()`, and `scannable_extensions()` (which drives the library
   scan / DAT-match discovery).
 - **`chdman.py` / `dolphin.py` / `z3ds.py` / `nsz.py` / `maxcso.py` / `romz.py` /
-  `makeps3iso.py`** are the seven real plugins. Each is a thin `BaseTool`
-  subclass that holds `ModeSpec` rows and delegates the real work to the
-  underlying service singleton (`makeps3iso.py` is the directory-input one; see
-  §3.3.4 of the design doc). **`chain.py`** is the eighth registration: a
-  synthetic `ChainTool` with no binary and no service, which drives the others
-  through the registry (design doc §3.3.3).
-- **`__init__.py`** builds the `registry` singleton and registers all eight.
+  `makeps3iso.py` / `nkit2iso.py`** are the eight real plugins. Each is a thin
+  `BaseTool` subclass that holds `ModeSpec` rows and delegates the real work to
+  the underlying service singleton (`makeps3iso.py` is the directory-input one,
+  see §3.3.4 of the design doc; `nkit2iso.py` is the compound-extension one,
+  see §18). **`chain.py`** is the ninth registration: a synthetic `ChainTool`
+  with no binary and no service, which drives the others through the registry
+  (design doc §3.3.3).
+- **`__init__.py`** builds the `registry` singleton and registers all nine.
   This is the single wiring point. Order matters at the end: `ChainTool` takes
   the registry itself and must register *after* the component tools it drives.
 

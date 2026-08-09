@@ -72,6 +72,7 @@ MATRIX = [
     # The nkit_to_rvz chain takes the same members and names its product off
     # the FIRST step's stem, so the compound suffix is stripped here too.
     (".nkit.iso", ConversionMode.NKIT_TO_RVZ, ".rvz"),
+    (".nkit.gcz", ConversionMode.NKIT_TO_RVZ, ".rvz"),
 ]
 
 

@@ -892,7 +892,7 @@ async def get_nkit_info(
     except Exception as e:
         # Broad by design at the file-read boundary (OSError, struct/zlib
         # errors, ...); logged here so the 500 is traceable.
-        logger.exception("Failed to read NKit info for %s: %s", path, e)
+        logger.exception("Failed to read NKit info for %s", path)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to read NKit info: {e!s}",

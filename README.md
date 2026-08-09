@@ -51,8 +51,10 @@ delete-on-verify here trades the compressed source for a CHD. See
 [PSP / PS2 Support](#psp--ps2-support-cso--zso--dax).
 
 **NKit** is one-directional for the opposite reason: this app never *writes* NKit,
-it only restores it. `nkit_restore` rebuilds the original, bit-exact `.iso`, which
-you can then hand to Dolphin or CHDMAN like any other disc image — or use the
+it only restores it. `nkit_restore` rebuilds the original `.iso` — bit-exact and
+CRC32-verified, except for a Wii image missing its update partition (see
+[NKit Support](#nkit-support-nkit--iso)) — which you can then hand to Dolphin or
+CHDMAN like any other disc image — or use the
 one-step `nkit_to_rvz` chain, which restores and compresses to RVZ in a single job
 so the full-size ISO never lands in your library. See
 [NKit Support](#nkit-support-nkit--iso).
@@ -867,7 +869,12 @@ recreate: the pseudo-random "junk" padding Nintendo writes between and after
 files, the inter-file gaps, files whose contents are entirely junk, and — for Wii
 — the AES encryption and the H0–H3 hash tree. Restoring means regenerating all of
 it and putting the original layout back, then CRC32-checking the result against
-the value stored in the NKit header. A successful job is therefore bit-exact.
+the value stored in the NKit header. A successful job is therefore bit-exact,
+with one exception: a Wii image whose update partition was removed at shrink time
+cannot be, because that data is not in the file. Under the default
+`NKIT2ISO_RECOVERY=none` its region is zero-filled and the CRC32 check is skipped
+— the ISO is playable but not redump-verifiable, and the job's final message says
+so (details in the notes below).
 
 This is a one-way tool: Compressatorium never *writes* NKit. Once restored, the
 `.iso` is an ordinary source you can feed to Dolphin (→ `.rvz`) or CHDMAN.

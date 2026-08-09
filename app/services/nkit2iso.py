@@ -245,8 +245,7 @@ class Nkit2IsoService:
     @staticmethod
     def is_convertible(filename: str) -> bool:
         """Whether ``filename`` is an NKit image nkit2iso can restore."""
-        lower = filename.lower()
-        return any(lower.endswith(ext) for ext in NKIT2ISO_CONVERTIBLE_EXTENSIONS)
+        return match_extension(filename, NKIT2ISO_CONVERTIBLE_EXTENSIONS) is not None
 
     @staticmethod
     def _output_stem(name: str) -> str:
@@ -257,10 +256,11 @@ class Nkit2IsoService:
         suffix removal for a name that carries no recognised NKit extension
         (an archive member the caller flattened, say).
         """
-        lower = name.lower()
-        for ext in sorted(NKIT2ISO_CONVERTIBLE_EXTENSIONS, key=len, reverse=True):
-            if lower.endswith(ext):
-                return name[: -len(ext)]
+        # The shared matcher already does case-insensitive longest-suffix
+        # matching and hands back the full extension, so the strip is one slice.
+        matched = match_extension(name, NKIT2ISO_CONVERTIBLE_EXTENSIONS)
+        if matched is not None:
+            return name[: -len(matched)]
         return str(Path(name).with_suffix(""))
 
     def get_output_path(
