@@ -31,6 +31,7 @@ from utils.path_utils import (
     is_safe_directory_tree,
     is_within_configured_volumes,
     match_extension,
+    source_companions_are_safe,
 )
 
 router = APIRouter()
@@ -604,25 +605,6 @@ async def _plan_directory_job(
     )
 
 
-def _companions_are_safe(file_path: str) -> bool:
-    """Whether every sibling input this source consumes stays inside the volumes.
-
-    `source_companions` is name-derived, so a companion can be anything the
-    filesystem puts under that name — including a symlink out of the library.
-    Rejects a symlinked companion outright rather than following it: the
-    converter opens these files itself, so the only place to stop it is before
-    the job starts. Blocking I/O (lstat + realpath per companion); call it off
-    the event loop.
-    """
-    for companion in registry.source_companions(file_path):
-        if os.path.islink(companion):
-            return False
-        real = os.path.realpath(companion)
-        if not is_within_configured_volumes(real, treat_archives=False):
-            return False
-    return True
-
-
 async def plan_job(
     file_path: str,
     *,
@@ -745,7 +727,9 @@ async def plan_job(
     # the configured volumes and fold its bytes into the output. Registry-driven
     # and a no-op for the eight single-file tools (`source_companions` is `[]`).
     # Off the event loop: it stats and resolves each companion.
-    if not await run_in_threadpool(_companions_are_safe, file_path):
+    if not await run_in_threadpool(
+        source_companions_are_safe, file_path, mode,
+    ):
         raise SkipFile(SkipReason.SOURCE_COMPANION_UNSAFE)
 
     if mode == "romz_extract":

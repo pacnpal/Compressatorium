@@ -27,6 +27,7 @@ from utils.delete_plan import build_delete_plan, build_delete_snapshot
 from utils.path_utils import (
     is_safe_directory_tree,
     is_within_configured_volumes,
+    source_companions_are_safe,
     strip_archive_path,
 )
 
@@ -2007,6 +2008,32 @@ class JobManager:
                     )
                 if cancel_event.is_set():
                     raise ConversionCancelled("Conversion cancelled")
+
+            # Same point-in-time problem as the directory check below, for a
+            # multi-file *file* source: a queued split Wii U set's
+            # `game_partN.wud` can be swapped for a symlink out of the volumes
+            # after `plan_job` cleared it, and the converter enumerates and
+            # opens the parts itself. Re-check under the job's locks, and
+            # before clearing any existing output so a rejection on an
+            # overwrite job leaves the user's prior file intact.
+            if not await run_in_threadpool(
+                source_companions_are_safe, input_path, job.mode.value,
+            ):
+                job.status = JobStatus.FAILED
+                job.error_message = (
+                    "A companion file this source consumes is a symlink or "
+                    "resolves outside configured volumes"
+                )
+                job.completed_at = datetime.now(timezone.utc)
+                await self._notify_subscribers(
+                    job_id,
+                    {
+                        "type": "error",
+                        "job_id": job_id,
+                        "error": job.error_message,
+                    },
+                )
+                return
 
             if job.input_kind == InputKind.DIRECTORY:
                 # Re-check directory-input safety after acquiring the source

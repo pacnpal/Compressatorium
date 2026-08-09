@@ -159,8 +159,8 @@ class ToolPlugin(Protocol):
         matching a produced extension is provably not a standalone artifact, so
         hashing it can only ever waste I/O. Any tool answering ``False`` drops
         the path from the walk, since a file no tool considers scannable is one
-        no DAT can match. Pure name math: it runs once per candidate across the
-        whole library, so it must not touch the disk.
+        no DAT can match. It runs once per candidate across the whole library,
+        so keep it cheap — a stat or two at most, never a read.
         """
 
     def convert(

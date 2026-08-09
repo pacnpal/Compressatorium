@@ -198,8 +198,9 @@ class ToolRegistry:
         The per-file companion to :meth:`scannable_extensions`, which selects
         the walk by type only. A single tool vetoing the path drops it: a file
         that some tool knows is not a standalone artifact cannot match a DAT
-        whatever the other tools think. Pure name math — it runs once per
-        candidate across the whole library.
+        whatever the other tools think. Runs once per candidate across the whole
+        library, so implementations stay cheap (a stat at most); call it off the
+        event loop with the rest of the scan walk.
         """
         return all(t.scannable_path(path) for t in self._tools.values())
 

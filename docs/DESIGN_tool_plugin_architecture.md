@@ -1092,11 +1092,26 @@ registry-driven rather than jwud branches:
   whatever the filesystem puts under that name. The converter opens them itself
   — JNUSLib enumerates the parts from part 1 rather than taking a list from us —
   so the volume boundary the route enforces on the submitted path has to be
-  enforced on the companions too, before the job starts. `plan_job` rejects a
-  symlinked companion outright (rather than following it) and any companion
-  resolving outside the configured volumes, with
-  `SOURCE_COMPANION_UNSAFE`. It is a no-op for the eight tools whose
-  `source_companions` is `[]`.
+  enforced on the companions too. `utils.path_utils.source_companions_are_safe`
+  rejects a symlinked companion outright (rather than following it) and any
+  companion resolving outside the configured volumes.
+
+  Two properties make it correct, and both were review findings:
+
+  * **Checked twice, like the directory case.** `plan_job` rejects at queue time
+    with `SOURCE_COMPANION_UNSAFE`, and `_process_job` re-checks after taking
+    the job's locks — a queued job's `game_part2.wud` can be swapped for a
+    symlink in between, and the plan-time answer would be stale. The re-check
+    runs *before* clearing any existing output, so a rejection on an overwrite
+    job leaves the user's prior file intact. This is the same shape (and the
+    same ordering rationale) as the `is_safe_directory_tree` re-check that
+    guards makeps3iso's recursive read.
+  * **Scoped to the mode's own tool**, not the registry-wide union that
+    `build_delete_plan` uses. Deletion should take everything any tool considers
+    part of the source; conversion should consult only the tool that will read
+    it, or a chdman `createhd` on a raw file that happens to be named
+    `game_part1.wud` would be rejected over a sibling chdman never opens. A
+    no-op for the tools whose `source_companions` is `[]`.
 - **Scan cost.** `.wud` is a produced output, so `scannable_extensions` puts
   every `game_partN.wud` in the DAT-match walk — twelve 2 GiB files SHA1'd in
   full, ~25 GB per set, to match nothing, because a part is a slice of a disc
