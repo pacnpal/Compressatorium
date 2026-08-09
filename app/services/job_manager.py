@@ -21,7 +21,6 @@ from services.chd_metadata_store import chd_metadata_store
 from services.chdman import ConversionCancelled, chdman_service
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
-from services.makeps3iso import makeps3iso_service
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -810,46 +809,43 @@ class JobManager:
         """
         if not job.allow_overwrite or not job.output_path:
             return
-        if job.input_kind == InputKind.DIRECTORY:
-            # makeps3iso output is a single .iso OR a split set (.0/.1/…); clear
-            # all of it via the tool's own part-aware cleanup. But a destination
-            # that already exists as a *directory* named like the output can't be
-            # cleared by remove_outputs (its os.remove() fails on a dir and is
-            # suppressed); makeps3iso would then write *inside* it while the job
-            # still reports the bare path as its output. Reject rather than
-            # corrupt — mirroring the non-file guard on the file-job path below.
-            if await run_in_threadpool(os.path.isdir, job.output_path):
-                raise RuntimeError("Output path exists and is not a file")
-            await run_in_threadpool(
-                makeps3iso_service.remove_outputs, job.output_path,
-            )
-            await verification_store.clear(job.output_path)
-            return
-        # Clear the primary output and every companion the mode wrote beside it
-        # (enumerated from the tool, not re-derived). Companions are cleared even
-        # when the primary is already gone: a lone companion (e.g. a stray
-        # extractcd .bin whose .cue was deleted) is what made
-        # check_output_conflicts authorize the overwrite, so it must not be left
-        # to collide with the new output. Validate the whole set first — a
+        # Tool-neutral: the mode's own plugin enumerates everything to sweep
+        # (primary + companions, or for makeps3iso the base plus any numbered
+        # split parts). Directory-input jobs take this same path — there is no
+        # per-tool branch here, so a second folder-input tool gets correct
+        # cleanup instead of inheriting makeps3iso's part logic.
+        #
+        # Companions are cleared even when the primary is already gone: a lone
+        # companion (e.g. a stray extractcd .bin whose .cue was deleted) is what
+        # made check_output_conflicts authorize the overwrite, so it must not be
+        # left to collide with the new output. Validate the whole set first — a
         # non-file occupant (a directory squatting on the primary or a companion
         # name) can't be unlinked, so reject before removing anything rather than
         # deleting the primary and then failing against the stray occupant.
-        targets = [
-            job.output_path,
-            *registry.for_mode(job.mode.value).companion_outputs(
-                job.output_path, job.mode.value,
-            ),
-        ]
+        targets = registry.for_mode(job.mode.value).overwrite_targets(
+            job.output_path, job.mode.value,
+        )
+        removed = await run_in_threadpool(self._sweep_overwrite_targets, targets)
+        if removed:
+            await verification_store.clear(job.output_path)
+
+    @staticmethod
+    def _sweep_overwrite_targets(targets: list[str]) -> bool:
+        """Validate then unlink ``targets``; return whether anything was removed.
+
+        Blocking stat/unlink work, kept in one sync helper so the caller can run
+        the whole check-then-remove sequence off the event loop in a single hop
+        (it must stay atomic with respect to its own validation pass).
+        """
         for target in targets:
             if os.path.exists(target) and not os.path.isfile(target):
                 raise RuntimeError("Output path exists and is not a file")
-        primary_removed = False
+        removed = False
         for target in targets:
             if os.path.isfile(target):
                 os.remove(target)
-                primary_removed = primary_removed or target == job.output_path
-        if primary_removed:
-            await verification_store.clear(job.output_path)
+                removed = True
+        return removed
 
     def _get_queued_and_processing_jobs(self) -> tuple[list[str], list[str]]:
         """Get lists of queued and processing job IDs.

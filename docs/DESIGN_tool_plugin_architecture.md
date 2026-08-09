@@ -238,6 +238,20 @@ class ToolPlugin(Protocol):
     # size-sum and in-use tracking enumerate, instead of each re-encoding the
     # per-mode suffix. output_path itself is never included.
     def companion_outputs(self, output_path: str, mode: str) -> list[str]: ...
+
+    # Every path an authorized overwrite must sweep, primary FIRST. A superset
+    # of companion_outputs: it includes output_path, and it enumerates states
+    # only a *failed* run leaves (a makeps3iso -s build interrupted mid-split
+    # leaves the not-yet-renamed base AND numbered parts, which never coexist
+    # on success — so companion_outputs, which describes a finished output,
+    # would under-report). Enumeration only; the pipeline validates and unlinks.
+    def overwrite_targets(self, output_path: str, mode: str) -> list[str]: ...
+
+    # Runtime prerequisites met? False => GET /api/tools reports the tool
+    # unavailable and the frontend hides it, instead of offering jobs that can
+    # only fail. Default True; nsz overrides (prod.keys). Async because the
+    # probe may touch disk.
+    async def is_ready(self) -> bool: ...
 ```
 
 `BaseTool(ABC)` provides shared defaults so concrete tools stay tiny:
@@ -283,6 +297,15 @@ class BaseTool:
     # directory scans; modes with no companion_exts return [].
     def companion_outputs(self, output_path, mode) -> list[str]:
         return [str(Path(output_path).with_suffix(e)) for e in self.spec(mode).companion_exts]
+
+    # Default: the finished output set. Correct for every mode whose failed
+    # runs leave nothing a successful run wouldn't; makeps3iso overrides.
+    def overwrite_targets(self, output_path, mode) -> list[str]:
+        return [output_path, *self.companion_outputs(output_path, mode)]
+
+    # Default: nothing to check.
+    async def is_ready(self) -> bool:
+        return True
 
     # subclasses implement: output_path, convert (via self._runner.run),
     # verify_stream, info, info_model
@@ -630,9 +653,16 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
     (single `.iso` **or** the whole split set) **only when `allow_overwrite` was
     granted** — so a set that appears after planning is never deleted out from
     under a skip/rename decision (the per-path `acquire_lock` only sees the bare
-    name). makeps3iso's part-aware `remove_outputs` stays the directory-mode
-    cleanup primitive (it clears a mid-split base + parts that `split_parts`
-    would not), with `companion_outputs` clearing file-mode siblings.
+    name). The sweep is **tool-neutral**: it asks the owning plugin for
+    `overwrite_targets()` and applies the same validate-then-unlink pass to
+    every mode, file or directory. `MakePs3IsoTool` overrides that hook to
+    return the base plus every numbered part (via the service's
+    `output_artifacts`, which also backs its failure cleanup so the two can't
+    drift) — wider than `companion_outputs`, which reports only the finished
+    set. This used to be an `input_kind == DIRECTORY` branch calling
+    `makeps3iso_service.remove_outputs` directly, which meant a *second*
+    directory-input tool would have had its outputs swept by makeps3iso's
+    part logic.
   - **Completed size:** the completion block sums `output_path` plus
     `companion_outputs()`, so a split build (whose numbered parts replace the
     bare `.iso`) and an extractcd `.cue` + `.bin` both report a real
@@ -824,6 +854,23 @@ def register_verify_routes(router, tool: ToolPlugin):
 queue/done/2-second-heartbeat machinery that is copy-pasted ~6× in `info.py`
 today. Endpoint **paths stay identical** (a `tool_id → url_prefix` alias map
 keeps `chd`, `dolphin`, `z3ds`), so the frontend and API are unchanged.
+
+#### Tool availability (`is_ready` / `GET /api/tools`)
+
+`GET /api/tools` splits `registry.all()` into `{"available", "unavailable"}` by
+awaiting each plugin's `is_ready()`; `App.svelte` feeds the result to
+`ui.applyToolAvailability()`, which hides unavailable tools everywhere (the
+sidebar and dashboard both derive from `registry.all()` minus `ui.hiddenTools`,
+and the active tool falls back to a visible one).
+
+The readiness check belongs to the plugin, not the route. `BaseTool.is_ready`
+returns `True`; `NszTool` overrides it with a threadpooled
+`keys_available()` because Switch content is encrypted and the operator must
+supply their own `prod.keys` (§16 of `ADDING_PLATFORMS_AND_TOOLS.md`). The
+route previously computed `nsz_service.keys_available()` itself and branched on
+`tool.id == "nsz"`, so no *other* tool could ever be gated — a second
+secret-dependent tool would have been advertised in the UI while being unable
+to run.
 
 ### 3.6 Generic `FileEntry` outputs (`models.py`, `routes/files.py`)
 

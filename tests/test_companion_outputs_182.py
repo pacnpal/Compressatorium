@@ -181,11 +181,22 @@ def test_candidate_paths_skips_directory_companion_scan(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_clear_existing_output_removes_lone_companion(tmp_path):
+async def test_clear_existing_output_removes_lone_companion(tmp_path, monkeypatch):
     # Overwrite was authorized because a stray .bin exists even though the .cue
     # primary is gone; the clear must still remove the lone .bin so it can't
     # collide with the new output.
+    import app.services.job_manager as jm_module
     from app.services.job_manager import job_manager
+
+    # Removing *any* artifact invalidates the output's verification record, so
+    # the clear reaches the store even when the primary was already gone. Stub
+    # it — this suite has no DB engine (see the sibling PS3 test).
+    cleared: list[str] = []
+
+    async def _record_clear(path):
+        cleared.append(path)
+
+    monkeypatch.setattr(jm_module.verification_store, "clear", _record_clear)
 
     bin_path = tmp_path / "Game.bin"
     bin_path.write_bytes(b"data")
@@ -204,6 +215,7 @@ async def test_clear_existing_output_removes_lone_companion(tmp_path):
     await job_manager._clear_existing_output(job)
 
     assert not bin_path.exists()
+    assert cleared == [str(tmp_path / "Game.cue")]
 
 
 @pytest.mark.asyncio
