@@ -62,6 +62,25 @@ JWUD_OUTPUT_FORMATS = {".wud": ".wux", ".wux": ".wud"}
 # The fixed filename JNUSLib writes inside the -out folder, per direction.
 _PRODUCED_NAME = {"jwud_compress": "game.wux", "jwud_decompress": "game.wud"}
 
+# Split dumps (what FIX94's wudump writes). JNUSLib's WUDDiscReaderSplitted
+# hard-codes the filename template and compares it with String.equals, so the
+# names really are exactly `game_part1.wud` … `game_part12.wud`, case included,
+# all in one directory: 11 parts of exactly 2 GiB plus a 1,402,994,688-byte
+# twelfth, summing to WUD_IMAGE_SIZE. Selecting part 1 converts the whole set —
+# JWUDTool joins them itself — so part 1 is the only convertible member and the
+# rest are its `source_companions`.
+WUD_SPLIT_PART_TEMPLATE = "game_part%d.wud"
+WUD_SPLIT_PART_SIZE = 0x100000 * 0x800  # 2 GiB
+WUD_SPLIT_MAX_PARTS = 12
+_WUD_SPLIT_PART_RE = re.compile(r"^game_part(?P<idx>[0-9]+)\.wud$")
+
+# Per-job verification choice, carried on the `compression` field the same way
+# nsz carries solid/block and CSO/romz carry an effort preset. JWUDTool verifies
+# its output against the source by default; `-noVerify` trades that guarantee
+# for roughly half the runtime.
+JWUD_VERIFY = "verify"
+JWUD_NO_VERIFY = "noverify"
+
 # WUX container layout (JNUSLib ``WUDImageCompressedInfo``), little-endian:
 #   0x00 u32 magic "WUX0" │ 0x04 u32 0x1099d02e │ 0x08 u32 sectorSize
 #   0x0C u32 flags        │ 0x10 u64 uncompressedSize   (header is 0x20 bytes)
@@ -88,6 +107,71 @@ _PROGRESS_PATTERNS = (
 _INVALID_MARKER = "(De)Compressed file is INVALID"
 
 logger = get_logger("jwudtool")
+
+
+def split_part_index(file_path: str) -> int | None:
+    """The 1-based part number if ``file_path`` is named like a split member.
+
+    Pure name math against JNUSLib's exact template — no disk access, so it is
+    safe on synthetic paths (archive members) and deterministic.
+    """
+    match = _WUD_SPLIT_PART_RE.match(os.path.basename(file_path))
+    if match is None:
+        return None
+    index = int(match.group("idx"))
+    if 1 <= index <= WUD_SPLIT_MAX_PARTS:
+        return index
+    return None
+
+
+def split_set_parts(primary_path: str) -> list[str]:
+    """Existing sibling parts 2…12 for a ``game_part1.wud`` primary.
+
+    Returns ``[]`` for anything that isn't part 1, and stops at the first gap:
+    JNUSLib reads the parts in order, so a set missing part 3 is broken rather
+    than an 11-part set, and we must not report the stragglers as belonging to
+    a usable source.
+    """
+    if split_part_index(primary_path) != 1:
+        return []
+    directory = os.path.dirname(primary_path)
+    parts: list[str] = []
+    for index in range(2, WUD_SPLIT_MAX_PARTS + 1):
+        candidate = os.path.join(directory, WUD_SPLIT_PART_TEMPLATE % index)
+        if not os.path.isfile(candidate):
+            break
+        parts.append(candidate)
+    return parts
+
+
+def is_split_secondary(file_path: str) -> bool:
+    """Whether this is a non-primary member of a split set that exists on disk.
+
+    Part 7 on its own is not a disc image; it is only meaningful alongside
+    ``game_part1.wud``. A stray ``game_part7.wud`` with no part 1 beside it is
+    left alone (reported convertible) so it isn't silently hidden — the
+    conversion then fails with JWUDTool's own size complaint.
+    """
+    index = split_part_index(file_path)
+    if index is None or index == 1:
+        return False
+    primary = os.path.join(
+        os.path.dirname(file_path), WUD_SPLIT_PART_TEMPLATE % 1,
+    )
+    return os.path.isfile(primary)
+
+
+def verification_enabled(compression: str | None) -> bool:
+    """Resolve the per-job verification choice off the ``compression`` field.
+
+    Anything other than an explicit ``noverify`` keeps JWUDTool's default
+    (verify), so an absent, empty or stale preset can never silently drop the
+    integrity guarantee. A ``codec:level`` shaped value is tolerated because the
+    shared picker may append a level the tool ignores.
+    """
+    if not compression:
+        return True
+    return compression.partition(":")[0].strip().lower() != JWUD_NO_VERIFY
 
 
 def read_wux_header(file_path: str) -> dict:
@@ -168,14 +252,20 @@ class JwudToolService:
 
     # ----- command ----------------------------------------------------------
 
-    def _build_command(self, input_path: str, work_dir: str, mode: str) -> list[str]:
+    def _build_command(
+        self,
+        input_path: str,
+        work_dir: str,
+        mode: str,
+        compression: str | None = None,
+    ) -> list[str]:
         """Build the JWUDTool argv.
 
         Format: ``jwudtool -in <image> -out <folder> <-compress|-decompress>``.
         ``-out`` is a *folder*; JNUSLib picks the filename inside it. The
-        verification pass is left at its default (on) — it is the only integrity
-        guarantee the WUX format offers, and it is what makes delete-on-verify
-        safe for this tool.
+        verification pass stays on unless the job explicitly asks for
+        ``-noVerify``: it is the only integrity guarantee the WUX format offers,
+        and it is what makes delete-on-verify safe for this tool.
         """
         cmd = [
             self.jwudtool_path,
@@ -183,6 +273,8 @@ class JwudToolService:
             "-out", work_dir,
             "-decompress" if mode == "jwud_decompress" else "-compress",
         ]
+        if not verification_enabled(compression):
+            cmd.append("-noVerify")
         # Apply nice/ionice via command wrappers, NOT preexec_fn: forking a
         # Python callable in this multithreaded app can deadlock the child
         # before exec (same reason nsz/maxcso do it this way).
@@ -206,12 +298,28 @@ class JwudToolService:
 
     # ----- output paths -----------------------------------------------------
 
+    @staticmethod
+    def output_stem(input_path: str) -> str:
+        """The output filename stem for an input.
+
+        Normally the input's own stem, but a split set's primary
+        (``game_part1.wud``) names its product after the *disc*, ``game.wux``,
+        not ``game_part1.wux`` — the parts are one image, and the part number
+        has no meaning once they're joined. Pure name math (no disk access), so
+        the result is identical for a real file, an archive member and a
+        duplicate-check probe.
+        """
+        stem = Path(input_path).stem
+        if split_part_index(input_path) is not None:
+            return stem.rsplit("_part", 1)[0]
+        return stem
+
     def get_output_path(self, input_path: str, output_dir: str | None = None) -> str:
         input_file = Path(input_path)
         ext = input_file.suffix.lower()
         if ext not in JWUD_OUTPUT_FORMATS:
             raise ValueError(f"Unsupported file extension: {ext}")
-        output_name = input_file.stem + JWUD_OUTPUT_FORMATS[ext]
+        output_name = self.output_stem(input_path) + JWUD_OUTPUT_FORMATS[ext]
         if output_dir:
             return str(Path(output_dir) / output_name)
         return str(input_file.parent / output_name)
@@ -238,9 +346,10 @@ class JwudToolService:
         output_ext = JWUD_OUTPUT_FORMATS.get(ext)
         if output_ext is None:
             raise ValueError(f"Unsupported file extension: {ext}")
+        filename = f"{JwudToolService.output_stem(input_path)}{output_ext}"
         if output_dir:
-            return str(Path(output_dir) / f"{input_p.stem}{output_ext}")
-        return str(input_p.parent / f"{input_p.stem}{output_ext}")
+            return str(Path(output_dir) / filename)
+        return str(input_p.parent / filename)
 
     @staticmethod
     def is_convertible(filename: str) -> bool:
@@ -254,8 +363,8 @@ class JwudToolService:
         output_path: str,
         mode: str = "jwud_compress",
         *,
-        # `compression` is unused (WUX has no codec or level) but kept for
-        # interface consistency with the other services.
+        # WUX has no codec or level; the field carries the per-job verification
+        # choice instead ("verify" / "noverify"), like nsz's solid/block.
         compression: str | None = None,
         cancel_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[dict, None]:
@@ -290,6 +399,7 @@ class JwudToolService:
         try:
             async for update in self._run_convert(
                 input_path, produced_path, work_dir, mode, verb, cancel_event,
+                compression,
             ):
                 yield update
             await asyncio.to_thread(os.replace, produced_path, output_path)
@@ -299,8 +409,10 @@ class JwudToolService:
 
     async def _run_convert(
         self, input_path, produced_path, work_dir, mode, verb, cancel_event,
+        compression=None,
     ) -> AsyncGenerator[dict, None]:
-        cmd = self._build_command(input_path, work_dir, mode)
+        cmd = self._build_command(input_path, work_dir, mode, compression)
+        verifying = verification_enabled(compression)
         # JWUDTool keeps a 0 exit code when its own verification pass fails, so
         # the marker line is the only signal; collect it while parsing progress
         # and raise after the run rather than trusting the return code alone.
@@ -319,10 +431,14 @@ class JwudToolService:
                 except ValueError:
                     return None
                 pct = min(100.0, max(0.0, pct))
-                # Two phases share one bar: the conversion runs 1-50 %, the
-                # tool's byte-for-byte verification pass 51-99 %. The runner
+                # Two phases share one bar when verification is on: the
+                # conversion runs 1-50 %, the tool's byte-for-byte pass 51-99 %.
+                # With -noVerify there is only one phase, so the conversion gets
+                # the whole 1-99 % rather than stopping dead at half. The runner
                 # emits the terminal 100 % itself (suppressed below, since
                 # convert() only reaches 100 % after the file is moved).
+                if not verifying:
+                    return 1 + int(pct * 98 / 100)
                 base, span = (51, 48) if is_verify_phase else (1, 49)
                 return base + int(pct * span / 100)
             return None
@@ -351,7 +467,8 @@ class JwudToolService:
         if invalid:
             raise RuntimeError(
                 "JWUDTool's verification pass reported the output as invalid "
-                f"(the {verb[:-4] + 'ed'} image does not match the source): {invalid[-1]}",
+                f"(the {'de' if mode == 'jwud_decompress' else ''}compressed image "
+                f"does not match the source): {invalid[-1]}",
             )
 
     # ----- info -------------------------------------------------------------

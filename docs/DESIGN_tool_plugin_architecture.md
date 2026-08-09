@@ -942,6 +942,53 @@ Two consumer-side notes keep the gate airtight:
   in-progress). A coincidental multi-file `Game.gba.7z` thus never enters
   `outputs`, so the verify-from-output flow can't offer romz Verify on it.
 
+#### Multi-file sources (`converts_path` / `source_companions`)
+
+The two hooks above describe the *output* side per-file. `jwud` needed the same
+treatment on the **input** side, because a split Wii U dump is one disc image
+spread over twelve files: JNUSLib's `WUDDiscReaderSplitted` reads
+`game_part1.wud` … `game_part12.wud` (11 parts of exactly 2 GiB plus a
+1,402,994,688-byte twelfth) and joins them when you hand it part 1. Two shared
+paths assumed a source is exactly one file, and both got it wrong for a set:
+
+- **The listing** derived `convertible_by` from `ext in tool.input_extensions`,
+  so all twelve parts were offered as sources. Eleven of them can only fail —
+  a part on its own is not a disc image.
+- **The delete planner** (`utils/delete_plan.py`) collected the source plus, for
+  a `.cue`/`.gdi`, its parsed track files. A verified conversion with
+  delete-on-verify would therefore remove the part the job named and orphan the
+  other eleven — ~23 GB of silent leftovers.
+
+`ToolPlugin.converts_path(path) -> bool` is the input-side mirror of
+`verifies_path`: `BaseTool` defaults it to the plain `input_extensions` match
+(so the seven pre-existing tools are unchanged), and `JwudTool` returns `False`
+for a secondary part that has its primary beside it. The registry exposes
+`tools_converting_path(path)` next to `tools_verifying_path`, and
+`routes/files.py` feeds it into the same tool-neutral `FileEntry.convertible_by`
+list — so the secondary parts stay **visible** (you can still see and delete
+them) but are never offered for conversion, the same shape as the
+visible-but-not-convertible archive members in §17.5 of the adding-a-tool guide.
+
+`ToolPlugin.source_companions(path) -> list[str]` is the input-side mirror of
+`companion_outputs`: the sibling files this input also consumes, never including
+`path` itself, `[]` by default. `build_delete_plan` adds
+`registry.source_companions(source)` to its delete set, so removing a split
+source takes the whole set. A gap in the set truncates it — JNUSLib reads the
+parts in order, so a set missing part 3 is broken rather than an 11-part set,
+and the stragglers must not be reported as belonging to a usable source.
+
+Both hooks may touch the disk (they look for the sibling primary / enumerate the
+set), so they run in the `files.py` threadpool scan and inside
+`build_delete_plan`, never on the event loop.
+
+> **Not yet folded in: `.cue`/`.gdi` tracks.** `build_delete_plan` still parses
+> those out of the file's *contents*, with its own unsafe-reference handling
+> (absolute paths, refs escaping the source directory) that the naming-derived
+> hook has no equivalent for. Routing chdman's track files through
+> `source_companions` is the obvious next consolidation, but it would move that
+> security surface — and the `unsafe_paths` wire strings tests pin — so it is
+> deliberately left for its own change.
+
 ### 3.7 Frontend descriptor (`src/lib/tools/registry.js`)
 
 > **Status: implemented and extended.** The original §3.7 sketched a minimal

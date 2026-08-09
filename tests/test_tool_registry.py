@@ -160,9 +160,10 @@ def test_kind_classification():
         ("romz_7z", True),
         ("romz_zip", True),
         ("romz_extract", False),
-        # WUX is a fixed sector-dedup format: neither direction takes a codec.
-        ("jwud_compress", False),
-        ("jwud_decompress", False),
+        # jwud's picker is not a codec list: it carries JWUDTool's verify /
+        # -noVerify choice, so both directions declare compression support.
+        ("jwud_compress", True),
+        ("jwud_decompress", True),
     ],
 )
 def test_supports_compression_matches_current_behavior(mode, expected):

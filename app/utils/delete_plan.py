@@ -147,6 +147,17 @@ def build_delete_plan(source_path: str) -> Dict[str, object]:
                 unsafe_paths.append(str(exc))
                 continue
             _add_path(track_path)
+
+        # Sources that are really a *set* of files report the rest of the set
+        # through the registry (jwud: a split Wii U dump's game_part2.wud …
+        # game_part12.wud). Without this, deleting the source after a verified
+        # conversion would remove the part the job named and orphan ~23 GB of
+        # siblings. Imported lazily so this leaf utility keeps no import-time
+        # dependency on the tool package that builds the registry.
+        from services.tools import registry
+
+        for companion in registry.source_companions(str(source)):
+            _add_path(Path(companion))
     except Exception as exc:
         errors.append(str(exc))
 

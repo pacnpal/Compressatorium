@@ -114,6 +114,32 @@ class ToolRegistry:
         """
         return [t for t in self._tools.values() if t.accepts_directory(path)]
 
+    def tools_converting_path(self, path: str) -> list[ToolPlugin]:
+        """Tools that can convert a concrete file path on its own.
+
+        The per-file companion to :meth:`tools_for_input`: each tool refines
+        the plain extension match via ``converts_path``. jwud uses it to keep
+        the secondary members of a split Wii U dump (``game_part2.wud`` …)
+        visible but non-convertible — only ``game_part1.wud`` drives the set.
+        May do disk I/O; call it off the event loop.
+        """
+        return [t for t in self._tools.values() if t.converts_path(path)]
+
+    def source_companions(self, path: str) -> list[str]:
+        """Every sibling file the tools consuming ``path`` also read.
+
+        Union across tools (deduped, registration order), never including
+        ``path`` itself. The delete-on-verify plan adds these so removing a
+        multi-file source takes the whole set. Empty for ordinary single-file
+        inputs. May do disk I/O; call it off the event loop.
+        """
+        seen: list[str] = []
+        for tool in self._tools.values():
+            for companion in tool.source_companions(path):
+                if companion != path and companion not in seen:
+                    seen.append(companion)
+        return seen
+
     def tool_for_verify(self, path: str) -> ToolPlugin | None:
         ext = Path(path).suffix.lower()
         return next(

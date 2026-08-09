@@ -517,7 +517,7 @@ export const TOOLS = [
   },
   {
     id: 'jwud',
-    defaultCompression: ['zlib'],
+    defaultCompression: ['verify'],
     label: 'Wii U',
     hint: 'Compress and decompress Wii U disc images (WUD ↔ WUX). No keys needed.',
     verifyPrefix: 'jwud',
@@ -528,19 +528,28 @@ export const TOOLS = [
     defaultMode: 'jwud_compress',
     glyph: 'WUD',
     accent: 'var(--badge-wiiu)',
-    // WUX is a fixed sector-deduplication format: no codec, no level.
-    compressionCodecs: [],
-    compressionStyle: 'none',
+    // WUX is a fixed sector-dedup format, so there is no codec and no level.
+    // The dropdown carries JWUDTool's own verification pass instead — the same
+    // way nsz's carries solid/block rather than a codec. 'single-with-level'
+    // renders just the dropdown because both modes set
+    // supportsCompressionLevel: false.
+    compressionCodecs: [
+      { value: 'verify', label: 'Verify against source',
+        hint: 'JWUDTool re-reads both images and compares them byte for byte. Doubles the runtime.' },
+      { value: 'noverify', label: 'Skip verification (faster)',
+        hint: 'Passes -noVerify: about half the runtime, but the result is not checked against the source.' },
+    ],
+    compressionStyle: 'single-with-level',
     modes: [
       { mode: 'jwud_compress', kind: 'compress', label: 'Compress Wii U (WUD → WUX)',
         group: 'jwud',
         outputExt: '.wux', inputExtensions: JWUD_COMPRESS_EXTS,
-        supportsCompression: false, supportsCompressionLevel: false,
+        supportsCompression: true, supportsCompressionLevel: false,
         supportsDeleteOnVerify: true, allowsArchiveInput: true },
       { mode: 'jwud_decompress', kind: 'extract', label: 'Decompress Wii U (WUX → WUD)',
         group: 'jwud',
         outputExt: '.wud', inputExtensions: JWUD_VERIFY_EXTS,
-        supportsCompression: false, supportsCompressionLevel: false,
+        supportsCompression: true, supportsCompressionLevel: false,
         supportsDeleteOnVerify: false, allowsArchiveInput: true },
     ],
     getInfo: (path) => api.getJwudInfo(path),

@@ -27,7 +27,7 @@ A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool
 | **CSO** | PSP / PS2 game images | .iso, .cso, .zso, .dax | .cso, .zso, .dax, .iso, .chd | Effort preset (Fast/Default/Max); the `cso_to_chd` chain ignores it and uses chdman defaults | None | `maxcso` (+ chdman for `cso_to_chd`) |
 | **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
-| **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed) | None | `JWUDTool` (Java) |
+| **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed); a verify-after-conversion toggle | None | `JWUDTool` (Java) |
 
 Most conversions above are lossless and fully reversible, including **3DS**, which
 now decompresses back to the original ROM as well. This uses
@@ -386,6 +386,12 @@ A three-pane layout: navigation and tool picker on the left, the volume and file
 | Light | Dark |
 |-------|------|
 | ![3DS tool, light](docs/screenshots/workspace-3ds-light.png) | ![3DS tool, dark](docs/screenshots/workspace-3ds-dark.png) |
+
+**Wii U.** Compress `.wud` disc images to `.wux` with JWUDTool, and back again.
+
+| Light | Dark |
+|-------|------|
+| ![Wii U tool, light](docs/screenshots/workspace-wiiu-light.png) | ![Wii U tool, dark](docs/screenshots/workspace-wiiu-dark.png) |
 
 #### Dashboard
 
@@ -887,12 +893,16 @@ archive.
 
 ### Technical Details
 
-- **Every conversion is verified against its source.** JWUDTool re-reads both
-  images and compares them byte for byte before the job reports success, so a
-  compress job takes roughly twice as long as writing the output alone. A
-  mismatch fails the job rather than leaving a bad image in place.
-- **Progress covers both phases.** The conversion runs 1–50 % on the bar and the
-  built-in verification 51–99 %.
+- **Every conversion is verified against its source by default.** JWUDTool
+  re-reads both images and compares them byte for byte before the job reports
+  success, so a compress job takes roughly twice as long as writing the output
+  alone. A mismatch fails the job rather than leaving a bad image in place. The
+  tool picker's dropdown trades that guarantee for speed: **Skip verification**
+  passes `-noVerify` and roughly halves the runtime. (The dropdown sits where
+  other tools put their codec because WUX has no codec to choose.)
+- **Progress covers both phases.** With verification on, the conversion runs
+  1–50 % on the bar and the verification 51–99 %; with it off the conversion
+  gets the whole 1–99 %.
 - **Verify** checks the `.wux` container structurally: the header magic and
   fields, then every sector-index entry against the file's real length. That is
   what catches a truncated copy or a corrupt index table, and it is as deep as
@@ -901,10 +911,17 @@ archive.
   delete-on-verify is offered on compress but not on decompress.
 - **Info** reads the WUX header, so it reports the original image size and the
   resulting ratio alongside the usual file details.
-- **Split dumps** (`game_part1.wud`, `game_part2.wud`, … from wudump) are joined
-  by JWUDTool itself when you select the `_part1` file. The remaining parts are
-  still listed as `.wud` sources and will be rejected on their own, since a part
-  is not a whole disc image.
+- **Split dumps are supported.** wudump writes `game_part1.wud` …
+  `game_part12.wud` (eleven 2 GiB parts plus a smaller twelfth), and JWUDTool
+  joins them when you select part 1. Only part 1 is offered as a source — the
+  other parts stay listed, so you can see and delete them, but aren't
+  convertible on their own, since a part is not a disc image. The product is
+  named after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify
+  removes the **whole set** rather than orphaning the eleven parts it didn't
+  name. The names are matched exactly as JNUSLib defines them, so a renamed set
+  (`MyGame_part1.wud`) reads as an ordinary image. A split set can't be
+  converted from inside an archive — the sibling parts aren't extracted with the
+  member — and that attempt fails with JWUDTool's own size complaint.
 - **Disk space.** Decompressing always writes a full ~23 GiB image, and the
   conversion runs in a temp directory next to the destination before being moved
   into place, so the output volume needs room for the finished file.
@@ -1193,7 +1210,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for every tool (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |
 | `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` | `60` | Timeout in seconds for `info`/`header` subprocesses, used by chdman and Dolphin (nsz/3DS read info from the filesystem, so it doesn't apply to them). 0 disables. Legacy alias: `CHD_INFO_TIMEOUT`. |
 | `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `0` | Timeout in seconds for verify runs across all tools (0 disables). Legacy alias: `CHD_VERIFY_TIMEOUT`. |
-| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), or `MAKEPS3ISO` (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO` takes the `_NICE`/`_IOPRIO_*` knobs but has no `_VERIFY_TIMEOUT`, since makeps3iso has no verify step. |
+| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | (shared default) | Optional per-tool overrides that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `<TOOL>` is `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ` (handheld ROM), `MAKEPS3ISO`, or `JWUD` (Wii U) (e.g. `COMPRESSATORIUM_DOLPHIN_TOOL_NICE=15`, `COMPRESSATORIUM_NSZ_VERIFY_TIMEOUT=300`, `COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT=300`). `MAKEPS3ISO` and `JWUD` take the `_NICE`/`_IOPRIO_*` knobs but have no `_VERIFY_TIMEOUT`: makeps3iso has no verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
 | `COMPRESSATORIUM_<TOOL>_INFO_TIMEOUT` | (shared default) | Optional per-tool info-timeout override, only for `<TOOL>` = `CHDMAN` or `DOLPHIN_TOOL` (the only tools whose `info` runs a subprocess); falls back to the shared `COMPRESSATORIUM_TOOL_INFO_TIMEOUT`. |
 | `CHD_ARCHIVE_MAX_ENTRIES` | `5000` | Max archive members to list (0 disables limit) |
 | `CHD_ARCHIVE_MAX_MEMBER_SIZE` | `0` | Max size in bytes per archive member (0 disables limit) |

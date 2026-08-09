@@ -32,6 +32,18 @@ and #179, part of the #177 tech-debt epic).
   delete-on-verify is offered on compress but not on decompress. `/api/jwud-info`
   reads the same header, reporting the original image size and the ratio.
 
+  **Split dumps work too.** wudump writes `game_part1.wud` … `game_part12.wud`
+  and JWUDTool joins them when you pick part 1. Only part 1 is offered as a
+  source; the rest stay listed (so you can see and delete them) but aren't
+  convertible alone, since a part is not a disc image. The product is named
+  after the disc (`game.wux`, not `game_part1.wux`), and delete-on-verify takes
+  the whole set instead of orphaning eleven parts.
+
+  **The verification pass is now a choice.** It stays on by default, but the
+  tool picker's dropdown — where other tools put their codec, since WUX has none
+  — offers **Skip verification**, which passes `-noVerify` and roughly halves the
+  runtime.
+
   Both directions also accept a member straight out of a ZIP/7z/RAR. New env var:
   `JWUDTOOL_PATH` (default `/usr/local/bin/jwudtool`). JWUDTool is a Java program,
   so the image now installs a headless JRE plus the pinned, SHA256-checked
@@ -39,6 +51,23 @@ and #179, part of the #177 tech-debt epic).
   independent, so both `linux/amd64` and `linux/arm64` are covered. The tool
   hides itself in the UI (via the `is_ready()` hook) when no launcher is present,
   which is what a local checkout without Java sees.
+
+- **Two more shared paths that assumed a source is one file became plugin hooks
+  (`converts_path`, `source_companions`).** A split Wii U dump is one disc image
+  over twelve files, which broke both: the listing offered all twelve as sources
+  (eleven of which can only fail), and delete-on-verify removed the part the job
+  named while orphaning the rest — about 23 GB of silent leftovers.
+
+  `ToolPlugin.converts_path(path)` is the input-side mirror of `verifies_path`
+  (default: the plain `input_extensions` match, so the seven existing tools are
+  unchanged), read by `routes/files.py` into the same tool-neutral
+  `FileEntry.convertible_by`. `ToolPlugin.source_companions(path)` is the
+  input-side mirror of `companion_outputs` (default `[]`), read by
+  `utils/delete_plan.build_delete_plan`. The registry gained
+  `tools_converting_path()` and `source_companions()` alongside the existing
+  verify-side pair. `.cue`/`.gdi` track files still go through delete_plan's own
+  content parser rather than the new hook — folding those in would move their
+  unsafe-reference handling, so it is left for its own change.
 
 - **Two per-tool branches on shared paths became plugin hooks
   (`overwrite_targets`, `is_ready`).** Both were single-tool special cases

@@ -11,7 +11,13 @@ same shape would have silently inherited the first tool's behavior:
   a second key-gated tool could never be hidden, so the UI would advertise a
   converter that can only fail at job time.
 
-They are now the ``overwrite_targets`` and ``is_ready`` plugin hooks. These
+They are now the ``overwrite_targets`` and ``is_ready`` plugin hooks.
+
+The same file also covers the two *input-side* hooks added with jwud —
+``converts_path`` and ``source_companions`` — which exist so a multi-file source
+(a split Wii U dump) is described by its plugin instead of by a ``.wud`` branch
+in the file listing and the delete planner, next to the ``.cue``/``.gdi`` ladder
+that is still hard-coded there. These
 tests pin the generic behavior with a *synthetic* second tool, which is the
 only way to catch a regression back to an id/kind branch: asserting on
 makeps3iso or nsz alone passes either way.
@@ -336,3 +342,82 @@ async def test_list_tools_hides_any_unready_tool(monkeypatch):
     assert "cso" not in result["available"]
     # Everything else is unaffected.
     assert "chdman" in result["available"]
+
+
+# --- converts_path / source_companions ----------------------------------------
+
+def _split_set(tmp_path: Path, parts: int = 3) -> list[Path]:
+    made = []
+    for index in range(1, parts + 1):
+        part = tmp_path / f"game_part{index}.wud"
+        part.write_bytes(b"part")
+        made.append(part)
+    return made
+
+
+def test_converts_path_defaults_to_the_extension_match():
+    # Every tool that doesn't override it keeps the pre-hook behavior, so the
+    # listing is unchanged for the seven tools that predate the seam.
+    class _Plain(BaseTool):
+        id = "plain"
+        display_name = "Plain"
+        modes = ()
+
+    tool = _Plain("/bin/true")
+    assert tool.converts_path("/data/anything.iso") is False  # no modes, no exts
+    assert registry.get("z3ds").converts_path("/data/rom.3ds") is True
+    assert registry.get("z3ds").converts_path("/data/rom.iso") is False
+
+
+def test_source_companions_defaults_to_empty():
+    # A single-file source consumes nothing else; only a multi-file source
+    # overrides this.
+    assert registry.get("z3ds").source_companions("/data/rom.3ds") == []
+    assert registry.source_companions("/data/rom.3ds") == []
+
+
+def test_split_source_is_convertible_only_through_its_primary(tmp_path):
+    parts = _split_set(tmp_path, 3)
+
+    # Part 1 drives the whole set...
+    assert [t.id for t in registry.tools_converting_path(str(parts[0]))] == ["jwud"]
+    # ...and the rest stay listed but non-convertible, so the UI can't offer a
+    # job that could only fail.
+    for part in parts[1:]:
+        assert registry.tools_converting_path(str(part)) == []
+        # Still a .wud by extension — the narrowing is per-file, not per-type.
+        assert ".wud" in registry.get("jwud").input_extensions
+
+
+def test_split_source_companions_cover_the_whole_set(tmp_path):
+    parts = _split_set(tmp_path, 3)
+
+    companions = registry.source_companions(str(parts[0]))
+
+    assert companions == [str(parts[1]), str(parts[2])]
+    # Never includes the path itself, so a caller can't double-count it.
+    assert str(parts[0]) not in companions
+
+
+def test_delete_plan_takes_every_part_of_a_split_source(tmp_path):
+    """Delete-on-verify must not orphan the parts the job didn't name."""
+    from app.utils.delete_plan import build_delete_plan
+
+    parts = _split_set(tmp_path, 3)
+
+    plan = build_delete_plan(str(parts[0]))
+
+    assert sorted(plan["delete_paths"]) == sorted(str(p) for p in parts)
+    assert not plan["errors"]
+    assert not plan["missing_paths"]
+
+
+def test_delete_plan_is_unchanged_for_an_ordinary_source(tmp_path):
+    from app.utils.delete_plan import build_delete_plan
+
+    plain = tmp_path / "game.wud"
+    plain.write_bytes(b"image")
+
+    plan = build_delete_plan(str(plain))
+
+    assert plan["delete_paths"] == [str(plain)]

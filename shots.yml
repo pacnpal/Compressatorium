@@ -136,6 +136,36 @@
       await new Promise(r => setTimeout(r, 500));
     })()
 
+# --- Workspace: Wii U (Wii U volume selected) -----------------------------
+- url: http://127.0.0.1:8099/?s=workspace-wiiu-light#/workspace/jwud
+  output: docs/screenshots/workspace-wiiu-light.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: |
+    (async () => {
+      localStorage.setItem('theme-preference', 'light');
+      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
+      await new Promise(r => setTimeout(r, 400));
+      const vol = [...document.querySelectorAll('button.item')].find(b => b.textContent.trim() === 'Wii U');
+      if (vol) vol.click();
+      await new Promise(r => setTimeout(r, 500));
+    })()
+- url: http://127.0.0.1:8099/?s=workspace-wiiu-dark#/workspace/jwud
+  output: docs/screenshots/workspace-wiiu-dark.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: |
+    (async () => {
+      localStorage.setItem('theme-preference', 'dark');
+      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
+      await new Promise(r => setTimeout(r, 400));
+      const vol = [...document.querySelectorAll('button.item')].find(b => b.textContent.trim() === 'Wii U');
+      if (vol) vol.click();
+      await new Promise(r => setTimeout(r, 500));
+    })()
+
 # --- Dashboard ------------------------------------------------------------
 - url: http://127.0.0.1:8099/?s=dashboard-light#/dashboard
   output: docs/screenshots/dashboard-light.png

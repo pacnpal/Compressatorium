@@ -22,7 +22,8 @@ root="${1:?usage: make_screenshot_fixture.sh <target-dir>}"
 mkdir -p \
   "$root/Arcade CHD" \
   "$root/GameCube" \
-  "$root/Nintendo 3DS"
+  "$root/Nintendo 3DS" \
+  "$root/Wii U"
 
 # Placeholder file sizes are in KiB. `dd` is used rather than `head -c` because
 # the latter's byte count is a GNU extension the BSD `head` on macOS lacks.
@@ -40,5 +41,11 @@ placeholder "$root/GameCube/zelda-wind-waker.rvz" 1024
 # 3DS: a couple of ROMs.
 placeholder "$root/Nintendo 3DS/pokemon-x.3ds" 2048
 placeholder "$root/Nintendo 3DS/mario-3d-land.cci" 2048
+
+# Wii U: a raw disc dump plus an already-compressed .wux. These are placeholders
+# for the file list only — a real .wud is a fixed 25 GB, which is neither
+# shippable nor needed to render the row.
+placeholder "$root/Wii U/splatoon.wud" 3072
+placeholder "$root/Wii U/mario-maker.wux" 1024
 
 echo "Fixture volume created under: $root"

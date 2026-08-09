@@ -58,7 +58,7 @@
     {
       glyph: 'WUD',
       name: 'Wii U',
-      blurb: 'Wii U disc dumps to WUX and back, using JWUDTool. Every Wii U disc image is exactly 25 GB regardless of how much of it the game uses, so WUX deduplicates the repeated sectors and typically lands a fraction of that; Cemu reads the .wux directly. Lossless and fully reversible, with no settings to pick. No keys needed either — this only repacks the image, it never decrypts it, so a WUX stays as encrypted as the WUD it came from. JWUDTool compares the result against the source byte for byte before the job reports success, which is why a compress job takes about twice as long as the write itself.',
+      blurb: 'Wii U disc dumps to WUX and back, using JWUDTool. Every Wii U disc image is exactly 25 GB regardless of how much of it the game uses, so WUX deduplicates the repeated sectors and typically lands a fraction of that; Cemu reads the .wux directly. Lossless and fully reversible. No keys needed either — this only repacks the image, it never decrypts it, so a WUX stays as encrypted as the WUD it came from. JWUDTool compares the result against the source byte for byte before the job reports success, which is why a compress job takes about twice as long as the write itself; the dropdown can turn that off if you want the speed instead. Split dumps from wudump (game_part1.wud through game_part12.wud) work too — pick part 1 and the whole set converts as one image.',
       io: '.wud  ↔  .wux',
     },
   ];

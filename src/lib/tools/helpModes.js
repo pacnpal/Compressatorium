@@ -65,10 +65,14 @@ export const MODE_BLURBS = {
   romz_extract: 'Extract the ROM back out of a .7z/.zip archive.',
   // Wii U
   jwud_compress:
-    'Pack a 25 GB Wii U disc dump into a .wux. No settings — WUX deduplicates '
-    + 'repeated sectors. JWUDTool compares the result against the source before '
-    + 'the job finishes.',
-  jwud_decompress: 'Restore the original .wud from a .wux, byte for byte.',
+    'Pack a 25 GB Wii U disc dump into a .wux, which deduplicates the repeated '
+    + 'sectors. No codec to pick; the dropdown chooses whether JWUDTool compares '
+    + 'the result against the source before the job finishes (on by default, and '
+    + 'about half the runtime with it off). Select part 1 of a split dump to '
+    + 'convert the whole set.',
+  jwud_decompress:
+    'Restore the original .wud from a .wux, byte for byte. Same verification '
+    + 'choice as the compress direction.',
   // PS3
   folder_to_iso:
     'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle '

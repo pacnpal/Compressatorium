@@ -16,7 +16,9 @@ from services.jwudtool import (
     JWUD_COMPRESS_EXTENSIONS,
     JWUD_DECOMPRESS_EXTENSIONS,
     JWUD_OUTPUT_FORMATS,
+    is_split_secondary,
     jwudtool_service,
+    split_set_parts,
 )
 from services.lock_manager import lock_manager
 
@@ -36,8 +38,12 @@ class JwudTool(BaseTool):
             group="jwud",
             output_ext=".wux",
             input_extensions=frozenset(JWUD_COMPRESS_EXTENSIONS),
+            # Not a codec: the picker carries JWUDTool's verify / -noVerify
+            # choice, the way nsz's carries solid/block. No numeric level.
+            supports_compression=True,
             # Safe: the .wux output is itself verifiable, and the conversion
-            # already ran JWUDTool's byte-for-byte comparison against the source.
+            # runs JWUDTool's byte-for-byte comparison against the source unless
+            # the job explicitly opted out of it.
             supports_delete_on_verify=True,
             allows_archive_input=True,
         ),
@@ -49,6 +55,9 @@ class JwudTool(BaseTool):
             group="jwud",
             output_ext=".wud",
             input_extensions=frozenset(JWUD_DECOMPRESS_EXTENSIONS),
+            # Decompress verifies its output against the source too, so it takes
+            # the same verify / -noVerify choice.
+            supports_compression=True,
             # No delete-on-verify: the output is a raw .wud, which is not in
             # verify_extensions (only the WUX container carries structure to
             # check), so the output can't be confirmed before deleting the source.
@@ -71,6 +80,19 @@ class JwudTool(BaseTool):
         # offering jobs that can only fail. Threadpooled: it stats the disk.
         return await run_in_threadpool(self._service.binary_available)
 
+    def converts_path(self, path: str) -> bool:
+        # A split dump is one disc image spread over game_part1…12.wud, and
+        # JWUDTool joins it from part 1. The other parts stay listed (you may
+        # want to see or delete them) but are not independently convertible.
+        if is_split_secondary(path):
+            return False
+        return super().converts_path(path)
+
+    def source_companions(self, path: str) -> list[str]:
+        # Parts 2…N of a split set, so delete-on-verify takes the whole source
+        # instead of orphaning ~23 GB of parts it never named.
+        return split_set_parts(path)
+
     def detect_output(self, input_path: str) -> OutputStatus | None:
         # Compress direction only: badge "the .wux already exists" next to a
         # .wud source (mirrors z3ds/maxcso). The job pipeline's
@@ -78,7 +100,13 @@ class JwudTool(BaseTool):
         source = Path(input_path)
         if source.suffix.lower() not in JWUD_COMPRESS_EXTENSIONS:
             return None
-        candidate = str(source.with_suffix(".wux"))
+        if is_split_secondary(input_path):
+            # Part 7's product is part 1's product; badging it here would show
+            # the same .wux against every member of the set.
+            return None
+        # Resolve through the same output-path math the job uses, so a split
+        # primary badges game.wux rather than game_part1.wux.
+        candidate = self.output_path("jwud_compress", input_path)
         file_exists, is_converting = lock_manager.check_file_status(candidate)
         if not (file_exists or is_converting):
             return None

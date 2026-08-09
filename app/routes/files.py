@@ -109,7 +109,7 @@ def _fold_split_iso_entries(entries: list[FileEntry]) -> list[FileEntry]:
 
 
 def _detect_file_outputs(
-    item_path: str, ext: str,
+    item_path: str,
 ) -> tuple[list[str], list[OutputStatus], dict[str, OutputStatus]]:
     """Drive convertibility + output detection off the tool registry.
 
@@ -121,7 +121,11 @@ def _detect_file_outputs(
     outputs: list[OutputStatus] = []
     by_tool: dict[str, OutputStatus] = {}
     for tool in registry.all():
-        if ext in tool.input_extensions:
+        # ``converts_path`` is the extension match by default; a tool whose
+        # source is a *set* of files narrows it per-file (jwud leaves the
+        # secondary members of a split Wii U dump visible but non-convertible,
+        # since only game_part1.wud drives the set).
+        if tool.converts_path(item_path):
             convertible_by.append(tool.id)
         status = tool.detect_output(item_path)
         if status is not None:
@@ -171,9 +175,10 @@ def _detect_archive_member_outputs(
     )
     member_ext = (entry.get("extension") or Path(entry["name"]).suffix).lower()
     synthetic_input = os.path.join(archive_dir, f"{output_stem}{member_ext}")
-    _, outputs, by_tool = _detect_file_outputs(synthetic_input, member_ext)
-    # `_detect_file_outputs` derives convertibility from `ext in input_extensions`
-    # alone — but a member is only convertible in *place* when a tool can accept
+    _, outputs, by_tool = _detect_file_outputs(synthetic_input)
+    # `_detect_file_outputs` derives convertibility from each tool's
+    # `converts_path` — but a member is only convertible in *place* when a tool
+    # can accept
     # it straight from an archive. Re-derive against `allows_archive_input` so a
     # listing-only member (a romz ROM) is shown without offering a conversion
     # `plan_job` would reject (ARCHIVE_INPUT_NOT_ALLOWED).
@@ -352,7 +357,7 @@ async def list_files(
                             convertible_by, outputs = [], []
                         else:
                             convertible_by, outputs, _ = _detect_file_outputs(
-                                item_path, ext,
+                                item_path,
                             )
 
                         archive_items = None
@@ -522,7 +527,7 @@ async def search_files(
                                 convertible_by, outputs = [], []
                             else:
                                 convertible_by, outputs, _ = _detect_file_outputs(
-                                    item_path, ext,
+                                    item_path,
                                 )
                             if convertible_by:
                                 files.append(

@@ -80,6 +80,37 @@ class ToolPlugin(Protocol):
         disk I/O — call it off the event loop.
         """
 
+    def converts_path(self, path: str) -> bool:
+        """Whether this tool can convert a concrete file *on its own*.
+
+        The input-side mirror of ``verifies_path``: the default is a plain
+        match against ``input_extensions``, but a tool whose source is really a
+        *set* of files overrides it so only the primary member is offered.
+        JWUDTool's split Wii U dumps are the case — ``game_part1.wud`` through
+        ``game_part12.wud`` are one disc image, and selecting part 7 alone can
+        only fail. Listing code calls it so ``FileEntry.convertible_by`` marks
+        the secondary members non-convertible while leaving them visible.
+        May do disk I/O (it looks for the sibling primary) — it runs inside the
+        threadpool scan.
+        """
+
+    def source_companions(self, path: str) -> list[str]:
+        """Sibling files this input consumes *besides* ``path`` itself.
+
+        The input-side mirror of ``companion_outputs``: a source that is really
+        several files on disk (a split Wii U dump's ``game_part2.wud`` …
+        ``game_part12.wud``) reports the rest of the set here, so
+        delete-on-verify removes the whole source rather than orphaning the
+        parts it didn't name. ``path`` itself is never included, and a tool
+        whose inputs are single files returns ``[]``.
+
+        Note ``.cue``/``.gdi`` track files are *not* routed through this hook
+        today: they're parsed out of the file's contents by
+        ``utils.delete_plan``, with its own unsafe-reference handling, rather
+        than derived from naming. Folding those into this seam is the obvious
+        next consolidation.
+        """
+
     def verifies_path(self, path: str) -> bool:
         """Whether this tool's verify/info applies to a concrete file.
 
@@ -245,6 +276,17 @@ class BaseTool:
     def accepts_directory(self, path: str) -> bool:
         # Default: file-only tool. Directory-input tools (makeps3iso) override.
         return False
+
+    def converts_path(self, path: str) -> bool:
+        # Default: a plain extension match, the same rule the listing used
+        # before this hook existed. Tools whose source is a *set* of files
+        # (jwud's split Wii U dumps) override it so only the primary is
+        # offered; every other tool inherits the extension match.
+        return Path(path).suffix.lower() in self.input_extensions
+
+    def source_companions(self, path: str) -> list[str]:
+        # Default: a single-file source consumes nothing else.
+        return []
 
     def verifies_path(self, path: str) -> bool:
         # Default: a plain extension match. Tools that over-claim a container

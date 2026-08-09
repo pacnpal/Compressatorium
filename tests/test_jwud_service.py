@@ -46,18 +46,21 @@ def _build_wux(
     table = b"".join(
         struct.pack("<I", i % stored_sectors) for i in range(entry_count)
     )
+    path = tmp_path / name
     if truncate_table:
-        table = table[: len(table) // 2]
+        # Stop right here: padding out to the sector array would hand the
+        # verifier a *complete* table and it would fail on the missing sectors
+        # instead, never exercising the index-table check.
+        path.write_bytes(header + table[: len(table) // 2])
+        return path
 
     body = header + table
     sector_array_offset = len(header) + entry_count * 4 + sector_size - 1
     sector_array_offset -= sector_array_offset % sector_size
     body += b"\0" * (sector_array_offset - len(body))
-    if not truncate_table:
-        stored = stored_sectors - 1 if truncate_sectors else stored_sectors
-        body += b"S" * (sector_size * stored)
+    stored = stored_sectors - 1 if truncate_sectors else stored_sectors
+    body += b"S" * (sector_size * stored)
 
-    path = tmp_path / name
     path.write_bytes(body)
     return path
 
@@ -424,8 +427,10 @@ async def test_verify_accepts_a_well_formed_container(tmp_path):
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"truncate_table": True}, "truncated"),
-        ({"truncate_sectors": True}, "truncated"),
+        # A short index table is caught by the table walk itself...
+        ({"truncate_table": True}, "sector index table is truncated"),
+        # ...a short sector array by the length check that follows it.
+        ({"truncate_sectors": True}, "wux is truncated"),
         ({"magic": b"NOPE"}, "not a valid wux container"),
     ],
 )
@@ -462,3 +467,162 @@ async def test_verify_rejects_missing_and_empty_files(tmp_path, make, match):
 
     assert result["valid"] is False
     assert match in result["message"].lower()
+
+
+# --- split dumps -------------------------------------------------------------
+
+
+def _make_split_set(tmp_path: Path, parts: int = 4) -> list[Path]:
+    """A wudump-style split set: game_part1.wud … game_partN.wud."""
+    return [
+        _write(tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % i), b"part")
+        for i in range(1, parts + 1)
+    ]
+
+
+def _write(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("game_part1.wud", 1),
+        ("game_part12.wud", 12),
+        # Out of JNUSLib's 1..12 range, so not a part at all.
+        ("game_part13.wud", None),
+        ("game_part0.wud", None),
+        # JNUSLib compares the filename with String.equals, so the template is
+        # literal: anything else is an ordinary image.
+        ("MyGame_part1.wud", None),
+        ("game_part1.wux", None),
+        ("game.wud", None),
+    ],
+)
+def test_split_part_index_matches_the_jnuslib_template(name, expected):
+    assert jwud_module.split_part_index(f"/data/{name}") == expected
+
+
+def test_split_set_parts_reports_the_rest_of_the_set(tmp_path):
+    parts = _make_split_set(tmp_path, 4)
+
+    assert jwud_module.split_set_parts(str(parts[0])) == [str(p) for p in parts[1:]]
+    # Only part 1 owns the set; the others report nothing.
+    assert jwud_module.split_set_parts(str(parts[2])) == []
+
+
+def test_split_set_parts_stops_at_the_first_gap(tmp_path):
+    _make_split_set(tmp_path, 2)
+    # part3 missing, part4 present: JNUSLib reads the parts in order, so the
+    # set ends at the gap rather than silently skipping it.
+    _write(tmp_path / (jwud_module.WUD_SPLIT_PART_TEMPLATE % 4), b"part")
+
+    parts = jwud_module.split_set_parts(str(tmp_path / "game_part1.wud"))
+
+    assert [Path(p).name for p in parts] == ["game_part2.wud"]
+
+
+def test_split_secondary_needs_the_primary_beside_it(tmp_path):
+    parts = _make_split_set(tmp_path, 3)
+
+    assert jwud_module.is_split_secondary(str(parts[1])) is True
+    assert jwud_module.is_split_secondary(str(parts[0])) is False
+
+    # A stray part with no part 1 is left alone rather than silently hidden.
+    orphan_dir = tmp_path / "orphan"
+    orphan_dir.mkdir()
+    orphan = _write(orphan_dir / "game_part7.wud", b"part")
+    assert jwud_module.is_split_secondary(str(orphan)) is False
+
+
+def test_split_primary_names_its_output_after_the_disc():
+    # game_part1.wud is one member of one image, so the product is game.wux --
+    # naming it game_part1.wux would imply a per-part output.
+    assert service.get_output_path_for_mode(
+        "jwud_compress", "/data/game_part1.wud",
+    ) == "/data/game.wux"
+    assert service.output_stem("/data/game_part1.wud") == "game"
+    assert service.output_stem("/data/game.wud") == "game"
+
+
+# --- verification toggle -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("compression", "expected"),
+    [
+        (None, True),
+        ("", True),
+        ("verify", True),
+        ("noverify", False),
+        ("NoVerify", False),
+        # A level the picker may append is ignored.
+        ("noverify:19", False),
+        # Anything unrecognised keeps the guarantee rather than dropping it.
+        ("zlib", True),
+    ],
+)
+def test_verification_enabled_defaults_to_on(compression, expected):
+    assert jwud_module.verification_enabled(compression) is expected
+
+
+@pytest.mark.parametrize(
+    ("compression", "expect_flag"),
+    [("verify", False), ("noverify", True)],
+)
+def test_build_command_passes_noverify_only_when_asked(
+    compression, expect_flag, fake_binary,
+):
+    cmd = service._build_command(
+        "/data/game.wud", "/data/.jwud-tmp", "jwud_compress", compression,
+    )
+
+    assert ("-noVerify" in cmd) is expect_flag
+
+
+@pytest.mark.asyncio
+async def test_convert_uses_the_whole_bar_when_verification_is_off(
+    tmp_path, monkeypatch, fake_binary,
+):
+    """With one phase instead of two, the conversion shouldn't stall at 50 %."""
+    source = tmp_path / "game.wud"
+    source.write_bytes(b"image")
+    _install_fake_exec(monkeypatch, [
+        b"Compressing into .wux | Progress 50.00% | Ratio: 1:2.00 | Read: 1MB\r",
+        b"Compressing into .wux | Progress 100.00% | Ratio: 1:2.00 | Read: 2MB\r",
+        b"Compression successful!\n",
+    ])
+
+    updates = await _drain(
+        service.convert(
+            str(source), str(tmp_path / "game.wux"), "jwud_compress",
+            compression="noverify",
+        ),
+    )
+
+    progress = [u["progress"] for u in updates]
+    assert 50 in progress   # half way through the conversion, not the whole job
+    assert 99 in progress   # conversion complete
+    assert progress[-1] == 100
+    assert progress == sorted(progress)
+
+
+@pytest.mark.asyncio
+async def test_convert_still_fails_on_an_invalid_verification_result(
+    tmp_path, monkeypatch, fake_binary,
+):
+    """The decompress direction reports the marker too, and must also fail."""
+    source = tmp_path / "game.wux"
+    source.write_bytes(b"image")
+    _install_fake_exec(monkeypatch, [
+        b"Decompression successful!\n",
+        b"Warning! (De)Compressed file is INVALID!\n",
+    ])
+
+    with pytest.raises(RuntimeError, match="decompressed image does not match"):
+        await _drain(
+            service.convert(
+                str(source), str(tmp_path / "game.wud"), "jwud_decompress",
+            ),
+        )

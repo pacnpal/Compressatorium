@@ -33,6 +33,22 @@ def mock_jwud_service(monkeypatch):
     mock_service = Mock()
 
     def fake_info(path):
+        # Branch on the suffix like the real service does: a raw .wud carries no
+        # WUX header, so it has no original size and no ratio. Returning WUX
+        # metadata for both would let the route report a .wud as compressed and
+        # still pass.
+        if path.lower().endswith(".wud"):
+            return {
+                "file": path,
+                "size": 25025314816,
+                "size_display": "23.31 GB",
+                "format": "WUD (Wii U disc image)",
+                "extension": ".wud",
+                "compressed": False,
+                "compression_type": None,
+                "original_size": None,
+                "ratio": None,
+            }
         return {
             "file": path,
             "size": 3112960,
@@ -149,6 +165,11 @@ async def test_jwud_info_accepts_the_raw_source(jwud_test_env, mock_jwud_service
     result = await info_routes.get_jwud_info(path=jwud_test_env["source_path"])
 
     assert result.file == jwud_test_env["source_path"]
+    # A raw dump is not a compressed container, and has no ratio to report.
+    assert result.compressed is False
+    assert result.compression_type is None
+    assert result.original_size is None
+    assert result.ratio is None
 
 
 @pytest.mark.asyncio
