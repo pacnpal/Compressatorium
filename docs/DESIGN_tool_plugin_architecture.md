@@ -1119,7 +1119,13 @@ registry-driven rather than jwud branches:
   `True`) is the per-file veto on that walk, the scan-side analogue of
   `converts_path`; the registry drops a path any tool rejects, since a file some
   tool knows is not a standalone artifact cannot match a DAT whatever the others
-  think. Pure name math — it runs once per candidate across the whole library.
+  think. It may do *bounded* disk I/O: the veto is on membership of a real set
+  rather than on the name, so a lone `game_part1.wud` stays scannable and the
+  same path stops being scannable once its siblings appear — which a pure
+  filename check could not express, and which keeps the hook agreeing with
+  `converts_path` and `output_stem`. It runs once per candidate across the whole
+  library, so implementations stay to a stat or two and never a read, inside the
+  threadpool scan walk rather than on the event loop.
 
 **Naming the set's product is a third disk-reading decision.** Part 1 of a set
 produces `game.wux`, not `game_part1.wux` — the parts are one image and the part

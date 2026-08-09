@@ -51,8 +51,12 @@ and #179, part of the #177 tech-debt epic).
   a total: a short part balanced by a long one sums to a whole image but is
   still unjoinable, because the reader computes each part's offset from its
   index. A set whose sibling parts are symlinks, or resolve outside the
-  configured volumes, is refused before the job starts (`plan_job`) — the
-  converter opens those files itself, so that is the only place to stop it. And
+  configured volumes, is refused — the converter opens those files itself, so
+  the only place to stop it is before it runs. Checked twice, like the PS3
+  folder walk it mirrors: once when the job is queued (`plan_job`) and again in
+  the worker after the job takes its locks, since a queued set's part can be
+  swapped in between. The re-check runs before any existing output is cleared,
+  so a rejection on an overwrite job leaves your previous file intact. And
   because `.wud` is a produced output, the DAT-match scan would otherwise SHA1
   all twelve 2 GiB parts of every set; a new `ToolPlugin.scannable_path` hook
   (default `True`) drops them from the walk.
