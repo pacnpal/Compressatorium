@@ -472,10 +472,13 @@ for the stage list). Pick the one that fits:
 - **Build from source in the `builder` stage** (z3ds), then copy the artifact
   into the runtime image.
 
-For `nszip` built from source, add to the `builder` stage:
+For `nszip` built from source, add to the `builder` stage. Note the base image
+is **digest-pinned** — copy the `FROM` line from the repo's `Dockerfile`
+verbatim rather than writing a bare `debian:trixie-slim` tag, so the supply-chain
+pin holds (see §8):
 
 ```dockerfile
-FROM debian:trixie-slim AS builder
+FROM debian:trixie-slim@sha256:<the digest already used in the Dockerfile> AS builder
 RUN apt-get update -o Acquire::Retries=3 && \
     apt-get install -y --no-install-recommends \
       git build-essential libzstd-dev ca-certificates && \
@@ -578,7 +581,11 @@ class NszipService:
             return list(self._active_pids)
 
     async def convert(self, input_path, output_path, mode="nszip_compress",
-                      *, compression=None, cancel_event=None) -> AsyncGenerator[dict, None]:
+                      *, compression=None, split=False,
+                      cancel_event=None) -> AsyncGenerator[dict, None]:
+        # `split` is accepted and ignored unless your tool implements it —
+        # job_manager passes it unconditionally, so omitting it is a TypeError
+        # at runtime. Same rule as a `compression` your tool doesn't use.
         # 1. mkdir -p output dir
         # 2. build cmd, spawn with asyncio.create_subprocess_exec (NEVER shell=True)
         # 3. apply the shared nice level via preexec_fn (posix only):
@@ -639,9 +646,11 @@ class NszipTool(BaseTool):
     def output_path(self, mode, input_path, output_dir=None, *, treat_as_stem=False):
         return nszip_service.get_output_path(input_path, output_dir)
 
-    def convert(self, input_path, output_path, mode, *, compression=None, cancel_event=None):
+    def convert(self, input_path, output_path, mode, *, compression=None,
+                split=False, cancel_event=None):
         return nszip_service.convert(input_path, output_path, mode,
-                                     compression=compression, cancel_event=cancel_event)
+                                     compression=compression, split=split,
+                                     cancel_event=cancel_event)
 
     async def verify(self, path): return await nszip_service.verify(path)
     def verify_stream(self, path): return nszip_service.verify_stream(path)
@@ -655,6 +664,11 @@ class NszipTool(BaseTool):
 - **Never** use `shell=True`. Build an argv list and use
   `asyncio.create_subprocess_exec(cmd[0], *cmd[1:], ...)`. The binary path comes
   from validated settings; inputs are never shell-interpreted.
+- **Accept the full keyword set, even the parts you ignore.** `job_manager`
+  calls `plugin.convert(..., compression=…, split=…, cancel_event=…)`
+  unconditionally, so a `convert()` missing `split` (or `compression`) raises
+  `TypeError` the first time a job runs — something unit tests that call your
+  service directly will not catch. Take the kwarg and drop it on the floor.
 - **Always** support `cancel_event`: spawn a watcher task that
   `process.terminate()`s (then `kill()`s after a timeout), clean up the partial
   output file, and raise `ConversionCancelled`. See `z3ds_compress.py`.
@@ -894,7 +908,12 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
   glyph: 'NSW',                           // 2-3 char affordance for sidebar / dashboard
   accent: 'var(--badge-dat-match)',       // CSS color or token
 
-  // --- compression UI (all optional; omit for a fixed compressor) ---
+  // --- compression UI (the whole block is optional) ---
+  // Omit ALL of it for a fixed compressor whose modes set
+  // supportsCompression: false and supportsCompressionLevel: false — the
+  // block and the per-mode flags must agree, or the UI offers a control the
+  // backend ignores. z3ds is the fixed-compressor example (compressionStyle:
+  // 'none', no codecs, no range).
   // 'none' | 'multi' (chdman: comma-joined codec list) | 'single-with-level'
   compressionStyle: 'single-with-level',
   compressionCodecs: [/* { value, label, hint } */],
@@ -910,11 +929,17 @@ downstream. Adding `nszip` is **one new entry** appended to the `TOOLS` array:
       outputExt: null,                    // mapped from input extension
       inputExtensions: ['.nsp', '.xci'],
       // inputKinds: ['directory'],       // only for a folder-input mode
-      supportsCompression: false,
-      supportsCompressionLevel: false,
+      supportsCompression: false,         // no codec dropdown...
+      supportsCompressionLevel: true,     // ...but the level slider is live,
+                                          // which is what earns the
+                                          // compressionLevelRange above
       supportsDeleteOnVerify: true,
       allowsArchiveInput: false,
-      // supportsSplit: true,             // only if the mode declares a split flag
+      // supportsSplit: true,             // frontend-only capability flag;
+                                          // there is NO ModeSpec.supports_split
+                                          // on the backend — `split` rides the
+                                          // job request and every convert()
+                                          // accepts it (see §5.3)
     },
   ],
   getInfo:     (path) => api.getNszipInfo(path),
