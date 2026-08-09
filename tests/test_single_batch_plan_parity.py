@@ -155,6 +155,27 @@ def _cases():
             DuplicateAction.SKIP,
             "accept",
         ),
+        (
+            "nkit_restore_nkit_iso_accept",
+            lambda t: write(t, "game.nkit.iso"),
+            ConversionMode.NKIT_RESTORE,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "nkit_restore_nkit_gcz_accept",
+            lambda t: write(t, "game.nkit.gcz"),
+            ConversionMode.NKIT_RESTORE,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "nkit_to_rvz_accept",  # the chain takes the same NKit sources
+            lambda t: write(t, "game.nkit.iso"),
+            ConversionMode.NKIT_TO_RVZ,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
         # --- rejections / skips ---
         (
             "createcd_chd_reject",  # CREATE_REQUIRES_NON_CHD
@@ -181,6 +202,22 @@ def _cases():
             "dolphin_rvz_bad_ext_reject",  # DOLPHIN_BAD_EXTENSION
             lambda t: write(t, "game.txt"),
             ConversionMode.DOLPHIN_RVZ,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "nkit_to_rvz_bad_ext_reject",  # CHAIN_BAD_EXTENSION
+            lambda t: write(t, "game.iso"),
+            ConversionMode.NKIT_TO_RVZ,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "nkit_restore_bad_ext_reject",  # NKIT_BAD_EXTENSION
+            # A PLAIN .iso must be rejected: nkit2iso declares the compound
+            # `.nkit.iso`, so the generic tail alone is not one of its sources.
+            lambda t: write(t, "game.iso"),
+            ConversionMode.NKIT_RESTORE,
             DuplicateAction.SKIP,
             "reject",
         ),
@@ -233,6 +270,20 @@ def _cases():
             ConversionMode.Z3DS_COMPRESS,
             DuplicateAction.SKIP,
             "accept",
+        ),
+        (
+            "archive_nkit_accept",  # archive allowed for the NKit restore
+            lambda t: f"{_make_zip(t, 'arch.zip')}::game.nkit.iso",
+            ConversionMode.NKIT_RESTORE,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "archive_nkit_plain_iso_reject",  # NKIT_BAD_EXTENSION on a member
+            lambda t: f"{_make_zip(t, 'arch.zip')}::game.iso",
+            ConversionMode.NKIT_RESTORE,
+            DuplicateAction.SKIP,
+            "reject",
         ),
         (
             "archive_missing_reject",  # ARCHIVE_NOT_FOUND

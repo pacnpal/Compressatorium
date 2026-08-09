@@ -70,6 +70,16 @@ const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 const PS3_SOURCE_EXTS = [];
 const PS3_VERIFY_EXTS = [];
 
+// nkit2iso (NKit-shrunk GC/Wii image -> full .iso). COMPOUND extensions: the
+// meaningful part is `.nkit`, but the trailing `.iso`/`.gcz` is what CHDMAN and
+// Dolphin already own. `endsWithAny` (below) is a suffix match, so declaring the
+// full `.nkit.iso` keeps the two apart — a plain `.iso` never matches nkit, and
+// an NKit image matches both (the user picks). The backend mirrors this via
+// utils.path_utils.match_extension. One direction only: this app never *writes*
+// NKit, so there is no verify class and no compress mode.
+const NKIT_SOURCE_EXTS = ['.nkit.iso', '.nkit.gcz'];
+const NKIT_VERIFY_EXTS = [];
+
 /**
  * @typedef {Object} ModeEntry
  * @property {string} mode
@@ -509,6 +519,62 @@ export const TOOLS = [
     // The product is a sibling "<folder>.iso" (folder name, not a stem swap).
     productPath: (path) => `${(path ?? '').replace(/[/\\]+$/, '')}.iso`,
   },
+  {
+    id: 'nkit',
+    label: 'NKit',
+    hint: 'Restore an NKit-shrunk GameCube / Wii image back to a full .iso.',
+    // No verify endpoint: nkit2iso has no verify subcommand. Integrity is the
+    // NKit header CRC32 the binary checks inline during the restore, so a
+    // completed job IS the verification.
+    verifyPrefix: '',
+    sourceExts: NKIT_SOURCE_EXTS,
+    verifyExts: NKIT_VERIFY_EXTS,
+    modeGroups: ['nkit', 'chain'],
+    groups: { nkit: 'NKit → ISO', chain: 'One-step pipeline' },
+    defaultMode: 'nkit_restore',
+    glyph: 'NKT',
+    accent: 'var(--badge-dvd)',
+    // Fixed restore: the output is the original disc image, byte for byte.
+    // Nothing to pick, so no codec list and no level slider.
+    compressionCodecs: [],
+    compressionStyle: 'none',
+    modes: [
+      { mode: 'nkit_restore', kind: 'extract', label: 'Restore ISO from NKit', group: 'nkit',
+        outputExt: '.iso', inputExtensions: NKIT_SOURCE_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        // No delete-on-verify: this tool declares no verifyExts, so the
+        // restored .iso can't be confirmed before dropping the source.
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
+      // Composite pipeline (nkit2iso restore -> dolphin_rvz). The .rvz is
+      // verified/badged by the Dolphin tool entry, and the full-size ISO stays
+      // in a scratch dir instead of landing in the library. The final RVZ uses
+      // dolphin's default compression, so no codec picker is shown here.
+      { mode: 'nkit_to_rvz', kind: 'compress', label: 'Convert to RVZ (→ ISO → RVZ)',
+        group: 'chain',
+        outputExt: '.rvz', inputExtensions: NKIT_SOURCE_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        // NO delete-on-verify, even though Dolphin can verify the .rvz: that
+        // check is structural (the container), not a match against the original
+        // disc. A Wii source whose update partition was removed restores
+        // zero-filled with its CRC32 check skipped, yet still yields a cleanly
+        // verifying RVZ — deleting the NKit source then would destroy the only
+        // file a recovery-enabled restore could ever use. Mirrors the backend
+        // ChainSpec; parity is enforced by tests/test_frontend_parity_186.py.
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
+    ],
+    // Info reads the NKit header (console, game, restored size, CRC32). No
+    // verify: nkit2iso has none, and claiming `.iso` would hijack every CD/DVD
+    // ISO's Verify action — the same trap DOLPHIN_VERIFY_EXTS documents.
+    getInfo: (path) => api.getNkitInfo(path),
+    verify: undefined,
+    verifyBatch: undefined,
+    // Compound extension: strip the whole ".nkit.iso" / ".nkit.gcz", not just
+    // the trailing suffix, or the "product" would be the source path itself.
+    // `mode` picks the chain's .rvz over the plain restore's .iso.
+    productPath: (path, mode = 'nkit_restore') => (path ?? '').replace(
+      /\.nkit\.(iso|gcz)$/i, mode === 'nkit_to_rvz' ? '.rvz' : '.iso',
+    ),
+  },
 ];
 
 const byId = new Map(TOOLS.map((t) => [t.id, t]));
@@ -517,9 +583,39 @@ const byMode = new Map(
 );
 
 function endsWithAny(path, exts) {
-  if (!path) return false;
+  return matchedExtLength(path, exts) > 0;
+}
+
+/**
+ * Length of the LONGEST extension in `exts` that `path` ends with, else 0.
+ * Mirrors the backend's `utils.path_utils.match_extension`, and the length is
+ * what lets callers rank a compound claim (`.nkit.iso`) above the generic tail
+ * (`.iso`) that other tools own.
+ */
+function matchedExtLength(path, exts) {
+  if (!path) return 0;
   const lower = path.toLowerCase();
-  return exts.some((ext) => lower.endsWith(ext));
+  let best = 0;
+  for (const ext of exts) {
+    if (lower.endsWith(ext) && ext.length > best) best = ext.length;
+  }
+  return best;
+}
+
+/**
+ * Tools claiming `path` as a source, MOST SPECIFIC first (declared order
+ * breaks ties). An NKit image is claimed by `nkit` via the compound
+ * `.nkit.iso` and by chdman / Dolphin / CSO via the plain `.iso` tail; the
+ * specific claim has to win, or the Info modal walks the generic tools first
+ * and Dolphin's header reader "succeeds" on an NKit file (it has a real GC/Wii
+ * disc header) and reports the shrunk image as if it were a plain disc.
+ */
+function sourceToolsBySpecificity(path) {
+  return TOOLS
+    .map((t) => ({ t, n: matchedExtLength(path, t.sourceExts) }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .map((x) => x.t);
 }
 
 /** Verify-class tool whose verifyExts match the path (extension only). */
@@ -577,26 +673,41 @@ export const registry = {
     return tool;
   },
 
-  /** Tools whose source extensions match the given path (convertible sources). */
-  toolsForSourcePath: (path) => TOOLS.filter((t) => endsWithAny(path, t.sourceExts)),
+  /** Tools whose source extensions match the given path (convertible sources),
+   *  most-specific claim first — see `sourceToolsBySpecificity`. */
+  toolsForSourcePath: (path) => sourceToolsBySpecificity(path),
 
   /**
    * Info-capable tools for a path, richest-first, deduped by id. A path
    * can be claimed by more than one tool (a raw .iso is both a chdman
    * create source and a Dolphin disc) and only one actually reads it, so
    * callers try these in order and keep the first getInfo() that returns.
-   * Order: the verify-path owner, then any source-claiming tool. Tools
-   * without a getInfo binding are skipped.
+   * Order: most-specific claim first, with the verify-path owner winning ties.
+   * Tools without a getInfo binding are skipped.
    */
   infoToolsForPath: (path) => {
     if (!path) return [];
-    // Verify-path owner first, then every source-claiming tool, in
-    // declared order. Dedup by reference (same TOOLS objects) and skip
-    // tools without a getInfo binding.
-    const ordered = [
-      TOOLS.find((t) => endsWithAny(path, t.verifyExts)),
-      ...TOOLS.filter((t) => endsWithAny(path, t.sourceExts)),
-    ];
+    // Rank EVERY claim — source or verify — by matched-extension length, so the
+    // tool that understands the container comes first. The verify owner must
+    // not simply be prepended: for `Game.nkit.gcz` that is Dolphin (via its
+    // generic `.gcz`), whose reader parses the GCZ and its embedded disc header
+    // successfully, so the modal would stop there and never reach /nkit-info.
+    // Verify ownership only breaks ties at equal specificity, which preserves
+    // the old order for every single-suffix path (e.g. a `.chd` still starts at
+    // chdman). Dedup by reference; skip tools without a getInfo binding.
+    const verifyOwner = matchVerifyTool(path);
+    const ordered = TOOLS
+      .map((t) => ({
+        t,
+        n: Math.max(
+          matchedExtLength(path, t.sourceExts),
+          matchedExtLength(path, t.verifyExts),
+        ),
+        v: t === verifyOwner ? 1 : 0,
+      }))
+      .filter((x) => x.n > 0)
+      .sort((a, b) => b.n - a.n || b.v - a.v)
+      .map((x) => x.t);
     const out = [];
     for (const t of ordered) {
       if (t && typeof t.getInfo === 'function' && !out.includes(t)) {

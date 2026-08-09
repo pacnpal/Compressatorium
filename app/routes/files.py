@@ -27,6 +27,7 @@ from utils.path_utils import (
     get_volume_name_for_path,
     is_configured_volume_root,
     is_within_configured_volumes,
+    match_extension,
 )
 
 router = APIRouter()
@@ -109,19 +110,24 @@ def _fold_split_iso_entries(entries: list[FileEntry]) -> list[FileEntry]:
 
 
 def _detect_file_outputs(
-    item_path: str, ext: str,
+    item_path: str,
 ) -> tuple[list[str], list[OutputStatus], dict[str, OutputStatus]]:
     """Drive convertibility + output detection off the tool registry.
 
     Returns the tool ids that accept this input, the detected sibling
     outputs, and a ``{tool_id: OutputStatus}`` index used to derive the
     legacy per-tool booleans from a single source of truth.
+
+    Convertibility is matched against the whole filename rather than a
+    pre-computed ``Path.suffix``, so a tool declaring a compound extension
+    (nkit2iso's ``.nkit.iso``) is recognised — see
+    ``utils.path_utils.match_extension``.
     """
     convertible_by: list[str] = []
     outputs: list[OutputStatus] = []
     by_tool: dict[str, OutputStatus] = {}
     for tool in registry.all():
-        if ext in tool.input_extensions:
+        if match_extension(item_path, tool.input_extensions) is not None:
             convertible_by.append(tool.id)
         status = tool.detect_output(item_path)
         if status is not None:
@@ -169,15 +175,23 @@ def _detect_archive_member_outputs(
     output_stem = (
         entry.get("output_stem") or Path(entry["internal_path"]).stem
     )
-    member_ext = (entry.get("extension") or Path(entry["name"]).suffix).lower()
-    synthetic_input = os.path.join(archive_dir, f"{output_stem}{member_ext}")
-    _, outputs, by_tool = _detect_file_outputs(synthetic_input, member_ext)
-    # `_detect_file_outputs` derives convertibility from `ext in input_extensions`
+    # Extension-PRESERVING flattened name (not stem + trailing suffix): a
+    # compound-extension source keeps its whole ".nkit.iso", which is what the
+    # owning tool's detect_output needs to resolve its sibling output. For a
+    # plain extension the two are identical.
+    synthetic_input = os.path.join(
+        archive_dir, archive_service._output_name_for_member(entry["internal_path"]),
+    )
+    _, outputs, by_tool = _detect_file_outputs(synthetic_input)
+    # `_detect_file_outputs` derives convertibility from `input_extensions`
     # alone — but a member is only convertible in *place* when a tool can accept
     # it straight from an archive. Re-derive against `allows_archive_input` so a
     # listing-only member (a romz ROM) is shown without offering a conversion
     # `plan_job` would reject (ARCHIVE_INPUT_NOT_ALLOWED).
-    convertible_by = registry.tools_accepting_archive_member(member_ext)
+    # Pass the member's NAME, not just its extension: a compound-extension
+    # source (.nkit.iso) is only distinguishable from the generic tail the
+    # listing records (.iso) by the full name.
+    convertible_by = registry.tools_accepting_archive_member(entry["internal_path"])
     return output_stem, convertible_by, outputs, by_tool
 
 
@@ -352,7 +366,7 @@ async def list_files(
                             convertible_by, outputs = [], []
                         else:
                             convertible_by, outputs, _ = _detect_file_outputs(
-                                item_path, ext,
+                                item_path,
                             )
 
                         archive_items = None
@@ -522,7 +536,7 @@ async def search_files(
                                 convertible_by, outputs = [], []
                             else:
                                 convertible_by, outputs, _ = _detect_file_outputs(
-                                    item_path, ext,
+                                    item_path,
                                 )
                             if convertible_by:
                                 files.append(

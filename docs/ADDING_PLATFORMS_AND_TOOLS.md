@@ -7,7 +7,7 @@ vertical slice, from the binary in the Docker image, through the Python service
 and tool plugin, the job pipeline, the FastAPI routes, and finally the Svelte
 web UI, and shows how to add a tool and a platform in tandem.
 
-It is written against the codebase as it stands today, with seven real tools
+It is written against the codebase as it stands today, with eight real tools
 plus one synthetic pipeline tool already wired up:
 
 | Tool id | Binary | Service module | Plugin | Handles |
@@ -19,11 +19,20 @@ plus one synthetic pipeline tool already wired up:
 | **`cso`** | maxcso, built from source (`/usr/local/bin/maxcso`) | `app/services/maxcso.py` | `app/services/tools/maxcso.py` | PSP/PS2 `.iso` to/from `.cso` (v1/v2) / `.zso` / `.dax` |
 | **`romz`** | `p7zip-full` (`7z` on PATH) | `app/services/romz.py` | `app/services/tools/romz.py` | Handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` to/from `.7z`/`.zip` |
 | **`makeps3iso`** | built from source (`/usr/local/bin/makeps3iso`) | `app/services/makeps3iso.py` | `app/services/tools/makeps3iso.py` | A decrypted PS3 folder (`PS3_GAME/` layout) packed to `.iso` — **directory input** |
-| **`chain`** | *(none — drives the tools above)* | *(none)* | `app/services/tools/chain.py` | Composite `cso_to_chd`: `.cso/.zso/.dax` → `.iso` → `.chd` as one job |
+| **`nkit`** | built from source, Go (`/usr/local/bin/nkit2iso`) | `app/services/nkit2iso.py` | `app/services/tools/nkit2iso.py` | NKit-shrunk GameCube/Wii `.nkit.iso`/`.nkit.gcz` restored to `.iso` — **compound extensions**, info route but no verify |
+| **`chain`** | *(none — drives the tools above)* | *(none)* | `app/services/tools/chain.py` | Composite `cso_to_chd` (`.cso/.zso/.dax` → `.iso` → `.chd`) and `nkit_to_rvz` (`.nkit.iso/.nkit.gcz` → `.iso` → `.rvz`), each one job |
 
 Note the **tool id is not always the binary name**: maxcso registers as `cso`,
-7z registers as `romz`. The id is what the registry, the API and the frontend
-key on; use it consistently.
+7z registers as `romz`, nkit2iso registers as `nkit`. The id is what the
+registry, the API and the frontend key on; use it consistently.
+
+Extensions are matched as **suffixes**, so a tool can declare a *compound*
+extension: `nkit` declares `.nkit.iso` even though `Path.suffix` would only ever
+say `.iso`. Every "does this tool handle this file?" check runs through the
+shared `utils.path_utils.match_extension`, which takes the longest declared
+extension the name ends with; single-component declarations behave exactly as
+before. Read §18 before declaring one — two display-side sites still record the
+plain trailing suffix on purpose.
 
 > **Three tool shapes.** Most tools take a file matched by suffix, and that is
 > the path this guide walks. Two other shapes sit on the same plugin/registry
@@ -128,11 +137,11 @@ Two supporting layers:
 - **`app/models.py`** holds the `ConversionMode` enum (every mode string lives
   here), the `InputKind` enum, the `OutputStatus` / `FileEntry` listing models,
   and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`,
-  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`).
+  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`, `NkitInfo`).
 - **`app/config.py`** `Settings` holds the binary path for each tool
   (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`, `nsz_path`,
-  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`) plus the shared and
-  per-tool nice/ioprio/timeout policy knobs.
+  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`, `nkit2iso_path`) plus the
+  shared and per-tool nice/ioprio/timeout policy knobs.
 
 ### The tool registry
 
@@ -149,19 +158,20 @@ Two supporting layers:
 - **`registry.py`** defines `ToolRegistry`, the lookup object. It indexes tools
   by id and by mode and answers `all()`, `get(tool_id)`, `for_mode(mode)`,
   `spec(mode)`, `mode_specs()`, `convertible_extensions()`,
-  `archive_input_extensions()`, `tools_accepting_archive_member(ext)`,
+  `archive_input_extensions()`, `tools_accepting_archive_member(member)`,
   `tools_for_input(filename)`, `tools_for_directory(path)`,
   `tool_for_verify(path)`, `tools_verifying_path(path)`, `verify_extensions()`,
   `output_extensions()`, and `scannable_extensions()` (which drives the library
   scan / DAT-match discovery).
 - **`chdman.py` / `dolphin.py` / `z3ds.py` / `nsz.py` / `maxcso.py` / `romz.py` /
-  `makeps3iso.py`** are the seven real plugins. Each is a thin `BaseTool`
-  subclass that holds `ModeSpec` rows and delegates the real work to the
-  underlying service singleton (`makeps3iso.py` is the directory-input one; see
-  §3.3.4 of the design doc). **`chain.py`** is the eighth registration: a
-  synthetic `ChainTool` with no binary and no service, which drives the others
-  through the registry (design doc §3.3.3).
-- **`__init__.py`** builds the `registry` singleton and registers all eight.
+  `makeps3iso.py` / `nkit2iso.py`** are the eight real plugins. Each is a thin
+  `BaseTool` subclass that holds `ModeSpec` rows and delegates the real work to
+  the underlying service singleton (`makeps3iso.py` is the directory-input one,
+  see §3.3.4 of the design doc; `nkit2iso.py` is the compound-extension one,
+  see §18). **`chain.py`** is the ninth registration: a synthetic `ChainTool`
+  with no binary and no service, which drives the others through the registry
+  (design doc §3.3.3).
+- **`__init__.py`** builds the `registry` singleton and registers all nine.
   This is the single wiring point. Order matters at the end: `ChainTool` takes
   the registry itself and must register *after* the component tools it drives.
 
@@ -302,7 +312,7 @@ the non-obvious rows is in §8 to §14.
 | # | File | What you do | When |
 |---|------|-------------|------|
 | 7 | `app/config.py` | Add a `<tool>_path` `Field` with an env alias (`<TOOL>_PATH`). | New tool |
-| 8 | `app/services/<tool>.py` | The underlying service: `_build_command`, the subprocess spawn, progress parsing, cancel handling, the `*_CONVERTIBLE_EXTENSIONS` set, `*_OUTPUT_FORMATS`, and the module singleton. | New tool |
+| 8 | `app/services/<tool>.py` | The underlying service: `_build_command`, the subprocess spawn, progress parsing, cancel handling, the `*_CONVERTIBLE_EXTENSIONS` set, `*_OUTPUT_FORMATS`, and the module singleton. A **compound** extension (`.nkit.iso`) is declared here in full and needs its own output-stem helper — see §18. | New tool |
 | 9 | `app/services/tools/<tool>.py` | The plugin: a `BaseTool` subclass with `id`, `display_name`, `modes` (`ModeSpec` rows), `output_extensions`, `verify_extensions`, delegating `convert`/`verify`/`info`/`output_path`/`detect_output` to the service. Optionally override `embedded_hashes` (DAT-match fast path) / `embedded_hash_is_exhaustive`; the default falls back to file-level SHA1. | New tool |
 | 10 | `app/services/tools/__init__.py` | One line: `registry.register(<Tool>(settings.<tool>_path))` (plus the import). This is the only dispatch wiring. | New tool |
 | 11 | `app/models.py` | Add `ConversionMode` value(s) and a `<Tool>Info` model. **No `FileEntry` change** — listings are tool-neutral (`convertible_by` / `outputs` / `verifiable_by`), see §5.8. | New mode and/or tool |
@@ -1130,6 +1140,13 @@ PLUGIN (app/services/tools/<tool>.py)
 [ ] optional: allows_archive_input=True on source modes (both registries) — see §17.
     (Your members already show up in browse just by bein' declared input_extensions;
     this flag's only for *converting* them straight out of the archive.)
+[ ] optional: a COMPOUND extension (.nkit.iso) — declare it in full; the shared
+    match_extension handles it, but write your own output-stem helper (§18)
+[ ] optional: expected_output_size() when a source header states the output size
+    — only used by the chain preflight; default None falls back to output_ratio
+[ ] optional: mark an update `warning: True` when your tool reports a caveat about
+    its own output — a chain buries plain messages, and only marked ones survive
+    into its terminal message (design doc §3.3.3)
 
 REGISTER (app/services/tools/__init__.py)
 [ ] registry.register(<Tool>(settings.<tool>_path))
@@ -1174,6 +1191,7 @@ FRONTEND
 
 TESTS + DOCS
 [ ] tests/test_<tool>_routes.py, tests/test_<tool>_service.py
+    (skip the routes suite if the tool registers no info/verify — see nkit)
 [ ] extend: test_tool_registry (bump mode count), test_dispatch_routing,
     test_single_batch_plan_parity (_cases table), and the archive matrix if
     archive-aware
@@ -1216,6 +1234,7 @@ have solved the awkward part.
 | …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
+| …has a **compound** extension, or info-but-no-verify | **nkit** (`services/nkit2iso.py` + `tools/nkit2iso.py`) | Declaring `.nkit.iso`/`.nkit.gcz` against the shared suffix match (§18), a Go builder stage in the Dockerfile, a one-direction tool that registers an info route but `verify_extensions = frozenset()` (claiming a *shared* extension like `.iso` for verify would hijack every other tool's rows — see the plugin docstring), an `info()` that parses a header in Python because the binary has no info subcommand, and a service that rewrites the runner's terminal message when the tool reports a caveat. |
 
 For a **binary-backed** tool — every row above except **chain** — the *shape* of
 the work is the same: a service that owns the subprocess, a plugin that owns the
@@ -1235,8 +1254,13 @@ this respect however unusual their inputs or hashes are. Two notes on top:
   `_TOOL_ID_EXCEPTIONS` — today `{"cso_to_chd"}`. Add your mode there (or key the
   exception off `ChainSpec` rather than a literal) or the parity test fails.
 
-  Before starting, **`grep -rn cso_to_chd app src tests`**. This list has been
-  incomplete twice; the grep is the only reliable inventory. Most of the ~14
+  Before starting, **`grep -rn 'cso_to_chd\|nkit_to_rvz' app src tests`**. This
+  list has been incomplete twice; the grep is the only reliable inventory.
+  `nkit_to_rvz` is the second chain and the one that generalized the naming and
+  sizing seams (design doc §3.3.3): a chain names its product from its **first**
+  step's stem plus the chain's own `output_ext`, and sizes its preflight by
+  asking that step's plugin for `expected_output_size` rather than importing one
+  tool's header reader. Most of the ~14
   hits are things a second chain gets naturally (the `ConversionMode` member, a
   `_BAD_EXTENSION_REASON` row, Help blurbs, test fixtures), but read each one and
   decide — anything that names the *one* chain by literal is a site that may need
@@ -1255,22 +1279,27 @@ this respect however unusual their inputs or hashes are. Two notes on top:
 
 ## 8. The Docker image in depth: `Dockerfile`, `.dockerignore`, deps
 
-The image is a **five-stage** multi-arch build. Four stages build things and
-the fifth is the runtime:
+The image is a **six-stage** multi-arch build. Five stages build things and
+the sixth is the runtime:
 
 | Stage | Base | Builds |
 |-------|------|--------|
 | `builder` | `debian:trixie-slim` | z3ds_compressor (from source) |
 | `maxcso-builder` | `debian:trixie-slim` | maxcso (from source) |
 | `makeps3iso-builder` | `debian:trixie-slim` | makeps3iso (from source) |
+| `nkit2iso-builder` | `golang:1.26-trixie` | nkit2iso (from source, Go) |
 | `frontend-builder` | `node:lts-slim` | the Svelte UI (`npm ci && npm run build`) |
 | *(runtime)* | `debian:trixie-slim` | the final image — no Node, no toolchain |
 
 Every base image is **pinned by digest** (`debian:trixie-slim@sha256:…`), so
 adding a stage means copying an existing `FROM` line verbatim rather than
 writing a bare tag. A tool with a heavy or slow build gets its own stage (the
-three source-built tools each have one) so it caches independently; a small
-build can join the existing `builder` stage.
+four source-built tools each have one) so it caches independently; a small
+build can join the existing `builder` stage. A tool needing a *different*
+toolchain image needs its own stage regardless: `nkit2iso-builder` uses the
+official digest-pinned `golang` image because its `go.mod` wants a newer Go than
+Debian trixie packages, and builds with `CGO_ENABLED=0` so the result is static
+and adds nothing to the runtime stage's shared-library list.
 
 **Build args & arch.** `ARG TARGETARCH` (set in the runtime stage) is
 `amd64`/`arm64`. A from-source build (g++) compiles per-arch automatically. A
@@ -1325,6 +1354,7 @@ absolute default is what gets executed. You must set the override explicitly.
 NSZIP_PATH=/abs/path/to/compressatorium/.local-bin/nszip
 MAXCSO_PATH=/abs/path/to/maxcso
 MAKEPS3ISO_PATH=/abs/path/to/makeps3iso
+NKIT2ISO_PATH=/abs/path/to/nkit2iso
 ```
 
 The two tools whose defaults are a bare binary name (`nsz`, `7z`) *do* resolve
@@ -1512,6 +1542,7 @@ tests/test_single_batch_plan_parity.py  add nszip_compress to the _cases() matri
 tests/test_archive_conversion_e2e.py + test_archive_preference.py  archive matrix (if archive-aware)
 tests/conftest.py                   DB-only; no tool-binary stub (mocks live per-test-file)
 tests/test_files_outputs_parity.py  nothing to add — it pins the tool-neutral FileEntry surface
+tests/test_compound_extension_matching.py  only for a compound extension (§18)
 docker-compose*.yml                 (optional) NSZIP_PATH / CLI env docs
 package.json                        version bump (release)
 app/main.py                         add the tool to the FastAPI description= (shown at /docs)
@@ -1841,3 +1872,106 @@ Run them:
 PYTHONPATH=app python -m pytest -q \
     tests/test_archive_conversion_e2e.py tests/test_archive_preference.py
 ```
+
+---
+
+## 18. Tools with compound extensions (`.nkit.iso`)
+
+Most formats own a whole trailing suffix: `.chd`, `.rvz`, `.nsz`. Some don't.
+NKit-shrunk GameCube/Wii images are `Game.nkit.iso` and `Game.nkit.gcz` — the
+part that identifies the format is `.nkit`, but the *trailing* component is the
+generic `.iso` / `.gcz` that CHDMAN, Dolphin and maxcso already own. `nkit2iso`
+is the reference; follow this if your format is shaped the same way.
+
+### 18.1 Just declare the whole thing
+
+```python
+NKIT2ISO_CONVERTIBLE_EXTENSIONS = {".nkit.iso", ".nkit.gcz"}
+```
+
+There is nothing else to switch on. Every "does this tool handle this file?"
+check in the backend runs through `utils.path_utils.match_extension(name,
+extensions)`, which returns the **longest** declared extension `name` ends with
+(or `None`). The consumers are `registry.tools_for_input`,
+`registry.tool_for_verify`, `registry.tools_accepting_archive_member`,
+`BaseTool.verifies_path`, `routes/files.py::_detect_file_outputs`,
+`services/archive.py`'s member gate, and the plan-time gate in
+`routes/convert.py`. The frontend already matched with `endsWithAny`, so its
+`sourceExts` / `inputExtensions` take the compound form with no change.
+
+Three consequences worth internalizing:
+
+- **Per-tool, not global.** An NKit image is claimed by `nkit` *and* by the
+  generic-tail owners, exactly as a raw `.iso` is already claimed by chdman,
+  dolphin and cso. Nothing is displaced; the user picks a tool. If you want the
+  generic-tail owners to *stop* claiming your files, that's a separate product
+  decision and a different change.
+- **Single-component tools are untouched.** `game.iso` ends with `.iso` and
+  nothing else. `tests/test_compound_extension_matching.py` pins this.
+- **Longest match wins within a tool**, so a caller needing the concrete key
+  gets the most specific answer.
+
+### 18.2 Compute your own output stem
+
+`Path("Game.nkit.iso").stem` is `Game.nkit`, so `with_suffix()` / `stem + ext`
+would name your output `Game.nkit.iso` — the input path itself. Strip the whole
+declared extension:
+
+```python
+@staticmethod
+def _output_stem(name: str) -> str:
+    # Reuse the shared matcher — it already does case-insensitive longest-suffix
+    # matching and hands back the full extension, so the strip is one slice.
+    matched = match_extension(name, NKIT2ISO_CONVERTIBLE_EXTENSIONS)
+    if matched is not None:
+        return name[: -len(matched)]
+    return str(Path(name).with_suffix(""))
+```
+
+Mirror it in the frontend `productPath` (`replace(/\.nkit\.(iso|gcz)$/i, '.iso')`,
+not the shared `swapExt`).
+
+### 18.3 Rank your claim above the generic tail in the UI
+
+`registry.toolsForSourcePath` / `infoToolsForPath` order claiming tools by the
+**length of the matched `sourceExts` entry**. That is not cosmetic: the Info
+modal keeps the first `getInfo()` that returns, and the tools owning your
+generic tail may plausibly *succeed* on your file and report the wrong thing (an
+NKit image carries a real GC/Wii disc header, so Dolphin's reader answers). You
+get the right order for free by declaring the compound extension — but if you
+add a *new* consumer that walks claiming tools, rank it the same way.
+
+### 18.4 The two sites that still record a plain suffix, on purpose
+
+- **`services/archive.py::_filter_members`** gates members with
+  `match_extension`, but stores `entry["extension"] = Path(name).suffix.lower()`
+  — the generic tail. That field feeds the icon buckets and the synthetic
+  sibling path, both of which want the tail.
+- **`src/lib/util/fileIcon.js`** keys on `entry.extension`. Your compound
+  extensions land in the disc/game buckets automatically (they come from
+  `sourceExts`), and the generic tail is already classified, so both spellings
+  resolve.
+
+Because the listing records the tail, `routes/files.py` passes the member's
+**name** to `registry.tools_accepting_archive_member(member)` — that helper takes
+a name *or* an extension (`".nkit.iso"` still ends with `".iso"`), which is what
+keeps the archive `convertible_by` badge accurate for a compound source. Likewise
+`_detect_archive_member_outputs` builds its synthetic sibling path from
+`archive_service._output_name_for_member` (extension-preserving) rather than
+`output_stem + tail`, so your `detect_output` sees the full name.
+
+One more consumer worth knowing about if you route your source through a
+**chain**: `ChainTool` names its product from the *first* step's output path
+(not the last step's tool), precisely so a compound source is stripped
+correctly. See design doc §3.3.3.
+
+### 18.5 Tests
+
+Add rows to `tests/test_compound_extension_matching.py` (its
+`test_every_other_tool_declares_only_single_component_extensions` is a tripwire
+that will fail the moment a second compound tool lands — update it deliberately,
+and re-read this section while you do). Then cover the usual matrices: a plain
+`.iso` must be **rejected** for your mode in
+`tests/test_single_batch_plan_parity.py`, and your compound extension needs a
+`tests/test_archive_conversion_e2e.py` MATRIX row proving the whole suffix is
+stripped from the output name.

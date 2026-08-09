@@ -27,7 +27,11 @@ from services.lock_manager import lock_manager
 from services.tools import InputKind, ModeKind, registry
 from sse_starlette.sse import EventSourceResponse
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
-from utils.path_utils import is_safe_directory_tree, is_within_configured_volumes
+from utils.path_utils import (
+    is_safe_directory_tree,
+    is_within_configured_volumes,
+    match_extension,
+)
 
 router = APIRouter()
 logger = get_logger()
@@ -256,6 +260,18 @@ def _input_extension(path: str) -> str:
     return Path(path).suffix.lower()
 
 
+def _declares_input(path: str, spec) -> bool:
+    """Whether ``spec`` declares an input extension matching ``path``.
+
+    Archive-aware (an ``archive.zip::game.nsp`` member is judged on the
+    member's name, not the ``.zip`` container) and suffix-based via the shared
+    ``match_extension``, so a mode declaring a compound extension
+    (nkit2iso's ``.nkit.iso``) validates the same way as a plain one.
+    """
+    name = path.split("::", 1)[1] if "::" in path else path
+    return match_extension(name, spec.input_extensions) is not None
+
+
 def _priority(ext: str) -> int:
     if ext in {".cue", ".gdi"}:
         return 4
@@ -301,6 +317,7 @@ class SkipReason(Enum):
     CSO_BAD_EXTENSION = "cso_bad_extension"
     ROMZ_BAD_EXTENSION = "romz_bad_extension"
     ROMZ_INVALID_ARCHIVE = "romz_invalid_archive"
+    NKIT_BAD_EXTENSION = "nkit_bad_extension"
     DOLPHIN_SAME_PATH = "dolphin_same_path"
     CHAIN_BAD_EXTENSION = "chain_bad_extension"
     PS3_FOLDER_INVALID = "ps3_folder_invalid"
@@ -380,13 +397,19 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
         "Archive is not a single handheld-ROM archive produced by this tool "
         "(corrupt, multi-file, or holds no ROM)",
     ),
+    SkipReason.NKIT_BAD_EXTENSION: (
+        400,
+        "nkit_restore requires an NKit-shrunk GameCube/Wii image "
+        "(.nkit.iso, .nkit.gcz)",
+    ),
     SkipReason.DOLPHIN_SAME_PATH: (
         400,
         "Output path matches input; overwriting would delete the source file",
     ),
     SkipReason.CHAIN_BAD_EXTENSION: (
         400,
-        "cso_to_chd requires a .cso/.zso/.dax source",
+        "cso_to_chd requires a .cso/.zso/.dax source; "
+        "nkit_to_rvz requires an NKit image (.nkit.iso, .nkit.gcz)",
     ),
     SkipReason.PS3_FOLDER_INVALID: (
         400,
@@ -422,6 +445,7 @@ _BAD_EXTENSION_REASON: dict[str, SkipReason] = {
     "cso": SkipReason.CSO_BAD_EXTENSION,
     "chain": SkipReason.CHAIN_BAD_EXTENSION,
     "romz": SkipReason.ROMZ_BAD_EXTENSION,
+    "nkit": SkipReason.NKIT_BAD_EXTENSION,
 }
 
 
@@ -591,10 +615,8 @@ async def plan_job(
         if not os.path.isfile(archive_path):
             raise SkipFile(SkipReason.ARCHIVE_NOT_FOUND)
 
-        if bad_ext_reason is not None:
-            ext = _input_extension(file_path)
-            if ext not in spec.input_extensions:
-                raise SkipFile(bad_ext_reason)
+        if bad_ext_reason is not None and not _declares_input(file_path, spec):
+            raise SkipFile(bad_ext_reason)
 
         # Calculate output path before extraction to avoid unnecessary work.
         # Use the extension-preserving flattened name so tools whose output
@@ -638,10 +660,8 @@ async def plan_job(
     # direction is validated against the right set. chdman is handled above by
     # the .chd create/extract checks (it drops .chd from input_extensions). The
     # per-tool skip reason carries the tool-specific message.
-    if bad_ext_reason is not None:
-        ext = _input_extension(file_path)
-        if ext not in spec.input_extensions:
-            raise SkipFile(bad_ext_reason)
+    if bad_ext_reason is not None and not _declares_input(file_path, spec):
+        raise SkipFile(bad_ext_reason)
 
     if mode == "romz_extract":
         # romz-specific: validate the archive is a real single-ROM archive

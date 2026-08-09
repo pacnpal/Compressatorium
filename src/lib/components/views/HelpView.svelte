@@ -55,6 +55,12 @@
       blurb: 'A decrypted PS3 disc or JB folder packed into a single .iso that RPCS3 mounts directly, using makeps3iso. This is the one tool that takes a folder instead of a file, and the only tool with no reverse mode at all: it repackages a folder you already decrypted, and never deletes it. Most PS3 discs are over 4 GB, so for a FAT32 drive there is a per-job toggle that splits the image into 4 GB parts (RPCS3 mounts the .0). No keys, and no decryption here.',
       io: 'the folder holding PS3_GAME/  →  .iso',
     },
+    {
+      glyph: 'NKT',
+      name: 'NKit',
+      blurb: 'NKit-shrunk GameCube and Wii images back to a plain, full-size .iso, using nkit2iso. NKit shrinks a disc by dropping everything a program can recreate — the junk padding, the gaps, and for Wii the encryption and hash tree — so restoring means rebuilding all of it and checking the result against the CRC32 stored in the NKit header. There are no per-job settings to choose, and the output is bit-exact and CRC32-verified — except for one case: a Wii image whose update partition was removed at shrink time has no way back to bit-exact, because that data is not in the file. By default that region is zero-filled and the CRC32 check is skipped, so the ISO is playable but not redump-verifiable, and the job says so plainly. One direction only: this app never writes NKit. There is also a one-step Convert to RVZ mode (nkit_to_rvz) that restores and compresses in a single job, keeping the full-size ISO in a scratch directory instead of your library — usually what you want, since no emulator reads NKit and Dolphin reads RVZ natively. Info reads the NKit header, so you can see the console, game and restored size before spending the restore. Set NKIT2ISO_RECOVERY=download if you want the tool to fetch the publicly archived recovery partition for those images instead and get a bit-exact, redump-verified restore — the only case where it uses the network.',
+      io: '.nkit.iso / .nkit.gcz  →  .iso  (or  →  .rvz  in one step)',
+    },
   ];
 
   // Per-tool mode reference. Generated from the registry (one section per
