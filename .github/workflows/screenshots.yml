@@ -9,13 +9,17 @@ name: Take screenshots
 # with Oxipng, uploads the generated screenshots, then commits any changes from
 # a separate write-scoped job.
 #
-# Runs on manual dispatch and on pushes that touch the UI. Changes under
+# Runs on manual dispatch and on branch pushes that touch the UI. Changes under
 # docs/screenshots/** are intentionally NOT a trigger, so the commit this
-# workflow makes cannot trigger itself.
+# workflow makes cannot trigger itself. Tag pushes are excluded: the commit job
+# rebases onto and pushes to the pushed ref, which only works on a branch (a
+# tag checkout is a detached HEAD with nothing to push to).
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "**"
     paths:
       - "src/**"
       - "index.html"
@@ -123,6 +127,9 @@ jobs:
           if-no-files-found: error
 
   commit-screenshots:
+    # A workflow_dispatch can still target a tag; there is no branch to commit
+    # back to in that case, so keep the screenshots as a run artifact and skip.
+    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
     needs: screenshots
     permissions:
