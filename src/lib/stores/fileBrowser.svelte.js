@@ -161,9 +161,20 @@ class FileBrowserStore {
   get filteredEntries() {
     if (!this.filter) return this.sortedEntries;
     const f = this.filter.toLowerCase();
-    return this.sortedEntries.filter(
-      (e) => e.type !== 'file' || (e.extension ?? '').toLowerCase() === f,
-    );
+    return this.sortedEntries.filter((e) => {
+      if (e.type !== 'file') return true;
+      // Suffix match on the row's NAME, not equality against `extension`.
+      // The filter values come from `registry.allFilterableExts()`, which
+      // includes compound extensions (`.nkit.iso`), while the backend
+      // deliberately records only the trailing `Path.suffix` (`.iso`) in
+      // `extension` — so an equality test hides every row the compound filter
+      // is meant to show. The extension equality is kept as a fallback for
+      // rows that carry no name. A plain `.iso` filter still matches
+      // `Game.nkit.iso`, exactly as it did before: that row's `extension`
+      // was already `.iso`.
+      const name = (e.name ?? e.path ?? '').toLowerCase();
+      return name.endsWith(f) || (e.extension ?? '').toLowerCase() === f;
+    });
   }
 
   get pageCount() {

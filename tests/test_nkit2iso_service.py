@@ -9,6 +9,7 @@ cleanup, and the registry/listing wiring.
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
 import zlib
 from pathlib import Path
@@ -440,6 +441,19 @@ def test_expected_output_size_feeds_the_chain_preflight(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def _restored_size_of(header_bytes: bytes) -> int:
+    """``read_nkit_header`` on an in-memory header, via a temp file."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".nkit.iso", delete=False) as fh:
+        fh.write(header_bytes)
+        path = fh.name
+    try:
+        return read_nkit_header(path)["restored_size"]
+    finally:
+        os.unlink(path)
+
+
 def _gcz_header(*, comp_size, data_size, block_size, num_blocks) -> bytes:
     return struct.pack(
         "<IIQQII", 0xB10BC001, 0, comp_size, data_size, block_size, num_blocks,
@@ -519,3 +533,41 @@ async def test_inexact_restore_update_is_marked_as_a_warning(tmp_path, monkeypat
     assert updates[-1]["warning"] is True
     # A clean restore carries no warning marker.
     assert not any(u.get("warning") for u in updates[:-1])
+
+
+def test_image_size_field_matches_upstream_with_real_disc_sizes():
+    """The 0x210 image size is a 32-bit field, in 4-byte units on Wii.
+
+    Pinned against realistic disc sizes because the alternative reading (one
+    64-bit byte count for both consoles) is tempting and wrong:
+
+    * A single-layer Wii DVD is 4,699,979,776 bytes, which does NOT fit in a
+      u32 as plain bytes — that is exactly why upstream scales by 4
+      (``wii.go``: ``int64(be32(hdr, 0x210)) * 4``), and it is positive proof
+      the interpretation is console-dependent.
+    * A 64-bit field would span 0x210-0x218 and collide with fields upstream
+      actively parses there: the GameCube junk-id override at ``hdr[0x214:0x218]``
+      (``nkit.go``) and the Wii ``updateCrc`` at ``be32(hdr, 0x218)``.
+    * Reading a be64 image size as be32 would yield 0 for a GameCube disc and 1
+      for a Wii disc — i.e. the restore itself would be broken for every image.
+
+    What matters for the chain preflight is agreeing with the binary that will
+    do the restore, so this asserts our value equals what upstream computes.
+    """
+    gamecube_bytes = 1_459_978_240
+    wii_bytes = 4_699_979_776
+    assert wii_bytes > 2**32, "premise: a Wii disc cannot be a u32 byte count"
+
+    gc_src = _disc_header(wii=False, size_field=gamecube_bytes)
+    wii_src = _disc_header(wii=True, size_field=wii_bytes // 4)
+
+    # Both fields are 32-bit, so both fit the header slot upstream writes.
+    assert gamecube_bytes < 2**32 and wii_bytes // 4 < 2**32
+
+    assert struct.unpack_from(">I", gc_src, 0x210)[0] == gamecube_bytes
+    assert struct.unpack_from(">I", wii_src, 0x210)[0] == wii_bytes // 4
+    assert _restored_size_of(gc_src) == gamecube_bytes
+    assert _restored_size_of(wii_src) == wii_bytes
+    # The 4 bytes at 0x214 stay free for the junk-id override a 64-bit size
+    # would have swallowed.
+    assert struct.unpack_from(">I", gc_src, 0x214)[0] == 0
