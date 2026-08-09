@@ -30,8 +30,16 @@ and #179, part of the #177 tech-debt epic).
   run. Availability now awaits each plugin's `ToolPlugin.is_ready()` (default
   `True`; `NszTool` overrides it with the threadpooled keys probe).
 
-  No API or behavior change for existing tools — the makeps3iso and nsz paths
-  behave exactly as before. One deliberate refinement: an authorized overwrite
+  A third instance of the same pattern, in `ChainTool`: `detect_output`
+  hard-coded a `.chd` candidate and `_final_tool()` read `self.modes[0]`, so a
+  second `ChainSpec` would have badged the first chain's product and delegated
+  verify/info to the first chain's final tool. Both now resolve per spec —
+  `detect_output` takes the candidate extension from whichever mode accepts the
+  input, and verify/info resolve the owning spec by output extension (they get a
+  path and no mode).
+
+  No API or behavior change for existing tools — the makeps3iso, nsz and
+  `cso_to_chd` paths behave exactly as before. One deliberate refinement: an authorized overwrite
   now clears the output's verification record whenever it removes *any*
   artifact, not only the primary, so a stale record can't outlive a
   primary-absent sweep. Tests: new `tests/test_tool_seams_generalized.py` pins

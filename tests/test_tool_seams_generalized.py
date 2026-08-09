@@ -163,6 +163,58 @@ async def test_directory_job_still_rejects_a_non_file_primary(tmp_path, monkeypa
     assert out.is_dir(), "left intact, not partially clobbered"
 
 
+# --- ChainTool: per-spec resolution instead of modes[0] -----------------------
+
+def _second_chain_spec():
+    """A synthetic second chain: .foo -> .bar, verified by its own final tool."""
+    from app.services.tools.spec import ChainSpec, ChainStep, ModeKind
+
+    return ChainSpec(
+        mode="foo_to_bar",
+        tool_id="chain",
+        kind=ModeKind.CREATE,
+        label="FOO to BAR",
+        group="chain",
+        output_ext=".bar",
+        input_extensions=frozenset({".foo"}),
+        steps=(
+            ChainStep(tool_id="cso", mode="cso_decompress", weight=0.5, output_ratio=2.0),
+            ChainStep(tool_id="z3ds", mode="z3ds_compress", weight=0.5, output_ratio=1.0),
+        ),
+        intermediate_exts=(".iso",),
+        verify_step=1,
+    )
+
+
+def test_chain_detect_output_uses_each_specs_own_extension(tmp_path, monkeypatch):
+    # Regression: detect_output hard-coded a ".chd" candidate, so a second chain
+    # ending in another format probed the *first* chain's product.
+    chain = registry.get("chain")
+    monkeypatch.setattr(chain, "modes", (*chain.modes, _second_chain_spec()))
+
+    source = tmp_path / "Game.foo"
+    source.write_bytes(b"src")
+    # Only the .bar product exists; a ".chd" probe would miss it entirely.
+    (tmp_path / "Game.bar").write_bytes(b"out")
+
+    status = chain.detect_output(str(source))
+
+    assert status is not None
+    assert status.path == str(tmp_path / "Game.bar")
+
+
+def test_chain_final_tool_resolves_per_output_extension(monkeypatch):
+    # Regression: _final_tool() read modes[0], so every chain's verify/info was
+    # delegated to the first chain's final tool.
+    chain = registry.get("chain")
+    monkeypatch.setattr(chain, "modes", (*chain.modes, _second_chain_spec()))
+
+    # The shipped chain still verifies through chdman...
+    assert chain._final_tool("/data/Game.chd").id == "chdman"
+    # ...while the synthetic one routes to its own verify_step tool.
+    assert chain._final_tool("/data/Game.bar").id == "z3ds"
+
+
 # --- is_ready -----------------------------------------------------------------
 
 @pytest.mark.asyncio
