@@ -322,7 +322,7 @@ the non-obvious rows is in §8 to §14.
 | 20 | `src/lib/api/endpoints.js` | `get<Tool>Info`, `verify<Tool>`, `verifyBatch<Tool>` client methods alongside the existing ones. | New tool |
 | 21 | `src/lib/tools/registry.js` | **One new entry** in the `TOOLS` array. Everything downstream (sidebar, workspace, badges, modals, verify dispatch, SSE URL building, compression defaults, icons, Help) looks up this registry. | New mode and/or tool |
 | 22 | `src/styles/tokens.css` | Add a semantic token only if you need a new tool accent / badge color. Most tools reuse existing tokens via `accent: 'var(--badge-<token>)'`. Add it under **both** `:root` and `:root.dark`. | If new visual identity |
-| 22a | `src/lib/util/fileIcon.js` | **One `TOOL_MEDIA` entry** mapping your tool id to `'disc'` or `'game'`. The `DISC_EXTS`/`GAME_EXTS` sets are *derived* from the registry, so you never re-type extensions — you only say which bucket your media reads as. The coverage guard (`tests/test_frontend_registry_derives_186.py`) fails until every registered tool is classified. | New tool |
+| 22a | `src/lib/util/fileIcon.js` | **One `TOOL_MEDIA` entry** mapping your tool id to `'disc'` or `'game'`. The `DISC_EXTS`/`GAME_EXTS` sets are *derived* from the registry, so you never re-type extensions — you only say which bucket your media reads as. The coverage guard (`tests/test_frontend_registry_derives_186.py`) fails until every registered tool is classified. **If your tool writes an archive container other than `.7z`/`.zip`, also add it to `ARCHIVE_EXTS`** — that set is hard-coded and checked *first*, so otherwise your output renders with a disc/game icon. The guard won't catch it: the extension is classified, just in the wrong bucket. | New tool |
 | 22b | `src/lib/stores/conversion.svelte.js` | **Nothing.** `defaultCompressionFor()` / `defaultLevelFor()` read `defaultCompression` and `compressionLevelRange` off your registry descriptor. Declare them in `registry.js` (item 21) and the initial value, the slider default, and the shared **Reset to default** button in `CompressionPicker.svelte` all work for free. | Never (registry-driven) |
 | 22c | `src/lib/tools/helpModes.js` | One `MODE_BLURBS` line per new mode (and a `MODE_OUTPUT` override only when a single `outputExt` can't tell the story — a reversible mode whose output depends on the input, or a companion pair like extractcd's `.cue` + `.bin`). The same guard test fails on a mode with no blurb or a stale key. | New mode |
 | 22d | `src/lib/components/views/HelpView.svelte` | One curated **tool blurb**. The per-tool mode reference *table* is generated via `helpModeSections(registry)`, so modes and output columns can't drift — only the prose is hand-written. | New tool (docs) |
@@ -1163,7 +1163,8 @@ FRONTEND
 [ ] src/lib/tools/registry.js: one new entry in the TOOLS array — including
     defaultCompression / compressionStyle / compressionLevelRange if it has a
     compression UI
-[ ] src/lib/util/fileIcon.js: one TOOL_MEDIA entry ('disc' or 'game')
+[ ] src/lib/util/fileIcon.js: one TOOL_MEDIA entry ('disc' or 'game'),
+    plus ARCHIVE_EXTS if you write a container beyond .7z/.zip
 [ ] src/lib/tools/helpModes.js: MODE_BLURBS line per mode (+ MODE_OUTPUT
     override for input-derived / companion-pair outputs)
 [ ] src/lib/components/views/HelpView.svelte: the curated tool blurb only
@@ -1227,7 +1228,12 @@ this respect however unusual their inputs or hashes are. Two notes on top:
   its mode lives *inside* an existing tool's descriptor (`cso_to_chd` sits in
   the `cso` entry under `group: 'chain'`). Adding a second chain mode means a
   new `ChainSpec` and a mode row on an existing descriptor — not a new service
-  layer and not a new `TOOLS` entry, both of which would duplicate surface.
+  layer and not a new `TOOLS` entry, both of which would duplicate surface. One
+  test-side edit does come with it: a chain mode's frontend descriptor sits under
+  its *host* tool (`cso`) while its backend `ChainSpec.tool_id` is `"chain"`, so
+  `tests/test_frontend_parity_186.py` skips that field via
+  `_TOOL_ID_EXCEPTIONS` — today `{"cso_to_chd"}`. Add your mode there (or key the
+  exception off `ChainSpec` rather than a literal) or the parity test fails.
   `ChainTool` resolves the output candidate and the verify/info owner **per
   spec** (`detect_output` takes the candidate extension from the mode that
   accepts the input; verify/info resolve the owning spec by output extension,
@@ -1483,7 +1489,8 @@ app/routes/info.py                  _VERIFY_CONFIG entry + register_verify_route
 app/services/job_manager.py         usually nothing (registry dispatches)
 src/lib/api/endpoints.js            getNszipInfo, verifyNszip, verifyBatchNszip
 src/lib/tools/registry.js           one new entry in TOOLS (+ defaultCompression etc.)
-src/lib/util/fileIcon.js            one TOOL_MEDIA entry ('disc' or 'game')
+src/lib/util/fileIcon.js            one TOOL_MEDIA entry ('disc' or 'game');
+                                    + ARCHIVE_EXTS for a new archive container
 src/lib/tools/helpModes.js          MODE_BLURBS line per mode (+ MODE_OUTPUT if needed)
 src/lib/components/views/HelpView.svelte   the curated tool blurb only
 src/lib/stores/conversion.svelte.js NOTHING (reads defaultCompression off the descriptor)
