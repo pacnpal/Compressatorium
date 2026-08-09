@@ -291,7 +291,7 @@ the non-obvious rows is in §8 to §14.
 | 2 | `.dockerignore` | Verify the binary/source you reference isn't excluded. `app/`, `static/`, `migrations/` are copied; `tests/` and most `*.md` are excluded. | New tool (check only) |
 | 3 | `requirements.txt` | Add any new **Python** runtime dependency the service imports. | If service needs a new pip dep |
 | 4 | `requirements-dev.txt` | Add test-only Python deps. | Rare |
-| 5 | `.local-bin/` | Local-dev copy of a from-source binary. Only `z3ds_compressor` is committed here today; maxcso and makeps3iso are built in the image only, so local runs need them on `PATH` or a `<TOOL>_PATH` override. Add yours if you want `run_dev.sh` to work out of the box. | New from-source tool |
+| 5 | `.local-bin/` + `.env.local` | Local-dev copy of a from-source binary. Only `z3ds_compressor` is committed here today. Dropping a binary in `.local-bin/` is **not** enough: `run_dev.sh` doesn't add it to `PATH`, and from-source tools default to an absolute `/usr/local/bin/...` path, so you must set `<TOOL>_PATH` in `.env.local` (which `run_dev.sh` sources). See §8. | New from-source tool |
 | 6 | `entrypoint.sh` | Add the binary path env passthrough; extend the **CLI batch mode** loop if the tool should run headless (see §9). | New tool, CLI support optional |
 
 ### 3.2 Backend code
@@ -344,11 +344,13 @@ the non-obvious rows is in §8 to §14.
 
 | # | File | What it enforces | Action |
 |---|------|------------------|--------|
-| 28 | `.github/workflows/codacy.yml` | Push/PR/weekly: ruff, eslint, pylint, etc. via Codacy CLI. | New code must pass; see §11 |
-| 29 | `.github/workflows/codeql.yml` | Push/PR/weekly CodeQL for Python **and** JS/TS. | Auto-covers new code |
+| 28 | *(no workflow file)* — **Codacy** runs as a GitHub App checks integration ("Codacy Static Code Analysis"), configured in the Codacy UI plus the in-repo config in rows 33–39. There is **no** `.github/workflows/codacy.yml`. | ruff, eslint, pylint, bandit, etc. | New code must pass; see §11 |
+| 29 | `.github/workflows/codeql.yml` | Push/PR/weekly CodeQL for Python, JS/TS **and** GitHub Actions. | Auto-covers new code |
 | 30 | `.github/workflows/docker-image.yml` | On release: hadolint, multi-arch build, Trivy scan, SBOM/attestation. | Dockerfile must pass hadolint; see §8/§10 |
 | 31 | `.github/workflows/label.yml` + `.github/labeler.yml` | PR auto-labeling by path. | Add a path glob if you want a label |
-| 32 | `.github/dependabot.yml` | Dependency bumps. | Only if adding a new ecosystem |
+| 31a | `.github/workflows/screenshots.yml` | **Take screenshots**: rebuilds the README/docs captures from `shots.yml` and commits them. | See §3.6 item 49 |
+| 31b | `.github/workflows/stale.yml` | Marks stale issues/PRs. | Irrelevant |
+| 32 | `renovate.json` | Dependency bumps are handled by **Renovate**, not Dependabot — there is no `.github/dependabot.yml`. | Only if adding a new ecosystem |
 | 33 | `pyproject.toml` | pylint + ruff config (Codacy reads this). | Respect line-length 100, py310 |
 | 34 | `.pylintrc`, `.prospector.yaml`, `.bandit` | Python lint/security (bandit flags `shell=True`, predictable tmp). | Follow the no-shell rule (§15) |
 | 35 | `eslint.config.js`, `.eslintrc.json`, `.jshintrc` | ESLint for the frontend (`src/`). | New JS and Svelte must pass |
@@ -744,6 +746,24 @@ are chdman-specific: GAME/NAME disc-id tagging after `createcd`/`createdvd`, and
 `.bin` sidecar handling for multi-track CD inputs. A clean single-file tool like
 nszip needs none of that.
 
+> **Exception: a *second* directory-input tool is not drop-in.** "The pipeline
+> needs no edits" holds for file-based tools. The directory path is currently
+> written for the only directory tool that exists, so a new one would silently
+> inherit PS3 behavior until these are generalized into shared seams:
+>
+> - `job_manager._clear_existing_output` calls
+>   `makeps3iso_service.remove_outputs(...)` for **every** `InputKind.DIRECTORY`
+>   job, so overwrite cleanup for your tool would run makeps3iso's split-part
+>   logic. This is the one that silently corrupts rather than errors.
+> - `routes/convert.py::_plan_directory_job` raises PS3-specific skip reasons
+>   (`PS3_FOLDER_INVALID`, `PS3_OUTPUT_INSIDE_SOURCE`,
+>   `PS3_OUTPUT_OUTSIDE_VOLUMES`, `PS3_FOLDER_UNSAFE`), and the worker's
+>   post-lock safety re-walk records a PS3-specific error.
+>
+> Generalize those first (a plugin-level cleanup hook and tool-neutral skip
+> reasons), then add your tool. Per the repo's modularity rule, that
+> generalization is the work — not a per-tool branch alongside the existing one.
+
 ### 5.7 Validation + output dispatch: `app/routes/convert.py`
 
 Output paths and the generic spec-flag validation are handled by the registry,
@@ -954,8 +974,14 @@ are the authoritative schema — read them before adding an entry. Two shapes
 worth knowing:
 
 - **No Info/Verify.** Leave `getInfo` / `verify` / `verifyBatch` as `undefined`
-  and `sourceExts` / `verifyExts` empty, as `makeps3iso` does; the row-action
-  helpers (`infoToolsForPath`, `toolForVerifyPath`) then skip the tool.
+  and `verifyExts` empty; the row-action helpers (`infoToolsForPath`,
+  `toolForVerifyPath`) then skip the tool. **Keep `sourceExts` populated** for a
+  file-based tool. `makeps3iso` empties it only because its input is a
+  *directory* with no extension to match. `sourceExts` is a separate fact from
+  your modes' `inputExtensions` and is what feeds `registry.allFilterableExts()`
+  (the file-list filter dropdown), `registry.toolsForSourcePath()`, and the
+  `fileIcon.js` disc/game buckets — emptying it on a file tool makes its inputs
+  unfilterable and unstyled even though conversion still works.
 - **A chain mode lives on an existing tool's entry**, not its own: `cso_to_chd`
   is a mode inside the `cso` descriptor with `group: 'chain'`. The backend's
   synthetic `chain` tool has no frontend descriptor of its own.
@@ -1090,6 +1116,11 @@ ROUTES
 PIPELINE (app/services/job_manager.py)
 [ ] usually nothing (registry dispatches convert + verify)
 [ ] only for special post-processing (disc-id tags, multi-file sidecars)
+[ ] NOT true for a SECOND directory-input tool: _clear_existing_output runs
+    makeps3iso's cleanup for every InputKind.DIRECTORY job, and the directory
+    skip reasons are PS3-specific. Generalize those seams first — see §5.6
+[ ] NOT true for a SECOND keys-gated tool: GET /api/tools branches on
+    tool.id == "nsz", so yours is never hidden — see §16.5
 
 FRONTEND
 [ ] src/lib/api/endpoints.js: get<Tool>Info, verify<Tool>, verifyBatch<Tool>
@@ -1143,15 +1174,25 @@ have solved the awkward part.
 | …is a plain compressor: one file in, one file out, both directions | **z3ds** (`services/z3ds_compress.py` + `tools/z3ds.py`) | The smallest complete plugin (~130 lines, mostly delegation). Progress estimated from output-file growth when the binary reports no percentage. **This is the default answer.** |
 | …exposes several output formats from one binary | **cso** (maxcso) | Five modes on one service (`cso_compress`, `cso2_compress`, `zso_compress`, `dax_compress`, `cso_decompress`), with an effort-preset compression UI rather than a codec list. |
 | …reuses a binary that already ships, and/or produces archives | **romz** (7z) | No Dockerfile work. Reuses `services/archive.py` for the read side. Shows `verifies_path()` / content-validating `detect_output()` for a tool that over-claims `.7z`/`.zip`, and the visible-but-not-convertible archive case (§17.5). |
-| …needs user-supplied keys or secrets | **nsz** | pip-packaged binary, `SWITCH_KEYS` resolution, the throwaway-`$HOME` trick for a binary with no `--keys` flag, and UI gating via `GET /api/tools`. See §16. |
-| …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. |
+| …needs user-supplied keys or secrets | **nsz** | pip-packaged binary, `SWITCH_KEYS` resolution, the throwaway-`$HOME` trick for a binary with no `--keys` flag, and UI gating via `GET /api/tools`. See §16 — **note §16.5**: the backend readiness check is still nsz-specific, so a second gated tool needs a shared seam first. |
+| …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. **Read the §5.6 warning first** — the directory job path still hard-codes makeps3iso's overwrite cleanup. |
 | …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
 
-Whatever you copy, the *shape* of the work is the same: a service that owns the
-subprocess, a plugin that owns the metadata, one `registry.register(...)` line,
-and one entry in the frontend `TOOLS` array.
+For a **binary-backed** tool — every row above except the last two — the *shape*
+of the work is the same: a service that owns the subprocess, a plugin that owns
+the metadata, one `registry.register(...)` line, and one entry in the frontend
+`TOOLS` array. The last two rows are the exceptions:
+
+- **A chain tool has no service and no new frontend entry.** `ChainTool` spawns
+  nothing itself; it drives already-registered tools through the registry, and
+  its mode lives *inside* an existing tool's descriptor (`cso_to_chd` sits in
+  the `cso` entry under `group: 'chain'`). Adding a second chain mode means a
+  new `ChainSpec` and a mode row on an existing descriptor — not a new service
+  layer and not a new `TOOLS` entry, both of which would duplicate surface.
+- **A second directory-input tool needs pipeline work first.** See the warning
+  in §5.6.
 
 ---
 
@@ -1213,9 +1254,24 @@ runtime stage). Dev/test-only deps go in `requirements-dev.txt`.
 
 **Local dev (`run_dev.sh`):** it bootstraps a `.venv` and runs uvicorn against
 your host. From-source binaries are kept in `.local-bin/` (the repo ships
-`.local-bin/z3ds_compressor`) so the app works without Docker. Drop your compiled
-binary there and point `<TOOL>_PATH` at it (or add it to `PATH`) for local
-testing.
+`.local-bin/z3ds_compressor`) so the app works without Docker.
+
+Dropping a binary in `.local-bin/` is **not** sufficient on its own:
+`run_dev.sh` does not add `.local-bin` to `PATH`, and every from-source tool's
+setting defaults to an absolute image path (`/usr/local/bin/...`) that won't
+exist on your host. Putting the binary on `PATH` doesn't help either — the
+absolute default is what gets executed. You must set the override explicitly.
+`run_dev.sh` sources `.env.local` first, so that's the place:
+
+```bash
+# .env.local — not committed
+NSZIP_PATH=/abs/path/to/compressatorium/.local-bin/nszip
+MAXCSO_PATH=/abs/path/to/maxcso
+MAKEPS3ISO_PATH=/abs/path/to/makeps3iso
+```
+
+The two tools whose defaults are a bare binary name (`nsz`, `7z`) *do* resolve
+from `PATH` and need no override.
 
 ---
 
@@ -1248,11 +1304,12 @@ The same file handles **PUID/PGID remap** and the privilege drop to `converter`
 | Workflow | Trigger | Relevance to a new tool |
 |----------|---------|-------------------------|
 | `docker-image.yml` | **release published** | Builds/pushes multi-arch image to Docker Hub + GHCR, runs **hadolint** (Dockerfile must pass), **Trivy** CRITICAL/HIGH scan (a vulnerable new dep can fail this), generates SBOM + provenance attestation, and **publishes `README.md` as the Docker Hub description**. Also syncs `package.json` from the release tag. |
-| `codacy.yml` | push, PR, weekly | Runs the Codacy CLI (ruff, eslint, pylint, bandit, etc.). New Python/JS must lint clean. Honors `pyproject.toml`, `.pylintrc`, `eslint.config.js`, `.codacy.yml`. |
-| `codeql.yml` | push, PR, weekly | CodeQL SAST for **python** and **javascript-typescript**. New code is scanned automatically, no config change, but don't introduce flagged patterns (for example command injection, another reason for the no-`shell=True` rule). |
+| *Codacy* — **not a workflow** | PR | Runs as a GitHub App check ("Codacy Static Code Analysis"): ruff, eslint, pylint, bandit, etc. New Python/JS must lint clean. Honors `pyproject.toml`, `.pylintrc`, `eslint.config.js`, `.codacy.yml`. Configured in the Codacy UI — there is no `.github/workflows/codacy.yml` to edit. |
+| `codeql.yml` | push, PR, weekly | CodeQL SAST for **python**, **javascript-typescript** and **actions**. New code is scanned automatically, no config change, but don't introduce flagged patterns (for example command injection, another reason for the no-`shell=True` rule). |
 | `label.yml` + `labeler.yml` | PR | Path-based auto-labels. Add a glob if you want your area labeled. |
+| `screenshots.yml` | push / manual | **Take screenshots**: rebuilds the README/docs captures from `shots.yml` and commits them. Relevant whenever your tool changes the UI. |
 | `stale.yml` | schedule | Marks stale issues/PRs. Irrelevant. |
-| `dependabot.yml` | schedule | Dependency PRs. Add an ecosystem entry only if you introduce a new manifest. |
+| *Renovate* (`renovate.json`) | schedule (Mondays) | Dependency PRs, via the Renovate app — **not** Dependabot; there is no `.github/dependabot.yml`. Adjust only if you introduce a new manifest. |
 
 Key takeaways for a contributor:
 - **The image only builds on a GitHub Release.** There is no build-on-push. To
@@ -1536,6 +1593,13 @@ exposes availability and the frontend hides unavailable tools entirely:
 - **Backend:** `GET /api/tools` (in `app/routes/info.py`) returns
   `{"available": [...], "unavailable": [...]}`. A tool lands in `unavailable`
   when its readiness check fails (for nsz, `keys_available()` is false).
+  **This half is *not* generic yet:** `list_tools()` awaits
+  `nsz_service.keys_available()` and branches on `tool.id == "nsz"` — there is
+  no plugin readiness callback. A second gated tool stays permanently
+  "available" and advertises a converter that can only fail at runtime, so you
+  must either extend that endpoint or (better, per the modularity rule) add a
+  readiness seam to the plugin contract — e.g. an `is_ready()` defaulting to
+  `True` on `BaseTool` — and have `list_tools()` loop over it.
 - **Frontend:** `App.svelte` fetches it on mount and calls
   `ui.applyToolAvailability(available)`, which stores `ui.hiddenTools`. Sidebar
   and the dashboard derive their tool list as
