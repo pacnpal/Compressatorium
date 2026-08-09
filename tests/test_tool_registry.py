@@ -28,6 +28,10 @@ from app.services.maxcso import (
     MAXCSO_DECOMPRESS_EXTENSIONS,
     maxcso_service,
 )
+from app.services.nkit2iso import (
+    NKIT2ISO_CONVERTIBLE_EXTENSIONS,
+    nkit2iso_service,
+)
 from app.services.nsz import (
     NSZ_COMPRESS_EXTENSIONS,
     NSZ_DECOMPRESS_EXTENSIONS,
@@ -72,12 +76,14 @@ def _legacy_tool_for_mode(mode: str) -> str:
         return "cso"
     if mode.startswith("romz_"):
         return "romz"
+    if mode.startswith("nkit_"):
+        return "nkit"
     return "chdman"
 
 
 def test_every_conversion_mode_resolves_to_exactly_one_tool():
     resolved = {m.value: registry.for_mode(m.value).id for m in CONVERSION_MODES}
-    assert len(resolved) == 29
+    assert len(resolved) == 30
     # Each registered mode is owned by exactly one tool (no duplicates).
     assert sorted(s.mode for s in registry.mode_specs()) == sorted(resolved)
 
@@ -179,6 +185,7 @@ def test_convertible_extensions_match_service_constants():
         | set(MAXCSO_DECOMPRESS_EXTENSIONS)
         | set(ROMZ_COMPRESS_EXTENSIONS)
         | set(ROMZ_ARCHIVE_EXTENSIONS)
+        | set(NKIT2ISO_CONVERTIBLE_EXTENSIONS)
     )
     assert set(registry.convertible_extensions()) == expected
 
@@ -206,6 +213,20 @@ def test_tools_for_input_representative():
     assert [t.id for t in registry.tools_for_input("Game.zip")] == ["romz"]
     # A finished .chd is not a "convertible-from" source in the listing.
     assert registry.tools_for_input("out.chd") == []
+    # Compound extensions: nkit2iso declares `.nkit.iso`/`.nkit.gcz`, so an NKit
+    # image adds it to (rather than displaces) the tools that own the generic
+    # `.iso`/`.gcz` tail, and a plain `.iso`/`.gcz` never picks nkit up.
+    assert sorted(t.id for t in registry.tools_for_input("game.nkit.iso")) == [
+        "chdman",
+        "cso",
+        "dolphin",
+        "nkit",
+    ]
+    assert sorted(t.id for t in registry.tools_for_input("game.nkit.gcz")) == [
+        "dolphin",
+        "nkit",
+    ]
+    assert [t.id for t in registry.tools_for_input("game.gcz")] == ["dolphin"]
 
 
 def test_tool_for_verify_representative():
@@ -268,6 +289,8 @@ def test_tools_verifying_path_refines_extension_match(tmp_path):
         ("cso_decompress", maxcso_service, "/data/game.dax"),
         ("romz_7z", romz_service, "/data/Game.gba"),
         ("romz_zip", romz_service, "/data/Game.nds"),
+        ("nkit_restore", nkit2iso_service, "/data/Game.nkit.iso"),
+        ("nkit_restore", nkit2iso_service, "/data/Game.nkit.gcz"),
     ],
 )
 def test_output_path_delegation_matches_service(

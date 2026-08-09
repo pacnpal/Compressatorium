@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,36 @@ from config import settings
 def strip_archive_path(path: str) -> str:
     """Return the filesystem portion of an archive path (archive::internal)."""
     return path.split("::", 1)[0] if "::" in path else path
+
+
+def match_extension(name: str, extensions: Iterable[str]) -> Optional[str]:
+    """Return the longest declared extension ``name`` ends with, else ``None``.
+
+    The shared primitive behind every "does this tool handle this file?"
+    check (``input_extensions`` / ``verify_extensions`` / the archive-member
+    gate). It is a **suffix** match rather than ``Path(name).suffix``
+    equality so a tool can declare a *compound* extension: nkit2iso's sources
+    are ``.nkit.iso`` / ``.nkit.gcz``, whose single ``Path.suffix`` is the
+    generic ``.iso`` / ``.gcz`` that CHDMAN and Dolphin already own. Matching
+    on the full suffix lets the specific format be declared without either
+    tool having to claim (or disclaim) the generic one.
+
+    For the single-component extensions every other tool declares this is
+    exactly the old behaviour: ``game.iso`` ends with ``.iso`` and nothing
+    else. Longest-match resolution means a name that matches both a compound
+    and its generic tail reports the compound one, so a caller that needs the
+    concrete key (the archive listing) gets the most specific answer.
+
+    ``name`` may be a full path, a bare filename, or an extension string
+    (``".nkit.iso"`` still ends with ``".iso"``), so callers holding only a
+    member's extension can use the same helper.
+    """
+    lower = name.lower()
+    best: Optional[str] = None
+    for ext in extensions:
+        if lower.endswith(ext) and (best is None or len(ext) > len(best)):
+            best = ext
+    return best
 
 
 def _resolve_path(raw_path: str, *, strict: bool = False) -> Optional[Path]:

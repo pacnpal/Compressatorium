@@ -63,6 +63,10 @@ export const MODE_BLURBS = {
     + 'Pick an effort preset (Fast/Default/Max).',
   romz_zip: 'Compress to a .zip archive (broadest compatibility). Same effort presets.',
   romz_extract: 'Extract the ROM back out of a .7z/.zip archive.',
+  // NKit
+  nkit_restore:
+    'Rebuild the full GameCube/Wii ISO from an NKit-shrunk .nkit.iso/.nkit.gcz. '
+    + 'No settings; the result is CRC32-checked against the NKit header.',
   // PS3
   folder_to_iso:
     'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle '

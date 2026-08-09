@@ -11,6 +11,7 @@ from typing import List, Tuple, Optional, Union, Dict
 from config import settings
 from services.archive_members import read_archive_members
 from utils.junk import is_junk_path
+from utils.path_utils import match_extension
 
 try:
     import py7zr
@@ -262,9 +263,15 @@ class ArchiveService:
                 self._validate_member(member.name)
             except ValueError:
                 continue
-            ext = Path(member.name).suffix.lower()
-            if ext not in convertible:
+            # Suffix match, not Path.suffix equality, so a member declared with
+            # a compound extension (nkit2iso's .nkit.iso) passes the gate. The
+            # recorded ``extension`` stays the plain trailing suffix: it feeds
+            # the synthetic-sibling path and the icon buckets, both of which key
+            # on the generic tail, while convertibility is re-derived from the
+            # member name via ``tools_accepting_archive_member``.
+            if match_extension(member.name, convertible) is None:
                 continue
+            ext = Path(member.name).suffix.lower()
             size = member.size
             if size is None:
                 if max_member_size > 0 or max_total_size > 0:

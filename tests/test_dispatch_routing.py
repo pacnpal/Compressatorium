@@ -26,6 +26,20 @@ CONVERSION_MODES = [
     if m not in EXTERNAL_MODES and registry.for_mode(m.value).id != "chain"
 ]
 
+# Tools whose service singleton is monkeypatched below. Kept in one place so
+# the two parity tests can't drift apart.
+_PATCHED_TOOLS = (
+    "chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso", "nkit",
+)
+
+# Modes whose tool exposes a verify at all. nkit2iso has no verify subcommand —
+# integrity is the NKit header CRC32 its restore checks inline — so its plugin
+# defines no ``verify`` and there is no dispatch to assert. Derived rather than
+# listed so a tool that later grows one is covered automatically.
+VERIFY_MODES = [
+    m for m in CONVERSION_MODES if hasattr(registry.for_mode(m), "verify")
+]
+
 
 def _legacy_dispatch_id(mode: str) -> str:
     """Replicates the convert/verify dispatch ladders formerly in
@@ -43,10 +57,12 @@ def _legacy_dispatch_id(mode: str) -> str:
         return "cso"
     if mode.startswith("romz_"):
         return "romz"
+    if mode.startswith("nkit_"):
+        return "nkit"
     return "chdman"
 
 
-@pytest.mark.parametrize("mode", CONVERSION_MODES)
+@pytest.mark.parametrize("mode", VERIFY_MODES)
 def test_verify_dispatch_matches_legacy_ladder(mode, monkeypatch):
     called: dict[str, str] = {}
 
@@ -57,10 +73,10 @@ def test_verify_dispatch_matches_legacy_ladder(mode, monkeypatch):
 
         return _verify
 
-    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso"):
-        monkeypatch.setattr(
-            registry.get(tool_id)._service, "verify", _record(tool_id)
-        )
+    for tool_id in _PATCHED_TOOLS:
+        service = registry.get(tool_id)._service
+        if hasattr(service, "verify"):
+            monkeypatch.setattr(service, "verify", _record(tool_id))
 
     result = asyncio.run(registry.for_mode(mode).verify("/data/out"))
 
@@ -84,7 +100,7 @@ def test_convert_dispatch_matches_legacy_ladder(mode, monkeypatch):
 
         return _convert
 
-    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso"):
+    for tool_id in _PATCHED_TOOLS:
         monkeypatch.setattr(
             registry.get(tool_id)._service, "convert", _record(tool_id)
         )

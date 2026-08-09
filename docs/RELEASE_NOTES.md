@@ -7,6 +7,36 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **New tool: NKit → ISO (`nkit2iso`).** Restores an NKit-shrunk GameCube or Wii
+  disc image (`.nkit.iso`, `.nkit.gcz`) back to a plain, full-size `.iso`, using
+  [nkit2iso](https://github.com/DonMikone/nkit2iso) (MIT, a static Go binary
+  built into the image for `linux/amd64` and `linux/arm64`). One mode,
+  `nkit_restore`, with no settings: NKit drops everything a program can recreate
+  (junk padding, gaps, all-junk files, and for Wii the AES encryption and H0–H3
+  hash tree), and the restore rebuilds all of it, then CRC32-checks the result
+  against the value stored in the NKit header — so a completed job is bit-exact.
+  Archive members work too: an NKit image inside a `.zip`/`.7z`/`.rar` converts
+  in place.
+
+  This is a one-way tool — Compressatorium never *writes* NKit — so there is no
+  compress direction. It also registers **no info or verify routes**: nkit2iso
+  has no such subcommand, integrity is the header CRC32 checked inline during
+  the restore, and for the same reason delete-on-verify is not offered.
+
+  A Wii image whose update partition was removed at shrink time cannot come back
+  byte-exact — that data simply is not in the file. By default
+  (`NKIT2ISO_RECOVERY=none`) the region is zero-filled, exactly as official NKit
+  does without its recovery files, and the job's final message says plainly that
+  the ISO is playable but **not** redump-verifiable. Set
+  `NKIT2ISO_RECOVERY=download` to have nkit2iso fetch the publicly archived
+  recovery partition and splice it in for a bit-exact restore; that is the only
+  path on which the tool touches the network, which is why it is opt-in. The
+  tool's own interactive `ask` mode is never used — a job worker has no terminal
+  to answer it on.
+
+  New env vars: `NKIT2ISO_PATH`, `NKIT2ISO_RECOVERY`, plus the usual
+  `COMPRESSATORIUM_NKIT2ISO_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` overrides.
+
 - **Two per-tool branches on shared paths became plugin hooks
   (`overwrite_targets`, `is_ready`).** Both were single-tool special cases
   sitting on code every tool runs through, so a *second* tool of the same shape
@@ -89,6 +119,30 @@ and #179, part of the #177 tech-debt epic).
   on; the file/search JSON simply no longer carries the dead flags.
 
 ### Changed
+
+- **Extension matching is now a suffix match, so a tool can declare a compound
+  extension.** Every "does this tool handle this file?" check used to be
+  `Path(name).suffix.lower() in declared`, re-typed at each site. That can only
+  ever see one trailing component, which made a format like `.nkit.iso`
+  undeclarable: its trailing component is the generic `.iso` that CHDMAN,
+  Dolphin and maxcso already own, so the choice would have been over-claiming
+  every ISO or hard-coding a content sniff.
+
+  The check moved behind one shared helper,
+  `utils.path_utils.match_extension(name, extensions)`, which returns the
+  longest declared extension the name ends with. It is used by
+  `registry.tools_for_input` / `tool_for_verify` /
+  `tools_accepting_archive_member`, `BaseTool.verifies_path`, the archive-member
+  gate, `routes/files.py`'s output detection, and the plan-time input gate in
+  `routes/convert.py`. The frontend already matched with `endsWithAny`, so it
+  needed no change.
+
+  **No behavior change for any existing tool**: every other declaration is a
+  single component, and `game.iso` ends with `.iso` and nothing else. Matching is
+  per-tool, so an NKit image is claimed by `nkit` *and* by the generic-tail
+  owners — the same way a raw `.iso` is already claimed by chdman, dolphin and
+  cso — rather than displacing them. `tests/test_compound_extension_matching.py`
+  pins both halves.
 
 - **"Adding a tool" guide brought back in sync with the code.**
   `docs/ADDING_PLATFORMS_AND_TOOLS.md` had drifted behind the Phase 7/9

@@ -786,11 +786,11 @@ class ToolRegistry:
     def convertible_extensions(self) -> tuple[str, ...]:   # sorted (issue #183)
         return tuple(sorted(set().union(*(t.input_extensions for t in self._tools.values()))))
     def tools_for_input(self, filename: str) -> list[ToolPlugin]:
-        ext = Path(filename).suffix.lower()
-        return [t for t in self._tools.values() if ext in t.input_extensions]
+        return [t for t in self._tools.values()
+                if match_extension(filename, t.input_extensions) is not None]
     def tool_for_verify(self, path: str) -> ToolPlugin | None:
-        ext = Path(path).suffix.lower()
-        return next((t for t in self._tools.values() if ext in t.verify_extensions), None)
+        return next((t for t in self._tools.values()
+                     if match_extension(path, t.verify_extensions) is not None), None)
     # Discovery helpers (issue #131): the union of every tool's produced /
     # verifiable extensions drives the registry-driven library scan, so a new
     # tool's outputs become scannable for free.
@@ -801,6 +801,48 @@ class ToolRegistry:
     def scannable_extensions(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.output_extensions()) | set(self.verify_extensions())))
 ```
+
+#### Extension matching is a suffix match (`utils.path_utils.match_extension`)
+
+Every "does this tool handle this file?" decision goes through one helper:
+
+```python
+def match_extension(name: str, extensions: Iterable[str]) -> str | None:
+    """The longest declared extension ``name`` ends with, else None."""
+```
+
+It replaced the `Path(name).suffix.lower() in declared` test that used to be
+re-typed at each site (`tools_for_input`, `tool_for_verify`,
+`BaseTool.verifies_path`, the archive-member gate in `services/archive.py`, and
+the plan-time input gate in `routes/convert.py`). The reason is **compound
+extensions**: nkit2iso's sources are `.nkit.iso` and `.nkit.gcz`, whose trailing
+component is the generic `.iso` / `.gcz` that CHDMAN, Dolphin and maxcso already
+own. A single-component match can only see the generic tail, so the specific
+format could not be declared without either over-claiming every ISO or
+hard-coding a content sniff.
+
+Three properties make this safe to apply everywhere:
+
+- **Single-component declarations are unchanged.** `game.iso` ends with `.iso`
+  and nothing else, so every pre-existing tool matches exactly what it did
+  before. (`tests/test_compound_extension_matching.py` pins this.)
+- **Per-tool, not global.** Each tool is asked independently, so an NKit image is
+  claimed by nkit *and* by the generic-tail owners, the same way a raw `.iso` is
+  already claimed by chdman, dolphin and cso. The user picks; nothing is
+  displaced.
+- **Longest match wins within a tool**, so a caller that needs the concrete key
+  (the archive listing) gets the most specific answer rather than an arbitrary
+  one.
+
+The subject may be a full path, a bare filename, or an extension string
+(`".nkit.iso"` still ends with `".iso"`), so a caller holding only a member's
+recorded extension uses the same helper.
+
+Two display-side sites deliberately still record the plain `Path.suffix`: the
+archive listing's `entry["extension"]` and, downstream of it, the frontend icon
+buckets. They want the generic tail. Convertibility for those rows is re-derived
+from the member's *name* via `registry.tools_accepting_archive_member(member)`,
+which takes a name-or-extension for exactly this reason.
 
 > **Ordering (issue #183):** the extension-union helpers return a **sorted
 > `tuple`**, not a `frozenset`. Hash-seeded set iteration order varies across
@@ -906,7 +948,8 @@ extension alone would offer the affordance where the tool can't actually use it
 
 The plugin contract closes that gap with `ToolPlugin.verifies_path(path) ->
 bool`: the per-file refinement of `verify_extensions`. `BaseTool` defaults it to
-the plain extension match, so existing tools are unaffected; `RomzTool`
+the declared-extension match (`match_extension`, §3.4), so existing tools are
+unaffected; `RomzTool`
 overrides it to inspect the archive's members (exactly one handheld-ROM member —
 the same invariant verify/extract enforce, via
 `RomzService.is_single_rom_archive`). The registry exposes

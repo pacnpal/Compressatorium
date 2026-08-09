@@ -63,6 +63,12 @@ MATRIX = [
     (".chd", ConversionMode.EXTRACTRAW, ".raw"),
     (".chd", ConversionMode.EXTRACTHD, ".raw"),
     (".chd", ConversionMode.EXTRACTLD, ".avi"),
+    # nkit2iso: the only COMPOUND-extension source. The flattened member name
+    # keeps ".nkit.iso"/".nkit.gcz", and the whole compound suffix (not just the
+    # trailing ".iso"/".gcz") must be stripped, or the output would collide with
+    # the member's own name.
+    (".nkit.iso", ConversionMode.NKIT_RESTORE, ".iso"),
+    (".nkit.gcz", ConversionMode.NKIT_RESTORE, ".iso"),
 ]
 
 

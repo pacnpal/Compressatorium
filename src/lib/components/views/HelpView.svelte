@@ -55,6 +55,12 @@
       blurb: 'A decrypted PS3 disc or JB folder packed into a single .iso that RPCS3 mounts directly, using makeps3iso. This is the one tool that takes a folder instead of a file, and the only tool with no reverse mode at all: it repackages a folder you already decrypted, and never deletes it. Most PS3 discs are over 4 GB, so for a FAT32 drive there is a per-job toggle that splits the image into 4 GB parts (RPCS3 mounts the .0). No keys, and no decryption here.',
       io: 'the folder holding PS3_GAME/  →  .iso',
     },
+    {
+      glyph: 'NKT',
+      name: 'NKit',
+      blurb: 'NKit-shrunk GameCube and Wii images back to a plain, full-size .iso, using nkit2iso. NKit shrinks a disc by dropping everything a program can recreate — the junk padding, the gaps, and for Wii the encryption and hash tree — so restoring means rebuilding all of it and checking the result against the CRC32 stored in the NKit header. There are no settings and the output is bit-exact. One direction only: this app never writes NKit. Once restored, the .iso is an ordinary source you can hand to Dolphin or CHDMAN. The one image that cannot come back byte-exact is a Wii disc whose update partition was removed at shrink time — that data simply is not in the file. By default the region is zero-filled and the job says so; the result is playable but not redump-verifiable. Set NKIT2ISO_RECOVERY=download if you want the tool to fetch the publicly archived recovery partition instead, the only case where it uses the network.',
+      io: '.nkit.iso / .nkit.gcz  →  .iso',
+    },
   ];
 
   // Per-tool mode reference. Generated from the registry (one section per

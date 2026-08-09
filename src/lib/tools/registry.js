@@ -70,6 +70,16 @@ const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 const PS3_SOURCE_EXTS = [];
 const PS3_VERIFY_EXTS = [];
 
+// nkit2iso (NKit-shrunk GC/Wii image -> full .iso). COMPOUND extensions: the
+// meaningful part is `.nkit`, but the trailing `.iso`/`.gcz` is what CHDMAN and
+// Dolphin already own. `endsWithAny` (below) is a suffix match, so declaring the
+// full `.nkit.iso` keeps the two apart — a plain `.iso` never matches nkit, and
+// an NKit image matches both (the user picks). The backend mirrors this via
+// utils.path_utils.match_extension. One direction only: this app never *writes*
+// NKit, so there is no verify class and no compress mode.
+const NKIT_SOURCE_EXTS = ['.nkit.iso', '.nkit.gcz'];
+const NKIT_VERIFY_EXTS = [];
+
 /**
  * @typedef {Object} ModeEntry
  * @property {string} mode
@@ -508,6 +518,42 @@ export const TOOLS = [
     verifyBatch: undefined,
     // The product is a sibling "<folder>.iso" (folder name, not a stem swap).
     productPath: (path) => `${(path ?? '').replace(/[/\\]+$/, '')}.iso`,
+  },
+  {
+    id: 'nkit',
+    label: 'NKit',
+    hint: 'Restore an NKit-shrunk GameCube / Wii image back to a full .iso.',
+    // No verify endpoint: nkit2iso has no verify subcommand. Integrity is the
+    // NKit header CRC32 the binary checks inline during the restore, so a
+    // completed job IS the verification.
+    verifyPrefix: '',
+    sourceExts: NKIT_SOURCE_EXTS,
+    verifyExts: NKIT_VERIFY_EXTS,
+    modeGroups: ['nkit'],
+    groups: { nkit: 'NKit → ISO' },
+    defaultMode: 'nkit_restore',
+    glyph: 'NKT',
+    accent: 'var(--badge-dvd)',
+    // Fixed restore: the output is the original disc image, byte for byte.
+    // Nothing to pick, so no codec list and no level slider.
+    compressionCodecs: [],
+    compressionStyle: 'none',
+    modes: [
+      { mode: 'nkit_restore', kind: 'extract', label: 'Restore ISO from NKit', group: 'nkit',
+        outputExt: '.iso', inputExtensions: NKIT_SOURCE_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        // No delete-on-verify: this tool declares no verifyExts, so the
+        // restored .iso can't be confirmed before dropping the source.
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
+    ],
+    // No Info/Verify routes; left undefined so infoToolsForPath /
+    // toolForVerifyPath skip this tool.
+    getInfo: undefined,
+    verify: undefined,
+    verifyBatch: undefined,
+    // Compound extension: strip the whole ".nkit.iso" / ".nkit.gcz", not just
+    // the trailing suffix, or the "product" would be the source path itself.
+    productPath: (path) => (path ?? '').replace(/\.nkit\.(iso|gcz)$/i, '.iso'),
   },
 ];
 

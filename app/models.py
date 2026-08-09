@@ -54,6 +54,7 @@ class ConversionMode(str, Enum):
     ROMZ_ZIP = "romz_zip"
     ROMZ_EXTRACT = "romz_extract"
     FOLDER_TO_ISO = "folder_to_iso"
+    NKIT_RESTORE = "nkit_restore"
     METADATA_SCAN = "metadata_scan"
     DAT_MATCH = "dat_match"
 

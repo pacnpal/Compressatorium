@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from models import OutputStatus
+from utils.path_utils import match_extension
 
 from .spec import ModeSpec
 
@@ -247,9 +248,11 @@ class BaseTool:
         return False
 
     def verifies_path(self, path: str) -> bool:
-        # Default: a plain extension match. Tools that over-claim a container
-        # extension (e.g. romz on .7z/.zip) override with per-file inspection.
-        return Path(path).suffix.lower() in self.verify_extensions
+        # Default: a declared-extension match (suffix-based, so a compound
+        # extension resolves — see utils.path_utils.match_extension). Tools that
+        # over-claim a container extension (e.g. romz on .7z/.zip) override with
+        # per-file inspection.
+        return match_extension(path, self.verify_extensions) is not None
 
     async def embedded_hashes(
         self, path: str, *, cancel_event: asyncio.Event | None = None,

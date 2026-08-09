@@ -1,7 +1,8 @@
 # Compressatorium — game-image converter (web UI + headless CLI)
 
-A FastAPI + Svelte app that wraps seven conversion tools — CHDMAN, dolphin-tool,
-z3ds, nsz, maxcso, 7z, and makeps3iso — behind one tool-plugin architecture.
+A FastAPI + Svelte app that wraps eight conversion tools — CHDMAN, dolphin-tool,
+z3ds, nsz, maxcso, 7z, makeps3iso, and nkit2iso — behind one tool-plugin
+architecture.
 Operational runbook for agents: `AGENTS.md`. Tool plugins and shared
 infrastructure: `docs/DESIGN_tool_plugin_architecture.md`. **Adding a tool or a
 platform/mode: `docs/ADDING_PLATFORMS_AND_TOOLS.md`** — the step-by-step
