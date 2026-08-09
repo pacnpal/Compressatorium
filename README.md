@@ -2,11 +2,11 @@
 
 > **Fork notice:** This is a fork of MarcTV's Docker CHD Converter. It adds a Web UI and more conversion tools on top of the original CLI converter. Thanks to [MarcTV](https://github.com/MarcTV) for the original.
 
-A game image converter that wraps seven tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), and **makeps3iso** (PS3 decrypted folder → ISO). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
+A game image converter that wraps eight tools: **CHDMAN** (MAME), **dolphin-tool** (Dolphin Emulator), **z3ds_compressor** (Nintendo 3DS), **nsz** (Nintendo Switch), **maxcso** (PSP/PS2 CSO/ZSO), **7z** (handheld ROM archives), **makeps3iso** (PS3 decrypted folder → ISO), and **JWUDTool** (Wii U WUD ↔ WUX). Pick the tool that matches your files and convert from a browser, or run it headless from the command line.
 
 ## Features
 
-* **Seven tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), or PS3 ISO (a decrypted PS3 folder packed to `.iso`), chosen per job.
+* **Eight tools in one.** CHDMAN, Dolphin, 3DS, Switch, CSO/ZSO, handheld ROM (GB/GBC/GBA/DS), PS3 ISO (a decrypted PS3 folder packed to `.iso`), or Wii U (WUD ↔ WUX), chosen per job.
 * **Web UI** for browsing files and converting them. The tool picker filters the whole interface down to the tool you chose.
 * **Nested directories and archives.** Browse subfolders and look inside ZIP, 7z, and RAR archives.
 * **Multiple volume mounts** so you can keep separate game libraries separate.
@@ -14,7 +14,7 @@ A game image converter that wraps seven tools: **CHDMAN** (MAME), **dolphin-tool
 * **Existing-output detection** with skip, rename, or overwrite.
 * **Delete-on-verify.** Optionally remove the source after a conversion verifies. Off by default.
 * **Progress tracking** through a live job queue.
-* **File info** for CHD, Dolphin, 3DS, Switch, CSO, and handheld ROM files.
+* **File info** for CHD, Dolphin, 3DS, Switch, CSO, handheld ROM, and Wii U files.
 
 ### Supported Conversions
 
@@ -27,6 +27,7 @@ A game image converter that wraps seven tools: **CHDMAN** (MAME), **dolphin-tool
 | **CSO** | PSP / PS2 game images | .iso, .cso, .zso, .dax | .cso, .zso, .dax, .iso, .chd | Effort preset (Fast/Default/Max); the `cso_to_chd` chain ignores it and uses chdman defaults | None | `maxcso` (+ chdman for `cso_to_chd`) |
 | **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
+| **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed) | None | `JWUDTool` (Java) |
 
 Most conversions above are lossless and fully reversible, including **3DS**, which
 now decompresses back to the original ROM as well. This uses
@@ -53,7 +54,7 @@ Each tool's full mode list (e.g. CHDMAN's `createcd`/`extractcd`, CSO's
 `cso2_compress`, the ROM packer's `romz_7z`/`romz_zip`/`romz_extract`, and the PS3
 packer's `folder_to_iso`) is in [Supported Operations](#supported-operations).
 
-> **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, and Switch dumps. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
+> **Archive inputs:** most input formats above can be converted straight from inside a ZIP, 7z, or RAR archive, including 3DS ROMs, Dolphin game images, Switch dumps, and Wii U images. Browse into the archive, pick a member, and convert. This even covers CHDMAN's extract modes pulling a `.chd` out of an archive and decompressing it back to a game image. A few exceptions: CHDMAN's **copy/recompress** mode is not offered from an archive (recompressing an already-finished `.chd` would be a pointless round trip); **Handheld ROM** does not accept loose ROMs from inside an archive — its `.7z`/`.zip` are the packed product, so to unpack one select the archive file itself and run `romz_extract`, rather than browsing into it for a member; and **PS3 ISO** takes a folder, not a file, so it is never an archive input (a zipped `PS3_GAME` tree can't be converted from inside an archive).
 
 ### MAME Redump DAT Integration
 
@@ -135,6 +136,7 @@ When you open the Web UI, you'll see the tool options at the top:
 * **CSO** - For compressing/decompressing PSP/PS2 ISO images to CSO/ZSO (and a one-step CSO → CHD chain)
 * **Handheld ROM** - For compressing/extracting GB/GBC/GBA/DS ROM dumps to .7z/.zip archives
 * **PS3 ISO** - For packing a decrypted PS3 folder into a `.iso` RPCS3 can mount
+* **Wii U** - For compressing Wii U disc images to `.wux` and back
 
 **Choose the tool that matches your files.** The interface then shows only the modes and file types that tool can use.
 
@@ -848,6 +850,86 @@ verify.
 
 ---
 
+## Wii U Support (WUD ↔ WUX)
+
+The Wii U tool converts a disc image between the raw `.wud` dump and the
+compressed `.wux` container, using [JWUDTool](https://www.gamebrew.org/wiki/JWUDTool_Wii_U)
+([source](https://github.com/Maschell/JWUDTool)). Lossless and fully reversible,
+with nothing to configure.
+
+Every Wii U disc image is exactly 25,025,314,816 bytes (about 23 GiB) no matter
+how much of the disc the game actually uses, so the padding compresses
+dramatically: WUX deduplicates repeated 32 KiB sectors and stores each distinct
+one once. Cemu reads a `.wux` directly, so the compressed file plays without a
+separate decompress step.
+
+**No keys.** This only repacks the image; it never decrypts it. A `.wux` carries
+exactly the same encrypted content as the `.wud` it came from, so no common key
+or title key is involved and none ships with this app. (JWUDTool's decrypt and
+extract features do need your own keys — they are out of scope here.)
+
+### How to Use
+
+Select **Wii U** as the primary tool, pick a `.wud` (or a `.wux` to go back), and
+run `jwud_compress` / `jwud_decompress`. The output is `<name>.wux` / `<name>.wud`
+next to the source, or in a custom output directory. The general workflow (queue,
+duplicate handling, delete-on-verify) is in the [Usage Guide](#usage-guide).
+
+### Supported File Formats
+
+| Direction | Input | Output |
+|-----------|-------|--------|
+| Compress  | `.wud` | `.wux` |
+| Decompress | `.wux` | `.wud` |
+
+Both directions can also read their input straight out of a ZIP, 7z, or RAR
+archive.
+
+### Technical Details
+
+- **Every conversion is verified against its source.** JWUDTool re-reads both
+  images and compares them byte for byte before the job reports success, so a
+  compress job takes roughly twice as long as writing the output alone. A
+  mismatch fails the job rather than leaving a bad image in place.
+- **Progress covers both phases.** The conversion runs 1–50 % on the bar and the
+  built-in verification 51–99 %.
+- **Verify** checks the `.wux` container structurally: the header magic and
+  fields, then every sector-index entry against the file's real length. That is
+  what catches a truncated copy or a corrupt index table, and it is as deep as
+  the format allows — WUX stores no content checksums. Only `.wux` is verifiable;
+  a raw `.wud` is 25 GB of bytes with nothing to check against, which is why
+  delete-on-verify is offered on compress but not on decompress.
+- **Info** reads the WUX header, so it reports the original image size and the
+  resulting ratio alongside the usual file details.
+- **Split dumps** (`game_part1.wud`, `game_part2.wud`, … from wudump) are joined
+  by JWUDTool itself when you select the `_part1` file. The remaining parts are
+  still listed as `.wud` sources and will be rejected on their own, since a part
+  is not a whole disc image.
+- **Disk space.** Decompressing always writes a full ~23 GiB image, and the
+  conversion runs in a temp directory next to the destination before being moved
+  into place, so the output volume needs room for the finished file.
+- JWUDTool is a Java program (GPL-3.0). The image installs a headless JRE and the
+  pinned upstream release jar, behind a `/usr/local/bin/jwudtool` launcher; it is
+  architecture-independent, so it works on both `linux/amd64` and `linux/arm64`.
+
+### Wii U Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher |
+
+(Global vars, including the tool-neutral priority knobs, are in [Environment Variables](#environment-variables).)
+
+### REST API Endpoints
+
+- `GET /api/jwud-info?path=<path>` - Wii U image info (format, size, and for a `.wux` its original size and ratio)
+- `GET /api/jwud-verify?path=<path>` - Verify a `.wux` container
+- `GET /api/jwud-verify/events?path=<path>` - Streaming verification (SSE)
+- `POST /api/jwud-verify-batch/events` - Batch verification (SSE)
+- `POST /api/jobs` or `POST /api/jobs/batch` - Queue a job with `mode: "jwud_compress"` or `"jwud_decompress"`
+
+---
+
 ## CLI Mode (Batch Processing)
 
 For automated/headless conversion, use CLI mode. CLI mode runs CHDMAN only and processes
@@ -947,13 +1029,16 @@ All actions are queued and processed by the job queue (FIFO). The queue is the o
 **PS3 ISO (decrypted folder)**
 - `folder_to_iso` (a folder containing `PS3_GAME/` → `<folder>.iso`, with an optional `-s` 4 GB FAT32 split)
 
+**Wii U**
+- `jwud_compress` (.wud → .wux), `jwud_decompress` (.wux → .wud)
+
 Notes:
 - Compression settings apply to CHD **create**/**copy**, Dolphin RVZ/WIA, Switch (`nsz_compress`), the CSO/CSO v2/ZSO/DAX compress modes, and the handheld ROM compress modes (`romz_7z`/`romz_zip`) — the last two take an effort preset. Other modes ignore them.
 - Extract/decompress operations ignore compression settings.
 - `extractcd` produces both `.cue` and `.bin` outputs.
 - Dolphin GCZ/ISO outputs ignore compression selection.
-- 3DS compression uses fixed settings (no user configuration needed).
-- Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, and CSO), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
+- 3DS and Wii U compression use fixed settings (no user configuration needed).
+- Archive inputs are supported for the file-based convertible sources (CHD create, Dolphin, 3DS, Switch, CSO, and Wii U), plus CHDMAN's extract modes decompressing a `.chd` pulled out of an archive. Exceptions: CHDMAN's copy/recompress mode (it would just re-compress an already-finished `.chd`), Handheld ROM compression (its `.7z`/`.zip` are the product), and PS3 ISO (its input is a folder, not a file).
 
 ---
 
@@ -1055,6 +1140,15 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | GET | `/api/cso-verify/events` | SSE stream for CSO verification progress |
 | POST | `/api/cso-verify-batch/events` | SSE stream for batch CSO verification |
 
+### Wii U Info & Verification
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/jwud-info` | Get Wii U `.wud`/`.wux` metadata (plus the WUX ratio) |
+| GET | `/api/jwud-verify` | Verify a `.wux` container's integrity |
+| GET | `/api/jwud-verify/events` | SSE stream for Wii U verification progress |
+| POST | `/api/jwud-verify-batch/events` | SSE stream for batch Wii U verification |
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1085,6 +1179,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `MAKEPS3ISO_PATH` | `/usr/local/bin/makeps3iso` | Path to the makeps3iso binary (PS3 folder → ISO) |
 | `NSZ_PATH` | `nsz` | Path to the nsz binary (Nintendo Switch); resolved on PATH by default |
 | `SEVENZIP_PATH` | `7z` | Path to the 7z binary (handheld ROM archives); resolved on PATH by default (set an absolute path or `7zz` if your distro ships the newer `7zip` package) |
+| `JWUDTOOL_PATH` | `/usr/local/bin/jwudtool` | Path to the JWUDTool launcher (Wii U WUD ↔ WUX); the image ships a launcher that execs the bundled jar with a headless JRE |
 | `MAX_CONCURRENT_JOBS` | `1` | Maximum parallel conversion jobs (`1` = serial queue processing) |
 | `MAX_QUEUE_DEPTH` | `0` | Max queued+processing conversion jobs before create endpoints return `429` (0 disables) |
 | `COMPRESSATORIUM_CHAIN_DISK_MARGIN_MB` | `512` | Free-space margin in MB the `cso_to_chd` chain keeps beyond the room needed for the temporary `.iso` plus the final `.chd`. A job is rejected when free space is below `required + margin`, so a bigger margin is stricter. If a valid chain job is wrongly rejected for headroom, lower this or free up space (or point `CHD_TEMP_DIR` / the output at a roomier volume). |
@@ -1259,6 +1354,8 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.zcci`, `.zcia`, `.z3ds`, `.zcxi`, `.z3dsx` - compressed 3DS ROMs (3DS decompression)
 - `.cso`, `.zso`, `.dax` - PSP/PS2 compressed ISO images (CSO decompression, or `cso_to_chd` to a `.chd`)
 - `.gb`, `.gbc`, `.gba`, `.nds` - Game Boy / GBC / GBA / DS ROMs (handheld ROM compression)
+- `.wud` - Wii U disc images (Wii U compression)
+- `.wux` - compressed Wii U disc images (Wii U decompression)
 - A decrypted PS3 folder (one containing a `PS3_GAME/` directory) - packed to `.iso` (PS3 ISO tool; the input is a folder, not a file)
 
 **Archive formats (Web UI):**
@@ -1273,6 +1370,7 @@ For production deployment guidance, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `.cso`, `.zso`, `.dax` - Compressed PSP/PS2 ISO images (maxcso; `.cso` covers CSO v1 and v2)
 - `.7z`, `.zip` - Handheld ROM archives (7z; `romz_extract` restores the original `.gb`/`.gbc`/`.gba`/`.nds`)
 - `.iso` (and a split `.iso.0`/`.iso.1`/… set on FAT32) - PS3 ISO packed from a decrypted folder (makeps3iso)
+- `.wux` - Compressed Wii U disc images (JWUDTool; `jwud_decompress` restores the original `.wud`)
 
 ---
 

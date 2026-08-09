@@ -55,6 +55,12 @@
       blurb: 'A decrypted PS3 disc or JB folder packed into a single .iso that RPCS3 mounts directly, using makeps3iso. This is the one tool that takes a folder instead of a file, and the only tool with no reverse mode at all: it repackages a folder you already decrypted, and never deletes it. Most PS3 discs are over 4 GB, so for a FAT32 drive there is a per-job toggle that splits the image into 4 GB parts (RPCS3 mounts the .0). No keys, and no decryption here.',
       io: 'the folder holding PS3_GAME/  →  .iso',
     },
+    {
+      glyph: 'WUD',
+      name: 'Wii U',
+      blurb: 'Wii U disc dumps to WUX and back, using JWUDTool. Every Wii U disc image is exactly 25 GB regardless of how much of it the game uses, so WUX deduplicates the repeated sectors and typically lands a fraction of that; Cemu reads the .wux directly. Lossless and fully reversible, with no settings to pick. No keys needed either — this only repacks the image, it never decrypts it, so a WUX stays as encrypted as the WUD it came from. JWUDTool compares the result against the source byte for byte before the job reports success, which is why a compress job takes about twice as long as the write itself.',
+      io: '.wud  ↔  .wux',
+    },
   ];
 
   // Per-tool mode reference. Generated from the registry (one section per

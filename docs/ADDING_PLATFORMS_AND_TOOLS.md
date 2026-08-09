@@ -7,7 +7,7 @@ vertical slice, from the binary in the Docker image, through the Python service
 and tool plugin, the job pipeline, the FastAPI routes, and finally the Svelte
 web UI, and shows how to add a tool and a platform in tandem.
 
-It is written against the codebase as it stands today, with seven real tools
+It is written against the codebase as it stands today, with eight real tools
 plus one synthetic pipeline tool already wired up:
 
 | Tool id | Binary | Service module | Plugin | Handles |
@@ -19,10 +19,11 @@ plus one synthetic pipeline tool already wired up:
 | **`cso`** | maxcso, built from source (`/usr/local/bin/maxcso`) | `app/services/maxcso.py` | `app/services/tools/maxcso.py` | PSP/PS2 `.iso` to/from `.cso` (v1/v2) / `.zso` / `.dax` |
 | **`romz`** | `p7zip-full` (`7z` on PATH) | `app/services/romz.py` | `app/services/tools/romz.py` | Handheld ROM `.gb`/`.gbc`/`.gba`/`.nds` to/from `.7z`/`.zip` |
 | **`makeps3iso`** | built from source (`/usr/local/bin/makeps3iso`) | `app/services/makeps3iso.py` | `app/services/tools/makeps3iso.py` | A decrypted PS3 folder (`PS3_GAME/` layout) packed to `.iso` — **directory input** |
+| **`jwud`** | JWUDTool release jar + JRE (`/usr/local/bin/jwudtool`) | `app/services/jwudtool.py` | `app/services/tools/jwud.py` | Wii U disc images `.wud` to/from `.wux` |
 | **`chain`** | *(none — drives the tools above)* | *(none)* | `app/services/tools/chain.py` | Composite `cso_to_chd`: `.cso/.zso/.dax` → `.iso` → `.chd` as one job |
 
 Note the **tool id is not always the binary name**: maxcso registers as `cso`,
-7z registers as `romz`. The id is what the registry, the API and the frontend
+7z registers as `romz`, JWUDTool as `jwud`. The id is what the registry, the API and the frontend
 key on; use it consistently.
 
 > **Three tool shapes.** Most tools take a file matched by suffix, and that is
@@ -128,10 +129,11 @@ Two supporting layers:
 - **`app/models.py`** holds the `ConversionMode` enum (every mode string lives
   here), the `InputKind` enum, the `OutputStatus` / `FileEntry` listing models,
   and the Pydantic info models (`CHDInfo`, `DolphinDiscInfo`, `Z3DSInfo`,
-  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`).
+  `NszInfo`, `CsoInfo`, `RomzInfo`, `Ps3IsoInfo`, `JwudInfo`).
 - **`app/config.py`** `Settings` holds the binary path for each tool
   (`chdman_path`, `dolphin_tool_path`, `z3ds_compressor_path`, `nsz_path`,
-  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`) plus the shared and
+  `maxcso_path`, `sevenzip_path`, `makeps3iso_path`, `jwudtool_path`) plus the
+  shared and
   per-tool nice/ioprio/timeout policy knobs.
 
 ### The tool registry
@@ -155,13 +157,13 @@ Two supporting layers:
   `output_extensions()`, and `scannable_extensions()` (which drives the library
   scan / DAT-match discovery).
 - **`chdman.py` / `dolphin.py` / `z3ds.py` / `nsz.py` / `maxcso.py` / `romz.py` /
-  `makeps3iso.py`** are the seven real plugins. Each is a thin `BaseTool`
+  `makeps3iso.py` / `jwud.py`** are the eight real plugins. Each is a thin `BaseTool`
   subclass that holds `ModeSpec` rows and delegates the real work to the
   underlying service singleton (`makeps3iso.py` is the directory-input one; see
   §3.3.4 of the design doc). **`chain.py`** is the eighth registration: a
   synthetic `ChainTool` with no binary and no service, which drives the others
   through the registry (design doc §3.3.3).
-- **`__init__.py`** builds the `registry` singleton and registers all eight.
+- **`__init__.py`** builds the `registry` singleton and registers all nine.
   This is the single wiring point. Order matters at the end: `ChainTool` takes
   the registry itself and must register *after* the component tools it drives.
 
@@ -519,7 +521,7 @@ list. The `zstd` CLI is already installed (z3ds's `verify_stream` shells out to
 
 Add next to the other tool paths (`chdman_path`, `dolphin_tool_path`,
 `z3ds_compressor_path`, `nsz_path`, `maxcso_path`, `sevenzip_path`,
-`makeps3iso_path`):
+`makeps3iso_path`, `jwudtool_path`):
 
 ```python
 nszip_path: str = Field(
@@ -1215,6 +1217,7 @@ have solved the awkward part.
 | …takes a **folder**, not a file | **makeps3iso** | `accepts_directory()`, `input_kinds={InputKind.DIRECTORY}`, a dynamic `companion_outputs()` for split parts, the `split` convert kwarg, and a tool that registers *no* info/verify routes at all. Design doc §3.3.4. Override `overwrite_targets()` too, so an authorized overwrite sweeps your artifacts rather than makeps3iso's split parts (§5.6). |
 | …writes sidecar files beside its output | **chdman** (`extractcd`) | `companion_exts` driving conflict detection, cleanup and size accounting from one place. |
 | …runs an existing tool's output through another tool | **chain** (`tools/chain.py`) | `ChainSpec` / `ChainStep`: a synthetic tool with no binary that drives registered tools in order. Design doc §3.3.3. |
+| …ships as a prebuilt release artifact that needs an interpreter (a .jar, a script) | **jwud** (JWUDTool) | A pinned, SHA256-checked release download plus a `/usr/local/bin/<tool>` launcher that `exec`s the interpreter (so the tracked PID is the real process), no builder stage, and `is_ready()` hiding the tool when the launcher is absent. Also the reference for a CLI that writes into an *output folder* under a name of its own choosing, and one that **exits 0 on failure** (`require_output` plus a stdout marker scan). |
 | …can report a content hash cheaply for DAT matching | **dolphin** | `embedded_hashes()` via `SubprocessRunner.run_capture()`, plus `embedded_hash_is_exhaustive=True` for recompressed containers. |
 
 For a **binary-backed** tool — every row above except **chain** — the *shape* of

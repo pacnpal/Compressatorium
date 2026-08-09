@@ -301,6 +301,7 @@ class SkipReason(Enum):
     CSO_BAD_EXTENSION = "cso_bad_extension"
     ROMZ_BAD_EXTENSION = "romz_bad_extension"
     ROMZ_INVALID_ARCHIVE = "romz_invalid_archive"
+    JWUD_BAD_EXTENSION = "jwud_bad_extension"
     DOLPHIN_SAME_PATH = "dolphin_same_path"
     CHAIN_BAD_EXTENSION = "chain_bad_extension"
     PS3_FOLDER_INVALID = "ps3_folder_invalid"
@@ -380,6 +381,11 @@ _SKIP_HTTP: dict[SkipReason, tuple[int, str]] = {
         "Archive is not a single handheld-ROM archive produced by this tool "
         "(corrupt, multi-file, or holds no ROM)",
     ),
+    SkipReason.JWUD_BAD_EXTENSION: (
+        400,
+        "jwud_compress requires a Wii U disc image (.wud); "
+        "jwud_decompress requires a compressed image (.wux)",
+    ),
     SkipReason.DOLPHIN_SAME_PATH: (
         400,
         "Output path matches input; overwriting would delete the source file",
@@ -422,6 +428,7 @@ _BAD_EXTENSION_REASON: dict[str, SkipReason] = {
     "cso": SkipReason.CSO_BAD_EXTENSION,
     "chain": SkipReason.CHAIN_BAD_EXTENSION,
     "romz": SkipReason.ROMZ_BAD_EXTENSION,
+    "jwud": SkipReason.JWUD_BAD_EXTENSION,
 }
 
 

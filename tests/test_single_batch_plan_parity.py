@@ -155,6 +155,20 @@ def _cases():
             DuplicateAction.SKIP,
             "accept",
         ),
+        (
+            "jwud_compress_wud_accept",
+            lambda t: write(t, "game.wud"),
+            ConversionMode.JWUD_COMPRESS,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "jwud_decompress_wux_accept",
+            lambda t: write(t, "game.wux"),
+            ConversionMode.JWUD_DECOMPRESS,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
         # --- rejections / skips ---
         (
             "createcd_chd_reject",  # CREATE_REQUIRES_NON_CHD
@@ -188,6 +202,13 @@ def _cases():
             "z3ds_bad_ext_reject",  # Z3DS_BAD_EXTENSION
             lambda t: write(t, "game.txt"),
             ConversionMode.Z3DS_COMPRESS,
+            DuplicateAction.SKIP,
+            "reject",
+        ),
+        (
+            "jwud_bad_ext_reject",  # JWUD_BAD_EXTENSION
+            lambda t: write(t, "game.iso"),
+            ConversionMode.JWUD_COMPRESS,
             DuplicateAction.SKIP,
             "reject",
         ),
@@ -231,6 +252,13 @@ def _cases():
             "archive_z3ds_accept",  # archive allowed for 3DS compress (issue #113)
             lambda t: f"{_make_zip(t, 'arch.zip')}::game.3ds",
             ConversionMode.Z3DS_COMPRESS,
+            DuplicateAction.SKIP,
+            "accept",
+        ),
+        (
+            "archive_jwud_accept",  # archive allowed for Wii U compress
+            lambda t: f"{_make_zip(t, 'arch.zip')}::game.wud",
+            ConversionMode.JWUD_COMPRESS,
             DuplicateAction.SKIP,
             "accept",
         ),

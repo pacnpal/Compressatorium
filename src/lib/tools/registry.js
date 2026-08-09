@@ -63,6 +63,12 @@ const ROMZ_COMPRESS_EXTS = ['.gb', '.gbc', '.gba', '.nds'];
 const ROMZ_VERIFY_EXTS = ['.7z', '.zip'];
 const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 
+// Wii U (JWUDTool). Compress takes the raw .wud dump; decompress takes the
+// .wux container. Both directions are "sources" depending on the chosen mode.
+const JWUD_COMPRESS_EXTS = ['.wud'];
+const JWUD_VERIFY_EXTS = ['.wux'];
+const JWUD_SOURCE_EXTS = [...JWUD_COMPRESS_EXTS, ...JWUD_VERIFY_EXTS];
+
 // makeps3iso (PS3 folder -> ISO). The unit of work is a DIRECTORY, not a file
 // with a suffix, so it declares no source/verify extensions; the mode carries
 // `inputKinds: ['directory']` and selection runs through the backend's
@@ -508,6 +514,43 @@ export const TOOLS = [
     verifyBatch: undefined,
     // The product is a sibling "<folder>.iso" (folder name, not a stem swap).
     productPath: (path) => `${(path ?? '').replace(/[/\\]+$/, '')}.iso`,
+  },
+  {
+    id: 'jwud',
+    defaultCompression: ['zlib'],
+    label: 'Wii U',
+    hint: 'Compress and decompress Wii U disc images (WUD ↔ WUX). No keys needed.',
+    verifyPrefix: 'jwud',
+    sourceExts: JWUD_SOURCE_EXTS,
+    verifyExts: JWUD_VERIFY_EXTS,
+    modeGroups: ['jwud'],
+    groups: { jwud: 'Wii U' },
+    defaultMode: 'jwud_compress',
+    glyph: 'WUD',
+    accent: 'var(--badge-wiiu)',
+    // WUX is a fixed sector-deduplication format: no codec, no level.
+    compressionCodecs: [],
+    compressionStyle: 'none',
+    modes: [
+      { mode: 'jwud_compress', kind: 'compress', label: 'Compress Wii U (WUD → WUX)',
+        group: 'jwud',
+        outputExt: '.wux', inputExtensions: JWUD_COMPRESS_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        supportsDeleteOnVerify: true, allowsArchiveInput: true },
+      { mode: 'jwud_decompress', kind: 'extract', label: 'Decompress Wii U (WUX → WUD)',
+        group: 'jwud',
+        outputExt: '.wud', inputExtensions: JWUD_VERIFY_EXTS,
+        supportsCompression: false, supportsCompressionLevel: false,
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
+    ],
+    getInfo: (path) => api.getJwudInfo(path),
+    verify: (path, opts) => api.verifyJwud(path, opts),
+    verifyBatch: (paths, opts) => api.verifyBatchJwud(paths, opts),
+    productPath: (path) => {
+      if (/\.wud$/i.test(path)) return swapExt(path, '.wux');
+      if (/\.wux$/i.test(path)) return swapExt(path, '.wud');
+      return path;
+    },
   },
 ];
 

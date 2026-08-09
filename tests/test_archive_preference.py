@@ -41,6 +41,7 @@ def test_archive_input_extensions_cover_all_source_tools():
     assert {".gdi", ".iso", ".cue", ".bin"} <= exts   # chdman create
     assert {".nsp", ".xci", ".nsz", ".xcz"} <= exts   # Switch (nsz)
     assert {".cso", ".zso", ".dax"} <= exts           # CSO (maxcso decompress)
+    assert {".wud", ".wux"} <= exts                   # Wii U (JWUDTool)
     assert ".chd" in exts                             # chdman extract-from-archive
     # Handheld ROMs are browse-only, not convertible in place, so they stay OUT
     # of the convert-gate set (recompressing an archived ROM would be recursive).

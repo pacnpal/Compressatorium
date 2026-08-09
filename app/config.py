@@ -144,6 +144,14 @@ class Settings(BaseSettings):
         default="/usr/local/bin/makeps3iso", alias="MAKEPS3ISO_PATH",
     )
 
+    # JWUDTool launcher (Wii U .wud <-> .wux). JWUDTool is a Java .jar, so the
+    # image ships a tiny `exec java -jar ...` launcher at /usr/local/bin/jwudtool
+    # next to the jar; set JWUDTOOL_PATH to point at your own launcher/wrapper
+    # (e.g. for a local checkout without the image's JRE).
+    jwudtool_path: str = Field(
+        default="/usr/local/bin/jwudtool", alias="JWUDTOOL_PATH",
+    )
+
     # Extra free space (MB) a chained conversion (e.g. cso->iso->chd) keeps
     # beyond its estimated peak before starting. A chain holds source + full
     # intermediate + partial final at once, so it preflights disk headroom on
@@ -328,6 +336,18 @@ class Settings(BaseSettings):
     )
     romz_verify_timeout: int | None = Field(
         default=None, alias="COMPRESSATORIUM_ROMZ_VERIFY_TIMEOUT",
+    )
+    # jwud (JWUDTool, Wii U .wud <-> .wux): one conversion subprocess. Like
+    # makeps3iso its verify is pure Python (a WUX header/index-table walk, no
+    # child process), so only the shared nice/ioprio policy applies.
+    jwud_nice: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_JWUD_NICE",
+    )
+    jwud_ioprio_class: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_JWUD_IOPRIO_CLASS",
+    )
+    jwud_ioprio_level: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_JWUD_IOPRIO_LEVEL",
     )
     verify_progress_timeout: int = Field(
         default=0,

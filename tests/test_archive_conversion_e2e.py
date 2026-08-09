@@ -63,6 +63,9 @@ MATRIX = [
     (".chd", ConversionMode.EXTRACTRAW, ".raw"),
     (".chd", ConversionMode.EXTRACTHD, ".raw"),
     (".chd", ConversionMode.EXTRACTLD, ".avi"),
+    # Wii U: both directions map on the member's own extension, like z3ds/nsz.
+    (".wud", ConversionMode.JWUD_COMPRESS, ".wux"),
+    (".wux", ConversionMode.JWUD_DECOMPRESS, ".wud"),
 ]
 
 

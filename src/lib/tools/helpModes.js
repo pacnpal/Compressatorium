@@ -63,6 +63,12 @@ export const MODE_BLURBS = {
     + 'Pick an effort preset (Fast/Default/Max).',
   romz_zip: 'Compress to a .zip archive (broadest compatibility). Same effort presets.',
   romz_extract: 'Extract the ROM back out of a .7z/.zip archive.',
+  // Wii U
+  jwud_compress:
+    'Pack a 25 GB Wii U disc dump into a .wux. No settings — WUX deduplicates '
+    + 'repeated sectors. JWUDTool compares the result against the source before '
+    + 'the job finishes.',
+  jwud_decompress: 'Restore the original .wud from a .wux, byte for byte.',
   // PS3
   folder_to_iso:
     'Pack a decrypted PS3 folder into an .iso RPCS3 mounts. An optional toggle '

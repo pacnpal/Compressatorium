@@ -319,8 +319,8 @@ class BaseTool:
 ### 3.3 `runner.py`: shared subprocess orchestration
 
 This collapses the ~150 near-identical lines that were duplicated in every
-tool's `convert()`. All seven conversion tools now delegate their streaming loop
-here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso` directly, and
+tool's `convert()`. All eight conversion tools now delegate their streaming loop
+here: `chdman`, `dolphin_tool`, `romz`, `makeps3iso`, `jwudtool` directly, and
 `z3ds_compress`, `maxcso`, `nsz` via the size-based-progress seam below (their
 CLIs print no parseable percent, so the growing output file is the progress
 signal).

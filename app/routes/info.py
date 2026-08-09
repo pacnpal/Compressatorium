@@ -16,6 +16,7 @@ from models import (
     ConversionMode,
     CsoInfo,
     DolphinDiscInfo,
+    JwudInfo,
     MetadataBatchRequest,
     NszInfo,
     RomzInfo,
@@ -31,6 +32,11 @@ from services.disc_id import (
 from services.dolphin_tool import (
     DOLPHIN_CONVERTIBLE_EXTENSIONS,
     dolphin_tool_service,
+)
+from services.jwudtool import (
+    JWUD_COMPRESS_EXTENSIONS,
+    JWUD_DECOMPRESS_EXTENSIONS,
+    jwudtool_service,
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
@@ -555,6 +561,14 @@ def _is_romz_info_file(path: str) -> bool:
     return ext in ROMZ_INFO_EXTENSIONS
 
 
+JWUD_INFO_EXTENSIONS = JWUD_COMPRESS_EXTENSIONS | JWUD_DECOMPRESS_EXTENSIONS
+
+
+def _is_jwud_info_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext in JWUD_INFO_EXTENSIONS
+
+
 @router.get("/info", response_model=CHDInfo)
 async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
     """Get information about a CHD file (cached with mtime-based invalidation)."""
@@ -922,6 +936,46 @@ async def get_romz_info(
         ) from None
 
 
+@router.get("/jwud-info", response_model=JwudInfo)
+async def get_jwud_info(
+    path: str = Query(..., description="Path to a Wii U .wud or .wux image"),
+):
+    """Get basic information about a Wii U disc image."""
+    if not await run_in_threadpool(
+        is_within_configured_volumes, path, treat_archives=False,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path outside configured volumes",
+        )
+    if not await run_in_threadpool(os.path.isfile, path):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not _is_jwud_info_file(path):
+        raise HTTPException(
+            status_code=400,
+            detail="Not a supported Wii U disc image format (.wud, .wux)",
+        )
+
+    try:
+        info = await run_in_threadpool(jwudtool_service.info, path)
+        return JwudInfo(
+            file=info["file"],
+            size=info["size"],
+            size_display=info["size_display"],
+            format=info.get("format"),
+            extension=info["extension"],
+            compressed=info["compressed"],
+            compression_type=info.get("compression_type"),
+            original_size=info.get("original_size"),
+            ratio=info.get("ratio"),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read Wii U image info: {e!s}",
+        ) from None
+
+
 @router.get("/tools")
 async def list_tools():
     """Which tools the frontend should show.
@@ -1050,6 +1104,15 @@ _VERIFY_CONFIG: dict[str, _VerifyRouteConfig] = {
         batch_name="verify_cso_batch_events",
         bad_ext_detail="Not a supported compressed CSO format (.cso, .zso, .dax)",
         verify_error_prefix="Failed to verify CSO file",
+    ),
+    "jwud": _VerifyRouteConfig(
+        url_prefix="jwud-",
+        service=lambda: jwudtool_service,
+        sync_name="verify_jwud",
+        events_name="verify_jwud_events",
+        batch_name="verify_jwud_batch_events",
+        bad_ext_detail="Not a compressed Wii U disc image (.wux)",
+        verify_error_prefix="Failed to verify Wii U image",
     ),
     "romz": _VerifyRouteConfig(
         url_prefix="romz-",
@@ -1388,4 +1451,7 @@ verify_cso, verify_cso_events, verify_cso_batch_events = register_verify_routes(
 )
 verify_romz, verify_romz_events, verify_romz_batch_events = register_verify_routes(
     router, registry.get("romz"),
+)
+verify_jwud, verify_jwud_events, verify_jwud_batch_events = register_verify_routes(
+    router, registry.get("jwud"),
 )

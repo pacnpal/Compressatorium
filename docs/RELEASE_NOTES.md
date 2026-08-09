@@ -7,6 +7,39 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
+  `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
+  how much of the disc a game uses, so the padding compresses dramatically: WUX
+  deduplicates repeated 32 KiB sectors and stores each distinct one once, and
+  Cemu reads the result directly. Two modes, `jwud_compress` and
+  `jwud_decompress`, both lossless, reversible, and with nothing to configure.
+
+  **No keys.** This only repacks the image, it never decrypts it — a `.wux`
+  carries exactly the same encrypted content as the `.wud` it came from, so no
+  common key or title key is involved and none ships with the app. (JWUDTool's
+  decrypt/extract features do need your own keys; they are out of scope here.)
+
+  Every conversion is verified against its source: JWUDTool's own pass re-reads
+  both images and compares them byte for byte before the job reports success, so
+  a compress job takes about twice as long as writing the output alone and a
+  mismatch fails the job instead of leaving a bad image in place. The progress
+  bar covers both phases (conversion 1–50 %, verification 51–99 %).
+
+  The `/api/jwud-verify` endpoints check a `.wux` structurally — header magic and
+  fields, then every sector-index entry against the file's real length — which
+  catches a truncated copy or a corrupt index table, and is as deep as the format
+  allows since WUX stores no content checksums. Only `.wux` is verifiable, so
+  delete-on-verify is offered on compress but not on decompress. `/api/jwud-info`
+  reads the same header, reporting the original image size and the ratio.
+
+  Both directions also accept a member straight out of a ZIP/7z/RAR. New env var:
+  `JWUDTOOL_PATH` (default `/usr/local/bin/jwudtool`). JWUDTool is a Java program,
+  so the image now installs a headless JRE plus the pinned, SHA256-checked
+  upstream release jar behind a small launcher; the jar is architecture-
+  independent, so both `linux/amd64` and `linux/arm64` are covered. The tool
+  hides itself in the UI (via the `is_ready()` hook) when no launcher is present,
+  which is what a local checkout without Java sees.
+
 - **Two per-tool branches on shared paths became plugin hooks
   (`overwrite_targets`, `is_ready`).** Both were single-tool special cases
   sitting on code every tool runs through, so a *second* tool of the same shape

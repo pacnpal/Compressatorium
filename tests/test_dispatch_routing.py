@@ -43,6 +43,8 @@ def _legacy_dispatch_id(mode: str) -> str:
         return "cso"
     if mode.startswith("romz_"):
         return "romz"
+    if mode.startswith("jwud_"):
+        return "jwud"
     return "chdman"
 
 
@@ -57,7 +59,8 @@ def test_verify_dispatch_matches_legacy_ladder(mode, monkeypatch):
 
         return _verify
 
-    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso"):
+    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso",
+                    "jwud"):
         monkeypatch.setattr(
             registry.get(tool_id)._service, "verify", _record(tool_id)
         )
@@ -84,7 +87,8 @@ def test_convert_dispatch_matches_legacy_ladder(mode, monkeypatch):
 
         return _convert
 
-    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso"):
+    for tool_id in ("chdman", "dolphin", "z3ds", "nsz", "cso", "romz", "makeps3iso",
+                    "jwud"):
         monkeypatch.setattr(
             registry.get(tool_id)._service, "convert", _record(tool_id)
         )

@@ -53,6 +53,8 @@ class ConversionMode(str, Enum):
     ROMZ_7Z = "romz_7z"
     ROMZ_ZIP = "romz_zip"
     ROMZ_EXTRACT = "romz_extract"
+    JWUD_COMPRESS = "jwud_compress"
+    JWUD_DECOMPRESS = "jwud_decompress"
     FOLDER_TO_ISO = "folder_to_iso"
     METADATA_SCAN = "metadata_scan"
     DAT_MATCH = "dat_match"
@@ -279,6 +281,15 @@ class RomzInfo(BasicFileInfo):
     # Archive-only extras: the single ROM inside, its uncompressed size, and the
     # archive-to-original size ratio (None for a loose ROM source).
     contained_name: str | None = None
+    original_size: int | None = None
+    ratio: str | None = None
+
+
+class JwudInfo(BasicFileInfo):
+    """Information about a Wii U disc image (.wud) or its .wux container."""
+    # WUX-only extras, read straight from the container header: the size of the
+    # image it decompresses back to, and the resulting compression ratio (None
+    # for a raw .wud source, which carries no such header).
     original_size: int | None = None
     ratio: str | None = None
 
