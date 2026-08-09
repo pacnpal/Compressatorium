@@ -44,7 +44,10 @@ and #179, part of the #177 tech-debt epic).
   delete-on-verify takes the whole set instead of orphaning eleven parts. A
   half-copied set, one with a gap, an orphan part and an archived part all keep
   their own name — none of them can produce the disc, so none of them may claim
-  its output and risk overwriting an unrelated finished image.
+  its output and risk overwriting an unrelated finished image. Output detection
+  gained a matching `from_archive` flag (`ToolPlugin.detect_output`), so an
+  archive member is never mistaken for a real file with real neighbours; the
+  seven pre-existing tools ignore it.
 
   **Delete-on-verify is guarded per job (`delete_on_verify_is_safe`).** A third
   input-side hook, because the verification toggle below would otherwise create

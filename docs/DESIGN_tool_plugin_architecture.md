@@ -991,9 +991,22 @@ dump, a set with a hole in it, an orphan part, and an archive member (whose
 synthesised path has no set behind it on disk) all keep their own stem. The
 reason is `allow_overwrite`: an input that claims `game.wux` but cannot produce
 it would let the worker unlink an unrelated finished image *before* JWUDTool
-failed. Deriving it from disk state rather than a flag also keeps
-`detect_output` — which has no archive parameter to consult — landing on the
-same path the archive planner targets.
+failed.
+
+Disk state answers that for a real path, but an **archive member's path is
+synthesised** — the location it would occupy once extracted — so reading its
+directory reads someone else's files. `ToolPlugin.detect_output` therefore takes
+`from_archive` (default `False`), the listing-side counterpart of the
+`treat_as_stem` `plan_job` already passes for the same member;
+`_detect_archive_member_outputs` sets it and `JwudTool` forwards it to
+`output_path`. The other seven tools ignore it, because they swap a suffix and a
+synthesised path resolves like a real one. It lives on the seam rather than in
+jwud because the property is general: extraction hands over one member and never
+its siblings, so a member can only ever produce a single-file output — a future
+tool whose output name depends on its input's neighbours would otherwise inherit
+the wrong answer silently. Without it, an archive holding `game_part1.wud` next
+to a genuinely extracted set badges the set's `game.wux` while the planner
+targets `game_part1.wux`.
 
 #### Per-job delete-on-verify guard (`delete_on_verify_is_safe`)
 
