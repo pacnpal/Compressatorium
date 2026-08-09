@@ -331,7 +331,7 @@ the non-obvious rows is in §8 to §14.
 | 23 | `tests/test_<tool>_routes.py` | Info + verify endpoint tests (copy `test_z3ds_routes.py`). | New tool |
 | 24 | `tests/test_<tool>_service.py` | `convert`/`verify`/cancel/bad-extension tests (copy `test_z3ds_verification_service.py`). | New tool |
 | 25 | `tests/test_tool_registry.py` | Assert your modes resolve to your tool and the spec flags are right. Bump the resolved-mode count (currently `29`), extend the `_legacy_tool_for_mode` ladder, the `convertible_extensions` union, `tools_for_input`/`tool_for_verify` cases, and the `output_path` + `output_extensions` parametrize lists. | New tool/mode |
-| 26 | `tests/test_mode_parity_fixes.py` | Add the mode so single-vs-batch validation parity is enforced; update the delete-on-verify error-message assertions if your compress mode supports it. See also `tests/test_single_batch_plan_parity.py`. | New mode |
+| 26 | `tests/test_single_batch_plan_parity.py` | **This** is the single-vs-batch parity matrix: add your mode + a representative input to the `_cases()` table. `tests/test_mode_parity_fixes.py` has no per-mode matrix — it holds targeted regressions (delete-on-verify messages, external modes, the nsz level token), so touch it only if one of those applies to your tool. | New mode |
 | 26a | `tests/test_dispatch_routing.py` | Extend the convert/verify dispatch ladder (`_legacy_dispatch_id`) and the patched-tool tuple so your modes route to your service. | New tool |
 | 26b | `tests/test_files_outputs_parity.py` | **Usually nothing.** It asserts the *exact* tool-neutral `FileEntry` JSON surface (`convertible_by` / `outputs` / `verifiable_by` / …). Touch it only if you change that surface — adding a tool must not. | Rare |
 | 26c | `tests/test_frontend_registry_derives_186.py` | Runs the real JS under Node and fails if the registry-derived frontend facts drift: an unclassified tool in `TOOL_MEDIA`, an extension with no icon bucket, a mode with no `MODE_BLURBS` entry, a stale key, or a null-output mode with no `MODE_OUTPUT` override. Nothing to edit — it's the guard that tells you what you forgot. | New tool/mode (guard) |
@@ -450,8 +450,8 @@ shows up wherever `registry.modesByGroup('chdman')` or
 
 ### 4.5 Test
 
-Add a case to `tests/test_mode_parity_fixes.py` (validation parity between single
-+ batch create), `tests/test_tool_registry.py` (the mode resolves to chdman with
+Add a case to `tests/test_single_batch_plan_parity.py`'s `_cases()` table
+(validation parity between single + batch create), `tests/test_tool_registry.py` (the mode resolves to chdman with
 the right flags), and `tests/test_chdman_annotations.py` if relevant.
 
 ---
@@ -474,13 +474,19 @@ for the stage list). Pick the one that fits:
 - **Build from source in the `builder` stage** (z3ds), then copy the artifact
   into the runtime image.
 
-For `nszip` built from source, add to the `builder` stage. Note the base image
-is **digest-pinned** — copy the `FROM` line from the repo's `Dockerfile`
-verbatim rather than writing a bare `debian:trixie-slim` tag, so the supply-chain
-pin holds (see §8):
+For `nszip` built from source, give it **its own builder stage with a unique
+alias**, the way `maxcso-builder` and `makeps3iso-builder` already do — a
+per-tool stage caches independently, and reusing the existing `builder` alias on
+a second `FROM` would declare a duplicate stage name that `COPY --from=builder`
+can't resolve unambiguously. (To extend the existing `builder` stage instead,
+append the `RUN` lines to it and write **no** `FROM` at all.)
+
+Note the base image is **digest-pinned** — copy the `FROM` line from the repo's
+`Dockerfile` verbatim rather than writing a bare `debian:trixie-slim` tag, so
+the supply-chain pin holds (see §8):
 
 ```dockerfile
-FROM debian:trixie-slim@sha256:<the digest already used in the Dockerfile> AS builder
+FROM debian:trixie-slim@sha256:<the digest already used in the Dockerfile> AS nszip-builder
 RUN apt-get update -o Acquire::Retries=3 && \
     apt-get install -y --no-install-recommends \
       git build-essential libzstd-dev ca-certificates && \
@@ -492,8 +498,11 @@ RUN g++ -O3 src/*.cpp -o nszip -lzstd && chmod +x nszip
 …and copy it into the runtime stage next to the existing z3ds copy:
 
 ```dockerfile
-COPY --from=builder /tmp/nszip/nszip /usr/local/bin/nszip
+COPY --from=nszip-builder /tmp/nszip/nszip /usr/local/bin/nszip
 ```
+
+The `--from` alias must match the stage alias above. If you appended to the
+shared `builder` stage instead of adding your own, copy `--from=builder`.
 
 If the tool needs a runtime shared lib, add it to the runtime `apt-get install`
 list. The `zstd` CLI is already installed (z3ds's `verify_stream` shells out to
@@ -644,21 +653,26 @@ class NszipTool(BaseTool):
 
     def __init__(self, binary_path):
         super().__init__(binary_path)
+        # Hold the service on `self._service` and delegate through it — every
+        # reference plugin does. `tests/test_dispatch_routing.py` monkeypatches
+        # `registry.get("<tool>")._service`, so a plugin that instead calls the
+        # module-global singleton directly makes that suite AttributeError.
+        self._service = nszip_service
 
     def output_path(self, mode, input_path, output_dir=None, *, treat_as_stem=False):
-        return nszip_service.get_output_path(input_path, output_dir)
+        return self._service.get_output_path(input_path, output_dir)
 
     def convert(self, input_path, output_path, mode, *, compression=None,
                 split=False, cancel_event=None):
-        return nszip_service.convert(input_path, output_path, mode,
+        return self._service.convert(input_path, output_path, mode,
                                      compression=compression, split=split,
                                      cancel_event=cancel_event)
 
-    async def verify(self, path): return await nszip_service.verify(path)
-    def verify_stream(self, path): return nszip_service.verify_stream(path)
-    async def info(self, path): return await run_in_threadpool(nszip_service.info, path)
-    def info_model(self, raw, path): return NszipInfo(**raw)
-    def active_pids(self): return nszip_service.active_pids()
+    async def verify(self, path): return await self._service.verify(path)
+    def verify_stream(self, path): return self._service.verify_stream(path)
+    async def info(self, path): return await run_in_threadpool(self._service.info, path)
+    def info_model(self, raw, path): return NszipInfo(**self._basic_info_fields(raw))
+    def active_pids(self): return self._service.active_pids()
 ```
 
 **Critical service rules** (all enforced by the existing services, copy them):
@@ -1035,8 +1049,9 @@ Add, modeled on the existing suites:
   bad-extension rejection (copy `tests/test_z3ds_verification_service.py`).
 - Extend `tests/test_tool_registry.py` so your mode resolves to your tool with
   the right spec flags (and bump the resolved-mode count).
-- Extend `tests/test_mode_parity_fixes.py` so single-job and batch-job validation
-  stay in lockstep for the new mode.
+- Add your mode to `tests/test_single_batch_plan_parity.py`'s `_cases()` table
+  so single-job and batch-job validation stay in lockstep. (`test_mode_parity_fixes.py`
+  is targeted regressions, not a per-mode matrix — add there only if one applies.)
 - Extend `tests/test_dispatch_routing.py` so convert + verify dispatch to your
   service.
 
@@ -1045,7 +1060,7 @@ Run them:
 ```bash
 # from the repo root, with app/ on PYTHONPATH
 PYTHONPATH=app python -m pytest -q tests/test_nszip_routes.py \
-    tests/test_tool_registry.py tests/test_mode_parity_fixes.py
+    tests/test_tool_registry.py tests/test_single_batch_plan_parity.py
 ```
 
 **`tests/conftest.py` does *not* stub tool binaries** — it is DB-only. Each
@@ -1154,7 +1169,8 @@ FRONTEND
 TESTS + DOCS
 [ ] tests/test_<tool>_routes.py, tests/test_<tool>_service.py
 [ ] extend: test_tool_registry (bump mode count), test_dispatch_routing,
-    test_mode_parity_fixes, and the archive matrix if archive-aware
+    test_single_batch_plan_parity (_cases table), and the archive matrix if
+    archive-aware
 [ ] tests/conftest.py: NOTHING — it's DB-only; mock per test file
 [ ] full suite green: PYTHONPATH=app python -m pytest -q tests
 [ ] README / RELEASE_NOTES / package.json version bump
@@ -1206,6 +1222,13 @@ the metadata, one `registry.register(...)` line, and one entry in the frontend
   the `cso` entry under `group: 'chain'`). Adding a second chain mode means a
   new `ChainSpec` and a mode row on an existing descriptor — not a new service
   layer and not a new `TOOLS` entry, both of which would duplicate surface.
+  `ChainTool` resolves the output candidate and the verify/info owner **per
+  spec** (`detect_output` takes the candidate extension from the mode that
+  accepts the input; verify/info resolve the owning spec by output extension,
+  since they arrive with a path and no mode), so a second chain ending in a
+  different format works without touching it. Both were `modes[0]` /
+  hard-coded-`.chd` lookups until they were generalized — if you're reading a
+  checkout that predates that, generalize them before adding a second chain.
 - **A second directory-input tool needs pipeline work first.** See the warning
   in §5.6.
 
@@ -1465,7 +1488,7 @@ tests/test_nszip_service.py         convert/verify/cancel/bad-ext tests
 tests/test_tool_registry.py         mode resolves to nszip; counts + ext unions + matrices
 tests/test_dispatch_routing.py      extend convert/verify dispatch ladder
 tests/test_frontend_registry_derives_186.py  guard only — run it, don't edit it
-tests/test_mode_parity_fixes.py     add nszip_compress to the parity matrix
+tests/test_single_batch_plan_parity.py  add nszip_compress to the _cases() matrix
 tests/test_archive_conversion_e2e.py + test_archive_preference.py  archive matrix (if archive-aware)
 tests/conftest.py                   DB-only; no tool-binary stub (mocks live per-test-file)
 tests/test_files_outputs_parity.py  nothing to add — it pins the tool-neutral FileEntry surface
@@ -1492,7 +1515,7 @@ DEPLOYMENT.md / DOCKER-COMPOSE.md    new env var, if any
   when you add a mode that doesn't fit an existing family.
 - **Single-job and batch endpoints must validate identically.** `create_job` and
   `create_batch_jobs` in `convert.py` share `plan_job`, and
-  `tests/test_mode_parity_fixes.py` exists to catch drift. Keep them in lockstep.
+  `tests/test_single_batch_plan_parity.py` exists to catch drift. Keep them in lockstep.
 - **The verify lane is global.** All verification across all tools shares
   `MAX_VERIFY_CONCURRENCY` via `workload_limiter`. The verify-route factory
   acquires the token for you (`_acquire_verify_lane_or_429`); don't bypass it.
