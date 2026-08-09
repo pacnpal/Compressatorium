@@ -909,8 +909,15 @@ on a multi-gigabyte image.
   claim `.iso` as a verify extension — verify routing picks the first tool
   matching an extension, so claiming it would hijack the Verify action for every
   CD/DVD ISO in a library (the same reason Dolphin keeps `.iso` off its verify
-  list). Consequently `nkit_restore` offers no delete-on-verify. **`nkit_to_rvz`
-  does**, because its product is a `.rvz` Dolphin can verify.
+  list).
+- **No delete-on-verify, for either mode.** `nkit_restore` has nothing to verify
+  its output against. `nkit_to_rvz` produces a `.rvz` Dolphin *can* verify, but
+  that check is structural — it confirms the RVZ container, not that the disc
+  inside matches the original. A Wii image restored without its update partition
+  (see below) yields a cleanly verifying RVZ that is nonetheless not bit-exact,
+  and deleting the NKit source on that evidence would destroy the only file a
+  later recovery-enabled restore could use. Delete the source yourself once
+  you're satisfied with the result.
 - **Removed Wii update partitions.** Some Wii images were shrunk by dropping the
   update (system-menu/IOS) partition, whose data is not in the file and cannot be
   regenerated. By default (`NKIT2ISO_RECOVERY=none`) that region is zero-filled,

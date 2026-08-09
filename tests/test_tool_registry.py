@@ -417,14 +417,31 @@ def _mode_output_exts(tool, mode) -> set[str]:
     }
 
 
-def test_delete_on_verify_iff_output_is_verifiable():
-    """Any platform/file that supports verify should support verify-and-delete.
+# Modes with a verifiable output that still decline delete-on-verify, each for a
+# reason a registry-wide rule can't see. Deliberately a literal allow-list: a new
+# entry should be an argued decision, not a silent flag flip.
+#
+# nkit_to_rvz: dolphin's RVZ verify is STRUCTURAL — it confirms the container,
+# not that the disc inside matches the original. A Wii source whose update
+# partition was removed restores zero-filled with its CRC32 check skipped
+# (NKIT2ISO_RECOVERY=none) and still yields a cleanly-verifying RVZ, so deleting
+# the NKit source on that evidence destroys the only file a later
+# NKIT2ISO_RECOVERY=download run could restore bit-exact.
+_DELETE_ON_VERIFY_DECLINED = {"nkit_to_rvz"}
 
-    Delete-on-verify removes the source only after the produced output passes
-    verification, so it is safe exactly when *every* output a mode can produce
-    is itself verifiable (its extension is in the tool's verify set). This locks
-    that invariant in registry-wide, so a future tool can't add a verifiable
-    output without also enabling delete-on-verify (or vice versa).
+
+def test_delete_on_verify_requires_a_verifiable_output():
+    """Delete-on-verify implies a verifiable output — but not the converse.
+
+    The safety-critical direction is one-way: a mode may only delete its source
+    after verifying the output, so *every* output it can produce must itself be
+    verifiable (its extension is in the owning tool's verify set). That is
+    asserted for every mode, with no exceptions.
+
+    The reverse ("verifiable output, therefore delete") used to be asserted too,
+    and is wrong: verification proves the output is well-formed, not that the
+    conversion preserved the source's content. A mode whose pipeline can be
+    lossy declines the flag via ``_DELETE_ON_VERIFY_DECLINED`` above.
     """
     for tool in registry.all():
         for mode in tool.modes:
@@ -438,7 +455,23 @@ def test_delete_on_verify_iff_output_is_verifiable():
             else:
                 vexts = tool.verify_extensions
             verifiable = bool(outs) and outs <= vexts
-            assert mode.supports_delete_on_verify == verifiable, (
-                f"{mode.mode}: supports_delete_on_verify={mode.supports_delete_on_verify} "
-                f"but outputs {sorted(outs)} verifiable against {sorted(vexts)} = {verifiable}"
-            )
+
+            if mode.supports_delete_on_verify:
+                assert verifiable, (
+                    f"{mode.mode}: deletes its source after verify, but its "
+                    f"outputs {sorted(outs)} are not verifiable against "
+                    f"{sorted(vexts)} — the source would be dropped on no evidence"
+                )
+            elif verifiable:
+                assert mode.mode in _DELETE_ON_VERIFY_DECLINED, (
+                    f"{mode.mode}: outputs {sorted(outs)} are verifiable against "
+                    f"{sorted(vexts)}, so delete-on-verify should be enabled — or "
+                    f"added to _DELETE_ON_VERIFY_DECLINED with the reason why not"
+                )
+
+
+def test_declined_delete_on_verify_list_is_not_stale():
+    modes = {m.mode for t in registry.all() for m in t.modes}
+    assert _DELETE_ON_VERIFY_DECLINED <= modes
+    for name in _DELETE_ON_VERIFY_DECLINED:
+        assert registry.spec(name).supports_delete_on_verify is False

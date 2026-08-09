@@ -77,6 +77,11 @@ _GCZ_MAGIC = 0xB10BC001         # le32 at 0 of a .nkit.gcz container
 # disc header we need.
 _GCZ_HEADER = struct.Struct("<IIQQII")  # magic, sub_type, comp_size, data_size,
 #                                          block_size, num_blocks
+# Sanity bounds on header-supplied lengths (Dolphin writes 16 KiB blocks; 32 MiB
+# is far beyond anything real). A stored block can exceed block_size only by
+# zlib's worst-case expansion, so a small slack covers the legitimate case.
+_GCZ_MAX_BLOCK_SIZE = 32 * 1024 * 1024
+_GCZ_BLOCK_SLACK = 64 * 1024
 
 logger = get_logger("nkit2iso")
 
@@ -91,19 +96,37 @@ def _format_size(size: int) -> str:
     return f"{size_mb:.2f} MB" if size_mb < 1024 else f"{size_mb / 1024:.2f} GB"
 
 
-def _gcz_first_block(handle) -> bytes:
-    """Inflate the first block of a Dolphin GCZ container."""
+def _gcz_first_block(handle, file_size: int) -> bytes:
+    """Inflate the first block of a Dolphin GCZ container.
+
+    Every length here comes from the file, so every length is bounded against
+    the file's real size before it reaches a ``read()``: ``num_blocks`` alone
+    could otherwise ask for tens of gigabytes from a 40-byte crafted file and
+    turn an intended 422 into a ``MemoryError``. Only the first block is ever
+    needed (16 KiB or larger, so it always covers the 0x440-byte disc header),
+    so only the one or two pointers bounding it are read — never the whole
+    table.
+    """
     raw = handle.read(_GCZ_HEADER.size)
     if len(raw) < _GCZ_HEADER.size:
         raise NkitHeaderError("Truncated GCZ header")
     magic, _sub_type, comp_size, data_size, block_size, num_blocks = (
         _GCZ_HEADER.unpack(raw)
     )
-    if magic != _GCZ_MAGIC or not block_size or not num_blocks:
+    if magic != _GCZ_MAGIC or not block_size or not num_blocks or not data_size:
         raise NkitHeaderError("Invalid GCZ header")
+    if block_size > _GCZ_MAX_BLOCK_SIZE:
+        raise NkitHeaderError(f"Implausible GCZ block size ({block_size})")
 
-    pointers = handle.read(8 * num_blocks)
-    if len(pointers) < 8 * min(num_blocks, 2) or len(pointers) < 8:
+    # The block table is one u64 pointer plus one u32 hash per block. If it
+    # can't fit in the file, the header is lying and nothing below is safe.
+    data_offset = _GCZ_HEADER.size + 12 * num_blocks
+    if data_offset >= file_size:
+        raise NkitHeaderError("GCZ block table does not fit in the file")
+
+    # Just the pointers bounding block 0.
+    pointers = handle.read(16 if num_blocks > 1 else 8)
+    if len(pointers) < 8:
         raise NkitHeaderError("Truncated GCZ block table")
     first = struct.unpack_from("<Q", pointers, 0)[0]
     stored_raw = bool(first & (1 << 63))
@@ -113,12 +136,15 @@ def _gcz_first_block(handle) -> bytes:
     end = comp_size
     if num_blocks > 1 and len(pointers) >= 16:
         end = struct.unpack_from("<Q", pointers, 8)[0] & ~(1 << 63)
-    if end <= start:
+    if end <= start or data_offset + start >= file_size:
         raise NkitHeaderError("Invalid GCZ block table")
 
-    data_offset = _GCZ_HEADER.size + 8 * num_blocks + 4 * num_blocks
+    # Clamp to what the file actually holds *and* to what one block can inflate
+    # from, so a bogus comp_size / pointer pair can't drive a huge allocation.
+    available = file_size - (data_offset + start)
+    stored_len = min(end - start, available, block_size + _GCZ_BLOCK_SLACK)
     handle.seek(data_offset + start)
-    stored = handle.read(end - start)
+    stored = handle.read(stored_len)
     # Every block inflates to block_size except a truncated final block.
     want = min(block_size, data_size)
     if stored_raw:
@@ -137,11 +163,12 @@ def read_nkit_header(path: str) -> dict:
     is not an NKit v01 image — which is also the honest answer for a plain
     ``.iso`` someone renamed.
     """
+    file_size = os.path.getsize(path)
     with open(path, "rb") as handle:
         gcz = handle.read(4) == struct.pack("<I", _GCZ_MAGIC)
         handle.seek(0)
         if gcz:
-            head = _gcz_first_block(handle)[:_DISC_HEADER_SIZE]
+            head = _gcz_first_block(handle, file_size)[:_DISC_HEADER_SIZE]
         else:
             head = handle.read(_DISC_HEADER_SIZE)
 
@@ -382,9 +409,13 @@ class Nkit2IsoService:
         if not_exact:
             # Overrides the runner's terminal 100% message: the restore
             # succeeded, but the operator needs to know this ISO will not match
-            # a redump checksum.
+            # a redump checksum. ``warning`` marks it as a caveat a *chain* must
+            # carry into its own terminal message (a later step's messages would
+            # otherwise bury it); job_manager reads only progress/message, so
+            # the extra key is inert on a direct job.
             yield {
                 "progress": 100,
+                "warning": True,
                 "message": (
                     "NKit restore complete — playable, but NOT bit-exact: the "
                     "Wii update partition was removed at shrink time and was "

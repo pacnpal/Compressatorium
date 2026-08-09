@@ -1143,6 +1143,9 @@ PLUGIN (app/services/tools/<tool>.py)
     match_extension handles it, but write your own output-stem helper (§18)
 [ ] optional: expected_output_size() when a source header states the output size
     — only used by the chain preflight; default None falls back to output_ratio
+[ ] optional: mark an update `warning: True` when your tool reports a caveat about
+    its own output — a chain buries plain messages, and only marked ones survive
+    into its terminal message (design doc §3.3.3)
 
 REGISTER (app/services/tools/__init__.py)
 [ ] registry.register(<Tool>(settings.<tool>_path))

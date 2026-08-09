@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -372,3 +373,89 @@ def test_chain_preflight_falls_back_to_ratio_without_a_header_size(
 
     # output_ratio 3.0 for the restore step, 1.0 for the RVZ step.
     assert sorted(size for _p, size in seen) == [1000, 3000]
+
+
+def test_nkit_chain_has_no_delete_on_verify():
+    """Dolphin's RVZ verify is structural, not a match against the original.
+
+    A Wii image whose update partition was removed restores zero-filled with
+    the CRC32 check skipped, yet the resulting RVZ still verifies cleanly — so
+    deleting the NKit source on that evidence would destroy the only file a
+    later NKIT2ISO_RECOVERY=download run could restore bit-exact.
+    """
+    assert registry.spec("nkit_to_rvz").supports_delete_on_verify is False
+
+
+def test_chain_preserves_a_steps_warning_in_the_terminal_message(
+    nkit_chain_env, tmp_path, monkeypatch,
+):
+    """A later step's messages must not bury an earlier step's caveat."""
+    calls, _work = nkit_chain_env
+
+    def _warning_convert(input_path, output_path, mode, *,
+                         compression=None, cancel_event=None):
+        async def _gen():
+            yield {
+                "progress": 100,
+                "warning": True,
+                "message": "NKit restore complete — playable, but NOT bit-exact",
+            }
+            Path(output_path).write_bytes(b"0" * 32)
+
+        return _gen()
+
+    monkeypatch.setattr(registry.get("nkit"), "convert", _warning_convert)
+
+    src = tmp_path / "Wii.nkit.iso"
+    src.write_bytes(b"x" * 1000)
+    updates = _drain(
+        registry.for_mode("nkit_to_rvz").convert(
+            str(src), str(tmp_path / "Wii.rvz"), "nkit_to_rvz",
+        )
+    )
+
+    final = updates[-1]
+    assert final["progress"] == 100
+    assert "NOT bit-exact" in final["message"]
+    # Still reports that the chain finished — the RVZ is real and usable.
+    assert "Conversion complete" in final["message"]
+    assert final["warning"] is True
+
+
+def test_chain_without_warnings_keeps_the_plain_terminal_message(
+    nkit_chain_env, tmp_path,
+):
+    src = tmp_path / "Melee.nkit.iso"
+    src.write_bytes(b"x" * 1000)
+    updates = _drain(
+        registry.for_mode("nkit_to_rvz").convert(
+            str(src), str(tmp_path / "Melee.rvz"), "nkit_to_rvz",
+        )
+    )
+    assert updates[-1]["message"] == "Conversion complete"
+    assert "warning" not in updates[-1]
+
+
+def test_chain_preflight_runs_off_the_event_loop(nkit_chain_env, tmp_path, monkeypatch):
+    """The preflight blocks (header read, zlib inflate, statvfs).
+
+    Running it inline in the async worker stalls API requests and SSE updates
+    for every client while it waits on storage, which is exactly what a slow or
+    network-mounted volume produces.
+    """
+    src = tmp_path / "Melee.nkit.iso"
+    src.write_bytes(b"x" * 1000)
+    ran_in_worker_thread: list[bool] = []
+    main_thread = threading.current_thread()
+
+    def _record(*_args, **_kwargs):
+        ran_in_worker_thread.append(threading.current_thread() is not main_thread)
+
+    monkeypatch.setattr(chain_mod.ChainTool, "_preflight_headroom", _record)
+
+    _drain(
+        registry.for_mode("nkit_to_rvz").convert(
+            str(src), str(tmp_path / "Melee.rvz"), "nkit_to_rvz",
+        )
+    )
+    assert ran_in_worker_thread == [True]

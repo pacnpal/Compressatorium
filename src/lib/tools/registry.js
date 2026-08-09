@@ -553,9 +553,14 @@ export const TOOLS = [
         group: 'chain',
         outputExt: '.rvz', inputExtensions: NKIT_SOURCE_EXTS,
         supportsCompression: false, supportsCompressionLevel: false,
-        // The .rvz IS verifiable (Dolphin claims it), so the NKit source can be
-        // dropped against a confirmed output — unlike the plain restore.
-        supportsDeleteOnVerify: true, allowsArchiveInput: true },
+        // NO delete-on-verify, even though Dolphin can verify the .rvz: that
+        // check is structural (the container), not a match against the original
+        // disc. A Wii source whose update partition was removed restores
+        // zero-filled with its CRC32 check skipped, yet still yields a cleanly
+        // verifying RVZ — deleting the NKit source then would destroy the only
+        // file a recovery-enabled restore could ever use. Mirrors the backend
+        // ChainSpec; parity is enforced by tests/test_frontend_parity_186.py.
+        supportsDeleteOnVerify: false, allowsArchiveInput: true },
     ],
     // Info reads the NKit header (console, game, restored size, CRC32). No
     // verify: nkit2iso has none, and claiming `.iso` would hijack every CD/DVD
@@ -677,19 +682,32 @@ export const registry = {
    * can be claimed by more than one tool (a raw .iso is both a chdman
    * create source and a Dolphin disc) and only one actually reads it, so
    * callers try these in order and keep the first getInfo() that returns.
-   * Order: the verify-path owner, then source-claiming tools most-specific
-   * first. Tools without a getInfo binding are skipped.
+   * Order: most-specific claim first, with the verify-path owner winning ties.
+   * Tools without a getInfo binding are skipped.
    */
   infoToolsForPath: (path) => {
     if (!path) return [];
-    // Verify-path owner first, then every source-claiming tool, most specific
-    // claim first (so `.nkit.iso` reaches NKit before the `.iso` owners, whose
-    // readers can plausibly "succeed" on it and report the wrong thing).
-    // Dedup by reference (same TOOLS objects) and skip tools without getInfo.
-    const ordered = [
-      TOOLS.find((t) => endsWithAny(path, t.verifyExts)),
-      ...sourceToolsBySpecificity(path),
-    ];
+    // Rank EVERY claim — source or verify — by matched-extension length, so the
+    // tool that understands the container comes first. The verify owner must
+    // not simply be prepended: for `Game.nkit.gcz` that is Dolphin (via its
+    // generic `.gcz`), whose reader parses the GCZ and its embedded disc header
+    // successfully, so the modal would stop there and never reach /nkit-info.
+    // Verify ownership only breaks ties at equal specificity, which preserves
+    // the old order for every single-suffix path (e.g. a `.chd` still starts at
+    // chdman). Dedup by reference; skip tools without a getInfo binding.
+    const verifyOwner = matchVerifyTool(path);
+    const ordered = TOOLS
+      .map((t) => ({
+        t,
+        n: Math.max(
+          matchedExtLength(path, t.sourceExts),
+          matchedExtLength(path, t.verifyExts),
+        ),
+        v: t === verifyOwner ? 1 : 0,
+      }))
+      .filter((x) => x.n > 0)
+      .sort((a, b) => b.n - a.n || b.v - a.v)
+      .map((x) => x.t);
     const out = [];
     for (const t of ordered) {
       if (t && typeof t.getInfo === 'function' && !out.includes(t)) {

@@ -533,6 +533,25 @@ sits **above** the plugin contract rather than rewriting it.
 New chained conversions (xci→nsp, wud→wua, a future folder→iso→chd) are a new
 `ChainSpec` row + its component modes — no new machinery.
 
+#### A step can flag a caveat the chain must not bury (`warning`)
+
+Each step's updates overwrite the job's `message`, so a caveat an *earlier* step
+raised about its own output is gone by the time the chain finishes — and the
+terminal `{"progress": 100, "message": "Conversion complete"}` says nothing.
+That matters when the caveat changes what the output *is*: nkit2iso restoring a
+Wii image whose update partition was removed produces a playable but **not**
+bit-exact ISO, and `nkit_to_rvz` would otherwise report an unqualified success.
+
+A step opts in by marking that update with `warning: True`; `ChainTool` collects
+them and appends them to its own terminal message (itself marked `warning`).
+`job_manager` reads only `progress` and `message`, so the extra key is inert for
+a direct job and needs no contract change.
+
+Note what this does **not** buy: the flag arrives mid-run, long after
+`supports_delete_on_verify` was read at plan time. It informs the operator; it
+cannot gate the pipeline. That is why `nkit_to_rvz` declines delete-on-verify
+outright rather than conditionally — see the flag's comment in `chain.py`.
+
 #### `expected_output_size`: preflight sizing without a tool-specific import
 
 `ChainTool._preflight_headroom` has to bound three things at once (source, full

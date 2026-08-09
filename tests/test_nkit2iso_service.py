@@ -433,3 +433,89 @@ def test_expected_output_size_feeds_the_chain_preflight(tmp_path):
     assert registry.get("nkit").expected_output_size(
         str(src), "nkit_restore",
     ) == 4_000_000
+
+
+# --------------------------------------------------------------------------- #
+# Malformed-GCZ hardening (Codex review, PR #257)
+# --------------------------------------------------------------------------- #
+
+
+def _gcz_header(*, comp_size, data_size, block_size, num_blocks) -> bytes:
+    return struct.pack(
+        "<IIQQII", 0xB10BC001, 0, comp_size, data_size, block_size, num_blocks,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "blob"),
+    [
+        # num_blocks claims ~4 billion entries: 48 GB of block table that isn't
+        # there. Must be rejected from the header alone, never read.
+        ("huge_block_table",
+         _gcz_header(comp_size=64, data_size=1 << 20, block_size=1 << 15,
+                     num_blocks=0xFFFFFFFF) + b"\x00" * 64),
+        # block_size beyond anything real.
+        ("huge_block_size",
+         _gcz_header(comp_size=64, data_size=1 << 20, block_size=1 << 31,
+                     num_blocks=1) + b"\x00" * 64),
+        # comp_size lies about how many stored bytes follow block 0.
+        ("lying_comp_size",
+         _gcz_header(comp_size=1 << 40, data_size=1 << 20, block_size=1 << 15,
+                     num_blocks=1) + struct.pack("<Q", 0) + struct.pack("<I", 0)
+         + b"\x00" * 32),
+        # A block pointer past the end of the file.
+        ("pointer_past_eof",
+         _gcz_header(comp_size=1 << 20, data_size=1 << 20, block_size=1 << 15,
+                     num_blocks=1) + struct.pack("<Q", 1 << 30)
+         + struct.pack("<I", 0) + b"\x00" * 32),
+        ("zero_blocks",
+         _gcz_header(comp_size=64, data_size=1 << 20, block_size=1 << 15,
+                     num_blocks=0) + b"\x00" * 64),
+        ("truncated_header", b"\x01\xc0\x0b\xb1" + b"\x00" * 8),
+    ],
+)
+def test_malformed_gcz_is_rejected_not_allocated(tmp_path, name, blob):
+    """A crafted container must surface NkitHeaderError (-> 422), not blow up.
+
+    Every length in a GCZ header comes from the file; without bounds checks a
+    ~40-byte file can drive a multi-gigabyte read and MemoryError the worker.
+    """
+    src = tmp_path / f"{name}.nkit.gcz"
+    src.write_bytes(blob)
+    with pytest.raises(NkitHeaderError):
+        read_nkit_header(str(src))
+    # The chain preflight must degrade quietly on the same input.
+    assert nkit2iso_service.restored_size(str(src)) is None
+
+
+def test_valid_gcz_still_reads_after_hardening(tmp_path):
+    # The bounds must not reject a legitimate single-block container.
+    src = tmp_path / "Melee.nkit.gcz"
+    src.write_bytes(_gcz_wrap(_disc_header(wii=False)))
+    assert read_nkit_header(str(src))["platform"] == "GameCube"
+
+
+@pytest.mark.asyncio
+async def test_inexact_restore_update_is_marked_as_a_warning(tmp_path, monkeypatch):
+    """The caveat carries a ``warning`` flag so a chain can preserve it.
+
+    A later chain step's messages replace earlier ones, so without the marker
+    the "not bit-exact" caveat is silently lost in a nkit_to_rvz job.
+    """
+    source = tmp_path / "Wii.nkit.iso"
+    source.write_bytes(b"nkit")
+    out_iso = str(tmp_path / "Wii.iso")
+
+    async def fake_run(cmd, *, output_path, complete_message, **_kwargs):
+        Path(output_path).write_bytes(b"restored")
+        yield {"progress": 100, "message": "CRC32 check skipped — not bit-exact"}
+        yield {"progress": 100, "message": complete_message}
+
+    monkeypatch.setattr(nkit2iso_service._runner, "run", fake_run)
+
+    updates = [
+        u async for u in nkit2iso_service.convert(str(source), out_iso, "nkit_restore")
+    ]
+    assert updates[-1]["warning"] is True
+    # A clean restore carries no warning marker.
+    assert not any(u.get("warning") for u in updates[:-1])

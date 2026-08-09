@@ -43,16 +43,22 @@ and #179, part of the #177 tech-debt epic).
   version, the size the restored ISO will occupy, the CRC32 the restore is
   checked against, and the shrunk-to-original ratio. Worth a look before
   spending a restore on a multi-gigabyte image. A `.nkit.gcz` is handled by
-  inflating a single zlib block to reach the header. A file named `.nkit.iso`
-  whose bytes carry no NKit marker reports 422, not 500.
+  inflating a single zlib block to reach the header — with every header-supplied
+  length bounded against the file's real size first, so a crafted container
+  can't drive a multi-gigabyte read. A file named `.nkit.iso` whose bytes carry
+  no NKit marker reports 422, not 500.
 
 - **New one-step pipeline: `nkit_to_rvz` (NKit → ISO → RVZ).** The second
   `ChainSpec`, alongside `cso_to_chd`. NKit is a shrink format no emulator
   reads, so the restored ISO is nearly always a stepping stone to RVZ — which
   Dolphin reads natively and which compresses better than NKit anyway. Chaining
-  keeps the full-size ISO in a scratch directory instead of the library. Unlike
-  the plain restore this **does** support delete-on-verify, because its product
-  is a `.rvz` Dolphin can verify. The final RVZ uses dolphin's defaults; run the
+  keeps the full-size ISO in a scratch directory instead of the library. Neither
+  NKit mode offers delete-on-verify: dolphin's RVZ verify is *structural* (it
+  confirms the container, not that the disc inside matches the original), and a
+  Wii image restored without its update partition yields a cleanly verifying RVZ
+  that is not bit-exact — deleting the source on that evidence would destroy the
+  only file a later recovery-enabled restore could use. The final RVZ uses
+  dolphin's defaults; run the
   two steps as separate jobs to pick a codec and level (the RVZ codec guards in
   `_validate_request_compression` key on `spec.tool_id == "dolphin"`, and making
   them chain-aware would mean reading `ChainSpec.steps` from the route, which
@@ -174,6 +180,22 @@ and #179, part of the #177 tech-debt epic).
   names its product from the **first** step's stem plus the chain's own
   `output_ext` rather than delegating to the last step's tool, which would have
   produced `Game.nkit.rvz`; the result is identical for `cso_to_chd`.
+
+- **Chain steps can flag a caveat that survives to the terminal message.** A
+  later step's messages replace earlier ones, so anything an earlier step needs
+  the operator to *know* (nkit2iso restoring a Wii image without its update
+  partition: playable, but not bit-exact) was lost when the chain reported a
+  bare "Conversion complete". A step now marks such an update with
+  `warning: True` and `ChainTool` carries those into its own final message;
+  `job_manager` reads only `progress`/`message`, so the key is inert elsewhere.
+
+- **`test_delete_on_verify_iff_output_is_verifiable` became
+  `test_delete_on_verify_requires_a_verifiable_output`.** The old test asserted
+  equivalence in both directions. The safety-critical direction still holds for
+  every mode with no exceptions (delete ⇒ the output must be verifiable), but
+  the converse is wrong: verification proves an output is *well-formed*, not
+  that the conversion preserved the source. A mode whose pipeline can be lossy
+  now declines the flag via an explicit, documented allow-list.
 
 - **`ToolPlugin.expected_output_size(input_path, mode)`.** `ChainTool`'s
   disk-headroom preflight imported `services.maxcso.uncompressed_iso_size`

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from config import settings
 from models import OutputStatus
+from fastapi.concurrency import run_in_threadpool
 from services.disk import create_scratch_dir, ensure_headroom
 from services.lock_manager import lock_manager
 from utils.path_utils import match_extension
@@ -102,9 +103,17 @@ NKIT_TO_RVZ = ChainSpec(
     # pick a level by running nkit_restore and dolphin_rvz as two jobs.
     supports_compression=False,
     supports_compression_level=False,
-    # The final .rvz IS verifiable (dolphin claims .rvz), so the original NKit
-    # source can be dropped against a confirmed output.
-    supports_delete_on_verify=True,
+    # NO delete-on-verify, even though dolphin can verify the final .rvz. That
+    # verify is *structural* — it confirms the RVZ container, not that its
+    # contents match the original disc. When the source is a Wii image whose
+    # update partition was removed and NKIT2ISO_RECOVERY is "none", step 1
+    # zero-fills the gap and skips its CRC32 check, yet the resulting RVZ still
+    # verifies cleanly. Deleting the source on that evidence would destroy the
+    # only file a later NKIT2ISO_RECOVERY=download run could restore bit-exact.
+    # The flag is a static ModeSpec field read at plan time, before the restore
+    # can report whether it was exact, so there is no safe "only when exact"
+    # setting — and the failure mode is silent data loss. Off.
+    supports_delete_on_verify=False,
     allows_archive_input=True,
 )
 
@@ -209,7 +218,13 @@ class ChainTool(BaseTool):
         spec = self.spec(mode)
         work_dir = create_scratch_dir("cmptr-chain-")
         try:
-            self._preflight_headroom(input_path, output_path, spec, work_dir)
+            # Off the event loop: the preflight stats the source, asks the
+            # first step's plugin for a header-derived size (a read, and a zlib
+            # block for a .nkit.gcz), and calls statvfs on two volumes — all
+            # blocking, and all potentially slow on a network mount.
+            await run_in_threadpool(
+                self._preflight_headroom, input_path, output_path, spec, work_dir,
+            )
 
             total_weight = sum(s.weight for s in spec.steps) or 1.0
             weights = [s.weight / total_weight for s in spec.steps]
@@ -226,6 +241,14 @@ class ChainTool(BaseTool):
             current_in = input_path
             cumulative = 0.0
             intermediate_source = input_path  # what feeds the final (for tagging)
+            # Caveats a step raised about its own output. A later step's
+            # messages replace the earlier ones in the job row, so anything a
+            # step needs the operator to KNOW (nkit2iso restoring a Wii image
+            # without its update partition: playable, but not bit-exact) has to
+            # be carried to the terminal message or it is lost. Steps opt in by
+            # marking an update with ``warning``; job_manager reads only
+            # progress/message, so the extra key is inert everywhere else.
+            caveats: list[str] = []
 
             for i, step in enumerate(spec.steps):
                 tool = self._registry.for_mode(step.mode)
@@ -259,6 +282,8 @@ class ChainTool(BaseTool):
                     compression=step_compression, cancel_event=cancel_event,
                 ):
                     last_message = update.get("message") or last_message
+                    if update.get("warning") and last_message not in caveats:
+                        caveats.append(last_message)
                     raw = update.get("progress") or 0
                     aggregate = int(round(base + span * (raw / 100.0)))
                     yield {
@@ -275,7 +300,18 @@ class ChainTool(BaseTool):
             await self._registry.for_mode(final_step.mode).post_convert(
                 intermediate_source, output_path, final_step.mode,
             )
-            yield {"progress": 100, "message": "Conversion complete"}
+            complete = "Conversion complete"
+            if caveats:
+                # Keep the caveat AND the fact that the chain finished: the
+                # output is real and usable, it just isn't what an unqualified
+                # "complete" would imply.
+                yield {
+                    "progress": 100,
+                    "message": f"{complete} — {' '.join(caveats)}",
+                    "warning": True,
+                }
+            else:
+                yield {"progress": 100, "message": complete}
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -87,6 +87,10 @@ def _dump(tmp_path: Path) -> dict:
         " output_keys: Object.keys(MODE_OUTPUT),"
         " sections: helpModeSections(registry).map((s) => ({"
         "   title: s.title, rows: s.rows })),"
+        " info_order: Object.fromEntries(["
+        "   'Game.nkit.iso','Game.nkit.gcz','Game.iso','Game.gcz',"
+        "   'out.chd','disc.rvz','Game.cso','Game.7z'"
+        " ].map((p) => [p, registry.infoToolsForPath(p).map((t) => t.id)])),"
         "};\n"
         "process.stdout.write(JSON.stringify(__out));\n"
     )
@@ -158,3 +162,32 @@ def test_help_table_covers_exactly_the_registry_modes(tmp_path):
         for row in section["rows"]:
             assert row["note"], f"mode {row['mode']} rendered an empty blurb"
             assert row["out"], f"mode {row['mode']} rendered an empty output"
+
+
+def test_info_tool_order_prefers_the_most_specific_claim(tmp_path):
+    """A compound claim must outrank the generic tail — including a verify owner.
+
+    ``FileInfoModal`` keeps the first ``getInfo()`` that returns. Dolphin's
+    reader succeeds on both NKit forms (they carry a real GC/Wii disc header,
+    and a ``.nkit.gcz`` is a real GCZ), so if it is tried first the modal never
+    reaches ``/nkit-info`` and reports the shrunk image as an ordinary disc.
+    The ``.gcz`` case is the sharp one: Dolphin owns it as a *verify* extension.
+    """
+    order = _dump(tmp_path)["info_order"]
+
+    assert order["Game.nkit.iso"][0] == "nkit"
+    assert order["Game.nkit.gcz"][0] == "nkit"
+    # The generic-tail owners still follow as fallbacks, not replacements.
+    assert "dolphin" in order["Game.nkit.gcz"]
+
+    # Single-suffix paths keep their previous ordering: the verify owner leads
+    # where one exists, otherwise declared order.
+    assert order["out.chd"][0] == "chdman"
+    assert order["disc.rvz"][0] == "dolphin"
+    assert order["Game.cso"][0] == "cso"
+    assert order["Game.7z"][0] == "romz"
+    assert order["Game.iso"][0] == "chdman"
+    assert order["Game.gcz"][0] == "dolphin"
+    # A plain .iso/.gcz must never route Info at nkit.
+    assert "nkit" not in order["Game.iso"]
+    assert "nkit" not in order["Game.gcz"]
