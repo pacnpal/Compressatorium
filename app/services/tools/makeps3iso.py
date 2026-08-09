@@ -126,6 +126,19 @@ class MakePs3IsoTool(BaseTool):
             if part != output_path
         ]
 
+    def overwrite_targets(
+        self, output_path: str, mode: str,  # noqa: ARG002 - single-mode tool
+    ) -> list[str]:
+        """Base ISO + every numbered part, whether or not the base exists.
+
+        Wider than ``companion_outputs`` on purpose: that one reports the
+        *finished* set (parts only when there is no bare ``.iso``), but an
+        overwrite must also sweep the both-present state a ``-s`` build leaves
+        when it fails mid-split. Enumeration only — the pipeline does the
+        non-file check and the unlinking.
+        """
+        return self._service.output_artifacts(output_path)
+
     def convert(
         self,
         input_path: str,

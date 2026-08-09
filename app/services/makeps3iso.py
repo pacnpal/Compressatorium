@@ -216,16 +216,31 @@ class MakePs3IsoService:
         yield {"progress": 100, "message": message}
 
     @classmethod
+    def output_artifacts(cls, output_path: str) -> list[str]:
+        """The base output *and* any numbered split parts, base first.
+
+        Everything a run of this tool may have put on disk for ``output_path``,
+        including the states only a *failed* run produces: a mid-split failure
+        can leave both the not-yet-renamed base and some numbered parts, which
+        never coexist after a successful build. Deliberately not
+        ``split_parts`` (which stops at the base when it exists) — that one
+        describes a finished output, this one describes everything to sweep.
+
+        Backs both the failure cleanup here and the plugin's
+        ``overwrite_targets``, so the two can't drift.
+        """
+        return [output_path, *cls._numbered_parts(output_path)]
+
+    @classmethod
     def remove_outputs(cls, output_path: str) -> None:
         """Synchronously unlink the base output *and* any split parts.
 
-        Used both for failure cleanup here and for authorized overwrite cleanup
-        by the job pipeline (which gates the call on ``allow_overwrite``). A
-        mid-split failure can leave both the not-yet-renamed base and some
-        numbered parts, so clear both unconditionally (don't go through
-        ``split_parts``, which stops at the base when it exists).
+        Failure cleanup. Authorized-overwrite cleanup goes through the job
+        pipeline's tool-neutral path instead (``overwrite_targets``), which
+        additionally rejects non-file occupants rather than silently skipping
+        them the way this ``suppress(OSError)`` does.
         """
-        for target in [output_path, *cls._numbered_parts(output_path)]:
+        for target in cls.output_artifacts(output_path):
             with contextlib.suppress(OSError):
                 os.remove(target)
 
