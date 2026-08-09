@@ -822,30 +822,50 @@ class JobManager:
         # non-file occupant (a directory squatting on the primary or a companion
         # name) can't be unlinked, so reject before removing anything rather than
         # deleting the primary and then failing against the stray occupant.
-        targets = registry.for_mode(job.mode.value).overwrite_targets(
-            job.output_path, job.mode.value,
+        tool = registry.for_mode(job.mode.value)
+        mode, output_path = job.mode.value, job.output_path
+
+        # Enumeration is inside the hop, not before it: a tool's
+        # ``overwrite_targets`` may probe the disk (makeps3iso walks .0/.1/…),
+        # which would otherwise block the event loop on a slow/network volume.
+        await run_in_threadpool(
+            lambda: self._sweep_overwrite_targets(
+                tool.overwrite_targets(output_path, mode),
+            ),
         )
-        removed = await run_in_threadpool(self._sweep_overwrite_targets, targets)
-        if removed:
-            await verification_store.clear(job.output_path)
+        # Unconditional: an authorized overwrite replaces whatever lives at this
+        # path, so a verification record for it is stale even when the sweep
+        # removed nothing — the prior output may have been deleted by something
+        # else while the job sat in the queue. Letting the record survive would
+        # report the freshly built, unverified artifact as verified.
+        await verification_store.clear(output_path)
 
     @staticmethod
-    def _sweep_overwrite_targets(targets: list[str]) -> bool:
-        """Validate then unlink ``targets``; return whether anything was removed.
+    def _sweep_overwrite_targets(targets: list[str]) -> None:
+        """Validate then unlink ``targets``.
 
-        Blocking stat/unlink work, kept in one sync helper so the caller can run
-        the whole check-then-remove sequence off the event loop in a single hop
-        (it must stay atomic with respect to its own validation pass).
+        Blocking stat/unlink work, kept in one sync helper so the caller runs
+        the whole enumerate-check-remove sequence off the event loop in a single
+        hop (the check must stay atomic with respect to its own removals).
+
+        Uses ``lexists``/``islink`` rather than ``exists``/``isfile``: both of
+        the latter *follow* symlinks and so report False for a **dangling** one,
+        which would leave it in place for the converter to write through —
+        potentially landing the output outside the validated volume. Unlinking a
+        symlink removes the link itself and never its target, so a link sitting
+        on an authorized-overwrite path is safe to clear; anything else that
+        isn't a regular file (a directory, a device node) can't be unlinked at
+        all and is rejected before anything is removed.
         """
+        def _removable(path: str) -> bool:
+            return os.path.islink(path) or os.path.isfile(path)
+
         for target in targets:
-            if os.path.exists(target) and not os.path.isfile(target):
+            if os.path.lexists(target) and not _removable(target):
                 raise RuntimeError("Output path exists and is not a file")
-        removed = False
         for target in targets:
-            if os.path.isfile(target):
+            if os.path.lexists(target) and _removable(target):
                 os.remove(target)
-                removed = True
-        return removed
 
     def _get_queued_and_processing_jobs(self) -> tuple[list[str], list[str]]:
         """Get lists of queued and processing job IDs.

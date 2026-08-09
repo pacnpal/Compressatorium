@@ -39,13 +39,25 @@ and #179, part of the #177 tech-debt epic).
   path and no mode).
 
   No API or behavior change for existing tools — the makeps3iso, nsz and
-  `cso_to_chd` paths behave exactly as before. One deliberate refinement: an authorized overwrite
-  now clears the output's verification record whenever it removes *any*
-  artifact, not only the primary, so a stale record can't outlive a
-  primary-absent sweep. Tests: new `tests/test_tool_seams_generalized.py` pins
-  both hooks against a *synthetic* second tool, which is what catches a
-  regression back to an id/kind branch (asserting on makeps3iso or nsz alone
-  passes either way).
+  `cso_to_chd` paths behave exactly as before. Two deliberate refinements while
+  the sweep was being unified:
+
+  - **A dangling symlink on an output path is now removed rather than ignored.**
+    `os.path.exists`/`isfile` both follow symlinks and report `False` for a
+    dangling one, so the old file-job check skipped it silently and the
+    converter could write *through* the link — landing the output wherever it
+    pointed, outside the validated volume. The sweep now tests with
+    `lexists`/`islink` (unlinking a symlink removes the link, never its target)
+    and still rejects any other non-file occupant before removing anything.
+  - **An authorized overwrite always clears the output's verification record**,
+    even when the sweep removed nothing. If something else deleted the prior
+    output while the job sat queued, the record would otherwise survive and
+    report the freshly built, unverified artifact as verified.
+
+  Tests: new `tests/test_tool_seams_generalized.py` pins each hook against a
+  *synthetic* second tool (a fake directory tool, a gated non-nsz tool, a
+  `.foo`→`.bar` `ChainSpec`), which is what catches a regression back to an
+  id/kind branch — asserting on the single existing instance passes either way.
 
 - **Web UI/API authentication (opt-in).** Optional token authentication for the networked UI and `/api` routes, gated behind `COMPRESSATORIUM_ENABLE_AUTH` (default off). When enabled, operators can set `COMPRESSATORIUM_AUTH_TOKEN` (or legacy `CHD_AUTH_TOKEN`), or let the app generate a persistent token in `/config/auth_token`; `/health` remains unauthenticated for container health checks. The token is accepted only in request headers (HTTP Basic, `Authorization: Bearer`, or `X-Compressatorium-Token`) — never the URL query string — and state-changing requests are restricted to same-origin callers to prevent CSRF via cached browser credentials.
 

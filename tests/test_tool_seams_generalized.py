@@ -163,6 +163,81 @@ async def test_directory_job_still_rejects_a_non_file_primary(tmp_path, monkeypa
     assert out.is_dir(), "left intact, not partially clobbered"
 
 
+@pytest.mark.asyncio
+async def test_sweep_unlinks_a_dangling_symlink(tmp_path, monkeypatch):
+    """A dangling symlink on the output path must not survive the sweep.
+
+    ``os.path.exists``/``isfile`` both follow symlinks and report False for a
+    dangling one, so an existence check built on them skips it silently — and
+    the converter then writes *through* the link, landing the output wherever
+    it points, outside the validated volume. Unlinking removes the link, not
+    its target.
+    """
+    import app.services.job_manager as jm_module
+    from app.services.job_manager import job_manager
+
+    out = tmp_path / "MyGame.iso"
+    out.symlink_to(tmp_path / "does-not-exist")
+    assert not out.exists() and out.is_symlink()  # the blind spot
+
+    async def _noop_clear(_path):
+        return None
+
+    monkeypatch.setattr(jm_module.verification_store, "clear", _noop_clear)
+
+    job = ConversionJob(
+        id="ps3-dangling-link",
+        file_path=str(tmp_path / "MyGame"),
+        filename="MyGame",
+        mode=ConversionMode.FOLDER_TO_ISO,
+        status=JobStatus.PROCESSING,
+        created_at=datetime.now(timezone.utc),
+        output_path=str(out),
+        input_kind=InputKind.DIRECTORY,
+        allow_overwrite=True,
+    )
+
+    await job_manager._clear_existing_output(job)
+
+    assert not out.is_symlink(), "the link itself must be removed"
+
+
+@pytest.mark.asyncio
+async def test_verification_cleared_even_when_nothing_was_swept(tmp_path, monkeypatch):
+    """The record is stale whether or not the old output was still there.
+
+    If something else deleted the prior output while the job sat queued, the
+    sweep removes nothing — but a new artifact is about to be written at that
+    path, so a surviving record would mark it verified without verifying it.
+    """
+    import app.services.job_manager as jm_module
+    from app.services.job_manager import job_manager
+
+    cleared: list[str] = []
+
+    async def _record_clear(path):
+        cleared.append(path)
+
+    monkeypatch.setattr(jm_module.verification_store, "clear", _record_clear)
+
+    out = tmp_path / "Gone.chd"  # never created
+    job = ConversionJob(
+        id="vanished-output",
+        file_path=str(tmp_path / "Game.cue"),
+        filename="Game.cue",
+        mode=ConversionMode.CREATECD,
+        status=JobStatus.PROCESSING,
+        created_at=datetime.now(timezone.utc),
+        output_path=str(out),
+        input_kind=InputKind.FILE,
+        allow_overwrite=True,
+    )
+
+    await job_manager._clear_existing_output(job)
+
+    assert cleared == [str(out)]
+
+
 # --- ChainTool: per-spec resolution instead of modes[0] -----------------------
 
 def _second_chain_spec():
