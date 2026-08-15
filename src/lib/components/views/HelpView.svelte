@@ -459,6 +459,17 @@
       <dt>Can I batch different formats and tools at once?</dt>
       <dd>You can select a pile of files and queue them together. They all run through the same queue. Each file is converted by whichever tool and mode you set, so plan a batch around one tool at a time.</dd>
 
+      <dt>How do I select every file in a huge folder?</dt>
+      <dd>
+        The checkbox in the table header covers the page you're on. When the folder runs to
+        more than one page, ticking it puts a banner just under the selection bar offering the
+        rest — <em>"Select all 2,140 items in this folder"</em> — which takes the whole folder in
+        one click. Shift-clicking the header checkbox does the same thing directly. It picks up
+        only what the current tool and mode accept, and it honours the extension filter, so
+        filtering to <code>.iso</code> first selects just the ISOs. It works the same inside an
+        archive and on <strong>Search all</strong> results.
+      </dd>
+
       <dt>What happens to a job that fails?</dt>
       <dd>It moves to the failed tab with the error attached, and your source is untouched. Read the error, fix the cause (usually a codec, a bad dump, or no disk space), and requeue it.</dd>
 

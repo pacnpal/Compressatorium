@@ -7,6 +7,32 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Select all files across every page, not just the visible one.** The header
+  checkbox has always covered only the current page, so a folder of 2,000+ discs
+  meant ticking it once on each of 80-odd pages before a batch could be queued.
+  Now, as soon as anything is selected in a view that spans more than one page, a
+  banner appears under the selection bar offering the whole thing —
+  *"Select all 2,140 items in this folder"* — in a single click. Shift-clicking
+  the header checkbox does the same without going through the banner, mirroring
+  the shift-click range select on the rows. Once everything is selected the
+  banner confirms the scope (*"All 2,140 in this folder are selected, across all
+  43 pages"*) and offers **Deselect all**; the existing **Clear** still drops the
+  whole selection.
+
+  It is scoped to what you are actually looking at, and it works everywhere the
+  file list does: any tool, any mode, any file type. It selects exactly the rows
+  the current mode accepts as input — files under a file mode, convertible
+  folders under makeps3iso `folder_to_iso`, archives under `romz_extract` — and
+  it respects the active extension filter, so with `.iso` picked in a mixed
+  folder the offer reads *"Select all 2,100 `.iso` items"* and leaves the rest
+  alone. It works the same inside an archive view and in the recursive
+  **Search all** results (*"…in these search results"*), and it only appears when
+  there is genuinely something off-page to gain — a filter that narrows the list
+  down to one page shows no banner at all.
+
+  No extra loading is involved: pagination was already client-side slicing of the
+  listing the browser holds, so "all pages" is the set already in hand.
+
 - **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
   `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
   how much of the disc a game uses, so the padding compresses dramatically: WUX

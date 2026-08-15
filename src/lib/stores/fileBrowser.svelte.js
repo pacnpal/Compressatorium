@@ -195,6 +195,28 @@ class FileBrowserStore {
     return visible.every((e) => this.selectedFiles.has(e.path));
   }
 
+  /**
+   * Every selectable row in the CURRENT VIEW, across all pages — the whole
+   * post-sort, post-filter set, not just `visibleEntries`. Pagination here is
+   * purely client-side slicing of `filteredEntries`, so "all pages" needs no
+   * extra fetching: the rows are already in the store. Tool-agnostic by
+   * construction — it reuses `_isSelectable`, so the active mode's own input
+   * rules (files, folders under a directory-input mode, archives under
+   * romz_extract) decide what counts, and it works the same in a plain
+   * directory listing, an archive view, and the recursive "Search all" view
+   * (all three feed `filteredEntries`).
+   */
+  get selectableEntries() {
+    return this.filteredEntries.filter((e) => this._isSelectable(e));
+  }
+
+  /** True when every selectable row in the current view (all pages) is selected. */
+  get allFilteredSelected() {
+    const all = this.selectableEntries;
+    if (all.length === 0) return false;
+    return all.every((e) => this.selectedFiles.has(e.path));
+  }
+
   // ─── Volumes ──────────────────────────────────────────────────────────
   async loadVolumes() {
     this.volumesLoading = true;
@@ -659,6 +681,24 @@ class FileBrowserStore {
     } else {
       for (const e of visible) this.selectedFiles.set(e.path, e);
     }
+  }
+
+  /**
+   * Select every selectable row in the current view, across ALL pages —
+   * the "…and all N in this folder" escape hatch from the header checkbox,
+   * which only ever covers the visible page. Saves paging through 80+ pages
+   * ticking the header box on each one (issue: select-all across pages).
+   *
+   * Deliberately additive: rows already picked on other pages stay selected,
+   * so this can only ever grow the set. The inverse is `clearSelection()`.
+   */
+  selectAllFiltered() {
+    for (const e of this.selectableEntries) this.selectedFiles.set(e.path, e);
+  }
+
+  /** Deselect every row in the current view (all pages), leaving others intact. */
+  deselectAllFiltered() {
+    for (const e of this.selectableEntries) this.selectedFiles.delete(e.path);
   }
 
   clearSelection() {
