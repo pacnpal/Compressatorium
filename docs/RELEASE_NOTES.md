@@ -1,9 +1,12 @@
 # Release Notes
 
-## Unreleased
+## 4.4.0 (unreleased)
 
-Idempotency, robustness, determinism, and modularity hardening (issues #184, #183
-and #179, part of the #177 tech-debt epic).
+A file-list release for large libraries. Selecting a whole platform folder no
+longer means ticking the header checkbox once per page — 2,000+ discs spread over
+80-odd pages is a single click — and how many rows a page shows is finally yours
+to set. Both work under every tool and mode, inside archives, and across **Search
+all** results. Sections are newest-first.
 
 ### Added
 
@@ -52,7 +55,34 @@ and #179, part of the #177 tech-debt epic).
   off a hash of the whole folder just by looking at it. Selecting everything no
   longer needs a giant page anyway, now that Select all spans pages.
 
-- **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
+### Fixed
+
+- **Shift-click no longer breaks after the page shrinks.** The shift-click range
+  anchor was an index into the page you were on, but nothing kept it inside the
+  page actually on screen. Walk to a shorter last page (or narrow the extension
+  filter, or re-sort) and the next shift-click ran off the end of the row list and
+  threw, swallowing the click. The anchor is now clamped to the current page, so
+  the range simply stops at its end. Changing rows-per-page additionally starts a
+  fresh range, since repagination re-cuts the page and extending from a row picked
+  under a different layout is surprising even when it happens to be in bounds.
+
+## 4.3.0 (2026-08-09)
+
+Two new tools take the roster to nine, and the tech-debt epic lands. **NKit → ISO**
+(`nkit2iso`) restores an NKit-shrunk GameCube or Wii disc to a playable `.iso`,
+with a one-step `nkit_to_rvz` pipeline and a synthesized NKit info endpoint; and
+**Wii U** (`jwud`) converts `.wud` ↔ `.wux`, exploiting the fact that every Wii U
+image is the same 25 GB however much of the disc a game actually uses. Alongside
+them: opt-in token authentication for the networked UI and `/api` routes, README
+screenshots that regenerate themselves in CI, and the bulk of the #177 tech-debt
+epic — idempotency, determinism, and modularity hardening (issues #184, #183, #186
+and #179) that turned several per-tool branches into plugin hooks, made extension
+matching compound-aware, and put every tool on one shared subprocess loop.
+Sections are newest-first.
+
+### Added
+
+- **Wii U support: a new ninth tool, `jwud` (JWUDTool), converting `.wud` ↔
   `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
   how much of the disc a game uses, so the padding compresses dramatically: WUX
   deduplicates repeated 32 KiB sectors and stores each distinct one once, and
