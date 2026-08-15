@@ -999,25 +999,43 @@ class JobManager:
         return result
 
     async def _prune_jobs(self, *, exclude_id: Optional[str] = None):
+        """Trim finished jobs down to ``max_job_history``.
+
+        The cap counts **terminal** jobs only, never the queue. It used to gate on
+        the total job count, which conflated pending work with history: submitting
+        more than ``max_job_history`` files at once (easy now that Select All spans
+        every page — a Redump platform set is thousands) put the total permanently
+        over the cap, so every sweep deleted every terminal job it could find and
+        still couldn't get under it. The Completed and Failed tabs emptied
+        continuously mid-batch, and a run finished with no record of which files
+        failed. Queued jobs were never at risk — they simply aren't removable — but
+        they were being *counted*, which is what evicted the history.
+
+        Pending and processing jobs are therefore ignored here: a deep queue is a
+        queue, not a backlog of history to trim. ``exclude_id`` (the job that just
+        finished) still counts toward the cap but is never itself deleted.
+        """
         if self.max_job_history <= 0:
             return
-        if len(self.jobs) <= self.max_job_history:
-            return
 
-        removable = []
-        for job_id, job in self.jobs.items():
-            if job_id == exclude_id:
-                continue
-            if job.status in (
+        # Insertion order is creation order, so this is oldest-first and the
+        # slice below evicts the oldest history first.
+        terminal_ids = [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.status
+            in (
                 JobStatus.COMPLETED,
                 JobStatus.FAILED,
                 JobStatus.CANCELLED,
-            ):
-                removable.append(job_id)
-            if len(self.jobs) - len(removable) <= self.max_job_history:
-                break
+            )
+        ]
+        excess = len(terminal_ids) - self.max_job_history
+        if excess <= 0:
+            return
 
-        for job_id in removable:
+        removable = [job_id for job_id in terminal_ids if job_id != exclude_id]
+        for job_id in removable[:excess]:
             await self.delete_job(job_id)
 
     async def cancel_job(self, job_id: str) -> bool:

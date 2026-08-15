@@ -1,6 +1,28 @@
 # Release Notes
 
-## 4.4.0 (unreleased)
+## 4.4.1 (unreleased)
+
+A follow-up fix for the batch sizes 4.4.0 made easy to queue.
+
+### Fixed
+
+- **A deep queue no longer wipes your job history mid-run.** `MAX_JOB_HISTORY`
+  (default 500) caps how many *finished* jobs are kept, but it was gating on the
+  **total** job count — pending work included. Queue more than 500 files at once,
+  which 4.4.0's cross-page Select all makes a single click, and the total sat
+  permanently over the cap: every sweep then deleted every completed, failed and
+  cancelled job it could find and still couldn't get under it, because the rest
+  were queued and not removable. The Completed and Failed tabs emptied
+  continuously while the batch ran, so a finished 2,000-file conversion left no
+  record of which files had failed. The cap now counts terminal jobs only.
+  Queued and processing jobs were never at risk of deletion — they simply aren't
+  removable — but they were being *counted*, and that is what evicted the
+  history. Nothing else changes: history past the cap is still trimmed oldest
+  first, and the just-finished job is still preserved. `MAX_QUEUE_DEPTH`, the
+  opt-in backpressure ceiling on queued+processing jobs, is untouched and still
+  defaults to `0` (disabled).
+
+## 4.4.0 (2026-08-15)
 
 A file-list release for large libraries. Selecting a whole platform folder no
 longer means ticking the header checkbox once per page — 2,000+ discs spread over
