@@ -677,9 +677,14 @@ class FileBrowserStore {
     const idx = visible.findIndex((e) => e.path === entry.path);
 
     if (shift && this.lastSelectedIndex >= 0 && idx >= 0) {
-      const [start, end] = idx > this.lastSelectedIndex
-        ? [this.lastSelectedIndex, idx]
-        : [idx, this.lastSelectedIndex];
+      // Clamp the anchor into THIS page. `lastSelectedIndex` is an index into
+      // the current page's selectable rows, so anything that reshapes the page
+      // can leave it past the end: a smaller Rows-per-page, a narrowing
+      // extension filter, a re-sort, or simply paging to a shorter last page.
+      // Iterating up to a stale anchor then walked off the end of `visible` and
+      // threw on `visible[i].path` (TypeError), losing the click entirely.
+      const anchor = Math.min(this.lastSelectedIndex, visible.length - 1);
+      const [start, end] = idx > anchor ? [anchor, idx] : [idx, anchor];
       for (let i = start; i <= end; i += 1) {
         this.selectedFiles.set(visible[i].path, visible[i]);
       }
@@ -774,6 +779,11 @@ class FileBrowserStore {
     this.pageSize = n;
     this.page = Math.floor(firstVisibleIndex / n) + 1;
     this._clampPage();
+    // Repagination re-cuts the page, so a row's index within it no longer means
+    // what it did; drop the shift-click range anchor rather than have the next
+    // shift-click extend from a row the user picked under a different layout.
+    // (`toggleSelect` also clamps defensively — this is about intent, not safety.)
+    this.lastSelectedIndex = -1;
     writeString(STORAGE_KEYS.PAGE_SIZE, n);
   }
 }
