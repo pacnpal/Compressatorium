@@ -401,3 +401,58 @@ async def test_finish_external_job_prunes_old_completed_jobs():
     assert len(mgr.jobs) <= 3
     # The just-finished job must be preserved
     assert j4.id in mgr.jobs
+
+
+@pytest.mark.asyncio
+async def test_deep_queue_does_not_evict_finished_history():
+    """A queue deeper than max_job_history must not evict finished jobs.
+
+    The cap bounds *history*; pending work isn't history. Gating on the total
+    job count conflated the two: submitting more than max_job_history files at
+    once (routine now that Select All spans every page — a Redump platform set
+    is thousands) kept the total permanently over the cap, so every sweep
+    deleted every terminal job it could find and still couldn't get under it.
+    The Completed / Failed tabs emptied mid-batch and a finished run had no
+    record of which files failed.
+    """
+    mgr = JobManager(max_concurrent=1, max_job_history=3)
+
+    # History sits exactly at the cap.
+    finished = []
+    for i in range(3):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+        finished.append(j.id)
+
+    # A backlog far deeper than the cap. These are not history.
+    pending = [
+        mgr.create_external_job(f"Pending{i}", ConversionMode.METADATA_SCAN).id
+        for i in range(20)
+    ]
+
+    await mgr._prune_jobs()
+
+    for job_id in finished:
+        assert job_id in mgr.jobs, "a deep queue must not evict finished jobs"
+    for job_id in pending:
+        assert job_id in mgr.jobs, "pending work must never be pruned"
+
+
+@pytest.mark.asyncio
+async def test_prune_still_evicts_oldest_history_past_the_cap():
+    """Counting only terminal jobs must not turn pruning off: history beyond the
+    cap is still trimmed, oldest first."""
+    mgr = JobManager(max_concurrent=1, max_job_history=3)
+
+    ids = []
+    for i in range(5):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+        ids.append(j.id)
+
+    await mgr._prune_jobs()
+
+    assert ids[0] not in mgr.jobs
+    assert ids[1] not in mgr.jobs
+    for job_id in ids[2:]:
+        assert job_id in mgr.jobs
