@@ -3,11 +3,28 @@
 
 import { SvelteMap } from 'svelte/reactivity';
 import { api } from '$lib/api/endpoints.js';
+import { STORAGE_KEYS, readString, writeString } from '$lib/util/localStorage.js';
 import { jobs } from './jobs.svelte.js';
 import { conversion } from './conversion.svelte.js';
 
 const DEFAULT_PAGE_SIZE = 50;
+// Rows-per-page choices offered in the file list footer.
+//
+// Deliberately capped rather than offering an unbounded "All": every row on the
+// visible page is hydrated by FileList's effect — archive summaries, CHD
+// metadata, and (when DATs are loaded) a background DAT hash job per file — so
+// the page size directly bounds that per-page work. Turning a 2,000-file folder
+// into one page would kick a hash of the whole folder just by looking at it.
+// Selecting everything no longer needs a giant page anyway: `selectAllFiltered`
+// spans all pages.
+const PAGE_SIZE_OPTIONS = Object.freeze([25, 50, 100, 250, 500]);
 const SORT_FIELDS = new Set(['name', 'size', 'extension', 'type']);
+
+/** Persisted rows-per-page, falling back to the default for anything unknown. */
+function loadPageSize() {
+  const n = Number(readString(STORAGE_KEYS.PAGE_SIZE, null));
+  return PAGE_SIZE_OPTIONS.includes(n) ? n : DEFAULT_PAGE_SIZE;
+}
 
 class FileBrowserStore {
   // Volumes
@@ -58,8 +75,13 @@ class FileBrowserStore {
   sortBy = $state('name');
   sortOrder = $state('asc');
   page = $state(1);
-  pageSize = $state(DEFAULT_PAGE_SIZE);
+  pageSize = $state(loadPageSize());
   autoRefresh = $state(true);
+
+  /** Rows-per-page choices for the footer picker. */
+  get pageSizeOptions() {
+    return PAGE_SIZE_OPTIONS;
+  }
 
   // ─── Derived ──────────────────────────────────────────────────────────
   get breadcrumbSegments() {
@@ -193,6 +215,28 @@ class FileBrowserStore {
     const visible = this.visibleEntries.filter((e) => this._isSelectable(e));
     if (visible.length === 0) return false;
     return visible.every((e) => this.selectedFiles.has(e.path));
+  }
+
+  /**
+   * Every selectable row in the CURRENT VIEW, across all pages — the whole
+   * post-sort, post-filter set, not just `visibleEntries`. Pagination here is
+   * purely client-side slicing of `filteredEntries`, so "all pages" needs no
+   * extra fetching: the rows are already in the store. Tool-agnostic by
+   * construction — it reuses `_isSelectable`, so the active mode's own input
+   * rules (files, folders under a directory-input mode, archives under
+   * romz_extract) decide what counts, and it works the same in a plain
+   * directory listing, an archive view, and the recursive "Search all" view
+   * (all three feed `filteredEntries`).
+   */
+  get selectableEntries() {
+    return this.filteredEntries.filter((e) => this._isSelectable(e));
+  }
+
+  /** True when every selectable row in the current view (all pages) is selected. */
+  get allFilteredSelected() {
+    const all = this.selectableEntries;
+    if (all.length === 0) return false;
+    return all.every((e) => this.selectedFiles.has(e.path));
   }
 
   // ─── Volumes ──────────────────────────────────────────────────────────
@@ -633,9 +677,14 @@ class FileBrowserStore {
     const idx = visible.findIndex((e) => e.path === entry.path);
 
     if (shift && this.lastSelectedIndex >= 0 && idx >= 0) {
-      const [start, end] = idx > this.lastSelectedIndex
-        ? [this.lastSelectedIndex, idx]
-        : [idx, this.lastSelectedIndex];
+      // Clamp the anchor into THIS page. `lastSelectedIndex` is an index into
+      // the current page's selectable rows, so anything that reshapes the page
+      // can leave it past the end: a smaller Rows-per-page, a narrowing
+      // extension filter, a re-sort, or simply paging to a shorter last page.
+      // Iterating up to a stale anchor then walked off the end of `visible` and
+      // threw on `visible[i].path` (TypeError), losing the click entirely.
+      const anchor = Math.min(this.lastSelectedIndex, visible.length - 1);
+      const [start, end] = idx > anchor ? [anchor, idx] : [idx, anchor];
       for (let i = start; i <= end; i += 1) {
         this.selectedFiles.set(visible[i].path, visible[i]);
       }
@@ -659,6 +708,30 @@ class FileBrowserStore {
     } else {
       for (const e of visible) this.selectedFiles.set(e.path, e);
     }
+  }
+
+  /**
+   * Select every selectable row in the current view, across ALL pages —
+   * the "…and all N in this folder" escape hatch from the header checkbox,
+   * which only ever covers the visible page. Saves paging through 80+ pages
+   * ticking the header box on each one (issue: select-all across pages).
+   *
+   * Deliberately additive: rows already picked on other pages stay selected,
+   * so this can only ever grow the set. The inverse is `clearSelection()`.
+   */
+  selectAllFiltered() {
+    for (const e of this.selectableEntries) this.selectedFiles.set(e.path, e);
+  }
+
+  /** Deselect every row in the current view (all pages), leaving others intact. */
+  deselectAllFiltered() {
+    for (const e of this.selectableEntries) this.selectedFiles.delete(e.path);
+    // Drop the shift-click range anchor, the same way clearSelection() does.
+    // This action is only reachable once the whole view is selected, so it always
+    // empties the view; an anchor left pointing into it is stale, and the next
+    // shift-click would silently re-select the range up to it even though the UI
+    // showed nothing selected.
+    this.lastSelectedIndex = -1;
   }
 
   clearSelection() {
@@ -685,6 +758,33 @@ class FileBrowserStore {
 
   setPage(p) {
     this.page = Math.max(1, Math.min(p, this.pageCount));
+  }
+
+  /**
+   * Change how many rows a page shows. Persisted, so it survives a reload and
+   * the user doesn't re-pick it for every folder.
+   *
+   * Keeps the user's place instead of snapping back to page 1: the first row
+   * currently on screen stays on screen, so going 50 → 100 on page 8 lands on
+   * page 4 showing the same file, not at the top of a 2,000-file folder. The
+   * page is clamped afterwards in case the new size leaves fewer pages.
+   *
+   * Selection is untouched — it's keyed by path, not by page — so re-paginating
+   * mid-selection (including a cross-page Select all) keeps every ticked row.
+   */
+  setPageSize(size) {
+    const n = Number(size);
+    if (!PAGE_SIZE_OPTIONS.includes(n) || n === this.pageSize) return;
+    const firstVisibleIndex = (this.page - 1) * this.pageSize;
+    this.pageSize = n;
+    this.page = Math.floor(firstVisibleIndex / n) + 1;
+    this._clampPage();
+    // Repagination re-cuts the page, so a row's index within it no longer means
+    // what it did; drop the shift-click range anchor rather than have the next
+    // shift-click extend from a row the user picked under a different layout.
+    // (`toggleSelect` also clamps defensively — this is about intent, not safety.)
+    this.lastSelectedIndex = -1;
+    writeString(STORAGE_KEYS.PAGE_SIZE, n);
   }
 }
 

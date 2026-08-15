@@ -57,7 +57,11 @@
       localStorage.setItem('theme-preference', 'light');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
       await new Promise(r => setTimeout(r, 400));
-      const all = document.querySelector('input[aria-label="Select all visible"]');
+      // Header select-all box. Matched structurally rather than by aria-label:
+      // the label is state-dependent ("Select all on this page" /
+      // "Deselect all on this page"), so a literal-text selector silently
+      // stops matching whenever that wording changes.
+      const all = document.querySelector('thead input[type="checkbox"]');
       if (all && !all.checked) all.click();
       await new Promise(r => setTimeout(r, 400));
     })()
@@ -71,7 +75,11 @@
       localStorage.setItem('theme-preference', 'dark');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
       await new Promise(r => setTimeout(r, 400));
-      const all = document.querySelector('input[aria-label="Select all visible"]');
+      // Header select-all box. Matched structurally rather than by aria-label:
+      // the label is state-dependent ("Select all on this page" /
+      // "Deselect all on this page"), so a literal-text selector silently
+      // stops matching whenever that wording changes.
+      const all = document.querySelector('thead input[type="checkbox"]');
       if (all && !all.checked) all.click();
       await new Promise(r => setTimeout(r, 400));
     })()

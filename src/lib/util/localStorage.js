@@ -7,6 +7,7 @@ const STORAGE_KEYS = Object.freeze({
   THEME: 'theme-preference',
   SIDEBAR_COLLAPSED: 'sidebar-collapsed',
   LAYOUT: 'workspace-layout',
+  PAGE_SIZE: 'compressatorium_file_list_page_size',
 });
 
 function safe() {

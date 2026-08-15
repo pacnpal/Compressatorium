@@ -35,6 +35,8 @@
   const filter = $derived(fileBrowser.filter);
   const loading = $derived(fileBrowser.loading);
   const searching = $derived(fileBrowser.searching);
+  const pageSize = $derived(fileBrowser.pageSize);
+  const pageSizeOptions = $derived(fileBrowser.pageSizeOptions);
 
   // Resizable table columns, stored per tool. `cols` carries the
   // effective widths (defaults filled in); `nameSet` is the explicit
@@ -68,6 +70,45 @@
   const selectedCount = $derived(fileBrowser.selectedFiles.size);
   const searchMode = $derived(fileBrowser.searchMode);
   const archiveMode = $derived(!!fileBrowser.currentArchivePath);
+
+  // Cross-page "select all" affordance. The header checkbox only ever covers
+  // the visible page, so in a folder of 2000+ discs the user would have to tick
+  // it once per page. Once anything is selected we offer the whole current view
+  // — every page of it — in one click.
+  //
+  // Everything here is derived from the store's own mode-aware predicate
+  // (`selectableEntries` → `_isSelectable`), so it is not tied to any tool,
+  // extension, or view: it counts exactly the rows the active mode accepts,
+  // whether that's .iso files under CHDMAN, folders under makeps3iso
+  // folder_to_iso, or archive members inside a "Search all" result set.
+  const selectableTotal = $derived(fileBrowser.selectableEntries.length);
+  // Whether every selectable row is a plain file. `filteredEntries` passes
+  // non-file rows (directories, archive containers) through the extension filter
+  // unconditionally — the filter only narrows files — so under a directory-input
+  // mode like makeps3iso `folder_to_iso` the selectable set is entirely folders
+  // even with `.iso` picked. Naming the extension there would promise ".iso
+  // items" and hand back folders, so the label only claims the extension when
+  // the rows really are files it applies to.
+  const selectableAllFiles = $derived(
+    fileBrowser.selectableEntries.every((e) => e?.type === 'file'),
+  );
+  const selectableOnPage = $derived(
+    fileBrowser.visibleEntries.filter((e) => fileBrowser.isSelectable(e)).length,
+  );
+  const allFilteredSelected = $derived(fileBrowser.allFilteredSelected);
+  // Only worth showing when there is genuinely something off-page to gain.
+  const canSelectAllPages = $derived(
+    selectedCount > 0 && !allFilteredSelected && selectableTotal > selectableOnPage,
+  );
+  // Name the scope honestly: an active extension filter means "all N" is the
+  // filtered set, not the whole folder, and search/archive views aren't folders.
+  const selectAllScope = $derived(
+    searchMode ? 'in these search results' : archiveMode ? 'in this archive' : 'in this folder',
+  );
+  const selectAllExt = $derived(filter && selectableAllFiles ? ` ${filter}` : '');
+  const selectAllLabel = $derived(
+    `Select all ${selectableTotal}${selectAllExt} ${selectableTotal === 1 ? 'item' : 'items'} ${selectAllScope}`,
+  );
   const autoRefresh = $derived(fileBrowser.autoRefresh);
   const jobsActive = $derived(jobs.hasActive);
 
@@ -306,6 +347,24 @@
         Clear
       </button>
     </div>
+    {#if canSelectAllPages}
+      <div class="select-all-bar">
+        {#if allSelected}
+          <span>All {selectableOnPage} on this page are selected.</span>
+        {/if}
+        <button type="button" class="link-strong" onclick={() => fileBrowser.selectAllFiltered()}>
+          {selectAllLabel}
+        </button>
+        <span class="muted-inline">(all {pageCount} pages)</span>
+      </div>
+    {:else if allFilteredSelected && pageCount > 1}
+      <div class="select-all-bar">
+        <span>All {selectableTotal} {selectAllScope} are selected, across all {pageCount} pages.</span>
+        <button type="button" class="link-strong" onclick={() => fileBrowser.deselectAllFiltered()}>
+          Deselect all
+        </button>
+      </div>
+    {/if}
   {/if}
 
   {#if error}
@@ -361,7 +420,19 @@
                 type="checkbox"
                 checked={allSelected}
                 onchange={() => fileBrowser.toggleSelectAll()}
-                aria-label={allSelected ? 'Deselect all' : 'Select all visible'}
+                title={pageCount > 1
+                  ? 'Selects this page. Shift-click (or use the banner) to select every page.'
+                  : undefined}
+                aria-label={allSelected ? 'Deselect all on this page' : 'Select all on this page'}
+                onclick={(e) => {
+                  // Shift-click the header box = select the whole view, every page.
+                  // Keeps the one-click-per-page default while giving power users a
+                  // shortcut that mirrors the row-level shift-click range select.
+                  if (!e.shiftKey) return;
+                  e.preventDefault();
+                  if (allFilteredSelected) fileBrowser.deselectAllFiltered();
+                  else fileBrowser.selectAllFiltered();
+                }}
               />
             </th>
             <th class="resizable" data-col="name" aria-sort={sortAria('name')}>
@@ -400,9 +471,26 @@
 
   <div class="footer">
     <Pager {page} {pageCount} onpage={(p) => fileBrowser.setPage(p)} />
-    {#if !searchMode && entries.length > 0}
-      <span class="muted">{entries.length} shown</span>
-    {/if}
+    <div class="footer-end">
+      {#if !searchMode && entries.length > 0}
+        <span class="muted">{entries.length} shown</span>
+      {/if}
+      <!-- Rows per page. Sits outside the Pager (which hides itself at a single
+           page) so the user can always get back to a smaller page size after
+           picking one big enough to collapse the pagination. -->
+      <label class="page-size">
+        <span class="muted">Rows</span>
+        <select
+          aria-label="Rows per page"
+          value={pageSize}
+          onchange={(e) => fileBrowser.setPageSize(e.currentTarget.value)}
+        >
+          {#each pageSizeOptions as size (size)}
+            <option value={size}>{size}</option>
+          {/each}
+        </select>
+      </label>
+    </div>
   </div>
 </section>
 
@@ -508,6 +596,35 @@
     margin-left: auto;
   }
 
+  /* Cross-page select-all prompt, sits directly under the selection bar so it
+     reads as a continuation of it. */
+  .select-all-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-2);
+    font-size: var(--text-sm);
+    text-align: center;
+  }
+  .link-strong {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    font: inherit;
+    font-weight: var(--weight-semibold);
+    padding: 0;
+  }
+  .link-strong:hover { text-decoration: none; }
+  .muted-inline { color: var(--text-3); font-size: var(--text-xs); }
+
   .error-state {
     display: flex;
     align-items: center;
@@ -589,6 +706,33 @@
     padding: var(--space-1);
   }
   .muted { color: var(--text-3); font-size: var(--text-sm); }
+  /* Keeps the row count and the rows-per-page picker together on the right,
+     so the footer reads pager | … | "50 shown  Rows [50]". */
+  .footer-end {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-left: auto;
+  }
+  .page-size {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 0 var(--space-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+  }
+  .page-size select {
+    background: none;
+    border: none;
+    color: var(--text-1);
+    font-size: var(--text-sm);
+    padding: 4px 0;
+    cursor: pointer;
+  }
+  .page-size select:focus-visible { outline: none; }
+  .page-size:focus-within { border-color: var(--accent); box-shadow: var(--focus-ring); }
 
   :global(.filelist .spin) { animation: spin 0.9s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }

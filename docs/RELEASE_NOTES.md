@@ -7,6 +7,51 @@ and #179, part of the #177 tech-debt epic).
 
 ### Added
 
+- **Select all files across every page, not just the visible one.** The header
+  checkbox has always covered only the current page, so a folder of 2,000+ discs
+  meant ticking it once on each of 80-odd pages before a batch could be queued.
+  Now, as soon as anything is selected in a view that spans more than one page, a
+  banner appears under the selection bar offering the whole thing —
+  *"Select all 2,140 items in this folder"* — in a single click. Shift-clicking
+  the header checkbox does the same without going through the banner, mirroring
+  the shift-click range select on the rows. Once everything is selected the
+  banner confirms the scope (*"All 2,140 in this folder are selected, across all
+  43 pages"*) and offers **Deselect all**; the existing **Clear** still drops the
+  whole selection.
+
+  It is scoped to what you are actually looking at, and it works everywhere the
+  file list does: any tool, any mode, any file type. It selects exactly the rows
+  the current mode accepts as input — files under a file mode, convertible
+  folders under makeps3iso `folder_to_iso`, archives under `romz_extract` — and
+  it respects the active extension filter, so with `.iso` picked in a mixed
+  folder the offer reads *"Select all 2,100 `.iso` items"* and leaves the rest
+  alone. It works the same inside an archive view and in the recursive
+  **Search all** results (*"…in these search results"*), and it only appears when
+  there is genuinely something off-page to gain — a filter that narrows the list
+  down to one page shows no banner at all.
+
+  No extra loading is involved: pagination was already client-side slicing of the
+  listing the browser holds, so "all pages" is the set already in hand.
+
+- **Rows per page is now yours to set.** A **Rows** picker in the file list
+  footer offers 25 / 50 / 100 / 250 / 500 (was a fixed 50), so a big folder can
+  be 5 pages instead of 43. The choice is remembered across reloads, and it sits
+  outside the pager — which hides itself at a single page — so you can always get
+  back to a smaller size after picking one big enough to collapse the pagination.
+
+  Changing it keeps your place rather than snapping to page 1: the rows you were
+  looking at stay on screen (50 → 100 on page 8 lands on page 4, still showing
+  the same files). Selection is keyed by path, not by page, so re-paginating
+  mid-selection — including after a cross-page Select all — keeps every ticked
+  row.
+
+  The list is deliberately capped at 500 rather than offering an unlimited "All":
+  every row on the visible page gets hydrated (archive summaries, CHD metadata,
+  and a background DAT hash per file when DATs are loaded), so page size directly
+  bounds that work — turning a 2,000-file folder into a single page would kick
+  off a hash of the whole folder just by looking at it. Selecting everything no
+  longer needs a giant page anyway, now that Select all spans pages.
+
 - **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
   `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
   how much of the disc a game uses, so the padding compresses dramatically: WUX
