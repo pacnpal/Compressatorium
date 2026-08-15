@@ -33,6 +33,25 @@ and #179, part of the #177 tech-debt epic).
   No extra loading is involved: pagination was already client-side slicing of the
   listing the browser holds, so "all pages" is the set already in hand.
 
+- **Rows per page is now yours to set.** A **Rows** picker in the file list
+  footer offers 25 / 50 / 100 / 250 / 500 (was a fixed 50), so a big folder can
+  be 5 pages instead of 43. The choice is remembered across reloads, and it sits
+  outside the pager — which hides itself at a single page — so you can always get
+  back to a smaller size after picking one big enough to collapse the pagination.
+
+  Changing it keeps your place rather than snapping to page 1: the rows you were
+  looking at stay on screen (50 → 100 on page 8 lands on page 4, still showing
+  the same files). Selection is keyed by path, not by page, so re-paginating
+  mid-selection — including after a cross-page Select all — keeps every ticked
+  row.
+
+  The list is deliberately capped at 500 rather than offering an unlimited "All":
+  every row on the visible page gets hydrated (archive summaries, CHD metadata,
+  and a background DAT hash per file when DATs are loaded), so page size directly
+  bounds that work — turning a 2,000-file folder into a single page would kick
+  off a hash of the whole folder just by looking at it. Selecting everything no
+  longer needs a giant page anyway, now that Select all spans pages.
+
 - **Wii U support: a new eighth tool, `jwud` (JWUDTool), converting `.wud` ↔
   `.wux`.** Every Wii U disc image is exactly 25,025,314,816 bytes regardless of
   how much of the disc a game uses, so the padding compresses dramatically: WUX

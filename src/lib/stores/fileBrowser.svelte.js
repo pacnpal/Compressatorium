@@ -3,11 +3,28 @@
 
 import { SvelteMap } from 'svelte/reactivity';
 import { api } from '$lib/api/endpoints.js';
+import { STORAGE_KEYS, readString, writeString } from '$lib/util/localStorage.js';
 import { jobs } from './jobs.svelte.js';
 import { conversion } from './conversion.svelte.js';
 
 const DEFAULT_PAGE_SIZE = 50;
+// Rows-per-page choices offered in the file list footer.
+//
+// Deliberately capped rather than offering an unbounded "All": every row on the
+// visible page is hydrated by FileList's effect — archive summaries, CHD
+// metadata, and (when DATs are loaded) a background DAT hash job per file — so
+// the page size directly bounds that per-page work. Turning a 2,000-file folder
+// into one page would kick a hash of the whole folder just by looking at it.
+// Selecting everything no longer needs a giant page anyway: `selectAllFiltered`
+// spans all pages.
+const PAGE_SIZE_OPTIONS = Object.freeze([25, 50, 100, 250, 500]);
 const SORT_FIELDS = new Set(['name', 'size', 'extension', 'type']);
+
+/** Persisted rows-per-page, falling back to the default for anything unknown. */
+function loadPageSize() {
+  const n = Number(readString(STORAGE_KEYS.PAGE_SIZE, null));
+  return PAGE_SIZE_OPTIONS.includes(n) ? n : DEFAULT_PAGE_SIZE;
+}
 
 class FileBrowserStore {
   // Volumes
@@ -58,8 +75,13 @@ class FileBrowserStore {
   sortBy = $state('name');
   sortOrder = $state('asc');
   page = $state(1);
-  pageSize = $state(DEFAULT_PAGE_SIZE);
+  pageSize = $state(loadPageSize());
   autoRefresh = $state(true);
+
+  /** Rows-per-page choices for the footer picker. */
+  get pageSizeOptions() {
+    return PAGE_SIZE_OPTIONS;
+  }
 
   // ─── Derived ──────────────────────────────────────────────────────────
   get breadcrumbSegments() {
@@ -699,6 +721,12 @@ class FileBrowserStore {
   /** Deselect every row in the current view (all pages), leaving others intact. */
   deselectAllFiltered() {
     for (const e of this.selectableEntries) this.selectedFiles.delete(e.path);
+    // Drop the shift-click range anchor, the same way clearSelection() does.
+    // This action is only reachable once the whole view is selected, so it always
+    // empties the view; an anchor left pointing into it is stale, and the next
+    // shift-click would silently re-select the range up to it even though the UI
+    // showed nothing selected.
+    this.lastSelectedIndex = -1;
   }
 
   clearSelection() {
@@ -725,6 +753,28 @@ class FileBrowserStore {
 
   setPage(p) {
     this.page = Math.max(1, Math.min(p, this.pageCount));
+  }
+
+  /**
+   * Change how many rows a page shows. Persisted, so it survives a reload and
+   * the user doesn't re-pick it for every folder.
+   *
+   * Keeps the user's place instead of snapping back to page 1: the first row
+   * currently on screen stays on screen, so going 50 → 100 on page 8 lands on
+   * page 4 showing the same file, not at the top of a 2,000-file folder. The
+   * page is clamped afterwards in case the new size leaves fewer pages.
+   *
+   * Selection is untouched — it's keyed by path, not by page — so re-paginating
+   * mid-selection (including a cross-page Select all) keeps every ticked row.
+   */
+  setPageSize(size) {
+    const n = Number(size);
+    if (!PAGE_SIZE_OPTIONS.includes(n) || n === this.pageSize) return;
+    const firstVisibleIndex = (this.page - 1) * this.pageSize;
+    this.pageSize = n;
+    this.page = Math.floor(firstVisibleIndex / n) + 1;
+    this._clampPage();
+    writeString(STORAGE_KEYS.PAGE_SIZE, n);
   }
 }
 

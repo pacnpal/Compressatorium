@@ -470,6 +470,17 @@
         archive and on <strong>Search all</strong> results.
       </dd>
 
+      <dt>Can I show more files per page?</dt>
+      <dd>
+        Yes — the <strong>Rows</strong> picker in the bottom-right of the file list takes
+        25, 50, 100, 250, or 500, and it's remembered for next time. Changing it keeps your
+        place instead of jumping back to page 1. It stops at 500 on purpose: every row on
+        screen gets checked for archive contents, CHD details, and a DAT match, so a single
+        page holding a whole 2,000-file folder would set all of that going at once. If you
+        just want everything selected, use <strong>Select all</strong> instead — it spans
+        every page.
+      </dd>
+
       <dt>What happens to a job that fails?</dt>
       <dd>It moves to the failed tab with the error attached, and your source is untouched. Read the error, fix the cause (usually a codec, a bad dump, or no disk space), and requeue it.</dd>
 

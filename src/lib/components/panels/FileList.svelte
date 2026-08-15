@@ -35,6 +35,8 @@
   const filter = $derived(fileBrowser.filter);
   const loading = $derived(fileBrowser.loading);
   const searching = $derived(fileBrowser.searching);
+  const pageSize = $derived(fileBrowser.pageSize);
+  const pageSizeOptions = $derived(fileBrowser.pageSizeOptions);
 
   // Resizable table columns, stored per tool. `cols` carries the
   // effective widths (defaults filled in); `nameSet` is the explicit
@@ -80,6 +82,16 @@
   // whether that's .iso files under CHDMAN, folders under makeps3iso
   // folder_to_iso, or archive members inside a "Search all" result set.
   const selectableTotal = $derived(fileBrowser.selectableEntries.length);
+  // Whether every selectable row is a plain file. `filteredEntries` passes
+  // non-file rows (directories, archive containers) through the extension filter
+  // unconditionally — the filter only narrows files — so under a directory-input
+  // mode like makeps3iso `folder_to_iso` the selectable set is entirely folders
+  // even with `.iso` picked. Naming the extension there would promise ".iso
+  // items" and hand back folders, so the label only claims the extension when
+  // the rows really are files it applies to.
+  const selectableAllFiles = $derived(
+    fileBrowser.selectableEntries.every((e) => e?.type === 'file'),
+  );
   const selectableOnPage = $derived(
     fileBrowser.visibleEntries.filter((e) => fileBrowser.isSelectable(e)).length,
   );
@@ -93,8 +105,9 @@
   const selectAllScope = $derived(
     searchMode ? 'in these search results' : archiveMode ? 'in this archive' : 'in this folder',
   );
+  const selectAllExt = $derived(filter && selectableAllFiles ? ` ${filter}` : '');
   const selectAllLabel = $derived(
-    `Select all ${selectableTotal}${filter ? ` ${filter}` : ''} ${selectableTotal === 1 ? 'item' : 'items'} ${selectAllScope}`,
+    `Select all ${selectableTotal}${selectAllExt} ${selectableTotal === 1 ? 'item' : 'items'} ${selectAllScope}`,
   );
   const autoRefresh = $derived(fileBrowser.autoRefresh);
   const jobsActive = $derived(jobs.hasActive);
@@ -458,9 +471,26 @@
 
   <div class="footer">
     <Pager {page} {pageCount} onpage={(p) => fileBrowser.setPage(p)} />
-    {#if !searchMode && entries.length > 0}
-      <span class="muted">{entries.length} shown</span>
-    {/if}
+    <div class="footer-end">
+      {#if !searchMode && entries.length > 0}
+        <span class="muted">{entries.length} shown</span>
+      {/if}
+      <!-- Rows per page. Sits outside the Pager (which hides itself at a single
+           page) so the user can always get back to a smaller page size after
+           picking one big enough to collapse the pagination. -->
+      <label class="page-size">
+        <span class="muted">Rows</span>
+        <select
+          aria-label="Rows per page"
+          value={pageSize}
+          onchange={(e) => fileBrowser.setPageSize(e.currentTarget.value)}
+        >
+          {#each pageSizeOptions as size (size)}
+            <option value={size}>{size}</option>
+          {/each}
+        </select>
+      </label>
+    </div>
   </div>
 </section>
 
@@ -676,6 +706,33 @@
     padding: var(--space-1);
   }
   .muted { color: var(--text-3); font-size: var(--text-sm); }
+  /* Keeps the row count and the rows-per-page picker together on the right,
+     so the footer reads pager | … | "50 shown  Rows [50]". */
+  .footer-end {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-left: auto;
+  }
+  .page-size {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 0 var(--space-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+  }
+  .page-size select {
+    background: none;
+    border: none;
+    color: var(--text-1);
+    font-size: var(--text-sm);
+    padding: 4px 0;
+    cursor: pointer;
+  }
+  .page-size select:focus-visible { outline: none; }
+  .page-size:focus-within { border-color: var(--accent); box-shadow: var(--focus-ring); }
 
   :global(.filelist .spin) { animation: spin 0.9s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
