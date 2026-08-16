@@ -149,6 +149,11 @@ class JobManager:
             maxlen=max(self.MAX_TRACKED_EVICTED_IDS, self.max_job_history * 4)
         )
         self._eviction_seq = 0
+        # Where the last Clear landed. A reset drops the id log, so a cursor
+        # from before it has no tombstones to replay — and since Clear deletes
+        # every finished job, a client whose cursor predates one is holding
+        # rows that no longer exist. Both make such a cursor expired.
+        self._last_reset_seq = 0
         # Identifies this process's eviction log. The sequence lives in memory
         # and restarts at 0 when the backend does, so a client that compares
         # sequences to reject stale payloads would reject every payload from
@@ -1129,6 +1134,12 @@ class JobManager:
             # since startup or since Clear, so there is nothing to replay.
             oldest_held = self._evicted_ids[0][0] if self._evicted_ids else None
             cursor_expired = oldest_held is not None and cursor < oldest_held - 1
+            # A Clear throws the log away, tombstones included, so a cursor
+            # from before it can't be answered either — and a Clear deletes
+            # *every* finished job, so a client reading the list either side
+            # of one is holding rows that no longer exist anywhere.
+            if cursor < self._last_reset_seq:
+                cursor_expired = True
         return {
             "generation": self.history_generation,
             "cursor_expired": cursor_expired,
@@ -1165,6 +1176,7 @@ class JobManager:
         self._evicted_history.clear()
         self._evicted_ids.clear()
         self._eviction_seq += 1
+        self._last_reset_seq = self._eviction_seq
         return self._eviction_seq
 
     async def cancel_job(self, job_id: str) -> bool:

@@ -333,7 +333,7 @@ class JobsStore {
    * page load, the SSE is already connected and the user can recover
    * by retrying any action.
    */
-  async refresh() {
+  async refresh(isRetry = false) {
     this.loading = true;
     // Cursor captured before the job list is read, so the history read below
     // can name anything evicted from here on. See the tail of this method.
@@ -430,9 +430,14 @@ class JobsStore {
     // and let the next poll re-establish truth.
     if (!listSynced) return;
     try {
-      this._applyHistoryOverflow(
-        await api.getJobHistoryOverflow(cursor, cursorGeneration),
-      );
+      const overflow = await api.getJobHistoryOverflow(cursor, cursorGeneration);
+      this._applyHistoryOverflow(overflow);
+      // An expired cursor means the backend can't account for everything that
+      // happened since the list read — most often another client ran Clear in
+      // between, which deletes every finished job and drops the tombstones
+      // with them, so the rows we just took are already gone there. Read once
+      // more, now with a current cursor; that pass cannot expire again.
+      if (overflow?.cursor_expired && !isRetry) await this.refresh(true);
     } catch (_e) {
       // Non-fatal: the next poll or `history` event re-establishes truth.
     }
@@ -549,14 +554,19 @@ class JobsStore {
       // badges would keep counting jobs no list can show. Adopting the
       // post-reset sequence rejects any history read still in flight from
       // before the clear, which would otherwise restore the tally.
-      // Guarded like any other payload: an eviction after the reset but before
-      // this response arrived can already have been applied from the stream at
-      // a newer sequence, and clobbering it would leave the totals too low
-      // until the next change — the backend only re-emits when they move.
-      if (typeof res?.history_seq !== 'number' || res.history_seq >= this.historySeq) {
-        this.historyOverflow = {};
-        if (typeof res?.history_seq === 'number') this.historySeq = res.history_seq;
-      }
+      // Routed through the same path as any other payload rather than hand
+      // rolled, so it inherits both rules: an eviction applied from the stream
+      // after the reset but before this response arrived is not clobbered
+      // (the backend only re-emits on change, so that would stick), and a
+      // sequence from a different generation is adopted rather than compared —
+      // a backend restart mid-request returns a small one that would otherwise
+      // read as stale and leave the badges up after a Clear.
+      this._applyHistoryOverflow({
+        generation: res?.history_generation ?? this.historyGeneration,
+        seq: res?.history_seq,
+        evicted: {},
+        max_job_history: this.historyLimit,
+      });
       this.jobs = this.jobs.filter((j) => !TERMINAL_STATUSES.has(j.status));
       this._byId.clear();
       for (const job of this.jobs) this._byId.set(job.id, job);

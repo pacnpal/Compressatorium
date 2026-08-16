@@ -506,6 +506,10 @@ async def test_clear_completed_resets_history_overflow(monkeypatch):
     # that was already in flight — applying it would restore the tally.
     assert result["history_seq"] == manager.history_eviction_seq()
     assert result["history_seq"] > 2
+    # The generation rides along: the sequence is only comparable within one,
+    # and a backend restart mid-request returns a small one that would
+    # otherwise read as stale and leave the badges up after a Clear.
+    assert result["history_generation"] == manager.history_generation
 
 
 @pytest.mark.asyncio

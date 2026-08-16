@@ -1332,7 +1332,11 @@ async def delete_completed_jobs(request: Request):
         "total_cleared": len(deleted_ids) + forgotten,
         # Post-reset cursor, so the caller can discard a history read that was
         # already in flight when this cleared — it would restore the tally.
+        # The generation rides along because the sequence is only comparable
+        # within one: a backend restart mid-request resets it to a small
+        # number that would otherwise read as stale.
         "history_seq": history_seq,
+        "history_generation": job_manager.history_generation,
     }
 
 

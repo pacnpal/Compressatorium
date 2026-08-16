@@ -626,6 +626,30 @@ async def test_cursor_older_than_the_id_log_reports_expired():
 
 
 @pytest.mark.asyncio
+async def test_cursor_from_before_a_clear_reports_expired():
+    """Clear deletes every finished job and drops the tombstones with them, so
+    a cursor from before it cannot be answered: a client reading the job list
+    either side of a Clear holds rows that no longer exist anywhere, and only
+    an expired cursor tells it to look again."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    for i in range(3):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+    cursor_before_clear = mgr.history_eviction_seq()
+
+    mgr.reset_history_overflow()
+
+    stale = mgr.get_history_overflow(since=cursor_before_clear)
+    assert stale["cursor_expired"] is True
+    assert stale["evicted"] == {}
+    # A cursor taken after the Clear is answerable again.
+    assert mgr.get_history_overflow(
+        since=mgr.history_eviction_seq()
+    )["cursor_expired"] is False
+
+
+@pytest.mark.asyncio
 async def test_history_eviction_seq_opens_a_cursor_at_the_current_position():
     """The SSE stream captures this before emitting its snapshot: a job evicted
     while the client is being handed rows must still be named in the first

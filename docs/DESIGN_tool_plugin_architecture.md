@@ -855,14 +855,17 @@ The contract, tool-agnostic and owned by `JobManager`:
   start of this log instead. `cursor_expired` says the cursor fell off the end
   of the bounded id log (sized to `max(2000, 4 × max_job_history)`), so the ids
   cannot be complete and the client must re-sync against the job list rather
-  than trust the rows it holds. `history_eviction_seq()` opens a cursor without
-  reading counts.
+  than trust the rows it holds — that includes a cursor from before a Clear,
+  which throws the log away and deletes every finished job with it.
+  `history_eviction_seq()` opens a cursor without reading counts.
 - **`reset_history_overflow()`** clears the tally and the id log, and returns
   the *advanced* `seq`. Never rewind it: it is a cursor clients hold, so
   rewinding would make a stale cursor look current, while advancing makes every
   read taken before the reset recognizably older. `DELETE /api/jobs/completed`
-  calls it and reports `history_forgotten` / `total_cleared` / `history_seq`
-  alongside the deleted row count.
+  calls it and reports `history_forgotten` / `total_cleared` / `history_seq` /
+  `history_generation` alongside the deleted row count — feed those back through
+  the same apply path as any other payload, so the Clear result obeys the same
+  staleness and generation rules instead of a hand-rolled copy of them.
 
 **Every change to the tally advances `seq`** — evictions and resets alike. That
 is what makes an out-of-order payload detectable: equal sequences carry equal
