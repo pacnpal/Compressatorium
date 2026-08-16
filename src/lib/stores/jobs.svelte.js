@@ -40,6 +40,12 @@ class JobsStore {
   // next poll. Every change to the tally (evictions and Clear alike) advances
   // the sequence, so an older payload is always recognizable.
   historySeq = -1;
+  // Which backend process the sequence belongs to. The sequence is in-memory
+  // and restarts at 0 with the backend, so without this a restart would make
+  // every payload from the new process look older than what we hold and the
+  // guard above would reject all of them — badges frozen for the rest of the
+  // session. A changed generation means: drop the cursor, trust the payload.
+  historyGeneration = null;
 
   cancellingAll = $state(false);
   clearingCompleted = $state(false);
@@ -273,6 +279,14 @@ class JobsStore {
    */
   _applyHistoryOverflow(payload) {
     if (!payload || typeof payload !== 'object') return;
+    // A new backend process restarts the sequence at 0, so the cursor from
+    // the old one is meaningless — adopt the new generation and take its
+    // payload as the baseline rather than comparing across processes.
+    const generation = payload.generation ?? null;
+    if (generation !== this.historyGeneration) {
+      this.historyGeneration = generation;
+      this.historySeq = -1;
+    }
     // Drop payloads older than what we've already applied. Equal sequences
     // carry equal counts (nothing changes the tally without advancing it), so
     // re-applying those is a no-op rather than a regression.
@@ -321,15 +335,14 @@ class JobsStore {
    */
   async refresh() {
     this.loading = true;
+    // Cursor captured before the job list is read, so the history read below
+    // can name anything evicted from here on. See the tail of this method.
+    const cursor = this.historySeq;
+    let listSynced = false;
     try {
-      // Re-read the evicted-history totals alongside the snapshot. The SSE
-      // `history` event is the live path, this is the safety net for a
-      // client whose stream dropped a frame or was never open (poll-only).
-      api.getJobHistoryOverflow()
-        .then((h) => this._applyHistoryOverflow(h))
-        .catch(() => {});
       const data = await api.getJobs();
       if (!Array.isArray(data)) return;
+      listSynced = true;
       // Plain object as a transient id→true map. The svelte-eslint
       // `prefer-svelte-reactivity` rule (when present) flags raw Set
       // usage even for non-reactive locals; an object lookup avoids
@@ -398,6 +411,27 @@ class JobsStore {
       console.error('Job snapshot hydration failed:', e);
     } finally {
       this.loading = false;
+    }
+    // Re-read the evicted-history totals. The `history` SSE event is the live
+    // path; this is the safety net for a client whose stream dropped a frame,
+    // reconnected across an outage, or was never open (poll-only).
+    //
+    // Deliberately AFTER the job list, and with the cursor captured BEFORE it:
+    // the two reads describe different moments, and a job evicted in between
+    // is both still in the list we just applied and inside these totals. The
+    // cursor makes the backend name it so we drop the row instead of counting
+    // it twice. Anything evicted before the list read is already absent from
+    // it, and counted here — the two reconcile exactly.
+    //
+    // Skipped when the list read failed: the halves are only coherent
+    // together, and advancing the cursor against a list we couldn't refresh
+    // would retire rows without taking their replacements. Leave both stale
+    // and let the next poll re-establish truth.
+    if (!listSynced) return;
+    try {
+      this._applyHistoryOverflow(await api.getJobHistoryOverflow(cursor));
+    } catch (_e) {
+      // Non-fatal: the next poll or `history` event re-establishes truth.
     }
   }
 
@@ -588,6 +622,13 @@ class JobsStore {
       {
         onOpen: () => {
           ui.reportConnection('open');
+          // Reconcile rows against the backend on every (re)connect. A stream
+          // opens its history cursor at the current sequence, so its first
+          // frame cannot name jobs evicted while we were disconnected — we'd
+          // hold rows for jobs already deleted and count them again inside
+          // the totals. The snapshot read drops exactly those rows, and it
+          // re-reads the totals with a matching cursor.
+          this.refresh().catch(() => {});
           // Re-sync verified state on every SSE (re)connect. Terminal
           // job snapshots emitted at reconnect only carry the `job`
           // payload, they drop the `verified` and `source_deleted`

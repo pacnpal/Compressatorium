@@ -145,6 +145,13 @@ class JobManager:
         # disconnect) still self-heals through refresh()'s deletion reconcile.
         self._evicted_ids: Deque[Tuple[int, str]] = deque(maxlen=self.MAX_TRACKED_EVICTED_IDS)
         self._eviction_seq = 0
+        # Identifies this process's eviction log. The sequence lives in memory
+        # and restarts at 0 when the backend does, so a client that compares
+        # sequences to reject stale payloads would reject every payload from
+        # the new process until it out-counted the old one — badges frozen for
+        # the rest of the browser session. A changed generation is the signal
+        # to drop the cursor instead of trusting it.
+        self.history_generation = uuid.uuid4().hex[:12]
 
     def _enforce_queue_backpressure_locked(self, additional_jobs: int = 1) -> None:
         """Raise QueueBackpressureError when queue depth limits are exceeded.
@@ -1088,11 +1095,17 @@ class JobManager:
         evicted after that point, so a client can drop rows it still holds for
         jobs the cap has already deleted (otherwise it would count them twice —
         once as a retained row, once in the tally). Omit it to get counts only.
+
+        ``generation`` identifies this process's log. The sequence is in-memory
+        and restarts at 0 with the backend, so a client comparing sequences
+        across a restart would reject every newer payload as stale; a changed
+        generation tells it to drop its cursor instead.
         """
         evicted_ids: List[str] = []
         if since is not None:
             evicted_ids = [job_id for seq, job_id in self._evicted_ids if seq > since]
         return {
+            "generation": self.history_generation,
             "max_job_history": self.max_job_history,
             "evicted": {
                 status: dict(by_mode) for status, by_mode in self._evicted_history.items()

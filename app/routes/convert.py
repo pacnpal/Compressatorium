@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 from config import settings
 from fastapi import APIRouter, HTTPException, Request
@@ -1259,7 +1260,7 @@ async def check_stuck_status():
 
 
 @router.get("/jobs/history-overflow")
-async def job_history_overflow():
+async def job_history_overflow(since: Optional[int] = None):
     """Counts of finished jobs already evicted by the MAX_JOB_HISTORY cap.
 
     /api/jobs can only return retained jobs, so a client counting that list
@@ -1267,8 +1268,15 @@ async def job_history_overflow():
     Adding these evicted counts to it gives the real total. Also pushed over
     the job event stream as a `history` event, so a connected client stays
     current without polling this.
+
+    Pass ``since`` (a previously returned ``seq``) to also get the ids evicted
+    after that point. A poll-only client needs them: it reads /api/jobs and
+    this endpoint at two different moments, and a job evicted in between is
+    still in the job list *and* in these counts — double-counted — unless it
+    can be named and dropped. Read the job list first, then pass the cursor
+    here, and the two reads reconcile.
     """
-    return job_manager.get_history_overflow()
+    return job_manager.get_history_overflow(since=since)
 
 
 @router.get("/jobs/{job_id}", response_model=ConversionJob)

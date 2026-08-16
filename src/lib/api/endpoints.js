@@ -240,8 +240,21 @@ export const api = {
   // already evicted. /jobs only returns what is still retained, so this is
   // what turns a capped list into a true total. Live updates arrive as
   // `history` events on the job stream; this is the hydration read.
-  getJobHistoryOverflow: () =>
-    fetchJson(`${API_BASE}/jobs/history-overflow`, undefined, 'Failed to fetch job history totals'),
+  //
+  // `since` is the caller's last applied `seq`. Passing it also returns the
+  // ids evicted after that point — read /jobs first, then pass the cursor
+  // here, and a job evicted between the two reads is named rather than
+  // counted twice (once as a row still in the list, once in the totals).
+  getJobHistoryOverflow(since) {
+    const params = typeof since === 'number' && since >= 0
+      ? new URLSearchParams({ since: String(since) })
+      : undefined;
+    return fetchJson(
+      buildApiUrl('/jobs/history-overflow', params),
+      undefined,
+      'Failed to fetch job history totals',
+    );
+  },
 
   getJob: (jobId) => fetchJson(`${API_BASE}/jobs/${jobId}`, undefined, 'Failed to fetch job'),
 

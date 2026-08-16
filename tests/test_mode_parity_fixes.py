@@ -330,6 +330,16 @@ async def test_history_overflow_endpoint_reports_evicted_counts(monkeypatch):
     assert payload["max_job_history"] == 1
     assert payload["total_evicted"] == 2
     assert payload["evicted"]["completed"]["metadata_scan"] == 2
+    # No cursor: counts only. A poll-only client passes one so a job evicted
+    # between its /api/jobs read and this one is named, not counted twice.
+    assert payload["evicted_ids"] == []
+    with_cursor = await convert_routes.job_history_overflow(since=1)
+    assert len(with_cursor["evicted_ids"]) == 1
+    # The generation identifies this process's log: the sequence restarts at 0
+    # with the backend, and a client comparing across a restart would reject
+    # every newer payload as stale without it.
+    assert payload["generation"] == manager.history_generation
+    assert JobManager(max_concurrent=1).history_generation != manager.history_generation
 
 
 @pytest.mark.asyncio

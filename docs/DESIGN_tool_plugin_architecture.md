@@ -860,7 +860,10 @@ The contract, tool-agnostic and owned by `JobManager`:
 **Every change to the tally advances `seq`** — evictions and resets alike. That
 is what makes an out-of-order payload detectable: equal sequences carry equal
 counts, so a client can reject anything older and re-apply an equal one as a
-no-op.
+no-op. The sequence is in-memory, so every payload also carries a
+**`generation`** for the process that produced it: a restart rewinds `seq` to 0,
+and a client comparing across that boundary would reject everything the new
+process sends. A changed generation means *drop the cursor*, not *reject*.
 
 Transport: `GET /api/jobs/history-overflow` for hydration and the polling
 fallback, plus a `history` event on `/api/jobs/events`, emitted on connect and
@@ -883,11 +886,21 @@ be able to retract it.
    row the backend has already deleted. Counting it as retained *and* as evicted
    inflates every badge by one per completion for as long as a batch runs past
    the cap.
-3. **Never apply a payload older than the one already applied.** The REST read
-   races the stream; without a `seq` check a hydration response captured before
-   a newer event can land after it and roll the totals backwards, and since the
-   backend only re-emits on change they would stay wrong until the next poll.
-   Adopt `history_seq` from the Clear response for the same reason.
+3. **Never apply a payload older than the one already applied**, and never
+   compare across generations. The REST read races the stream; without a `seq`
+   check a hydration response captured before a newer event can land after it
+   and roll the totals backwards, and since the backend only re-emits on change
+   they would stay wrong until the next poll. Adopt `history_seq` from the Clear
+   response for the same reason.
+
+**Reading both halves without a stream** (the 30 s poll, and every reconnect —
+a fresh stream opens its cursor at *now*, so its first frame cannot name what
+was evicted while the client was away): capture the cursor, read `/api/jobs`,
+then read the overflow **with that cursor**. In that order the two reads
+reconcile exactly — anything evicted before the list read is already absent from
+it and counted in the totals, and anything evicted after is named in
+`evicted_ids` and dropped. Skip the overflow read entirely if the list read
+failed: the halves are only coherent together.
 
 Where retained rows exist but the total exceeds them, say so in the UI rather
 than let a badge and a list disagree — `JobsPanel` renders *"Showing the 500
