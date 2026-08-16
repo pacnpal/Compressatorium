@@ -37,6 +37,7 @@ import shutil
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -45,6 +46,16 @@ from services.timeout_policy import compute_progress_stall_timeout
 
 class ConversionCancelled(Exception):
     """Raised when a conversion is cancelled before completion."""
+
+
+# Output-size probes run here rather than on the default threadpool. A `stat`
+# wedged in uninterruptible I/O cannot be cancelled -- Python can abandon the
+# future but not the OS thread -- so on a dead mount every job would strand one
+# worker forever and a deep queue would drain the shared pool, taking down every
+# other `run_in_threadpool` caller with it. A small dedicated pool caps that
+# damage: once these workers are stuck, further probes simply never run and the
+# size signal goes quiet, which the callers already handle as "no new sample".
+_SIZE_PROBE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="size-probe")
 
 
 # Bounds on reaping a subprocess: how long to let it exit on its own once its
@@ -180,7 +191,7 @@ def size_ratio_for(mode: str | None) -> float | None:
     return SIZE_RATIOS.get(mode) if mode else None
 
 
-def output_size_message(size: int, started_at: float) -> str:
+def output_size_message(size: int, delta_bytes: int, delta_seconds: float) -> str:
     """Status line for a size-growth tick: bytes written and the current rate.
 
     The shared human-readable half of the size-growth progress signal (the
@@ -188,13 +199,19 @@ def output_size_message(size: int, started_at: float) -> str:
     -- a conversion crawling against a saturated array or a stalled share --
     must read as slow rather than as indistinguishable from a hang, so the
     message carries an absolute (MB written) and a derivative (MB/min): the
-    first keeps climbing, the second collapses toward zero. Rate is expressed
-    per minute because the case worth diagnosing is the pathological one, where
-    a per-second figure rounds to ``0.0`` and tells the user nothing.
+    first keeps climbing, the second collapses toward zero.
+
+    The rate is measured **between consecutive samples**, not as total bytes
+    over total elapsed time. A cumulative average is dominated by whatever the
+    conversion did first: a job that writes gigabytes quickly and then crawls
+    would keep advertising hundreds of MB/min long after it slowed to nothing,
+    destroying the one distinction this line exists to make. Rate is per minute
+    because the case worth diagnosing is the pathological one, where a
+    per-second figure rounds to ``0.0`` and says nothing.
     """
     written_mb = size / (1024 * 1024)
-    elapsed_min = max(time.monotonic() - started_at, 1e-9) / 60.0
-    return f"Working... ({written_mb:,.0f} MB written, {written_mb / elapsed_min:,.1f} MB/min)"
+    per_min = (delta_bytes / (1024 * 1024)) / (max(delta_seconds, 1e-9) / 60.0)
+    return f"Working... ({written_mb:,.0f} MB written, {per_min:,.1f} MB/min)"
 
 
 def output_size_progress(current: int, expected_size: int) -> int:
@@ -497,6 +514,8 @@ class SubprocessRunner:
             last_progress_value = initial_progress
             last_output_size: int | None = None
             last_activity_at = time.monotonic()
+            # Start of the current rate window (last observed growth).
+            last_growth_at = last_activity_at
             start = last_activity_at
             last_heartbeat_at = start
 
@@ -590,7 +609,9 @@ class SubprocessRunner:
                         with contextlib.suppress(Exception):
                             probed_size = size_probe.result()
                     size_probe = asyncio.ensure_future(
-                        run_in_threadpool(_measure_output_sync)
+                        asyncio.get_running_loop().run_in_executor(
+                            _SIZE_PROBE_POOL, _measure_output_sync,
+                        )
                     )
                 return probed_size
 
@@ -620,6 +641,7 @@ class SubprocessRunner:
                 # carries the news, which needs no ratio and so costs a new tool
                 # no wiring at all.
                 nonlocal last_output_size, last_activity_at, last_progress_value
+                nonlocal last_growth_at
                 if saw_native_progress:
                     return None
                 size = _measure_output()
@@ -627,7 +649,10 @@ class SubprocessRunner:
                     return None
                 if last_output_size is not None and size <= last_output_size:
                     return None
+                delta_bytes = size - (last_output_size or 0)
+                delta_seconds = now - last_growth_at
                 last_output_size = size
+                last_growth_at = now
                 last_activity_at = now
                 progress = last_progress_value
                 if expected_size:
@@ -637,7 +662,7 @@ class SubprocessRunner:
                     last_progress_value = progress
                 return {
                     "progress": progress,
-                    "message": output_size_message(size, start),
+                    "message": output_size_message(size, delta_bytes, delta_seconds),
                 }
 
             async def _check_stall(now: float) -> bool:
@@ -739,7 +764,15 @@ class SubprocessRunner:
                     yield update
                 await _check_stall(time.monotonic())
 
-            if not await self.reap(process):
+            # A cancel or a stall already sent TERM (and KILL). Waiting out the
+            # voluntary-exit grace again would hold the queue's only slot for
+            # another minute for no reason, so go straight to the ladder.
+            already_signalled = stall_error is not None or (
+                cancel_event is not None and cancel_event.is_set()
+            )
+            if not await self.reap(
+                process, exit_timeout=0 if already_signalled else _EXIT_GRACE,
+            ):
                 abandoned_error = (
                     f"{fail_label} did not exit and could not be killed "
                     f"(pid {process.pid}); it is likely blocked on unresponsive "

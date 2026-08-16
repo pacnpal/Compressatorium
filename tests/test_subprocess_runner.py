@@ -680,3 +680,20 @@ def test_native_progress_suppresses_the_size_fallback(tmp_path):
 
     assert not [u for u in updates if "MB written" in u["message"]]
     assert 50 in [u["progress"] for u in updates]
+
+
+def test_size_message_rate_reflects_the_current_window_not_the_average():
+    """A job that was fast and is now crawling must report the crawl.
+
+    Guards the distinction the status line exists to make: with a cumulative
+    average, an early fast phase keeps advertising a high rate long after the
+    conversion has slowed to nothing.
+    """
+    mb = 1024 * 1024
+    # Same 2 GB written in both cases; only the most recent window differs.
+    fast = runner_module.output_size_message(2000 * mb, 500 * mb, 60.0)
+    crawling = runner_module.output_size_message(2000 * mb, 1 * mb, 60.0)
+
+    assert "2,000 MB written" in fast and "2,000 MB written" in crawling
+    assert "500.0 MB/min" in fast
+    assert "1.0 MB/min" in crawling

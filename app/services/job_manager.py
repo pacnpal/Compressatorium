@@ -1507,6 +1507,14 @@ class JobManager:
         Jobs in the verify phase are exempt. Verification emits no progress and
         legitimately runs for many minutes on a large image, so warning on it
         would report healthy work as stalled.
+
+        Deliberately touches no filesystem. Running at the default log level
+        means running for every processing job on every heartbeat, and the mount
+        this is meant to report on is precisely the one where ``stat`` blocks in
+        uninterruptible I/O -- which would freeze the event loop it is diagnosing.
+        ``idle_for`` comes from the in-memory progress clock, and the job message
+        already carries bytes written and rate for tools using the size-growth
+        fallback.
         """
         if settings.debug_progress_timeout <= 0:
             return
@@ -1514,40 +1522,26 @@ class JobManager:
         for job in list(self.jobs.values()):
             if job.status != JobStatus.PROCESSING or job.id in self._verifying:
                 continue
-            output_size = None
-            output_idle = None
-            if job.output_path and os.path.exists(job.output_path):
-                try:
-                    output_size = os.path.getsize(job.output_path)
-                except OSError:
-                    output_size = None
-                if output_size is not None:
-                    last_size = self._last_output_size.get(job.id)
-                    last_size_at = self._last_output_size_at.get(job.id, now)
-                    if last_size is None or output_size != last_size:
-                        self._last_output_size[job.id] = output_size
-                        self._last_output_size_at[job.id] = now
-                    else:
-                        output_idle = now - last_size_at
             last_progress = self._last_progress_at.get(job.id, now)
             idle_for = now - last_progress
             if idle_for < settings.debug_progress_timeout:
                 continue
-            last_stall = self._last_stall_log_at.get(job.id, 0)
-            if now - last_stall < settings.debug_progress_timeout:
+            # None, not 0, for "never logged": monotonic() counts from boot, so
+            # a 0 sentinel reads as "logged at boot" and suppressed the first
+            # warning for the first debug_progress_timeout seconds of uptime.
+            last_stall = self._last_stall_log_at.get(job.id)
+            if last_stall is not None and now - last_stall < settings.debug_progress_timeout:
                 continue
             self._last_stall_log_at[job.id] = now
             logger.warning(
                 "Stalled job %s idle=%.1fs progress=%s message=%s input=%s output=%s "
-                "output_size=%s output_idle=%s started_at=%s",
+                "started_at=%s",
                 job.id,
                 idle_for,
                 job.progress,
                 job.message,
                 job.file_path,
                 job.output_path,
-                output_size,
-                output_idle,
                 job.started_at,
             )
 
