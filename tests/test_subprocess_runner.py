@@ -704,32 +704,20 @@ def test_bounded_probe_gives_up_instead_of_waiting(monkeypatch):
     """A filesystem probe that never returns must not hold the caller.
 
     Stands in for a `stat` wedged on an unresponsive mount, which cannot be
-    cancelled -- the thread is written off and the caller continues without the
-    measurement rather than hanging the job (issue #263).
+    cancelled -- the thread is written off and the caller decides its own
+    fallback rather than the job hanging (issue #263).
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     monkeypatch.setattr(runner_module, "_STAT_TIMEOUT", 0.05)
-    pool = ThreadPoolExecutor(max_workers=1)
 
     async def _go():
-        return await runner_module._bounded_probe(pool, time.sleep, 30)
+        return await runner_module._bounded_probe(time.sleep, 30)
 
-    try:
-        assert asyncio.run(_go()) is None
-    finally:
-        pool.shutdown(wait=False)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(_go())
 
 
 def test_bounded_probe_returns_the_value_when_it_lands():
-    from concurrent.futures import ThreadPoolExecutor
-
-    pool = ThreadPoolExecutor(max_workers=1)
-
     async def _go():
-        return await runner_module._bounded_probe(pool, len, "abcd")
+        return await runner_module._bounded_probe(len, "abcd")
 
-    try:
-        assert asyncio.run(_go()) == 4
-    finally:
-        pool.shutdown(wait=False)
+    assert asyncio.run(_go()) == 4

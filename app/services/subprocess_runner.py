@@ -53,23 +53,34 @@ class ConversionCancelled(Exception):
 _STAT_TIMEOUT = 10.0
 
 
-async def _bounded_probe(pool: ThreadPoolExecutor, func, *args, **kwargs):
-    """Run a blocking filesystem probe with a hard bound. None on timeout/error.
+async def _bounded_probe(func, *args, **kwargs):
+    """Run a one-shot blocking filesystem call with a hard bound.
+
+    Raises :class:`asyncio.TimeoutError` if it does not finish within
+    :data:`_STAT_TIMEOUT`; every other exception propagates untouched. The
+    timeout is signalled rather than folded into a ``None`` return because some
+    of these calls (``os.makedirs``) return ``None`` on success, and each caller
+    wants a different fallback anyway.
 
     A ``stat`` on an unresponsive mount blocks in uninterruptible I/O and cannot
-    be cancelled -- Python can abandon the future but never the OS thread. So a
-    probe is bounded in time and its thread is simply written off if it never
-    comes back; the caller continues without that measurement rather than
-    waiting on it, which is the whole point of issue #263.
+    be cancelled -- Python can abandon the future but never the OS thread. Each
+    call therefore gets its **own** disposable executor, shut down without
+    joining: a wedged probe writes off exactly one thread and cannot occupy a
+    worker that anything else depends on. Sharing one would let a hung
+    input-side stat starve the continuous output-growth probe, leaving a job
+    whose output is writing perfectly well with no status and no watchdog
+    activity until the stall timeout killed it.
     """
-    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fs-probe")
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(pool, functools.partial(func, *args, **kwargs)),
+            asyncio.get_running_loop().run_in_executor(
+                pool, functools.partial(func, *args, **kwargs),
+            ),
             timeout=_STAT_TIMEOUT,
         )
-    except (asyncio.TimeoutError, OSError):
-        return None
+    finally:
+        pool.shutdown(wait=False)
 
 
 # Bounds on reaping a subprocess: how long to let it exit on its own once its
@@ -470,14 +481,11 @@ class SubprocessRunner:
         rather than a bare "no output" message. Used by nsz, whose ``output_path``
         is the temp file the runner already watches.
         """
-        # One probe worker per run, deliberately not a shared pool. A filesystem
-        # call wedged in uninterruptible I/O occupies its thread forever, so a
-        # shared pool would let two bad mounts starve every later job of the
-        # growth signal -- and a healthy job with no native percentage would then
-        # be killed by the stall watchdog while writing perfectly well. Per-run
-        # isolation means a dead mount costs one abandoned thread for that job
-        # and nothing for the next.
-        probe_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="size-probe")
+        # A worker dedicated to this run's output-growth probe, and to nothing
+        # else. Per-run so one dead mount cannot starve later jobs of the growth
+        # signal; exclusive to growth probing so a hung input-side stat cannot
+        # either. A wedged probe costs this one thread, abandoned at teardown.
+        growth_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="growth-probe")
 
         output_dir = os.path.dirname(output_path)
         if output_dir:
@@ -486,21 +494,11 @@ class SubprocessRunner:
             # before the child exists, would freeze the whole queue behind it
             # (issue #263).
             try:
-                await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        probe_pool,
-                        functools.partial(os.makedirs, output_dir, exist_ok=True),
-                    ),
-                    timeout=_STAT_TIMEOUT,
-                )
+                await _bounded_probe(os.makedirs, output_dir, exist_ok=True)
             except asyncio.TimeoutError:
-                probe_pool.shutdown(wait=False)
                 raise RuntimeError(
                     f"{fail_label}: output directory {output_dir} stopped responding"
                 ) from None
-            except BaseException:
-                probe_pool.shutdown(wait=False)
-                raise
 
         def _preexec():
             apply_nice(self._owner)
@@ -535,6 +533,10 @@ class SubprocessRunner:
         # Bound before the try: the finally tears these down, so an early failure
         # must not hit an unbound name and mask the real error.
         size_probe: asyncio.Task | None = None
+        # Set once the ladder has already run and given up, so teardown does not
+        # repeat TERM/KILL on a child known to be unkillable -- that second pass
+        # is another 15s holding the queue's only slot for no possible gain.
+        reap_failed = False
         try:
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(
@@ -546,15 +548,15 @@ class SubprocessRunner:
             # mount that must not hang the spawn path, so fall back to the
             # non-adaptive baseline rather than waiting -- a watchdog with a
             # rough bound beats no watchdog.
-            stall_timeout = await _bounded_probe(
-                probe_pool,
-                compute_progress_stall_timeout,
-                input_path=input_path,
-                base_timeout=getattr(settings, "progress_timeout", 0),
-                timeout_per_gib=getattr(settings, "progress_timeout_per_gib", 0),
-                timeout_cap=getattr(settings, "progress_timeout_cap", 0),
-            )
-            if stall_timeout is None:
+            try:
+                stall_timeout = await _bounded_probe(
+                    compute_progress_stall_timeout,
+                    input_path=input_path,
+                    base_timeout=getattr(settings, "progress_timeout", 0),
+                    timeout_per_gib=getattr(settings, "progress_timeout_per_gib", 0),
+                    timeout_cap=getattr(settings, "progress_timeout_cap", 0),
+                )
+            except asyncio.TimeoutError:
                 stall_timeout = max(0, int(getattr(settings, "progress_timeout", 0) or 0))
             # Seed the progress floor with the caller's preamble (e.g. the
             # service's "Starting..." yield at 1/5%) so an early non-parseable
@@ -609,7 +611,10 @@ class SubprocessRunner:
                 # Unbounded here would hang the job after the child is already
                 # running, with no stall loop yet to end it. No sample just means
                 # no percentage; the bytes/rate message needs no ratio.
-                input_size = await _bounded_probe(probe_pool, os.path.getsize, input_path)
+                try:
+                    input_size = await _bounded_probe(os.path.getsize, input_path)
+                except (asyncio.TimeoutError, OSError):
+                    input_size = None
                 if input_size is not None:
                     expected_size = max(1, int(input_size * ratio))
 
@@ -660,7 +665,7 @@ class SubprocessRunner:
                             probed_size = size_probe.result()
                     size_probe = asyncio.ensure_future(
                         asyncio.get_running_loop().run_in_executor(
-                            probe_pool, _measure_output_sync,
+                            growth_pool, _measure_output_sync,
                         )
                     )
                 return probed_size
@@ -823,6 +828,7 @@ class SubprocessRunner:
             if not await self.reap(
                 process, exit_timeout=0 if already_signalled else _EXIT_GRACE,
             ):
+                reap_failed = True
                 abandoned_error = (
                     f"{fail_label} did not exit and could not be killed "
                     f"(pid {process.pid}); it is likely blocked on unresponsive "
@@ -880,7 +886,7 @@ class SubprocessRunner:
                 size_probe.cancel()
             # wait=False: never join. A wedged probe thread is abandoned with the
             # executor rather than holding the job open behind it.
-            probe_pool.shutdown(wait=False)
+            growth_pool.shutdown(wait=False)
             if cancel_task:
                 cancel_task.cancel()
                 try:
@@ -889,4 +895,5 @@ class SubprocessRunner:
                     pass
             # exit_timeout=0: nothing is reading the child's output any more, so
             # go straight to signalling instead of waiting out a voluntary exit.
-            await self.reap(process, exit_timeout=0)
+            if not reap_failed:
+                await self.reap(process, exit_timeout=0)
