@@ -845,11 +845,18 @@ The contract, tool-agnostic and owned by `JobManager`:
   with a monotonic `seq`. **Only automatic eviction is tallied.** A job deleted
   by the user (single row, or Clear) is history *they* dropped; counting it
   would make a badge outlive every list that could show it.
-- **`get_history_overflow(since=None)`** returns
-  `{max_job_history, evicted, total_evicted, seq, evicted_ids}` — absolute
-  totals, never deltas, so a dropped frame or a reconnect self-heals. Pass a
-  previously returned `seq` as `since` to also receive the ids evicted after
-  that point; `history_eviction_seq()` opens a cursor without reading counts.
+- **`get_history_overflow(since=None, generation=None)`** returns
+  `{generation, max_job_history, evicted, total_evicted, seq, evicted_ids,
+  cursor_expired}` — absolute totals, never deltas, so a dropped frame or a
+  reconnect self-heals. Pass a previously returned `seq` as `since` to also
+  receive the ids evicted after that point, **and the `generation` that cursor
+  came from**: a cursor minted by an earlier process is meaningless here, and
+  reading it literally would return no ids at all, so it is rewound to the
+  start of this log instead. `cursor_expired` says the cursor fell off the end
+  of the bounded id log (sized to `max(2000, 4 × max_job_history)`), so the ids
+  cannot be complete and the client must re-sync against the job list rather
+  than trust the rows it holds. `history_eviction_seq()` opens a cursor without
+  reading counts.
 - **`reset_history_overflow()`** clears the tally and the id log, and returns
   the *advanced* `seq`. Never rewind it: it is a cursor clients hold, so
   rewinding would make a stale cursor look current, while advancing makes every

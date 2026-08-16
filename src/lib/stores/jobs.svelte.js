@@ -338,6 +338,7 @@ class JobsStore {
     // Cursor captured before the job list is read, so the history read below
     // can name anything evicted from here on. See the tail of this method.
     const cursor = this.historySeq;
+    const cursorGeneration = this.historyGeneration;
     let listSynced = false;
     try {
       const data = await api.getJobs();
@@ -429,7 +430,9 @@ class JobsStore {
     // and let the next poll re-establish truth.
     if (!listSynced) return;
     try {
-      this._applyHistoryOverflow(await api.getJobHistoryOverflow(cursor));
+      this._applyHistoryOverflow(
+        await api.getJobHistoryOverflow(cursor, cursorGeneration),
+      );
     } catch (_e) {
       // Non-fatal: the next poll or `history` event re-establishes truth.
     }
@@ -546,8 +549,14 @@ class JobsStore {
       // badges would keep counting jobs no list can show. Adopting the
       // post-reset sequence rejects any history read still in flight from
       // before the clear, which would otherwise restore the tally.
-      this.historyOverflow = {};
-      if (typeof res?.history_seq === 'number') this.historySeq = res.history_seq;
+      // Guarded like any other payload: an eviction after the reset but before
+      // this response arrived can already have been applied from the stream at
+      // a newer sequence, and clobbering it would leave the totals too low
+      // until the next change — the backend only re-emits when they move.
+      if (typeof res?.history_seq !== 'number' || res.history_seq >= this.historySeq) {
+        this.historyOverflow = {};
+        if (typeof res?.history_seq === 'number') this.historySeq = res.history_seq;
+      }
       this.jobs = this.jobs.filter((j) => !TERMINAL_STATUSES.has(j.status));
       this._byId.clear();
       for (const job of this.jobs) this._byId.set(job.id, job);
@@ -614,6 +623,11 @@ class JobsStore {
             // Absolute totals, not deltas, so a missed frame or a reconnect
             // self-heals on the next emission.
             this._applyHistoryOverflow(data?.history);
+            // `cursor_expired` means the backend can no longer name every job
+            // it evicted since our cursor, so rows we hold may already be
+            // deleted there. The totals alone can't settle that — only the job
+            // list can, and refresh() is the authoritative read.
+            if (data?.history?.cursor_expired) this.refresh().catch(() => {});
             break;
           default:
             break;

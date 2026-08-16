@@ -1208,7 +1208,9 @@ async def job_events():
                     # Emit the evicted-history totals on connect and on every
                     # subsequent change. Legacy clients that don't listen for
                     # "history" drop it silently, as with "snapshot".
-                    history = job_manager.get_history_overflow(since=last_seq)
+                    history = job_manager.get_history_overflow(
+                        since=last_seq, generation=job_manager.history_generation
+                    )
                     counts = (history["evicted"], history["seq"])
                     if counts != last_history:
                         last_history = counts
@@ -1260,7 +1262,7 @@ async def check_stuck_status():
 
 
 @router.get("/jobs/history-overflow")
-async def job_history_overflow(since: Optional[int] = None):
+async def job_history_overflow(since: Optional[int] = None, generation: Optional[str] = None):
     """Counts of finished jobs already evicted by the MAX_JOB_HISTORY cap.
 
     /api/jobs can only return retained jobs, so a client counting that list
@@ -1275,8 +1277,13 @@ async def job_history_overflow(since: Optional[int] = None):
     still in the job list *and* in these counts — double-counted — unless it
     can be named and dropped. Read the job list first, then pass the cursor
     here, and the two reads reconcile.
+
+    Pass ``generation`` with it — the generation the cursor came from. A cursor
+    minted by an earlier process means nothing to this one, and reading it
+    literally would return no ids at all, which is exactly the double-count the
+    cursor exists to prevent.
     """
-    return job_manager.get_history_overflow(since=since)
+    return job_manager.get_history_overflow(since=since, generation=generation)
 
 
 @router.get("/jobs/{job_id}", response_model=ConversionJob)

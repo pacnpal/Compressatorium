@@ -1,5 +1,7 @@
 """Tests for JobManager external-job API and METADATA_SCAN non-cancellability."""
 
+from collections import deque
+
 import pytest
 
 from app.models import ConversionMode, JobStatus
@@ -574,6 +576,53 @@ async def test_reset_history_overflow_advances_the_sequence():
     assert returned == after["seq"] == seq_before + 1
     assert after["evicted_ids"] == []
     assert after["evicted"] == {}
+
+
+@pytest.mark.asyncio
+async def test_cursor_from_another_generation_is_rewound_not_read_literally():
+    """A cursor minted before a restart is meaningless against a log that began
+    again at 0. Read literally it would name nothing — the exact double-count
+    the cursor exists to prevent — so it rewinds to the start of this log."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    ids = []
+    for i in range(3):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+        ids.append(j.id)
+
+    stale_cursor = 9_999  # a sequence from a previous, longer-lived process
+    literal = mgr.get_history_overflow(since=stale_cursor)
+    assert literal["evicted_ids"] == [], "sanity: read literally, it names nothing"
+
+    rewound = mgr.get_history_overflow(since=stale_cursor, generation="from-a-past-life")
+    assert rewound["evicted_ids"] == ids[:2]
+    # A cursor from *this* generation is still honoured as written.
+    assert mgr.get_history_overflow(
+        since=1, generation=mgr.history_generation
+    )["evicted_ids"] == [ids[1]]
+
+
+@pytest.mark.asyncio
+async def test_cursor_older_than_the_id_log_reports_expired():
+    """The id log is bounded. A cursor that falls off the end can't be answered
+    completely, and saying so is what lets the client re-sync instead of
+    silently keeping a row the cap already deleted."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+    # Shrink the window so the test doesn't need thousands of jobs.
+    mgr._evicted_ids = deque(mgr._evicted_ids, maxlen=2)
+
+    for i in range(5):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+
+    fresh = mgr.get_history_overflow(since=mgr.history_eviction_seq())
+    assert fresh["cursor_expired"] is False
+
+    stale = mgr.get_history_overflow(since=0)
+    assert stale["cursor_expired"] is True
+    # Nothing has been evicted yet → nothing was dropped → not expired.
+    assert JobManager(max_concurrent=1).get_history_overflow(since=0)["cursor_expired"] is False
 
 
 @pytest.mark.asyncio

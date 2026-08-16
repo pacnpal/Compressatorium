@@ -245,10 +245,16 @@ export const api = {
   // ids evicted after that point — read /jobs first, then pass the cursor
   // here, and a job evicted between the two reads is named rather than
   // counted twice (once as a row still in the list, once in the totals).
-  getJobHistoryOverflow(since) {
+  //
+  // `generation` is the backend process the cursor came from. Without it, a
+  // cursor minted before a backend restart reads as a huge sequence against a
+  // log that restarted at 0, so the reply names nothing — the exact
+  // double-count the cursor exists to prevent.
+  getJobHistoryOverflow(since, generation) {
     const params = typeof since === 'number' && since >= 0
       ? new URLSearchParams({ since: String(since) })
       : undefined;
+    if (params && generation) params.set('generation', generation);
     return fetchJson(
       buildApiUrl('/jobs/history-overflow', params),
       undefined,
