@@ -383,13 +383,16 @@ def test_stall_timeout_raises_runtimeerror(tmp_path, monkeypatch):
 
 
 def test_size_progress_emits_from_output_growth(tmp_path):
-    """Progress for a no-parseable-percent tool comes from the size_progress hook.
+    """A tool that prints no percent still reports, from output-file growth.
 
     The child writes the output file then a stdout line each step, so the
     post-line size tick fires without waiting on the read timeout, and the
-    stream ends at the runner's terminal 100%.
+    stream ends at the runner's terminal 100%. ``mode`` supplies the size ratio,
+    so the fallback carries a percentage as well as the bytes/rate message.
     """
     out = tmp_path / "out.bin"
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)  # cso_compress ratio 0.5 -> expected 1000
     script = (
         "import sys\n"
         f"out = {str(out)!r}\n"
@@ -400,26 +403,20 @@ def test_size_progress_emits_from_output_growth(tmp_path):
     )
     runner = SubprocessRunner(owner="test")
 
-    def _size_progress(size: int) -> dict:
-        return {
-            "progress": runner_module.output_size_progress(size, 1000),
-            "message": f"sz {size}",
-        }
-
     updates = asyncio.run(
         _drain(
             runner.run(
                 _py_cmd(script),
-                input_path=str(tmp_path / "in.bin"),
+                input_path=str(src),
                 output_path=str(out),
                 parse_progress=lambda _line: None,
-                size_progress=_size_progress,
+                mode="cso_compress",
                 fail_label="testproc",
             )
         )
     )
 
-    size_updates = [u for u in updates if u["message"].startswith("sz ")]
+    size_updates = [u for u in updates if "MB written" in u["message"]]
     assert size_updates, "expected at least one size-based progress update"
     # The estimate matches the shared helper (100 B against expected 1000 -> 14%)
     # and the emitted bar never goes backwards.
@@ -514,22 +511,18 @@ def test_initial_progress_floor_keeps_bar_monotonic(tmp_path):
         "    sys.stdout.write('step\\n'); sys.stdout.flush()\n"
     )
     runner = SubprocessRunner(owner="test")
-
-    def _size_progress(size: int) -> dict:
-        return {
-            "progress": runner_module.output_size_progress(size, 1000),
-            "message": f"sz {size}",
-        }
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)
 
     updates = asyncio.run(
         _drain(
             runner.run(
                 _py_cmd(script),
-                input_path=str(tmp_path / "in.bin"),
+                input_path=str(src),
                 output_path=str(out),
                 parse_progress=lambda _line: None,
                 initial_progress=5,
-                size_progress=_size_progress,
+                mode="cso_compress",
                 fail_label="testproc",
             )
         )
@@ -592,3 +585,94 @@ def test_run_capture_timeout_returns_none_and_terminates():
     )
     assert rc is None
     assert not runner.active_pids()
+
+
+# ---------------------------------------------------------------------------
+# reap()  (bounded teardown -- issue #263)
+# ---------------------------------------------------------------------------
+
+
+class _UnkillableProcess:
+    """A child that ignores every signal, like one wedged in D state.
+
+    A real process in uninterruptible I/O cannot be simulated (SIGKILL always
+    works on a healthy one), so the ladder is exercised against a stand-in that
+    records the signals and never exits.
+    """
+
+    def __init__(self):
+        self.pid = -1
+        self.returncode = None
+        self.signals: list[str] = []
+
+    def terminate(self):
+        self.signals.append("TERM")
+
+    def kill(self):
+        self.signals.append("KILL")
+
+    async def wait(self):
+        await asyncio.sleep(3600)  # never returns; every caller must bound it
+
+
+def test_reap_abandons_a_child_that_survives_sigkill(monkeypatch):
+    """reap() escalates TERM -> KILL and then gives up instead of hanging.
+
+    The regression guard for #263: an unbounded wait here blocked the job
+    forever and, at MAX_CONCURRENT_JOBS=1, every job queued behind it.
+    """
+    monkeypatch.setattr(runner_module, "_TERM_GRACE", 0.01)
+    monkeypatch.setattr(runner_module, "_KILL_GRACE", 0.01)
+    runner = SubprocessRunner(owner="test")
+    process = _UnkillableProcess()
+
+    reaped = asyncio.run(runner.reap(process, exit_timeout=0.01))
+
+    assert reaped is False, "an unkillable child must be abandoned, not waited on"
+    assert process.signals == ["TERM", "KILL"], "expected the full escalation ladder"
+
+
+def test_reap_returns_true_for_an_already_exited_child():
+    """The common case costs nothing: no signals, no waiting."""
+    runner = SubprocessRunner(owner="test")
+    process = _UnkillableProcess()
+    process.returncode = 0
+
+    assert asyncio.run(runner.reap(process)) is True
+    assert process.signals == []
+
+
+def test_native_progress_suppresses_the_size_fallback(tmp_path):
+    """A tool that reports its own percent is left alone.
+
+    Native parsing and the growth fallback must not both drive the message
+    line; once a real percent is parsed the fallback stands down.
+    """
+    out = tmp_path / "out.bin"
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)
+    script = (
+        "import sys\n"
+        f"out = {str(out)!r}\n"
+        "with open(out, 'wb') as f:\n"
+        "    for pct in (10, 50):\n"
+        "        f.write(b'x' * 100); f.flush()\n"
+        "        sys.stdout.write(f'{pct}%\\n'); sys.stdout.flush()\n"
+    )
+    runner = SubprocessRunner(owner="test")
+
+    updates = asyncio.run(
+        _drain(
+            runner.run(
+                _py_cmd(script),
+                input_path=str(src),
+                output_path=str(out),
+                parse_progress=_parse_pct,
+                mode="cso_compress",
+                fail_label="testproc",
+            )
+        )
+    )
+
+    assert not [u for u in updates if "MB written" in u["message"]]
+    assert 50 in [u["progress"] for u in updates]

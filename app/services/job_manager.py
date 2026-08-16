@@ -1621,7 +1621,12 @@ class JobManager:
                         if now - last_stall < settings.debug_progress_timeout:
                             continue
                         self._last_stall_log_at[job.id] = now
-                        logger.debug(
+                        # WARNING, not DEBUG: a job silently wedged mid-conversion
+                        # is the one state `is_stuck()` cannot see (it only fires
+                        # when jobs are queued and *none* are processing), so at
+                        # the default log level this was the sole trace of a
+                        # frozen queue -- and it was invisible (issue #263).
+                        logger.warning(
                             "Stalled job %s idle=%.1fs progress=%s message=%s input=%s output=%s "
                             "output_size=%s output_idle=%s started_at=%s",
                             job.id,

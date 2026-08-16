@@ -359,7 +359,7 @@ class Nkit2IsoService:
         self,
         input_path: str,
         output_path: str,
-        mode: str = "nkit_restore",  # noqa: ARG002 - single-mode tool
+        mode: str = "nkit_restore",
         *,
         compression: str | None = None,  # noqa: ARG002 - NKit restore has no codec
         cancel_event: asyncio.Event | None = None,
@@ -390,6 +390,7 @@ class Nkit2IsoService:
                 fail_label="nkit2iso",
                 complete_message="NKit restore complete (CRC32 verified)",
                 require_output=True,
+                mode=mode,
             ):
                 if _NOT_EXACT_MARKER in update.get("message", ""):
                     not_exact = True

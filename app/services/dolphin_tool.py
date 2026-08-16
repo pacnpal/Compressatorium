@@ -114,6 +114,7 @@ class DolphinToolService:
             cancel_event=cancel_event,
             heartbeat=True,
             fail_label="dolphin-tool",
+            mode=mode,
         ):
             yield update
 

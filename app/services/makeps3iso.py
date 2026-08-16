@@ -157,7 +157,7 @@ class MakePs3IsoService:
         self,
         input_path: str,
         output_path: str,
-        mode: str = "folder_to_iso",  # noqa: ARG002 - single-mode tool
+        mode: str = "folder_to_iso",
         *,
         compression: str | None = None,  # noqa: ARG002 - no compression knob
         split: bool = False,
@@ -183,6 +183,7 @@ class MakePs3IsoService:
                 fail_label="makeps3iso",
                 complete_message="ISO build complete",
                 output_growth_paths=growth_paths,
+                mode=mode,
             ):
                 # Hold back the runner's terminal 100% so the readback message
                 # is the final update the job records.

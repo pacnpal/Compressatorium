@@ -528,6 +528,7 @@ class JwudToolService:
             complete_message=f"Wii U {verb} complete",
             nice_via_wrapper=True,
             require_output=True,
+            mode=mode,
         ):
             if update.get("progress", 0) >= 100:
                 continue

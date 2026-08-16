@@ -338,7 +338,7 @@ class SubprocessRunner:
     async def run(self, cmd: list[str], *, input_path: str, output_path: str,
                   parse_progress, cancel_event=None, heartbeat=False,
                   fail_label="process", complete_message="Conversion complete",
-                  cwd=None, output_growth_paths=None, size_progress=None,
+                  cwd=None, output_growth_paths=None, mode=None,
                   nice_via_wrapper=False, env=None,
                   require_output=False) -> AsyncGenerator[dict, None]:
         """Spawn cmd, stream stdout, yield {"progress","message"}.
@@ -347,7 +347,8 @@ class SubprocessRunner:
         `_split_stream_lines` so segmentation is a pure function of the byte
         stream, not chunk boundaries -- issue #183),
         stall timeout via compute_progress_stall_timeout, cancel-watcher
-        (terminate->kill), ConversionCancelled, non-zero exit -> RuntimeError(tail),
+        (terminate->kill via the bounded `reap()` ladder), ConversionCancelled,
+        non-zero exit -> RuntimeError(tail),
         final 100%. `parse_progress(line) -> int|None` is the only per-tool knob
         in the common path. `cwd` sets the working directory (romz runs `7z a`
         from the ROM dir).
@@ -356,10 +357,10 @@ class SubprocessRunner:
         - `heartbeat` — dolphin's 2s "Converting... (Ns)" keep-alive.
         - `output_growth_paths()` — widen the stall probe to a set of files whose
           summed size grows even as filenames change mid-run (makeps3iso split).
-        - `size_progress(output_size) -> dict|None` — turn output growth into the
-          emitted progress for tools with no parseable percent (maxcso/nsz/z3ds);
-          see `output_size_progress()` for the shared 5–95% estimate. Also raises
-          the progress floor so a later non-parseable line can't reset the bar.
+        - `mode` — the conversion mode, used to look up an expected output/input
+          size ratio in `SIZE_RATIOS` so the size-growth fallback (below) can
+          emit a percentage as well as a message. Optional: a mode with no row
+          still reports bytes and rate.
         - `nice_via_wrapper` — skip preexec_fn when the caller prefixed cmd with
           nice/ionice command wrappers (maxcso/nsz avoid forking a Python callable
           in this multithreaded process before exec). `env` — forwarded to the
@@ -369,6 +370,17 @@ class SubprocessRunner:
           non-zero-exit path, so a tool that exits 0 without producing output
           still reports the reason it printed first (nsz, whose `output_path` is
           the temp file the runner already watches).
+        """
+
+    async def reap(self, process, *, exit_timeout=_EXIT_GRACE) -> bool:
+        """Bounded teardown for any spawned child. True if reaped, False if
+        abandoned. Escalates: wait exit_timeout for a voluntary exit, then
+        SIGTERM + grace, then SIGKILL + grace, then give up. A child blocked in
+        uninterruptible I/O (D state) survives SIGKILL, so every wait must be
+        bounded -- an unbounded one blocks the job forever and, at
+        MAX_CONCURRENT_JOBS=1 (the default, which runs jobs inline in the
+        dispatcher), every job queued behind it (issue #263). The single
+        teardown path for run(), run_capture() and their finally blocks.
         """
 
     async def run_capture(self, cmd: list[str], *, timeout=None,
@@ -387,11 +399,37 @@ class SubprocessRunner:
 
 Per-tool `convert()` becomes ~15 lines: build argv, then
 `async for u in self._runner.run(cmd, ..., parse_progress=self._parse_progress): yield u`.
-Tools with no parseable percent (maxcso/nsz/z3ds) pass `size_progress=` to drive
-the bar from output growth and `nice_via_wrapper=True` to keep their
-command-wrapper nice; nsz also forwards its keys-home `env=`, sets
-`require_output=True`, and writes into a private work dir, moving the result onto
-`output_path` after `run()` returns.
+Tools with no parseable percent (maxcso/nsz/z3ds) additionally pass
+`nice_via_wrapper=True` to keep their command-wrapper nice; nsz also forwards its
+keys-home `env=`, sets `require_output=True`, and writes into a private work dir,
+moving the result onto `output_path` after `run()` returns.
+
+### Every tool reports status (issue #263)
+
+Progress reporting is **not** a per-tool responsibility, and no tool hand-rolls
+it. The runner owns both signals and picks between them:
+
+1. **Native, preferred.** `parse_progress(line) -> int|None` parses the tool's
+   own percentage. The moment it returns a real percent, that tool is reporting
+   for itself and the fallback stands down for the rest of the run — the two
+   never compete for the message line.
+2. **Output growth, automatic fallback.** When native parsing never yields a
+   percent — the common case, because most of these CLIs draw a TTY bar that
+   goes silent on a pipe — the runner reports from the output file growing on
+   disk: `output_size_message()` emits **MB written and a MB/min rate**. This
+   needs no per-tool wiring at all, so *a tool that does nothing gets it*.
+   Passing `mode` adds a percentage when `SIZE_RATIOS` knows that mode's
+   expected output/input ratio.
+
+The rate matters as much as the byte count: it is what distinguishes a job that
+is merely slow (bytes climbing, MB/min collapsing) from one that has stopped
+dead. Before this, dolphin-tool reported only elapsed seconds against a 0% bar,
+and users could not tell a crawling conversion from a hung one.
+
+**Adding a tool:** do nothing and it already reports bytes + rate. Add a
+`SIZE_RATIOS` row to also get a percentage bar. Implement `parse_progress` if
+the tool prints a percentage that survives being piped — and verify that it
+actually does, because several do not.
 dolphin's heartbeat and the makeps3iso split-stall probe are likewise opt-in
 flags. One-shot subprocess work (info / header / embedded-hash extraction)
 shares `run_capture()` rather than re-implementing the spawn / cancel / timeout /

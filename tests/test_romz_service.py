@@ -354,7 +354,7 @@ def stub_runner(monkeypatch):
     """Replace the service's SubprocessRunner.run/run_capture with recorders."""
     calls: dict[str, object] = {}
 
-    async def fake_run(cmd, *, input_path, output_path, parse_progress,
+    async def fake_run(cmd, *, input_path, output_path, parse_progress, mode=None,
                        cancel_event=None, cwd=None, fail_label="",
                        complete_message=""):
         calls["run_cmd"] = cmd
@@ -499,7 +499,7 @@ def test_convert_cleans_partial_output_on_failure(tmp_path, monkeypatch):
     rom.write_bytes(b"ROM")
     out = tmp_path / "Game.gba.7z"
 
-    async def boom(cmd, *, input_path, output_path, parse_progress,
+    async def boom(cmd, *, input_path, output_path, parse_progress, mode=None,
                    cancel_event=None, cwd=None, fail_label="",
                    complete_message=""):
         Path(output_path).write_bytes(b"PARTIAL")

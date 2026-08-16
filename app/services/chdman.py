@@ -99,6 +99,7 @@ class ChdmanService:
             parse_progress=self._parse_progress,
             cancel_event=cancel_event,
             fail_label="chdman",
+            mode=mode,
         ):
             yield update
 

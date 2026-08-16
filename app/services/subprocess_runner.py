@@ -47,6 +47,13 @@ class ConversionCancelled(Exception):
     """Raised when a conversion is cancelled before completion."""
 
 
+# Bounds on reaping a subprocess: how long to let it exit on its own once its
+# output stream closes, then the SIGTERM and SIGKILL grace periods.
+_EXIT_GRACE = 60.0
+_TERM_GRACE = 5.0
+_KILL_GRACE = 10.0
+
+
 # --- Shared process-priority / timeout policy -----------------------------
 #
 # These knobs (nice level, I/O priority, info/verify timeouts) govern *every*
@@ -146,6 +153,50 @@ def _split_stream_lines(buffer: str) -> tuple[list[str], str]:
     return [s.strip() for s in segments[:-1] if s.strip()], remainder
 
 
+# Expected output size as a multiple of the input, per conversion mode. The
+# single source of truth for the size-growth progress estimate: one table here
+# rather than a `_COMPRESS_RATIO`/`_DECOMPRESS_RATIO` pair and an
+# `expected_size` closure re-derived inside every tool service. A mode absent
+# from the table still reports status -- it falls back to the bytes-written
+# message, which needs no ratio -- so a new tool is never *required* to add a
+# row, and adding one only sharpens its percentage estimate. The ratio only
+# smooths the bar (see `output_size_progress`), so an approximate value is fine.
+SIZE_RATIOS: dict[str, float] = {
+    # dolphin-tool: RVZ/WIA/GCZ compression, and decompression back to ISO.
+    "dolphin_rvz": 0.5, "dolphin_wia": 0.5, "dolphin_gcz": 0.7,
+    "dolphin_iso": 2.0,
+    # maxcso: PSP/PS2 CSO family.
+    "cso_compress": 0.5, "cso2_compress": 0.5, "zso_compress": 0.5,
+    "dax_compress": 0.5, "cso_decompress": 2.0,
+    # nsz: Switch NSP/XCI <-> NSZ/XCZ.
+    "nsz_compress": 0.6, "nsz_decompress": 1.7,
+    # z3ds: 3DS CIA/3DS <-> Z3DS.
+    "z3ds_compress": 0.5, "z3ds_decompress": 2.0,
+}
+
+
+def size_ratio_for(mode: str | None) -> float | None:
+    """Expected output/input size ratio for ``mode`` (None when unknown)."""
+    return SIZE_RATIOS.get(mode) if mode else None
+
+
+def output_size_message(size: int, started_at: float) -> str:
+    """Status line for a size-growth tick: bytes written and the current rate.
+
+    The shared human-readable half of the size-growth progress signal (the
+    numeric half is :func:`output_size_progress`). A tool that is merely *slow*
+    -- a conversion crawling against a saturated array or a stalled share --
+    must read as slow rather than as indistinguishable from a hang, so the
+    message carries an absolute (MB written) and a derivative (MB/min): the
+    first keeps climbing, the second collapses toward zero. Rate is expressed
+    per minute because the case worth diagnosing is the pathological one, where
+    a per-second figure rounds to ``0.0`` and tells the user nothing.
+    """
+    written_mb = size / (1024 * 1024)
+    elapsed_min = max(time.monotonic() - started_at, 1e-9) / 60.0
+    return f"Working... ({written_mb:,.0f} MB written, {written_mb / elapsed_min:,.1f} MB/min)"
+
+
 def output_size_progress(current: int, expected_size: int) -> int:
     """Estimate a 5-95% progress value from output-file growth.
 
@@ -193,6 +244,57 @@ class SubprocessRunner:
     def active_pids(self) -> list[int]:
         with self._pid_lock:
             return list(self._active_pids)
+
+    async def reap(self, process, *, exit_timeout: float = _EXIT_GRACE) -> bool:
+        """Wait for ``process`` to exit, bounded at every step. True if reaped.
+
+        The shared teardown for every subprocess this module spawns. A child
+        blocked in uninterruptible I/O (``D`` state -- a stalled mount, a drive
+        that stopped answering) does not die on ``SIGTERM`` *or* ``SIGKILL``:
+        the signal is only delivered once the kernel I/O returns, which may be
+        never. A bare ``await process.wait()`` on such a child therefore blocks
+        its job forever, and because ``MAX_CONCURRENT_JOBS=1`` runs jobs inline
+        in the dispatcher, every job queued behind it too (issue #263).
+
+        So each step is bounded and the ladder terminates: wait ``exit_timeout``
+        for a voluntary exit (skipped when 0 -- teardown paths have already
+        stopped reading), then ``SIGTERM`` + grace, then ``SIGKILL`` + grace.
+        Returning ``False`` means the child outlived ``SIGKILL`` and has been
+        abandoned -- it keeps its pipes and one OS process until the kernel
+        unblocks it, which is the unavoidable cost of not hanging the queue.
+        Callers turn that into a failed job.
+        """
+        if process.returncode is not None:
+            return True
+
+        async def _wait(timeout: float) -> bool:
+            if timeout <= 0:
+                return process.returncode is not None
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return False
+            return True
+
+        if await _wait(exit_timeout):
+            return True
+
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        if await _wait(_TERM_GRACE):
+            return True
+
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        if await _wait(_KILL_GRACE):
+            return True
+
+        self._logger.error(
+            "%s pid=%s survived SIGKILL (likely blocked in uninterruptible I/O); "
+            "abandoning it so the job fails instead of stalling the queue",
+            self._owner, process.pid,
+        )
+        return False
 
     async def run_capture(
         self,
@@ -261,15 +363,9 @@ class SubprocessRunner:
                 cancel_wait.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await cancel_wait
-            if process.returncode is None:
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                except ProcessLookupError:
-                    pass
+            # exit_timeout=0: nothing is reading the child's output any more, so
+            # go straight to signalling instead of waiting out a voluntary exit.
+            await self.reap(process, exit_timeout=0)
             if not comm.done():
                 comm.cancel()
             # CancelledError is a BaseException, so it is NOT covered by
@@ -294,7 +390,7 @@ class SubprocessRunner:
         complete_message: str = "Conversion complete",
         cwd: str | None = None,
         output_growth_paths: Callable[[], list[str]] | None = None,
-        size_progress: Callable[[int], dict | None] | None = None,
+        mode: str | None = None,
         nice_via_wrapper: bool = False,
         env: Mapping[str, str] | None = None,
         require_output: bool = False,
@@ -316,15 +412,19 @@ class SubprocessRunner:
         makeps3iso ``-s`` renames the base ``.iso`` to ``.iso.0`` and then writes
         ``.iso.1``/…, which the bare ``output_path`` probe would stop seeing.
 
-        ``size_progress(output_size) -> dict | None`` turns the measured output
-        size into a progress update for tools whose CLI prints no parseable
-        percent (its TTY bar goes silent on a pipe): on each output-growth tick
-        the runner calls it and yields its ``{"progress", "message"}``, clamped
-        to never drop below the current floor. ``parse_progress`` still wins when
-        it returns a percent. See :func:`output_size_progress` for the shared
-        estimate. ``initial_progress`` seeds that floor with the caller's preamble
-        (e.g. a service's "Starting..." yield at 1/5%) so an early non-parseable
-        line cannot drop the bar below it.
+        **Every run reports status, with no per-tool wiring.** ``parse_progress``
+        is the preferred signal and always wins: as soon as it returns a real
+        percent, that tool is reporting for itself. When it never does — the
+        common case, since most of these CLIs draw a TTY bar that falls silent
+        on a pipe — the runner falls back to the growing output file, emitting
+        bytes-written and a MB/min rate (:func:`output_size_message`) so a slow
+        job is visibly slow rather than indistinguishable from a hung one. Pass
+        ``mode`` to additionally get a percentage from :data:`SIZE_RATIOS`; a
+        mode absent from that table still gets the message, so a new tool needs
+        no wiring to be observable and a ratio only sharpens the bar.
+        ``initial_progress`` seeds the floor with the caller's preamble (e.g. a
+        service's "Starting..." yield at 1/5%) so an early non-parseable line
+        cannot drop the bar below it.
 
         ``nice_via_wrapper`` skips the ``preexec_fn`` renice when the caller has
         already prefixed ``cmd`` with ``nice``/``ionice`` command wrappers
@@ -427,6 +527,17 @@ class SubprocessRunner:
             buffer = ""
             output_lines: list[str] = []
             stall_error: str | None = None
+            abandoned_error: str | None = None
+            # Native stdout parsing is the preferred signal; the size-growth
+            # fallback below only speaks while this stays False.
+            saw_native_progress = False
+            ratio = size_ratio_for(mode)
+            expected_size = 0
+            if ratio:
+                try:
+                    expected_size = max(1, int(os.path.getsize(input_path) * ratio))
+                except OSError:
+                    expected_size = 0
 
             def _record_line(line: str) -> None:
                 if not output_lines or output_lines[-1] != line:
@@ -463,15 +574,23 @@ class SubprocessRunner:
                     last_activity_at = now
 
             def _size_update(now: float) -> dict | None:
-                # Size-based progress for tools whose CLI prints no parseable
-                # percent (maxcso/nsz/z3ds): on each output-growth tick, refresh
-                # the stall clock, advance the progress floor, and return the
-                # tool's {"progress","message"} update to yield. The emitted
-                # progress is clamped to the floor so a size estimate can never
-                # drop the bar below a higher parsed/seeded value. No-op (returns
-                # None) for every existing caller, which leaves size_progress unset.
+                # Status from output-file growth, the universal fallback for a
+                # tool whose stdout tells us nothing: every conversion writes a
+                # file, so a growing file is a progress signal even when the CLI
+                # prints no parseable percent (its TTY bar goes silent on a pipe)
+                # -- which is most of them. This is what makes a merely *slow*
+                # job legible instead of indistinguishable from a hung one
+                # (issue #263).
+                #
+                # Native parsing wins whenever it works: once a real percent has
+                # been parsed, that tool is reporting for itself and the fallback
+                # stands down rather than fighting it for the message line. A
+                # percentage is emitted only for a mode with a known size ratio;
+                # otherwise the bar holds at its floor and the message alone
+                # carries the news, which needs no ratio and so costs a new tool
+                # no wiring at all.
                 nonlocal last_output_size, last_activity_at, last_progress_value
-                if size_progress is None:
+                if saw_native_progress:
                     return None
                 size = _measure_output()
                 if size is None:
@@ -480,15 +599,16 @@ class SubprocessRunner:
                     return None
                 last_output_size = size
                 last_activity_at = now
-                update = size_progress(size)
-                if update is not None:
-                    pct = update.get("progress")
-                    if isinstance(pct, int):
-                        if pct < last_progress_value:
-                            update = {**update, "progress": last_progress_value}
-                        elif pct > last_progress_value:
-                            last_progress_value = pct
-                return update
+                progress = last_progress_value
+                if expected_size:
+                    # Clamped to the floor: an estimate must never walk the bar
+                    # backward from a higher seeded value.
+                    progress = max(progress, output_size_progress(size, expected_size))
+                    last_progress_value = progress
+                return {
+                    "progress": progress,
+                    "message": output_size_message(size, start),
+                }
 
             async def _check_stall(now: float) -> bool:
                 nonlocal stall_error
@@ -533,6 +653,11 @@ class SubprocessRunner:
                     update = _size_update(now)
                     if update is not None:
                         yield update
+                        # A size update carries strictly more than the generic
+                        # heartbeat (bytes and a rate, not just elapsed seconds),
+                        # so it stands in for one rather than being overwritten
+                        # by one on the same tick.
+                        last_heartbeat_at = now
                     if await _check_stall(now):
                         break
                     if heartbeat and now - last_heartbeat_at >= 2:
@@ -553,9 +678,11 @@ class SubprocessRunner:
                     _record_line(line)
                     now = time.monotonic()
                     progress = parse_progress(line)
-                    if progress is not None and progress > last_progress_value:
-                        last_progress_value = progress
-                        last_activity_at = now
+                    if progress is not None:
+                        saw_native_progress = True
+                        if progress > last_progress_value:
+                            last_progress_value = progress
+                            last_activity_at = now
                     # Clamp to the running floor (incl. initial_progress) so a
                     # parsed value below it can't move the bar backward.
                     yield {"progress": last_progress_value, "message": line}
@@ -571,16 +698,23 @@ class SubprocessRunner:
                 _record_line(line)
                 now = time.monotonic()
                 progress = parse_progress(line)
-                if progress is not None and progress > last_progress_value:
-                    last_progress_value = progress
-                    last_activity_at = now
+                if progress is not None:
+                    saw_native_progress = True
+                    if progress > last_progress_value:
+                        last_progress_value = progress
+                        last_activity_at = now
                 yield {"progress": last_progress_value, "message": line}
                 update = _size_update(time.monotonic())
                 if update is not None:
                     yield update
                 await _check_stall(time.monotonic())
 
-            await process.wait()
+            if not await self.reap(process):
+                abandoned_error = (
+                    f"{fail_label} did not exit and could not be killed "
+                    f"(pid {process.pid}); it is likely blocked on unresponsive "
+                    "storage. Abandoning it so the queue can continue."
+                )
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(
                     "%s pid=%s exit=%s", self._owner, process.pid, process.returncode,
@@ -596,6 +730,11 @@ class SubprocessRunner:
             # is valid and must not be deleted as a false cancellation.
             if cancelled_by_request:
                 raise ConversionCancelled("Conversion cancelled")
+
+            # Nothing below can be trusted for an abandoned child: it has no
+            # return code and never will.
+            if abandoned_error:
+                raise RuntimeError(abandoned_error)
 
             if process.returncode != 0:
                 tail = "\n".join(output_lines[-6:])
@@ -630,12 +769,6 @@ class SubprocessRunner:
                     await cancel_task
                 except asyncio.CancelledError:
                     pass
-            if process.returncode is None:
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                except ProcessLookupError:
-                    pass
+            # exit_timeout=0: nothing is reading the child's output any more, so
+            # go straight to signalling instead of waiting out a voluntary exit.
+            await self.reap(process, exit_timeout=0)
