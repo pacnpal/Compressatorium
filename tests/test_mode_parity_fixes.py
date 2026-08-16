@@ -407,6 +407,57 @@ async def test_job_events_stream_names_newly_evicted_jobs(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_job_events_opens_its_cursor_before_the_snapshot(monkeypatch):
+    """A job evicted while the client is being handed snapshot rows must still
+    be named in the first `history` frame.
+
+    Emitting the snapshot suspends the generator between jobs, so the client
+    can already hold a row that the cap deletes moments later. If the cursor
+    only opened after the snapshot, that row would never be retracted and the
+    client would count it twice — as a retained row and in the tally.
+    """
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    doomed = manager.create_external_job("Scan0", ConversionMode.METADATA_SCAN)
+    await manager.finish_external_job(doomed.id, success=True)
+
+    # Evict `doomed` from inside the snapshot pass — i.e. after the generator
+    # captured its cursor, and as the client is being handed the row.
+    real_get_all = manager.get_all_jobs
+    calls = {"n": 0}
+
+    def get_all_jobs_evicting_mid_snapshot():
+        calls["n"] += 1
+        listed = real_get_all()
+        if calls["n"] == 2:  # 1 = subscribe pass, 2 = snapshot pass
+            manager._record_history_eviction(manager.jobs[doomed.id])
+            del manager.jobs[doomed.id]
+        return listed
+
+    monkeypatch.setattr(manager, "get_all_jobs", get_all_jobs_evicting_mid_snapshot)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+    history = None
+    try:
+        for _ in range(20):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=3)
+            if event.get("event") == "history":
+                history = json.loads(event["data"])["history"]
+                break
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert history is not None
+    assert history["total_evicted"] == 1
+    assert history["evicted_ids"] == [doomed.id], (
+        "the first frame must retract a row evicted during snapshot emission"
+    )
+
+
+@pytest.mark.asyncio
 async def test_clear_completed_resets_history_overflow(monkeypatch):
     """Clear wipes history wholesale, so the evicted tally goes with it —
     otherwise the tab badges would count jobs no list can show."""
@@ -441,6 +492,10 @@ async def test_clear_completed_resets_history_overflow(monkeypatch):
     assert result["count"] == 1
     assert result["history_forgotten"] == 2
     assert result["total_cleared"] == 3
+    # The post-reset cursor rides along so a caller can discard a history read
+    # that was already in flight — applying it would restore the tally.
+    assert result["history_seq"] == manager.history_eviction_seq()
+    assert result["history_seq"] > 2
 
 
 @pytest.mark.asyncio

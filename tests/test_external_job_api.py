@@ -552,9 +552,14 @@ async def test_history_overflow_replays_evicted_ids_from_a_cursor():
 
 
 @pytest.mark.asyncio
-async def test_reset_history_overflow_keeps_the_sequence_monotonic():
-    """Clear empties the tally and the id log, but the cursor must not rewind —
-    a client holding a stale `seq` would otherwise look current."""
+async def test_reset_history_overflow_advances_the_sequence():
+    """Clear empties the tally and the id log, and *advances* the cursor.
+
+    Never rewind it — a client holding a stale `seq` would look current. And
+    advancing (rather than holding) is what lets a client discard a history
+    read that was already in flight when the clear landed; applying that
+    response would restore the tally it just cleared.
+    """
     mgr = JobManager(max_concurrent=1, max_job_history=1)
 
     for i in range(3):
@@ -563,11 +568,31 @@ async def test_reset_history_overflow_keeps_the_sequence_monotonic():
     seq_before = mgr.get_history_overflow()["seq"]
     assert seq_before > 0
 
-    mgr.reset_history_overflow()
+    returned = mgr.reset_history_overflow()
 
     after = mgr.get_history_overflow(since=0)
-    assert after["seq"] == seq_before
+    assert returned == after["seq"] == seq_before + 1
     assert after["evicted_ids"] == []
+    assert after["evicted"] == {}
+
+
+@pytest.mark.asyncio
+async def test_history_eviction_seq_opens_a_cursor_at_the_current_position():
+    """The SSE stream captures this before emitting its snapshot: a job evicted
+    while the client is being handed rows must still be named in the first
+    `history` frame, or the client counts it as both a row and an eviction."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    first = mgr.create_external_job("Done0", ConversionMode.METADATA_SCAN)
+    await mgr.finish_external_job(first.id, success=True)
+
+    cursor = mgr.history_eviction_seq()
+
+    # This completion evicts `first` — after the cursor was opened.
+    second = mgr.create_external_job("Done1", ConversionMode.METADATA_SCAN)
+    await mgr.finish_external_job(second.id, success=True)
+
+    assert mgr.get_history_overflow(since=cursor)["evicted_ids"] == [first.id]
 
 
 @pytest.mark.asyncio

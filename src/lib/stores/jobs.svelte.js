@@ -33,6 +33,13 @@ class JobsStore {
   // SSE event and re-read on refresh(); see convert.py:event_generator.
   historyOverflow = $state({});
   historyLimit = $state(0);
+  // Sequence of the newest overflow state applied. The REST read in refresh()
+  // races the `history` stream, so without it a hydration response captured
+  // before a newer event could land after it and roll the totals backwards —
+  // and since the backend only re-emits on change, they'd stay wrong until the
+  // next poll. Every change to the tally (evictions and Clear alike) advances
+  // the sequence, so an older payload is always recognizable.
+  historySeq = -1;
 
   cancellingAll = $state(false);
   clearingCompleted = $state(false);
@@ -266,6 +273,14 @@ class JobsStore {
    */
   _applyHistoryOverflow(payload) {
     if (!payload || typeof payload !== 'object') return;
+    // Drop payloads older than what we've already applied. Equal sequences
+    // carry equal counts (nothing changes the tally without advancing it), so
+    // re-applying those is a no-op rather than a regression.
+    const seq = payload.seq;
+    if (typeof seq === 'number') {
+      if (seq < this.historySeq) return;
+      this.historySeq = seq;
+    }
     const evictedIds = payload.evicted_ids;
     if (Array.isArray(evictedIds) && evictedIds.length > 0) {
       // Plain object as an id→true map, matching refresh(): the svelte-eslint
@@ -494,8 +509,11 @@ class JobsStore {
       const res = await api.deleteCompletedJobs();
       // Drop terminal jobs locally for instant feedback. The backend forgets
       // its evicted-history tally on the same call, so drop ours too or the
-      // badges would keep counting jobs no list can show.
+      // badges would keep counting jobs no list can show. Adopting the
+      // post-reset sequence rejects any history read still in flight from
+      // before the clear, which would otherwise restore the tally.
       this.historyOverflow = {};
+      if (typeof res?.history_seq === 'number') this.historySeq = res.history_seq;
       this.jobs = this.jobs.filter((j) => !TERMINAL_STATUSES.has(j.status));
       this._byId.clear();
       for (const job of this.jobs) this._byId.set(job.id, job);

@@ -1104,20 +1104,29 @@ class JobManager:
             "evicted_ids": evicted_ids,
         }
 
+    def history_eviction_seq(self) -> int:
+        """Current position in the eviction log, for opening a client cursor."""
+        return self._eviction_seq
+
     def history_overflow_total(self) -> int:
         """How many finished jobs the cap has evicted and is still counting."""
         return sum(
             count for by_mode in self._evicted_history.values() for count in by_mode.values()
         )
 
-    def reset_history_overflow(self) -> None:
+    def reset_history_overflow(self) -> int:
         """Forget the evicted-history tally (Clear wipes history wholesale).
 
-        ``_eviction_seq`` deliberately keeps counting: it is a cursor clients
-        hold, and rewinding it would make a stale cursor look current.
+        The sequence *advances* rather than rewinding. It is a cursor clients
+        hold, so rewinding it would make a stale cursor look current; advancing
+        it makes every read taken before the reset recognizably older, which is
+        how a client rejects an in-flight hydration response that would
+        otherwise restore the tally it just cleared. Returns the new sequence.
         """
         self._evicted_history.clear()
         self._evicted_ids.clear()
+        self._eviction_seq += 1
+        return self._eviction_seq
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job."""

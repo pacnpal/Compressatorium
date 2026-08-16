@@ -1184,6 +1184,14 @@ async def job_events():
 
                     # Then emit the one-time snapshot of every known job.
                     if not snapshot_sent:
+                        # Cursor captured BEFORE the first snapshot frame goes
+                        # out. Emitting the snapshot suspends this generator
+                        # between jobs, so a job can be evicted after the
+                        # client has already been handed its row; opening the
+                        # cursor here means the first `history` frame names it
+                        # and the client drops it, instead of counting it as
+                        # both a retained row and an evicted job.
+                        last_seq = job_manager.history_eviction_seq()
                         for job in job_manager.get_all_jobs():
                             yield {
                                 "event": "snapshot",
@@ -1294,7 +1302,7 @@ async def delete_completed_jobs(request: Request):
     # deletes 500 rows but clears 1,153 jobs' worth of history, and a
     # "Removed 500" toast under a "Remove 1,153?" prompt reads like a failure.
     forgotten = job_manager.history_overflow_total()
-    job_manager.reset_history_overflow()
+    history_seq = job_manager.reset_history_overflow()
     client_host = request.client.host if request.client else "unknown"
     logger.info(
         "Clear completed requested from %s; deleted=%d history_forgotten=%d",
@@ -1307,6 +1315,9 @@ async def delete_completed_jobs(request: Request):
         "count": len(deleted_ids),
         "history_forgotten": forgotten,
         "total_cleared": len(deleted_ids) + forgotten,
+        # Post-reset cursor, so the caller can discard a history read that was
+        # already in flight when this cleared — it would restore the tally.
+        "history_seq": history_seq,
     }
 
 

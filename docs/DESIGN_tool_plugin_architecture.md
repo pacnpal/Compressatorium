@@ -849,18 +849,30 @@ The contract, tool-agnostic and owned by `JobManager`:
   `{max_job_history, evicted, total_evicted, seq, evicted_ids}` — absolute
   totals, never deltas, so a dropped frame or a reconnect self-heals. Pass a
   previously returned `seq` as `since` to also receive the ids evicted after
-  that point.
-- **`reset_history_overflow()`** clears the tally and the id log (`seq` keeps
-  counting — it is a cursor clients hold, and rewinding it would make a stale
-  cursor look current). `DELETE /api/jobs/completed` calls it, and reports
-  `history_forgotten` / `total_cleared` alongside the deleted row count.
+  that point; `history_eviction_seq()` opens a cursor without reading counts.
+- **`reset_history_overflow()`** clears the tally and the id log, and returns
+  the *advanced* `seq`. Never rewind it: it is a cursor clients hold, so
+  rewinding would make a stale cursor look current, while advancing makes every
+  read taken before the reset recognizably older. `DELETE /api/jobs/completed`
+  calls it and reports `history_forgotten` / `total_cleared` / `history_seq`
+  alongside the deleted row count.
+
+**Every change to the tally advances `seq`** — evictions and resets alike. That
+is what makes an out-of-order payload detectable: equal sequences carry equal
+counts, so a client can reject anything older and re-apply an equal one as a
+no-op.
 
 Transport: `GET /api/jobs/history-overflow` for hydration and the polling
 fallback, plus a `history` event on `/api/jobs/events`, emitted on connect and
 whenever the totals change. Additive — clients that don't listen for it drop it
 silently, as with `snapshot`.
 
-**The two invariants a client must preserve** (`src/lib/stores/jobs.svelte.js`):
+The stream opens its cursor **before** emitting the snapshot, not after:
+snapshot emission suspends the generator between jobs, so a row already handed
+to the client can be evicted moments later, and the first `history` frame has to
+be able to retract it.
+
+**The three invariants a client must preserve** (`src/lib/stores/jobs.svelte.js`):
 
 1. **Displayed total = retained + evicted.** Apply the same filters to both
    halves; the tally is keyed by mode precisely so the external-scan filter
@@ -871,6 +883,11 @@ silently, as with `snapshot`.
    row the backend has already deleted. Counting it as retained *and* as evicted
    inflates every badge by one per completion for as long as a batch runs past
    the cap.
+3. **Never apply a payload older than the one already applied.** The REST read
+   races the stream; without a `seq` check a hydration response captured before
+   a newer event can land after it and roll the totals backwards, and since the
+   backend only re-emits on change they would stay wrong until the next poll.
+   Adopt `history_seq` from the Clear response for the same reason.
 
 Where retained rows exist but the total exceeds them, say so in the UI rather
 than let a badge and a list disagree — `JobsPanel` renders *"Showing the 500
