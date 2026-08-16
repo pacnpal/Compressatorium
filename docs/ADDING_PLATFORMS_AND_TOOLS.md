@@ -727,6 +727,11 @@ class NszipTool(BaseTool):
     modes to `SIZE_RATIOS` in `services/subprocess_runner.py` (expected output
     size as a multiple of the input — approximate is fine, it only smooths the
     bar). A mode with no row still reports bytes and rate.
+  - `parse_progress` must return **`None`**, never `0`, for a line carrying no
+    percentage. The runner reads "a percent was parsed" as proof the tool
+    reports its own progress and stands the fallback down for the rest of the
+    run, so a `0` sentinel on the first banner line silently disables status
+    reporting entirely. chdman did exactly this.
   - Implement `parse_progress` only if the binary prints a percentage **that
     survives being piped**. Check this against a real conversion rather than
     against `--help`: several of these tools draw a progress bar only on a TTY

@@ -393,13 +393,17 @@ def test_size_progress_emits_from_output_growth(tmp_path):
     out = tmp_path / "out.bin"
     src = tmp_path / "in.bin"
     src.write_bytes(b"s" * 2000)  # cso_compress ratio 0.5 -> expected 1000
+    # The growth probe runs in a worker thread and is read one tick later, so
+    # the child pauses between steps to let each measurement land -- mirroring a
+    # real conversion, where ticks are seconds apart.
     script = (
-        "import sys\n"
+        "import sys, time\n"
         f"out = {str(out)!r}\n"
         "with open(out, 'wb') as f:\n"
         "    for i in range(3):\n"
         "        f.write(b'x' * 100); f.flush()\n"
         "        sys.stdout.write(f'step {i}\\n'); sys.stdout.flush()\n"
+        "        time.sleep(0.2)\n"
     )
     runner = SubprocessRunner(owner="test")
 

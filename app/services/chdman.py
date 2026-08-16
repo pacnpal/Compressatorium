@@ -207,7 +207,7 @@ class ChdmanService:
                             line = part.strip()
                             if line:
                                 output_lines.append(line)
-                                progress = self._parse_progress(line)
+                                progress = self._parse_progress(line) or 0
                                 yield {
                                     "type": "progress",
                                     "progress": progress,
@@ -220,7 +220,7 @@ class ChdmanService:
                             line = part.strip()
                             if line:
                                 output_lines.append(line)
-                                progress = self._parse_progress(line)
+                                progress = self._parse_progress(line) or 0
                                 yield {
                                     "type": "progress",
                                     "progress": progress,
@@ -233,7 +233,7 @@ class ChdmanService:
             if buffer.strip():
                 line = buffer.strip()
                 output_lines.append(line)
-                progress = self._parse_progress(line)
+                progress = self._parse_progress(line) or 0
                 yield {"type": "progress", "progress": progress, "message": line}
 
             await process.wait()
@@ -280,13 +280,20 @@ class ChdmanService:
             # The process has already exited or no longer exists; nothing left to terminate.
             pass
 
-    def _parse_progress(self, line: str) -> int:
-        """Parse chdman output for progress percentage."""
+    def _parse_progress(self, line: str) -> int | None:
+        """Parse chdman output for progress percentage, None if the line has none.
+
+        None -- not 0 -- for a non-progress line (a banner, a status message).
+        The runner reads "a percent was parsed" as proof the tool reports its own
+        progress and stands its size-growth fallback down; a 0 sentinel made the
+        very first banner line look like a report and disabled the fallback for
+        the whole run (issue #263).
+        """
         # chdman outputs: "Compressing, 45.2% complete..."
         match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
         if match:
             return min(99, int(float(match.group(1))))
-        return 0
+        return None
 
     def _parse_info(self, output: str) -> dict:
         """Parse chdman info output into structured data."""

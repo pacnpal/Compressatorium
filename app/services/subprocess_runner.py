@@ -473,6 +473,9 @@ class SubprocessRunner:
         # error fires, the subprocess, the cancel-watcher task and the PID entry
         # are always cleaned up rather than leaked.
         cancel_task = None
+        # Bound before the try: the finally cancels this, so an early failure
+        # must not hit an unbound name and mask the real error.
+        size_probe: asyncio.Task | None = None
         try:
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(
@@ -480,7 +483,8 @@ class SubprocessRunner:
                     self._owner, process.pid, " ".join(cmd),
                 )
 
-            stall_timeout = compute_progress_stall_timeout(
+            stall_timeout = await run_in_threadpool(
+                compute_progress_stall_timeout,
                 input_path=input_path,
                 base_timeout=getattr(settings, "progress_timeout", 0),
                 timeout_per_gib=getattr(settings, "progress_timeout_per_gib", 0),
@@ -535,7 +539,8 @@ class SubprocessRunner:
             expected_size = 0
             if ratio:
                 try:
-                    expected_size = max(1, int(os.path.getsize(input_path) * ratio))
+                    input_size = await run_in_threadpool(os.path.getsize, input_path)
+                    expected_size = max(1, int(input_size * ratio))
                 except OSError:
                     expected_size = 0
 
@@ -545,7 +550,9 @@ class SubprocessRunner:
                     if len(output_lines) > 30:
                         output_lines.pop(0)
 
-            def _measure_output() -> int | None:
+            probed_size: int | None = None
+
+            def _measure_output_sync() -> int | None:
                 # Summed size of the growth-probe target(s). Default is the
                 # single output_path; output_growth_paths widens it to a set
                 # whose total grows monotonically even as filenames change
@@ -563,6 +570,29 @@ class SubprocessRunner:
                     except OSError:
                         continue
                 return total if found else None
+
+            def _measure_output() -> int | None:
+                """Most recent output size, measured off the event loop.
+
+                ``getsize`` on an unresponsive mount blocks in uninterruptible
+                I/O, and inline that would freeze the entire event loop --
+                including the stall watchdog and the ``reap()`` ladder that exist
+                to rescue exactly this situation (issue #263). So the probe runs
+                in a worker thread and is *never awaited*: each tick reads the
+                last completed measurement and kicks off the next. Single-flight,
+                so a wedged mount costs one blocked thread for the life of the
+                job rather than one per tick. The cost is that the size is one
+                tick (~2s) stale, which no consumer here cares about.
+                """
+                nonlocal size_probe, probed_size
+                if size_probe is None or size_probe.done():
+                    if size_probe is not None and not size_probe.cancelled():
+                        with contextlib.suppress(Exception):
+                            probed_size = size_probe.result()
+                    size_probe = asyncio.ensure_future(
+                        run_in_threadpool(_measure_output_sync)
+                    )
+                return probed_size
 
             def _update_output_activity(now: float):
                 nonlocal last_output_size, last_activity_at
@@ -763,6 +793,8 @@ class SubprocessRunner:
             yield {"progress": 100, "message": complete_message}
         finally:
             self.untrack_pid(process.pid)
+            if size_probe is not None and not size_probe.done():
+                size_probe.cancel()
             if cancel_task:
                 cancel_task.cancel()
                 try:

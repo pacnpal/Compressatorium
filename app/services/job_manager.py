@@ -113,6 +113,10 @@ class JobManager:
         # it runs (a cancel notification or history prune silently dropped).
         self._background_tasks: Set[asyncio.Task] = set()
         self._delete_plans: Dict[str, Dict[str, object]] = {}
+        # Jobs currently inside the verify phase. Verification emits no progress
+        # and can legitimately run for many minutes, so the stalled-job warning
+        # skips them rather than reporting healthy work as wedged.
+        self._verifying: set[str] = set()
         self._last_progress_at: Dict[str, float] = {}
         self._last_progress_log_at: Dict[str, float] = {}
         self._last_stall_log_at: Dict[str, float] = {}
@@ -1491,6 +1495,62 @@ class JobManager:
 
         return cleanup_counter
 
+    def _log_stalled_jobs(self) -> None:
+        """Warn about a PROCESSING job whose progress has gone quiet.
+
+        Runs at the default log level and *outside* the DEBUG-only heartbeat
+        block: a job wedged mid-conversion is precisely the state `is_stuck()`
+        cannot see -- it bails early on any PROCESSING conversion -- so without
+        this the sole trace of a frozen queue was a debug line nobody would find
+        (issue #263).
+
+        Jobs in the verify phase are exempt. Verification emits no progress and
+        legitimately runs for many minutes on a large image, so warning on it
+        would report healthy work as stalled.
+        """
+        if settings.debug_progress_timeout <= 0:
+            return
+        now = time.monotonic()
+        for job in list(self.jobs.values()):
+            if job.status != JobStatus.PROCESSING or job.id in self._verifying:
+                continue
+            output_size = None
+            output_idle = None
+            if job.output_path and os.path.exists(job.output_path):
+                try:
+                    output_size = os.path.getsize(job.output_path)
+                except OSError:
+                    output_size = None
+                if output_size is not None:
+                    last_size = self._last_output_size.get(job.id)
+                    last_size_at = self._last_output_size_at.get(job.id, now)
+                    if last_size is None or output_size != last_size:
+                        self._last_output_size[job.id] = output_size
+                        self._last_output_size_at[job.id] = now
+                    else:
+                        output_idle = now - last_size_at
+            last_progress = self._last_progress_at.get(job.id, now)
+            idle_for = now - last_progress
+            if idle_for < settings.debug_progress_timeout:
+                continue
+            last_stall = self._last_stall_log_at.get(job.id, 0)
+            if now - last_stall < settings.debug_progress_timeout:
+                continue
+            self._last_stall_log_at[job.id] = now
+            logger.warning(
+                "Stalled job %s idle=%.1fs progress=%s message=%s input=%s output=%s "
+                "output_size=%s output_idle=%s started_at=%s",
+                job.id,
+                idle_for,
+                job.progress,
+                job.message,
+                job.file_path,
+                job.output_path,
+                output_size,
+                output_idle,
+                job.started_at,
+            )
+
     async def _debug_loop(self):
         cleanup_counter = 0
         while self._running:
@@ -1499,6 +1559,10 @@ class JobManager:
 
                 # Handle background maintenance tasks
                 cleanup_counter = await self._handle_background_maintenance(cleanup_counter)
+
+                # Before the DEBUG gate: this warning must reach a default-level
+                # log, not just a debug one.
+                self._log_stalled_jobs()
 
                 if not logger.isEnabledFor(logging.DEBUG):
                     continue
@@ -1590,55 +1654,6 @@ class JobManager:
                         output_size,
                         output_idle,
                     )
-
-                if settings.debug_progress_timeout > 0:
-                    now = time.monotonic()
-                    for job in jobs:
-                        if job.status != JobStatus.PROCESSING:
-                            continue
-                        output_size = None
-                        output_idle = None
-                        if job.output_path and os.path.exists(job.output_path):
-                            try:
-                                output_size = os.path.getsize(job.output_path)
-                            except OSError:
-                                output_size = None
-                            if output_size is not None:
-                                last_size = self._last_output_size.get(job.id)
-                                last_size_at = self._last_output_size_at.get(
-                                    job.id, now
-                                )
-                                if last_size is None or output_size != last_size:
-                                    self._last_output_size[job.id] = output_size
-                                    self._last_output_size_at[job.id] = now
-                                else:
-                                    output_idle = now - last_size_at
-                        last_progress = self._last_progress_at.get(job.id, now)
-                        idle_for = now - last_progress
-                        if idle_for < settings.debug_progress_timeout:
-                            continue
-                        last_stall = self._last_stall_log_at.get(job.id, 0)
-                        if now - last_stall < settings.debug_progress_timeout:
-                            continue
-                        self._last_stall_log_at[job.id] = now
-                        # WARNING, not DEBUG: a job silently wedged mid-conversion
-                        # is the one state `is_stuck()` cannot see (it only fires
-                        # when jobs are queued and *none* are processing), so at
-                        # the default log level this was the sole trace of a
-                        # frozen queue -- and it was invisible (issue #263).
-                        logger.warning(
-                            "Stalled job %s idle=%.1fs progress=%s message=%s input=%s output=%s "
-                            "output_size=%s output_idle=%s started_at=%s",
-                            job.id,
-                            idle_for,
-                            job.progress,
-                            job.message,
-                            job.file_path,
-                            job.output_path,
-                            output_size,
-                            output_idle,
-                            job.started_at,
-                        )
 
                 for pid in chdman_service.active_pids():
                     proc_io_path = f"/proc/{pid}/io"
@@ -2322,9 +2337,13 @@ class JobManager:
                         },
                     )
 
-                    verify_result = await registry.for_mode(job.mode.value).verify(
-                        job.output_path
-                    )
+                    self._verifying.add(job_id)
+                    try:
+                        verify_result = await registry.for_mode(job.mode.value).verify(
+                            job.output_path
+                        )
+                    finally:
+                        self._verifying.discard(job_id)
                     if not verify_result.get("valid"):
                         raise RuntimeError(
                             f"Verification failed: {verify_result.get('message')}"
