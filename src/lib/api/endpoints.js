@@ -236,6 +236,13 @@ export const api = {
 
   getJobs: () => fetchJson(`${API_BASE}/jobs`, undefined, 'Failed to fetch jobs'),
 
+  // Counts of finished jobs the backend history cap (MAX_JOB_HISTORY) has
+  // already evicted. /jobs only returns what is still retained, so this is
+  // what turns a capped list into a true total. Live updates arrive as
+  // `history` events on the job stream; this is the hydration read.
+  getJobHistoryOverflow: () =>
+    fetchJson(`${API_BASE}/jobs/history-overflow`, undefined, 'Failed to fetch job history totals'),
+
   getJob: (jobId) => fetchJson(`${API_BASE}/jobs/${jobId}`, undefined, 'Failed to fetch job'),
 
   cancelJob: (jobId) =>
@@ -269,13 +276,16 @@ export const api = {
    * sends on connect (and re-sends after each reconnect) flows through
    * the same handler as live updates. See convert.py:event_generator.
    *
+   * `history` carries the counts of finished jobs the backend's history cap
+   * has evicted — absolute totals, re-sent whenever they change.
+   *
    * @param {(evt: { type: string, data: any }) => void} onEvent
    * @param {{onOpen?: () => void, onReconnecting?: () => void}} [status]
    */
   subscribeToJobs(onEvent, status) {
     const conn = sseConnectNamed(
       `${API_BASE}/jobs/events`,
-      ['snapshot', 'progress', 'complete', 'error', 'status', 'cancelled'],
+      ['snapshot', 'progress', 'complete', 'error', 'status', 'cancelled', 'history'],
       onEvent,
       status,
     );

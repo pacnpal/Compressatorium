@@ -1216,6 +1216,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | GET | `/api/jobs/events` | SSE stream for job progress updates |
 | GET | `/api/jobs/{id}/events` | SSE stream for a single job's progress |
 | GET | `/api/jobs/stuck-status` | Check if job queue is in a stuck state |
+| GET | `/api/jobs/history-overflow` | Counts of finished jobs already evicted by `MAX_JOB_HISTORY` |
 | POST | `/api/jobs/recover` | Manually trigger recovery from stuck job queue |
 
 **Destructive jobs actions require explicit confirmation headers:**
@@ -1326,7 +1327,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `MAX_METADATA_SCAN_CONCURRENCY` | `1` | Maximum concurrent metadata scan tasks |
 | `MAX_MATCH_CONCURRENCY` | `1` | Maximum concurrent DAT hash-matching operations. Raise only if your storage can handle parallel full-file reads (matching a raw Wii ISO is a full-file SHA1). |
 | `MATCH_MAX_FILE_SIZE` | `0` | Skip DAT hash-matching for files larger than this many bytes (0 disables the cap). Set e.g. `2147483648` on slow storage to keep 8 GB ISOs from blocking the browse-triggered matcher. |
-| `MAX_JOB_HISTORY` | `500` | Maximum completed jobs to retain in history |
+| `MAX_JOB_HISTORY` | `500` | Maximum finished jobs (completed + failed + cancelled) to retain in history. Past the cap the oldest are dropped, but the Jobs tab badges still report the true total — the panel says how many of them are still listed. |
 | `COMPRESSATORIUM_TOOL_NICE` | `10` | Nice level for every conversion tool (0-19, higher = lower priority). Legacy alias: `CHD_CHDMAN_NICE`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` | `2` | I/O priority class for every tool (`1` realtime, `2` best-effort, `3` idle). Legacy alias: `CHD_CHDMAN_IOPRIO_CLASS`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for every tool (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |

@@ -28,6 +28,11 @@
   const completedCount = $derived(jobs.visibleCompletedCount);
   const failedCount = $derived(jobs.visibleFailedCount);
   const stuck = $derived(jobs.stuckState);
+  // Past MAX_JOB_HISTORY the backend evicts the oldest finished jobs, so the
+  // tab badge (a true total) outruns what the pager can list. Say so rather
+  // than let the two silently disagree.
+  const retainedCount = $derived(jobs.retainedCount);
+  const trimmedCount = $derived(jobs.trimmedCount);
 
   // Stuck-state probe. The backend exposes /api/jobs/stuck-status as
   // a snapshot, not a stream, so we have to poll. Fire once on mount
@@ -165,6 +170,14 @@
       />
     {/if}
   {:else}
+    {#if trimmedCount > 0}
+      <p class="trimmed">
+        Showing the {retainedCount.toLocaleString()} most recent of
+        {(retainedCount + trimmedCount).toLocaleString()}. Older finished jobs are
+        dropped once history passes {jobs.historyLimit.toLocaleString()} (raise
+        <code>MAX_JOB_HISTORY</code> to keep more).
+      </p>
+    {/if}
     <ul class="rows">
       {#each pageJobs as job (job.id)}
         <JobRow {job} />
@@ -280,6 +293,16 @@
     border-color: var(--border-strong);
   }
   .bulk:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  .trimmed {
+    margin: 0;
+    color: var(--text-3);
+    font-size: var(--text-xs);
+  }
+  .trimmed code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
 
   .rows {
     list-style: none;

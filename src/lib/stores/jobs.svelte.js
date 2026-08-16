@@ -25,6 +25,15 @@ class JobsStore {
   stuckState = $state(null);
   showExternalScanJobs = $state(readBool(STORAGE_KEYS.SHOW_METADATA_JOBS, false));
 
+  // Finished jobs the backend's MAX_JOB_HISTORY cap has already evicted,
+  // keyed status → mode → count, plus the cap itself. The jobs list can
+  // never hold more than the cap, so every count derived from it alone
+  // freezes there ("Completed 500" while the queue is still draining
+  // thousands). Retained + evicted is the real number. Fed by the `history`
+  // SSE event and re-read on refresh(); see convert.py:event_generator.
+  historyOverflow = $state({});
+  historyLimit = $state(0);
+
   cancellingAll = $state(false);
   clearingCompleted = $state(false);
   recoveringStuck = $state(false);
@@ -51,16 +60,53 @@ class JobsStore {
     return this.jobs.reduce((n, j) => (j.status === 'processing' ? n + 1 : n), 0);
   }
 
+  /**
+   * Sum the evicted-history tally for `statuses`.
+   *
+   * `visibleOnly` applies the same external-scan filter the job list uses,
+   * so turning `Show metadata jobs` off doesn't leave pruned metadata scans
+   * silently inflating a tab badge. Locally hidden ids can't be honoured
+   * here — an evicted job no longer has a row to hide — so a job the user
+   * dismissed locally rejoins the total once the cap evicts it. That's a
+   * cosmetic edge on a count that was previously wrong by thousands.
+   */
+  _evictedCount(statuses, visibleOnly = false) {
+    let total = 0;
+    for (const status of statuses) {
+      const byMode = this.historyOverflow?.[status];
+      if (!byMode) continue;
+      for (const [mode, count] of Object.entries(byMode)) {
+        if (visibleOnly && !this.showExternalScanJobs && EXTERNAL_SCAN_MODES.has(mode)) continue;
+        total += count || 0;
+      }
+    }
+    return total;
+  }
+
+  // Terminal-status counts include jobs the history cap has evicted; the
+  // work happened, and the dashboard's Done / Failed tiles are totals for
+  // the run, not a measure of how much history we happen to be holding.
+  // Queued / processing counts need no such treatment: pruning only ever
+  // touches terminal jobs, so the live list is already complete.
   get completedCount() {
-    return this.jobs.reduce((n, j) => (j.status === 'completed' ? n + 1 : n), 0);
+    return (
+      this.jobs.reduce((n, j) => (j.status === 'completed' ? n + 1 : n), 0)
+      + this._evictedCount(['completed'])
+    );
   }
 
   get failedCount() {
-    return this.jobs.reduce((n, j) => (j.status === 'failed' ? n + 1 : n), 0);
+    return (
+      this.jobs.reduce((n, j) => (j.status === 'failed' ? n + 1 : n), 0)
+      + this._evictedCount(['failed'])
+    );
   }
 
   get cancelledCount() {
-    return this.jobs.reduce((n, j) => (j.status === 'cancelled' ? n + 1 : n), 0);
+    return (
+      this.jobs.reduce((n, j) => (j.status === 'cancelled' ? n + 1 : n), 0)
+      + this._evictedCount(['cancelled'])
+    );
   }
 
   /**
@@ -95,16 +141,16 @@ class JobsStore {
   }
 
   get visibleCompletedCount() {
-    return this.jobs.reduce(
-      (n, j) => (this._matchesTabFilter(j, 'completed') ? n + 1 : n),
-      0,
+    return (
+      this.jobs.reduce((n, j) => (this._matchesTabFilter(j, 'completed') ? n + 1 : n), 0)
+      + this._evictedCount(['completed'], true)
     );
   }
 
   get visibleFailedCount() {
-    return this.jobs.reduce(
-      (n, j) => (this._matchesTabFilter(j, 'failed') ? n + 1 : n),
-      0,
+    return (
+      this.jobs.reduce((n, j) => (this._matchesTabFilter(j, 'failed') ? n + 1 : n), 0)
+      + this._evictedCount(['failed', 'cancelled'], true)
     );
   }
 
@@ -125,6 +171,23 @@ class JobsStore {
       }
     });
     return filtered;
+  }
+
+  /** Rows the current tab can actually list — pagination spans these only. */
+  get retainedCount() {
+    return this.visibleJobs.length;
+  }
+
+  /**
+   * Jobs matching the current tab that the history cap has already evicted,
+   * i.e. counted in the tab badge but no longer listable. Non-zero only past
+   * the cap; the panel uses it to explain the gap rather than let the badge
+   * and the pager silently disagree.
+   */
+  get trimmedCount() {
+    if (this.tab === 'completed') return this._evictedCount(['completed'], true);
+    if (this.tab === 'failed') return this._evictedCount(['failed', 'cancelled'], true);
+    return 0;
   }
 
   get pageCount() {
@@ -190,6 +253,13 @@ class JobsStore {
     for (const job of jobs) this._byId.set(job.id, job);
   }
 
+  /** Absolute evicted-history totals from the backend ({evicted, max_job_history}). */
+  _applyHistoryOverflow(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    this.historyOverflow = payload.evicted ?? {};
+    this.historyLimit = payload.max_job_history ?? 0;
+  }
+
   /**
    * Hydrate / re-sync from the REST snapshot.
    *
@@ -213,6 +283,12 @@ class JobsStore {
   async refresh() {
     this.loading = true;
     try {
+      // Re-read the evicted-history totals alongside the snapshot. The SSE
+      // `history` event is the live path, this is the safety net for a
+      // client whose stream dropped a frame or was never open (poll-only).
+      api.getJobHistoryOverflow()
+        .then((h) => this._applyHistoryOverflow(h))
+        .catch(() => {});
       const data = await api.getJobs();
       if (!Array.isArray(data)) return;
       // Plain object as a transient id→true map. The svelte-eslint
@@ -392,7 +468,10 @@ class JobsStore {
     this.clearingCompleted = true;
     try {
       const res = await api.deleteCompletedJobs();
-      // Drop terminal jobs locally for instant feedback.
+      // Drop terminal jobs locally for instant feedback. The backend forgets
+      // its evicted-history tally on the same call, so drop ours too or the
+      // badges would keep counting jobs no list can show.
+      this.historyOverflow = {};
       this.jobs = this.jobs.filter((j) => !TERMINAL_STATUSES.has(j.status));
       this._byId.clear();
       for (const job of this.jobs) this._byId.set(job.id, job);
@@ -454,6 +533,11 @@ class JobsStore {
           case 'status':
             // Status pulses don't carry a job payload in some emit paths.
             if (data?.job) this._applyJob(data.job);
+            break;
+          case 'history':
+            // Absolute totals, not deltas, so a missed frame or a reconnect
+            // self-heals on the next emission.
+            this._applyHistoryOverflow(data?.history);
             break;
           default:
             break;

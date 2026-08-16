@@ -125,6 +125,15 @@ class JobManager:
         self._stuck_detected_at: Optional[float] = None
         self._last_stuck_recovery_at: float = 0
         self._create_lock = asyncio.Lock()
+        # Running tally of terminal jobs the history cap has evicted, keyed
+        # status → mode → count. `self.jobs` can only ever answer "how much
+        # history is still retained", so once a run passes max_job_history
+        # every UI count derived from it freezes at the cap while work keeps
+        # finishing. This is the missing half: retained + evicted is the real
+        # number. Keyed by mode as well as status so a client can apply the
+        # same external-scan filter it applies to live jobs (the Jobs panel
+        # hides metadata_scan / dat_match unless asked for them).
+        self._evicted_history: Dict[str, Dict[str, int]] = {}
 
     def _enforce_queue_backpressure_locked(self, additional_jobs: int = 1) -> None:
         """Raise QueueBackpressureError when queue depth limits are exceeded.
@@ -1036,7 +1045,45 @@ class JobManager:
 
         removable = [job_id for job_id in terminal_ids if job_id != exclude_id]
         for job_id in removable[:excess]:
-            await self.delete_job(job_id)
+            evicted = self.jobs.get(job_id)
+            if await self.delete_job(job_id) and evicted is not None:
+                self._record_history_eviction(evicted)
+
+    # ------------------------------------------------------------------
+    # History overflow: what the cap has already thrown away
+    # ------------------------------------------------------------------
+
+    def _record_history_eviction(self, job: ConversionJob) -> None:
+        """Tally a terminal job the history cap just evicted.
+
+        Only automatic eviction lands here. A job the user deletes (single
+        row, or Clear) is history they chose to drop, not history we dropped
+        behind their back, so it must not keep inflating the counts.
+        """
+        status = getattr(job.status, "value", str(job.status))
+        mode = getattr(job.mode, "value", str(job.mode))
+        by_mode = self._evicted_history.setdefault(status, {})
+        by_mode[mode] = by_mode.get(mode, 0) + 1
+
+    def get_history_overflow(self) -> Dict[str, object]:
+        """Counts of terminal jobs evicted by the ``max_job_history`` cap.
+
+        Clients add these to the jobs they can still see to report a true
+        total: the retained list stops growing at the cap, the work doesn't.
+        """
+        return {
+            "max_job_history": self.max_job_history,
+            "evicted": {
+                status: dict(by_mode) for status, by_mode in self._evicted_history.items()
+            },
+            "total_evicted": sum(
+                count for by_mode in self._evicted_history.values() for count in by_mode.values()
+            ),
+        }
+
+    def reset_history_overflow(self) -> None:
+        """Forget the evicted-history tally (Clear wipes history wholesale)."""
+        self._evicted_history.clear()
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job."""

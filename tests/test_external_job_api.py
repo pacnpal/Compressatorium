@@ -456,3 +456,81 @@ async def test_prune_still_evicts_oldest_history_past_the_cap():
     assert ids[1] not in mgr.jobs
     for job_id in ids[2:]:
         assert job_id in mgr.jobs
+
+
+# ---------------------------------------------------------------------------
+# History overflow — the counts the cap throws away
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_history_overflow_counts_evicted_jobs():
+    """Evicted history must be tallied, keyed by status and mode.
+
+    Without it every client count derived from the job list freezes at
+    max_job_history: the Completed badge reads 500 forever while the queue
+    keeps draining.
+    """
+    mgr = JobManager(max_concurrent=1, max_job_history=3)
+
+    assert mgr.get_history_overflow()["total_evicted"] == 0
+
+    for i in range(6):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+
+    await mgr._prune_jobs()
+
+    overflow = mgr.get_history_overflow()
+    assert overflow["max_job_history"] == 3
+    assert overflow["total_evicted"] == 3
+    assert overflow["evicted"]["completed"]["metadata_scan"] == 3
+    # Retained + evicted is the real total.
+    retained = sum(1 for job in mgr.jobs.values() if job.status == JobStatus.COMPLETED)
+    assert retained + overflow["evicted"]["completed"]["metadata_scan"] == 6
+
+
+@pytest.mark.asyncio
+async def test_history_overflow_splits_failed_from_completed():
+    """Statuses are tallied separately so each tab badge stays honest."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    for i in range(3):
+        j = mgr.create_external_job(f"Ok{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+    for i in range(3):
+        j = mgr.create_external_job(f"Bad{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=False, error_message="boom")
+
+    await mgr._prune_jobs()
+
+    evicted = mgr.get_history_overflow()["evicted"]
+    assert evicted["completed"]["metadata_scan"] == 3
+    assert evicted["failed"]["metadata_scan"] == 2
+
+
+@pytest.mark.asyncio
+async def test_user_deleted_jobs_are_not_counted_as_evicted():
+    """Deleting a job by hand is history the user dropped, not history the cap
+    took — it must not inflate the totals."""
+    mgr = JobManager(max_concurrent=1, max_job_history=10)
+
+    j = mgr.create_external_job("Done", ConversionMode.METADATA_SCAN)
+    await mgr.finish_external_job(j.id, success=True)
+    assert await mgr.delete_job(j.id) is True
+
+    assert mgr.get_history_overflow()["total_evicted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_history_overflow_clears_the_tally():
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    for i in range(4):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+    await mgr._prune_jobs()
+    assert mgr.get_history_overflow()["total_evicted"] > 0
+
+    mgr.reset_history_overflow()
+    assert mgr.get_history_overflow()["total_evicted"] == 0
+    assert mgr.get_history_overflow()["evicted"] == {}

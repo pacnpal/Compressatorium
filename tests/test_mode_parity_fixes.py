@@ -1,6 +1,7 @@
 """Regression tests for cross-mode parity fixes."""
 
 import asyncio
+import json
 import os
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -311,6 +312,86 @@ async def test_delete_completed_endpoint_requires_confirmation_header():
 
     assert exc_info.value.status_code == 400
     assert "Missing confirmation header" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_history_overflow_endpoint_reports_evicted_counts(monkeypatch):
+    """The history-overflow route exposes what the cap evicted, so a client can
+    report a true completed total instead of one frozen at max_job_history."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+
+    payload = await convert_routes.job_history_overflow()
+
+    assert payload["max_job_history"] == 1
+    assert payload["total_evicted"] == 2
+    assert payload["evicted"]["completed"]["metadata_scan"] == 2
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_emits_history_overflow(monkeypatch):
+    """The job stream pushes the evicted-history totals, so a connected client
+    learns its counts have outgrown the retained list without polling."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+    history_event = None
+    try:
+        for _ in range(20):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=2)
+            if event.get("event") == "history":
+                history_event = event
+                break
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert history_event is not None, "stream never emitted the history totals"
+    payload = json.loads(history_event["data"])
+    assert payload["type"] == "history"
+    assert payload["history"]["total_evicted"] == 2
+    assert payload["history"]["evicted"]["completed"]["metadata_scan"] == 2
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_resets_history_overflow(monkeypatch):
+    """Clear wipes history wholesale, so the evicted tally goes with it —
+    otherwise the tab badges would count jobs no list can show."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+    assert manager.get_history_overflow()["total_evicted"] == 2
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/api/jobs/completed",
+            "headers": [
+                (
+                    convert_routes.ACTION_CONFIRM_HEADER.encode(),
+                    convert_routes.CONFIRM_CLEAR_COMPLETED_JOBS.encode(),
+                )
+            ],
+            "client": ("test", 0),
+        }
+    )
+    await convert_routes.delete_completed_jobs(request)
+
+    assert manager.get_history_overflow()["total_evicted"] == 0
 
 
 @pytest.mark.asyncio
