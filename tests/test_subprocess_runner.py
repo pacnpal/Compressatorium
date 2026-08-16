@@ -12,6 +12,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 
 import pytest
 
@@ -697,3 +698,38 @@ def test_size_message_rate_reflects_the_current_window_not_the_average():
     assert "2,000 MB written" in fast and "2,000 MB written" in crawling
     assert "500.0 MB/min" in fast
     assert "1.0 MB/min" in crawling
+
+
+def test_bounded_probe_gives_up_instead_of_waiting(monkeypatch):
+    """A filesystem probe that never returns must not hold the caller.
+
+    Stands in for a `stat` wedged on an unresponsive mount, which cannot be
+    cancelled -- the thread is written off and the caller continues without the
+    measurement rather than hanging the job (issue #263).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(runner_module, "_STAT_TIMEOUT", 0.05)
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    async def _go():
+        return await runner_module._bounded_probe(pool, time.sleep, 30)
+
+    try:
+        assert asyncio.run(_go()) is None
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_bounded_probe_returns_the_value_when_it_lands():
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    async def _go():
+        return await runner_module._bounded_probe(pool, len, "abcd")
+
+    try:
+        assert asyncio.run(_go()) == 4
+    finally:
+        pool.shutdown(wait=False)

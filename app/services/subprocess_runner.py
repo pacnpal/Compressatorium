@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -40,7 +41,6 @@ from collections.abc import AsyncGenerator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 from config import settings
-from fastapi.concurrency import run_in_threadpool
 from services.timeout_policy import compute_progress_stall_timeout
 
 
@@ -48,14 +48,28 @@ class ConversionCancelled(Exception):
     """Raised when a conversion is cancelled before completion."""
 
 
-# Output-size probes run here rather than on the default threadpool. A `stat`
-# wedged in uninterruptible I/O cannot be cancelled -- Python can abandon the
-# future but not the OS thread -- so on a dead mount every job would strand one
-# worker forever and a deep queue would drain the shared pool, taking down every
-# other `run_in_threadpool` caller with it. A small dedicated pool caps that
-# damage: once these workers are stuck, further probes simply never run and the
-# size signal goes quiet, which the callers already handle as "no new sample".
-_SIZE_PROBE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="size-probe")
+# Hard bound on a filesystem probe taken on the spawn path, where there is no
+# stall loop yet to rescue a wait that never returns.
+_STAT_TIMEOUT = 10.0
+
+
+async def _bounded_probe(pool: ThreadPoolExecutor, func, *args, **kwargs):
+    """Run a blocking filesystem probe with a hard bound. None on timeout/error.
+
+    A ``stat`` on an unresponsive mount blocks in uninterruptible I/O and cannot
+    be cancelled -- Python can abandon the future but never the OS thread. So a
+    probe is bounded in time and its thread is simply written off if it never
+    comes back; the caller continues without that measurement rather than
+    waiting on it, which is the whole point of issue #263.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(pool, functools.partial(func, *args, **kwargs)),
+            timeout=_STAT_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, OSError):
+        return None
 
 
 # Bounds on reaping a subprocess: how long to let it exit on its own once its
@@ -456,9 +470,37 @@ class SubprocessRunner:
         rather than a bare "no output" message. Used by nsz, whose ``output_path``
         is the temp file the runner already watches.
         """
+        # One probe worker per run, deliberately not a shared pool. A filesystem
+        # call wedged in uninterruptible I/O occupies its thread forever, so a
+        # shared pool would let two bad mounts starve every later job of the
+        # growth signal -- and a healthy job with no native percentage would then
+        # be killed by the stall watchdog while writing perfectly well. Per-run
+        # isolation means a dead mount costs one abandoned thread for that job
+        # and nothing for the next.
+        probe_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="size-probe")
+
         output_dir = os.path.dirname(output_path)
         if output_dir:
-            await run_in_threadpool(os.makedirs, output_dir, exist_ok=True)
+            # Bounded like every other filesystem call here: an unresponsive
+            # output mount must fail this job, not hang it -- and hanging here,
+            # before the child exists, would freeze the whole queue behind it
+            # (issue #263).
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        probe_pool,
+                        functools.partial(os.makedirs, output_dir, exist_ok=True),
+                    ),
+                    timeout=_STAT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                probe_pool.shutdown(wait=False)
+                raise RuntimeError(
+                    f"{fail_label}: output directory {output_dir} stopped responding"
+                ) from None
+            except BaseException:
+                probe_pool.shutdown(wait=False)
+                raise
 
         def _preexec():
             apply_nice(self._owner)
@@ -490,7 +532,7 @@ class SubprocessRunner:
         # error fires, the subprocess, the cancel-watcher task and the PID entry
         # are always cleaned up rather than leaked.
         cancel_task = None
-        # Bound before the try: the finally cancels this, so an early failure
+        # Bound before the try: the finally tears these down, so an early failure
         # must not hit an unbound name and mask the real error.
         size_probe: asyncio.Task | None = None
         try:
@@ -500,13 +542,20 @@ class SubprocessRunner:
                     self._owner, process.pid, " ".join(cmd),
                 )
 
-            stall_timeout = await run_in_threadpool(
+            # Sizing the adaptive stall timeout stats the input. On a dead
+            # mount that must not hang the spawn path, so fall back to the
+            # non-adaptive baseline rather than waiting -- a watchdog with a
+            # rough bound beats no watchdog.
+            stall_timeout = await _bounded_probe(
+                probe_pool,
                 compute_progress_stall_timeout,
                 input_path=input_path,
                 base_timeout=getattr(settings, "progress_timeout", 0),
                 timeout_per_gib=getattr(settings, "progress_timeout_per_gib", 0),
                 timeout_cap=getattr(settings, "progress_timeout_cap", 0),
             )
+            if stall_timeout is None:
+                stall_timeout = max(0, int(getattr(settings, "progress_timeout", 0) or 0))
             # Seed the progress floor with the caller's preamble (e.g. the
             # service's "Starting..." yield at 1/5%) so an early non-parseable
             # stdout line — which emits last_progress_value — can't drop the bar
@@ -557,11 +606,12 @@ class SubprocessRunner:
             ratio = size_ratio_for(mode)
             expected_size = 0
             if ratio:
-                try:
-                    input_size = await run_in_threadpool(os.path.getsize, input_path)
+                # Unbounded here would hang the job after the child is already
+                # running, with no stall loop yet to end it. No sample just means
+                # no percentage; the bytes/rate message needs no ratio.
+                input_size = await _bounded_probe(probe_pool, os.path.getsize, input_path)
+                if input_size is not None:
                     expected_size = max(1, int(input_size * ratio))
-                except OSError:
-                    expected_size = 0
 
             def _record_line(line: str) -> None:
                 if not output_lines or output_lines[-1] != line:
@@ -610,7 +660,7 @@ class SubprocessRunner:
                             probed_size = size_probe.result()
                     size_probe = asyncio.ensure_future(
                         asyncio.get_running_loop().run_in_executor(
-                            _SIZE_PROBE_POOL, _measure_output_sync,
+                            probe_pool, _measure_output_sync,
                         )
                     )
                 return probed_size
@@ -828,6 +878,9 @@ class SubprocessRunner:
             self.untrack_pid(process.pid)
             if size_probe is not None and not size_probe.done():
                 size_probe.cancel()
+            # wait=False: never join. A wedged probe thread is abandoned with the
+            # executor rather than holding the job open behind it.
+            probe_pool.shutdown(wait=False)
             if cancel_task:
                 cancel_task.cancel()
                 try:
