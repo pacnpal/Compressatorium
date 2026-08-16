@@ -8,10 +8,10 @@ import sys
 import tempfile
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -94,6 +94,7 @@ class JobManager:
     STUCK_RECOVERY_COOLDOWN_SECONDS = 60
     ARCHIVED_JOB_TTL_SECONDS = 60 * 15
     MAX_ARCHIVED_JOBS = 2000
+    MAX_TRACKED_EVICTED_IDS = 2000
 
     def __init__(self, max_concurrent: int = 1, max_job_history: int = 500):
         self.jobs: OrderedDict[str, ConversionJob] = OrderedDict()
@@ -125,6 +126,41 @@ class JobManager:
         self._stuck_detected_at: Optional[float] = None
         self._last_stuck_recovery_at: float = 0
         self._create_lock = asyncio.Lock()
+        # Running tally of terminal jobs the history cap has evicted, keyed
+        # status → mode → count. `self.jobs` can only ever answer "how much
+        # history is still retained", so once a run passes max_job_history
+        # every UI count derived from it freezes at the cap while work keeps
+        # finishing. This is the missing half: retained + evicted is the real
+        # number. Keyed by mode as well as status so a client can apply the
+        # same external-scan filter it applies to live jobs (the Jobs panel
+        # hides metadata_scan / dat_match unless asked for them).
+        self._evicted_history: Dict[str, Dict[str, int]] = {}
+        # Ids of recently evicted jobs, each stamped with a monotonic sequence
+        # number. A client learns of a completion (SSE) before the prune that
+        # the completion triggers, so for a moment it holds a row the backend
+        # has since deleted; adding the eviction tally on top of that row would
+        # double-count it until the next snapshot poll. Replaying the ids lets
+        # the client drop the stale rows in the same beat it takes the new
+        # totals. The window scales with the history cap — a bigger retained
+        # history means bigger client snapshots and more ids in flight — and a
+        # client that still falls off the end is told its cursor expired so it
+        # can re-sync rather than silently keep a row the cap deleted.
+        self._evicted_ids: Deque[Tuple[int, str]] = deque(
+            maxlen=max(self.MAX_TRACKED_EVICTED_IDS, self.max_job_history * 4)
+        )
+        self._eviction_seq = 0
+        # Where the last Clear landed. A reset drops the id log, so a cursor
+        # from before it has no tombstones to replay — and since Clear deletes
+        # every finished job, a client whose cursor predates one is holding
+        # rows that no longer exist. Both make such a cursor expired.
+        self._last_reset_seq = 0
+        # Identifies this process's eviction log. The sequence lives in memory
+        # and restarts at 0 when the backend does, so a client that compares
+        # sequences to reject stale payloads would reject every payload from
+        # the new process until it out-counted the old one — badges frozen for
+        # the rest of the browser session. A changed generation is the signal
+        # to drop the cursor instead of trusting it.
+        self.history_generation = uuid.uuid4().hex[:12]
 
     def _enforce_queue_backpressure_locked(self, additional_jobs: int = 1) -> None:
         """Raise QueueBackpressureError when queue depth limits are exceeded.
@@ -1036,7 +1072,112 @@ class JobManager:
 
         removable = [job_id for job_id in terminal_ids if job_id != exclude_id]
         for job_id in removable[:excess]:
-            await self.delete_job(job_id)
+            evicted = self.jobs.get(job_id)
+            if await self.delete_job(job_id) and evicted is not None:
+                self._record_history_eviction(evicted)
+
+    # ------------------------------------------------------------------
+    # History overflow: what the cap has already thrown away
+    # ------------------------------------------------------------------
+
+    def _record_history_eviction(self, job: ConversionJob) -> None:
+        """Tally a terminal job the history cap just evicted.
+
+        Only automatic eviction lands here. A job the user deletes (single
+        row, or Clear) is history they chose to drop, not history we dropped
+        behind their back, so it must not keep inflating the counts.
+        """
+        status = getattr(job.status, "value", str(job.status))
+        mode = getattr(job.mode, "value", str(job.mode))
+        by_mode = self._evicted_history.setdefault(status, {})
+        by_mode[mode] = by_mode.get(mode, 0) + 1
+        self._eviction_seq += 1
+        self._evicted_ids.append((self._eviction_seq, job.id))
+
+    def get_history_overflow(
+        self,
+        since: Optional[int] = None,
+        generation: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Counts of terminal jobs evicted by the ``max_job_history`` cap.
+
+        Clients add these to the jobs they can still see to report a true
+        total: the retained list stops growing at the cap, the work doesn't.
+
+        ``since`` is a previously returned ``seq``; pass it to also get the ids
+        evicted after that point, so a client can drop rows it still holds for
+        jobs the cap has already deleted (otherwise it would count them twice —
+        once as a retained row, once in the tally). Omit it to get counts only.
+
+        ``generation`` identifies this process's log. The sequence is in-memory
+        and restarts at 0 with the backend, so a client comparing sequences
+        across a restart would reject every newer payload as stale; a changed
+        generation tells it to drop its cursor instead. Pass the generation the
+        cursor came from: a cursor minted by an earlier process means nothing
+        here, and reading it literally would silently return no ids — so it is
+        rewound to the start of this log instead.
+
+        ``cursor_expired`` says the cursor fell off the end of the bounded log,
+        so the ids cannot be complete. The client must then re-sync against the
+        job list rather than trust the rows it holds.
+        """
+        cursor = since
+        cursor_expired = False
+        if cursor is not None and generation is not None and generation != self.history_generation:
+            cursor = 0
+        evicted_ids: List[str] = []
+        if cursor is not None:
+            evicted_ids = [job_id for seq, job_id in self._evicted_ids if seq > cursor]
+            # The oldest entry we still hold is the furthest back we can speak
+            # for. A cursor older than that may be missing ids we dropped. An
+            # empty log holds nothing back: it means nothing has been evicted
+            # since startup or since Clear, so there is nothing to replay.
+            oldest_held = self._evicted_ids[0][0] if self._evicted_ids else None
+            cursor_expired = oldest_held is not None and cursor < oldest_held - 1
+            # A Clear throws the log away, tombstones included, so a cursor
+            # from before it can't be answered either — and a Clear deletes
+            # *every* finished job, so a client reading the list either side
+            # of one is holding rows that no longer exist anywhere.
+            if cursor < self._last_reset_seq:
+                cursor_expired = True
+        return {
+            "generation": self.history_generation,
+            "cursor_expired": cursor_expired,
+            "max_job_history": self.max_job_history,
+            "evicted": {
+                status: dict(by_mode) for status, by_mode in self._evicted_history.items()
+            },
+            "total_evicted": sum(
+                count for by_mode in self._evicted_history.values() for count in by_mode.values()
+            ),
+            "seq": self._eviction_seq,
+            "evicted_ids": evicted_ids,
+        }
+
+    def history_eviction_seq(self) -> int:
+        """Current position in the eviction log, for opening a client cursor."""
+        return self._eviction_seq
+
+    def history_overflow_total(self) -> int:
+        """How many finished jobs the cap has evicted and is still counting."""
+        return sum(
+            count for by_mode in self._evicted_history.values() for count in by_mode.values()
+        )
+
+    def reset_history_overflow(self) -> int:
+        """Forget the evicted-history tally (Clear wipes history wholesale).
+
+        The sequence *advances* rather than rewinding. It is a cursor clients
+        hold, so rewinding it would make a stale cursor look current; advancing
+        it makes every read taken before the reset recognizably older, which is
+        how a client rejects an in-flight hydration response that would
+        otherwise restore the tally it just cleared. Returns the new sequence.
+        """
+        self._evicted_history.clear()
+        self._evicted_ids.clear()
+        self._eviction_seq += 1
+        self._last_reset_seq = self._eviction_seq
+        return self._eviction_seq
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job."""

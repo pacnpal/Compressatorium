@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 from config import settings
 from fastapi import APIRouter, HTTPException, Request
@@ -1159,6 +1160,17 @@ async def job_events():
         # that don't subscribe to "snapshot" events drop them silently (SSE
         # listener semantics), preserving backwards compatibility.
         snapshot_sent = False
+        # Last `history` state pushed to this client. The history cap deletes
+        # finished jobs behind the client's back, so a client that only ever
+        # sees live jobs has no way to know its Completed/Failed counts have
+        # stopped tracking reality. Emitting the evicted totals whenever they
+        # change (absolute values, never deltas, so a dropped frame or a
+        # reconnect can't skew the count) keeps them true. `last_seq` is the
+        # client's cursor into the eviction log: it rides along so each event
+        # also names the jobs evicted since the previous one, which the client
+        # must drop or it would count them twice (stale row + tally).
+        last_history = None
+        last_seq = None
 
         try:
             while True:
@@ -1173,6 +1185,14 @@ async def job_events():
 
                     # Then emit the one-time snapshot of every known job.
                     if not snapshot_sent:
+                        # Cursor captured BEFORE the first snapshot frame goes
+                        # out. Emitting the snapshot suspends this generator
+                        # between jobs, so a job can be evicted after the
+                        # client has already been handed its row; opening the
+                        # cursor here means the first `history` frame names it
+                        # and the client drops it, instead of counting it as
+                        # both a retained row and an evicted job.
+                        last_seq = job_manager.history_eviction_seq()
                         for job in job_manager.get_all_jobs():
                             yield {
                                 "event": "snapshot",
@@ -1184,6 +1204,21 @@ async def job_events():
                                 ),
                             }
                         snapshot_sent = True
+
+                    # Emit the evicted-history totals on connect and on every
+                    # subsequent change. Legacy clients that don't listen for
+                    # "history" drop it silently, as with "snapshot".
+                    history = job_manager.get_history_overflow(
+                        since=last_seq, generation=job_manager.history_generation
+                    )
+                    counts = (history["evicted"], history["seq"])
+                    if counts != last_history:
+                        last_history = counts
+                        last_seq = history["seq"]
+                        yield {
+                            "event": "history",
+                            "data": json.dumps({"type": "history", "history": history}),
+                        }
 
                     # Check all queues for updates
                     for job_id, queue in list(queues.items()):
@@ -1226,6 +1261,31 @@ async def check_stuck_status():
     return job_manager.get_stuck_state_info()
 
 
+@router.get("/jobs/history-overflow")
+async def job_history_overflow(since: Optional[int] = None, generation: Optional[str] = None):
+    """Counts of finished jobs already evicted by the MAX_JOB_HISTORY cap.
+
+    /api/jobs can only return retained jobs, so a client counting that list
+    reports at most ``max_job_history`` no matter how much work finishes.
+    Adding these evicted counts to it gives the real total. Also pushed over
+    the job event stream as a `history` event, so a connected client stays
+    current without polling this.
+
+    Pass ``since`` (a previously returned ``seq``) to also get the ids evicted
+    after that point. A poll-only client needs them: it reads /api/jobs and
+    this endpoint at two different moments, and a job evicted in between is
+    still in the job list *and* in these counts — double-counted — unless it
+    can be named and dropped. Read the job list first, then pass the cursor
+    here, and the two reads reconcile.
+
+    Pass ``generation`` with it — the generation the cursor came from. A cursor
+    minted by an earlier process means nothing to this one, and reading it
+    literally would return no ids at all, which is exactly the double-count the
+    cursor exists to prevent.
+    """
+    return job_manager.get_history_overflow(since=since, generation=generation)
+
+
 @router.get("/jobs/{job_id}", response_model=ConversionJob)
 async def get_job(job_id: str):
     """Get a specific job by ID (including recently archived jobs)."""
@@ -1250,13 +1310,34 @@ async def delete_completed_jobs(request: Request):
         if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
             if await job_manager.delete_job(job.id):
                 deleted_ids.append(job.id)
+    # Clear wipes history wholesale, so the record of what the cap evicted
+    # goes with it: otherwise the tab badges would still count jobs that are
+    # gone from every list, on an empty Completed tab. Report those alongside
+    # the deleted rows — with history capped at 500, clearing a 1,153-job run
+    # deletes 500 rows but clears 1,153 jobs' worth of history, and a
+    # "Removed 500" toast under a "Remove 1,153?" prompt reads like a failure.
+    forgotten = job_manager.history_overflow_total()
+    history_seq = job_manager.reset_history_overflow()
     client_host = request.client.host if request.client else "unknown"
     logger.info(
-        "Clear completed requested from %s; deleted=%d",
+        "Clear completed requested from %s; deleted=%d history_forgotten=%d",
         client_host,
         len(deleted_ids),
+        forgotten,
     )
-    return {"deleted": deleted_ids, "count": len(deleted_ids)}
+    return {
+        "deleted": deleted_ids,
+        "count": len(deleted_ids),
+        "history_forgotten": forgotten,
+        "total_cleared": len(deleted_ids) + forgotten,
+        # Post-reset cursor, so the caller can discard a history read that was
+        # already in flight when this cleared — it would restore the tally.
+        # The generation rides along because the sequence is only comparable
+        # within one: a backend restart mid-request resets it to a small
+        # number that would otherwise read as stale.
+        "history_seq": history_seq,
+        "history_generation": job_manager.history_generation,
+    }
 
 
 @router.post("/jobs/cancel-all")

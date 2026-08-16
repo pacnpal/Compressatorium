@@ -236,6 +236,32 @@ export const api = {
 
   getJobs: () => fetchJson(`${API_BASE}/jobs`, undefined, 'Failed to fetch jobs'),
 
+  // Counts of finished jobs the backend history cap (MAX_JOB_HISTORY) has
+  // already evicted. /jobs only returns what is still retained, so this is
+  // what turns a capped list into a true total. Live updates arrive as
+  // `history` events on the job stream; this is the hydration read.
+  //
+  // `since` is the caller's last applied `seq`. Passing it also returns the
+  // ids evicted after that point — read /jobs first, then pass the cursor
+  // here, and a job evicted between the two reads is named rather than
+  // counted twice (once as a row still in the list, once in the totals).
+  //
+  // `generation` is the backend process the cursor came from. Without it, a
+  // cursor minted before a backend restart reads as a huge sequence against a
+  // log that restarted at 0, so the reply names nothing — the exact
+  // double-count the cursor exists to prevent.
+  getJobHistoryOverflow(since, generation) {
+    const params = typeof since === 'number' && since >= 0
+      ? new URLSearchParams({ since: String(since) })
+      : undefined;
+    if (params && generation) params.set('generation', generation);
+    return fetchJson(
+      buildApiUrl('/jobs/history-overflow', params),
+      undefined,
+      'Failed to fetch job history totals',
+    );
+  },
+
   getJob: (jobId) => fetchJson(`${API_BASE}/jobs/${jobId}`, undefined, 'Failed to fetch job'),
 
   cancelJob: (jobId) =>
@@ -269,13 +295,16 @@ export const api = {
    * sends on connect (and re-sends after each reconnect) flows through
    * the same handler as live updates. See convert.py:event_generator.
    *
+   * `history` carries the counts of finished jobs the backend's history cap
+   * has evicted — absolute totals, re-sent whenever they change.
+   *
    * @param {(evt: { type: string, data: any }) => void} onEvent
    * @param {{onOpen?: () => void, onReconnecting?: () => void}} [status]
    */
   subscribeToJobs(onEvent, status) {
     const conn = sseConnectNamed(
       `${API_BASE}/jobs/events`,
-      ['snapshot', 'progress', 'complete', 'error', 'status', 'cancelled'],
+      ['snapshot', 'progress', 'complete', 'error', 'status', 'cancelled', 'history'],
       onEvent,
       status,
     );

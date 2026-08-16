@@ -6,6 +6,24 @@ A follow-up fix for the batch sizes 4.4.0 made easy to queue.
 
 ### Fixed
 
+- **The Completed count no longer stops at `MAX_JOB_HISTORY`.** Finish more than
+  500 conversions in a run and the Jobs panel kept reading *Completed 500* while
+  the queue drained thousands — the same for Failed, and for the dashboard's
+  Done / Failed tiles. Every one of those counts was derived from the list of
+  jobs the backend still holds, and that list is capped: past 500 finished jobs
+  the oldest are dropped, so the count could never exceed the cap no matter how
+  much work finished. The backend now tallies what the cap evicts (by status and
+  mode) and publishes it — pushed live on `/api/jobs/events` as a `history`
+  event, and readable at `GET /api/jobs/history-overflow` — so the UI reports
+  retained **plus** evicted: the real total. Because those rows are genuinely
+  gone, the Completed and Failed tabs now say so rather than let the badge and
+  the list silently disagree: *"Showing the 500 most recent of 1,153."* A tab
+  whose jobs have **all** aged out says so too, instead of the old "No completed
+  jobs yet" under a non-zero badge. Raise `MAX_JOB_HISTORY` to keep more of them
+  listed. **Clear** still zeroes everything, evicted tally included, and now
+  reports the full number it cleared rather than only the rows it could still
+  see. `Show metadata jobs` is honoured in the new totals, so pruned background
+  scans don't inflate the badges while their rows stay hidden.
 - **A deep queue no longer wipes your job history mid-run.** `MAX_JOB_HISTORY`
   (default 500) caps how many *finished* jobs are kept, but it was gating on the
   **total** job count — pending work included. Queue more than 500 files at once,

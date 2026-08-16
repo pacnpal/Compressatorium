@@ -1,6 +1,7 @@
 """Regression tests for cross-mode parity fixes."""
 
 import asyncio
+import json
 import os
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -311,6 +312,204 @@ async def test_delete_completed_endpoint_requires_confirmation_header():
 
     assert exc_info.value.status_code == 400
     assert "Missing confirmation header" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_history_overflow_endpoint_reports_evicted_counts(monkeypatch):
+    """The history-overflow route exposes what the cap evicted, so a client can
+    report a true completed total instead of one frozen at max_job_history."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+
+    payload = await convert_routes.job_history_overflow()
+
+    assert payload["max_job_history"] == 1
+    assert payload["total_evicted"] == 2
+    assert payload["evicted"]["completed"]["metadata_scan"] == 2
+    # No cursor: counts only. A poll-only client passes one so a job evicted
+    # between its /api/jobs read and this one is named, not counted twice.
+    assert payload["evicted_ids"] == []
+    with_cursor = await convert_routes.job_history_overflow(since=1)
+    assert len(with_cursor["evicted_ids"]) == 1
+    # The generation identifies this process's log: the sequence restarts at 0
+    # with the backend, and a client comparing across a restart would reject
+    # every newer payload as stale without it.
+    assert payload["generation"] == manager.history_generation
+    assert JobManager(max_concurrent=1).history_generation != manager.history_generation
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_emits_history_overflow(monkeypatch):
+    """The job stream pushes the evicted-history totals, so a connected client
+    learns its counts have outgrown the retained list without polling."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+    history_event = None
+    try:
+        for _ in range(20):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=2)
+            if event.get("event") == "history":
+                history_event = event
+                break
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert history_event is not None, "stream never emitted the history totals"
+    payload = json.loads(history_event["data"])
+    assert payload["type"] == "history"
+    assert payload["history"]["total_evicted"] == 2
+    assert payload["history"]["evicted"]["completed"]["metadata_scan"] == 2
+    # First frame for a fresh client: the snapshot it just received already
+    # excludes evicted jobs, so there is nothing for it to drop.
+    assert payload["history"]["evicted_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_names_newly_evicted_jobs(monkeypatch):
+    """After the first frame, each `history` event must name the jobs evicted
+    since the previous one. A client applies a completion before the prune it
+    triggers, so without the ids it would count that job twice — once as a row
+    it still holds, once in the tally."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    first = manager.create_external_job("Scan0", ConversionMode.METADATA_SCAN)
+    await manager.finish_external_job(first.id, success=True)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+
+    async def next_history(timeout=3):
+        for _ in range(200):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+            if event.get("event") == "history":
+                return json.loads(event["data"])["history"]
+        return None
+
+    try:
+        opening = await next_history()
+        assert opening is not None and opening["total_evicted"] == 0
+
+        # This completion evicts `first`, which a live client would still hold.
+        second = manager.create_external_job("Scan1", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(second.id, success=True)
+
+        update = await next_history()
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert update is not None, "stream never re-emitted after an eviction"
+    assert update["total_evicted"] == 1
+    assert update["evicted_ids"] == [first.id]
+
+
+@pytest.mark.asyncio
+async def test_job_events_opens_its_cursor_before_the_snapshot(monkeypatch):
+    """A job evicted while the client is being handed snapshot rows must still
+    be named in the first `history` frame.
+
+    Emitting the snapshot suspends the generator between jobs, so the client
+    can already hold a row that the cap deletes moments later. If the cursor
+    only opened after the snapshot, that row would never be retracted and the
+    client would count it twice — as a retained row and in the tally.
+    """
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    doomed = manager.create_external_job("Scan0", ConversionMode.METADATA_SCAN)
+    await manager.finish_external_job(doomed.id, success=True)
+
+    # Evict `doomed` from inside the snapshot pass — i.e. after the generator
+    # captured its cursor, and as the client is being handed the row.
+    real_get_all = manager.get_all_jobs
+    calls = {"n": 0}
+
+    def get_all_jobs_evicting_mid_snapshot():
+        calls["n"] += 1
+        listed = real_get_all()
+        if calls["n"] == 2:  # 1 = subscribe pass, 2 = snapshot pass
+            manager._record_history_eviction(manager.jobs[doomed.id])
+            del manager.jobs[doomed.id]
+        return listed
+
+    monkeypatch.setattr(manager, "get_all_jobs", get_all_jobs_evicting_mid_snapshot)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+    history = None
+    try:
+        for _ in range(20):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=3)
+            if event.get("event") == "history":
+                history = json.loads(event["data"])["history"]
+                break
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert history is not None
+    assert history["total_evicted"] == 1
+    assert history["evicted_ids"] == [doomed.id], (
+        "the first frame must retract a row evicted during snapshot emission"
+    )
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_resets_history_overflow(monkeypatch):
+    """Clear wipes history wholesale, so the evicted tally goes with it —
+    otherwise the tab badges would count jobs no list can show."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    for i in range(3):
+        job = manager.create_external_job(f"Scan{i}", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(job.id, success=True)
+    assert manager.get_history_overflow()["total_evicted"] == 2
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/api/jobs/completed",
+            "headers": [
+                (
+                    convert_routes.ACTION_CONFIRM_HEADER.encode(),
+                    convert_routes.CONFIRM_CLEAR_COMPLETED_JOBS.encode(),
+                )
+            ],
+            "client": ("test", 0),
+        }
+    )
+    result = await convert_routes.delete_completed_jobs(request)
+
+    assert manager.get_history_overflow()["total_evicted"] == 0
+    # `count` is rows deleted; past the cap that undercounts what Clear wiped,
+    # so the response also reports the forgotten history and the true total —
+    # a "Removed 1" toast under a "Remove 3?" prompt reads like a failure.
+    assert result["count"] == 1
+    assert result["history_forgotten"] == 2
+    assert result["total_cleared"] == 3
+    # The post-reset cursor rides along so a caller can discard a history read
+    # that was already in flight — applying it would restore the tally.
+    assert result["history_seq"] == manager.history_eviction_seq()
+    assert result["history_seq"] > 2
+    # The generation rides along: the sequence is only comparable within one,
+    # and a backend restart mid-request returns a small one that would
+    # otherwise read as stale and leave the badges up after a Clear.
+    assert result["history_generation"] == manager.history_generation
 
 
 @pytest.mark.asyncio

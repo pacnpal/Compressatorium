@@ -28,6 +28,11 @@
   const completedCount = $derived(jobs.visibleCompletedCount);
   const failedCount = $derived(jobs.visibleFailedCount);
   const stuck = $derived(jobs.stuckState);
+  // Past MAX_JOB_HISTORY the backend evicts the oldest finished jobs, so the
+  // tab badge (a true total) outruns what the pager can list. Say so rather
+  // than let the two silently disagree.
+  const retainedCount = $derived(jobs.retainedCount);
+  const trimmedCount = $derived(jobs.trimmedCount);
 
   // Stuck-state probe. The backend exposes /api/jobs/stuck-status as
   // a snapshot, not a stream, so we have to poll. Fire once on mount
@@ -144,12 +149,32 @@
     {/if}
   </div>
 
+  {#if trimmedCount > 0 && retainedCount > 0}
+    <p class="trimmed">
+      Showing the {retainedCount.toLocaleString()} most recent of
+      {(retainedCount + trimmedCount).toLocaleString()}. Older finished jobs are
+      dropped once history passes {jobs.historyLimit.toLocaleString()} (raise
+      <code>MAX_JOB_HISTORY</code> to keep more).
+    </p>
+  {/if}
+
   {#if pageJobs.length === 0}
     {#if tab === 'queue'}
       <EmptyState
         title="Queue is idle"
         description="Submit a conversion from the Convert panel to see jobs here."
         glyph="∅"
+      />
+    {:else if retainedCount === 0 && trimmedCount > 0}
+      <!-- Every job this tab counts has aged out: newer finished jobs took all
+           {jobs.historyLimit} history slots. Saying "none yet" here would flatly
+           contradict the badge, which is the true total. -->
+      <EmptyState
+        title={tab === 'completed'
+          ? 'Completed jobs aged out of history'
+          : 'Failed jobs aged out of history'}
+        description={`These ${trimmedCount.toLocaleString()} finished, but history keeps only the ${jobs.historyLimit.toLocaleString()} most recent finished jobs and newer ones took every slot. Raise MAX_JOB_HISTORY to keep more listed.`}
+        glyph="⧗"
       />
     {:else if tab === 'completed'}
       <EmptyState
@@ -280,6 +305,16 @@
     border-color: var(--border-strong);
   }
   .bulk:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  .trimmed {
+    margin: 0;
+    color: var(--text-3);
+    font-size: var(--text-xs);
+  }
+  .trimmed code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
 
   .rows {
     list-style: none;
