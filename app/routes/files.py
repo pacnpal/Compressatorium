@@ -27,7 +27,6 @@ from utils.path_utils import (
     get_volume_name_for_path,
     is_configured_volume_root,
     is_within_configured_volumes,
-    match_extension,
 )
 
 router = APIRouter()
