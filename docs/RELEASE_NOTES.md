@@ -1,29 +1,71 @@
 # Release Notes
 
-## 4.4.1 (unreleased)
+## 4.4.2 (unreleased)
 
-A follow-up fix for the batch sizes 4.4.0 made easy to queue.
+The counting half of the fix 4.4.1 started. 4.4.1 stopped a deep queue from
+*deleting* your job history; this one stops the retention cap from *lying* about
+how much work finished, which is what you notice on a run of thousands.
 
 ### Fixed
 
 - **The Completed count no longer stops at `MAX_JOB_HISTORY`.** Finish more than
   500 conversions in a run and the Jobs panel kept reading *Completed 500* while
   the queue drained thousands — the same for Failed, and for the dashboard's
-  Done / Failed tiles. Every one of those counts was derived from the list of
-  jobs the backend still holds, and that list is capped: past 500 finished jobs
-  the oldest are dropped, so the count could never exceed the cap no matter how
-  much work finished. The backend now tallies what the cap evicts (by status and
-  mode) and publishes it — pushed live on `/api/jobs/events` as a `history`
-  event, and readable at `GET /api/jobs/history-overflow` — so the UI reports
-  retained **plus** evicted: the real total. Because those rows are genuinely
-  gone, the Completed and Failed tabs now say so rather than let the badge and
-  the list silently disagree: *"Showing the 500 most recent of 1,153."* A tab
-  whose jobs have **all** aged out says so too, instead of the old "No completed
-  jobs yet" under a non-zero badge. Raise `MAX_JOB_HISTORY` to keep more of them
-  listed. **Clear** still zeroes everything, evicted tally included, and now
-  reports the full number it cleared rather than only the rows it could still
-  see. `Show metadata jobs` is honoured in the new totals, so pruned background
-  scans don't inflate the badges while their rows stay hidden.
+  Done / Failed tiles. It looks like a pagination bug and isn't: 500 is
+  `MAX_JOB_HISTORY`, not a page size. Every one of those counts was derived from
+  the list of jobs the backend still holds, and that list is capped — past 500
+  finished jobs the oldest are deleted — so no count taken from it could ever
+  exceed the cap, however much work finished. The backend now keeps a tally of
+  what the cap evicts, and the UI reports retained **plus** evicted: the real
+  total. Queue counts were never affected; pruning only ever touches finished
+  jobs, so the live list was already complete.
+- **The Completed and Failed tabs say when the list is shorter than the count.**
+  Those older rows are genuinely gone, not hidden on another page, so the panel
+  now explains the gap instead of letting the badge and the pager disagree in
+  silence: *"Showing the 500 most recent of 1,153. Older finished jobs are
+  dropped once history passes 500."* A tab whose jobs have **all** aged out —
+  every retained slot taken by newer finished jobs — says that too, rather than
+  the old *"No completed jobs yet"* sitting under a non-zero badge. Raise
+  `MAX_JOB_HISTORY` if you want more of them listed rather than just counted;
+  the cost is memory, roughly linear in jobs retained.
+- **Clear reports what it actually cleared.** Past the cap it counted only the
+  rows it could still see, so clearing a 1,153-job run confirmed *"Remove
+  1,153?"* and then reported *"Removed 500."* It now reports the full number,
+  and still zeroes everything — evicted tally included, so a badge can never
+  outlive the list it came from.
+- **`Show metadata jobs` is honoured in the new totals.** The tally is keyed by
+  mode as well as status, so pruned `metadata_scan` and `dat_match` history
+  can't inflate a badge while its rows stay hidden. Jobs you dismiss by hand are
+  likewise never counted as evicted: that is history you dropped, not history
+  the cap took.
+
+### Added
+
+- **`GET /api/jobs/history-overflow`, and a `history` event on
+  `/api/jobs/events`.** Both report the same thing — how many finished jobs the
+  cap has already evicted, broken down by status and mode, alongside
+  `max_job_history` itself. The stream pushes it on connect and whenever the
+  totals change; the endpoint is the hydration read and the fallback for a
+  client that is polling rather than streaming. Anything counting finished jobs
+  through the API needs this: `/api/jobs` can only ever return what is retained.
+  Additive on both sides — a client that doesn't listen for `history` drops it
+  silently, exactly as it does `snapshot`.
+- **A cursor for reconciling the two halves.** The endpoint takes `since` (a
+  sequence from a previous reply) and `generation` (the backend process that
+  minted it), and answers with the ids evicted since that point, so a client can
+  drop rows the cap deleted in the gap between reading `/api/jobs` and reading
+  the totals — otherwise those jobs get counted twice, once as a row and once in
+  the tally. `cursor_expired` says the reply can't be complete and the client
+  should re-read the job list instead of trusting what it holds. The contract,
+  and the invariants a client has to preserve, are written up in
+  `docs/DESIGN_tool_plugin_architecture.md` §3.3.7.
+
+## 4.4.1 (2026-08-15)
+
+A follow-up fix for the batch sizes 4.4.0 made easy to queue.
+
+### Fixed
+
 - **A deep queue no longer wipes your job history mid-run.** `MAX_JOB_HISTORY`
   (default 500) caps how many *finished* jobs are kept, but it was gating on the
   **total** job count — pending work included. Queue more than 500 files at once,
