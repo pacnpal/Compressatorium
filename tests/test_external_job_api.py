@@ -522,6 +522,67 @@ async def test_user_deleted_jobs_are_not_counted_as_evicted():
 
 
 @pytest.mark.asyncio
+async def test_history_overflow_replays_evicted_ids_from_a_cursor():
+    """`since` must yield exactly the ids evicted after that point.
+
+    A client learns of a completion before the prune it triggers, so it holds a
+    row the backend has already deleted; without the ids it would count that
+    job twice (stale row + tally).
+    """
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    ids = []
+    for i in range(3):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+        ids.append(j.id)
+    await mgr._prune_jobs()
+
+    # No cursor: counts only, no ids.
+    assert mgr.get_history_overflow()["evicted_ids"] == []
+
+    full = mgr.get_history_overflow(since=0)
+    assert full["evicted_ids"] == ids[:2]
+    assert full["seq"] == 2
+
+    # A cursor mid-log replays only what followed it.
+    assert mgr.get_history_overflow(since=1)["evicted_ids"] == [ids[1]]
+    # A current cursor replays nothing.
+    assert mgr.get_history_overflow(since=full["seq"])["evicted_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_reset_history_overflow_keeps_the_sequence_monotonic():
+    """Clear empties the tally and the id log, but the cursor must not rewind —
+    a client holding a stale `seq` would otherwise look current."""
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+
+    for i in range(3):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+    seq_before = mgr.get_history_overflow()["seq"]
+    assert seq_before > 0
+
+    mgr.reset_history_overflow()
+
+    after = mgr.get_history_overflow(since=0)
+    assert after["seq"] == seq_before
+    assert after["evicted_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_history_overflow_total_matches_the_tally():
+    mgr = JobManager(max_concurrent=1, max_job_history=1)
+    assert mgr.history_overflow_total() == 0
+
+    for i in range(4):
+        j = mgr.create_external_job(f"Done{i}", ConversionMode.METADATA_SCAN)
+        await mgr.finish_external_job(j.id, success=True)
+
+    assert mgr.history_overflow_total() == mgr.get_history_overflow()["total_evicted"] == 3
+
+
+@pytest.mark.asyncio
 async def test_reset_history_overflow_clears_the_tally():
     mgr = JobManager(max_concurrent=1, max_job_history=1)
 

@@ -361,6 +361,49 @@ async def test_job_events_stream_emits_history_overflow(monkeypatch):
     assert payload["type"] == "history"
     assert payload["history"]["total_evicted"] == 2
     assert payload["history"]["evicted"]["completed"]["metadata_scan"] == 2
+    # First frame for a fresh client: the snapshot it just received already
+    # excludes evicted jobs, so there is nothing for it to drop.
+    assert payload["history"]["evicted_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_names_newly_evicted_jobs(monkeypatch):
+    """After the first frame, each `history` event must name the jobs evicted
+    since the previous one. A client applies a completion before the prune it
+    triggers, so without the ids it would count that job twice — once as a row
+    it still holds, once in the tally."""
+    manager = JobManager(max_concurrent=1, max_job_history=1)
+    monkeypatch.setattr(convert_routes, "job_manager", manager)
+
+    first = manager.create_external_job("Scan0", ConversionMode.METADATA_SCAN)
+    await manager.finish_external_job(first.id, success=True)
+
+    response = await convert_routes.job_events()
+    stream = response.body_iterator
+
+    async def next_history(timeout=3):
+        for _ in range(200):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+            if event.get("event") == "history":
+                return json.loads(event["data"])["history"]
+        return None
+
+    try:
+        opening = await next_history()
+        assert opening is not None and opening["total_evicted"] == 0
+
+        # This completion evicts `first`, which a live client would still hold.
+        second = manager.create_external_job("Scan1", ConversionMode.METADATA_SCAN)
+        await manager.finish_external_job(second.id, success=True)
+
+        update = await next_history()
+    finally:
+        with suppress(Exception):
+            await stream.aclose()
+
+    assert update is not None, "stream never re-emitted after an eviction"
+    assert update["total_evicted"] == 1
+    assert update["evicted_ids"] == [first.id]
 
 
 @pytest.mark.asyncio
@@ -389,9 +432,15 @@ async def test_clear_completed_resets_history_overflow(monkeypatch):
             "client": ("test", 0),
         }
     )
-    await convert_routes.delete_completed_jobs(request)
+    result = await convert_routes.delete_completed_jobs(request)
 
     assert manager.get_history_overflow()["total_evicted"] == 0
+    # `count` is rows deleted; past the cap that undercounts what Clear wiped,
+    # so the response also reports the forgotten history and the true total —
+    # a "Removed 1" toast under a "Remove 3?" prompt reads like a failure.
+    assert result["count"] == 1
+    assert result["history_forgotten"] == 2
+    assert result["total_cleared"] == 3
 
 
 @pytest.mark.asyncio

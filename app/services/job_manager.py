@@ -8,10 +8,10 @@ import sys
 import tempfile
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -94,6 +94,7 @@ class JobManager:
     STUCK_RECOVERY_COOLDOWN_SECONDS = 60
     ARCHIVED_JOB_TTL_SECONDS = 60 * 15
     MAX_ARCHIVED_JOBS = 2000
+    MAX_TRACKED_EVICTED_IDS = 2000
 
     def __init__(self, max_concurrent: int = 1, max_job_history: int = 500):
         self.jobs: OrderedDict[str, ConversionJob] = OrderedDict()
@@ -134,6 +135,16 @@ class JobManager:
         # same external-scan filter it applies to live jobs (the Jobs panel
         # hides metadata_scan / dat_match unless asked for them).
         self._evicted_history: Dict[str, Dict[str, int]] = {}
+        # Ids of recently evicted jobs, each stamped with a monotonic sequence
+        # number. A client learns of a completion (SSE) before the prune that
+        # the completion triggers, so for a moment it holds a row the backend
+        # has since deleted; adding the eviction tally on top of that row would
+        # double-count it until the next snapshot poll. Replaying the ids lets
+        # the client drop the stale rows in the same beat it takes the new
+        # totals. Bounded: a client that misses more than this (long
+        # disconnect) still self-heals through refresh()'s deletion reconcile.
+        self._evicted_ids: Deque[Tuple[int, str]] = deque(maxlen=self.MAX_TRACKED_EVICTED_IDS)
+        self._eviction_seq = 0
 
     def _enforce_queue_backpressure_locked(self, additional_jobs: int = 1) -> None:
         """Raise QueueBackpressureError when queue depth limits are exceeded.
@@ -1064,13 +1075,23 @@ class JobManager:
         mode = getattr(job.mode, "value", str(job.mode))
         by_mode = self._evicted_history.setdefault(status, {})
         by_mode[mode] = by_mode.get(mode, 0) + 1
+        self._eviction_seq += 1
+        self._evicted_ids.append((self._eviction_seq, job.id))
 
-    def get_history_overflow(self) -> Dict[str, object]:
+    def get_history_overflow(self, since: Optional[int] = None) -> Dict[str, object]:
         """Counts of terminal jobs evicted by the ``max_job_history`` cap.
 
         Clients add these to the jobs they can still see to report a true
         total: the retained list stops growing at the cap, the work doesn't.
+
+        ``since`` is a previously returned ``seq``; pass it to also get the ids
+        evicted after that point, so a client can drop rows it still holds for
+        jobs the cap has already deleted (otherwise it would count them twice —
+        once as a retained row, once in the tally). Omit it to get counts only.
         """
+        evicted_ids: List[str] = []
+        if since is not None:
+            evicted_ids = [job_id for seq, job_id in self._evicted_ids if seq > since]
         return {
             "max_job_history": self.max_job_history,
             "evicted": {
@@ -1079,11 +1100,24 @@ class JobManager:
             "total_evicted": sum(
                 count for by_mode in self._evicted_history.values() for count in by_mode.values()
             ),
+            "seq": self._eviction_seq,
+            "evicted_ids": evicted_ids,
         }
 
+    def history_overflow_total(self) -> int:
+        """How many finished jobs the cap has evicted and is still counting."""
+        return sum(
+            count for by_mode in self._evicted_history.values() for count in by_mode.values()
+        )
+
     def reset_history_overflow(self) -> None:
-        """Forget the evicted-history tally (Clear wipes history wholesale)."""
+        """Forget the evicted-history tally (Clear wipes history wholesale).
+
+        ``_eviction_seq`` deliberately keeps counting: it is a cursor clients
+        hold, and rewinding it would make a stale cursor look current.
+        """
         self._evicted_history.clear()
+        self._evicted_ids.clear()
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job."""

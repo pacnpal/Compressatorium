@@ -149,12 +149,32 @@
     {/if}
   </div>
 
+  {#if trimmedCount > 0 && retainedCount > 0}
+    <p class="trimmed">
+      Showing the {retainedCount.toLocaleString()} most recent of
+      {(retainedCount + trimmedCount).toLocaleString()}. Older finished jobs are
+      dropped once history passes {jobs.historyLimit.toLocaleString()} (raise
+      <code>MAX_JOB_HISTORY</code> to keep more).
+    </p>
+  {/if}
+
   {#if pageJobs.length === 0}
     {#if tab === 'queue'}
       <EmptyState
         title="Queue is idle"
         description="Submit a conversion from the Convert panel to see jobs here."
         glyph="∅"
+      />
+    {:else if retainedCount === 0 && trimmedCount > 0}
+      <!-- Every job this tab counts has aged out: newer finished jobs took all
+           {jobs.historyLimit} history slots. Saying "none yet" here would flatly
+           contradict the badge, which is the true total. -->
+      <EmptyState
+        title={tab === 'completed'
+          ? 'Completed jobs aged out of history'
+          : 'Failed jobs aged out of history'}
+        description={`These ${trimmedCount.toLocaleString()} finished, but history keeps only the ${jobs.historyLimit.toLocaleString()} most recent finished jobs and newer ones took every slot. Raise MAX_JOB_HISTORY to keep more listed.`}
+        glyph="⧗"
       />
     {:else if tab === 'completed'}
       <EmptyState
@@ -170,14 +190,6 @@
       />
     {/if}
   {:else}
-    {#if trimmedCount > 0}
-      <p class="trimmed">
-        Showing the {retainedCount.toLocaleString()} most recent of
-        {(retainedCount + trimmedCount).toLocaleString()}. Older finished jobs are
-        dropped once history passes {jobs.historyLimit.toLocaleString()} (raise
-        <code>MAX_JOB_HISTORY</code> to keep more).
-      </p>
-    {/if}
     <ul class="rows">
       {#each pageJobs as job (job.id)}
         <JobRow {job} />

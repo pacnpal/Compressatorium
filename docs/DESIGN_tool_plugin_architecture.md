@@ -829,6 +829,54 @@ compression-*level* difference on an otherwise-correct, verified artifact of the
 exact source — not a content mismatch — and is accepted rather than have every
 tool persist its resolved defaults.
 
+### 3.3.7 Finished-job history overflow (`JobManager.get_history_overflow`)
+
+`MAX_JOB_HISTORY` (default 500) caps how many **terminal** jobs `JobManager`
+retains; `_prune_jobs` deletes the oldest past the cap. That makes the retained
+job list a bounded window, not a record of the run — so **no count may be
+derived from the job list alone**. Doing so is what froze every finished-job
+count at the cap: the Jobs panel read *"Completed 500"* while a 1,153-file batch
+kept draining, and the dashboard's Done / Failed tiles did the same.
+
+The contract, tool-agnostic and owned by `JobManager`:
+
+- **`_record_history_eviction(job)`** tallies each automatically evicted job
+  under `status → mode → count`, and appends its id to a bounded log stamped
+  with a monotonic `seq`. **Only automatic eviction is tallied.** A job deleted
+  by the user (single row, or Clear) is history *they* dropped; counting it
+  would make a badge outlive every list that could show it.
+- **`get_history_overflow(since=None)`** returns
+  `{max_job_history, evicted, total_evicted, seq, evicted_ids}` — absolute
+  totals, never deltas, so a dropped frame or a reconnect self-heals. Pass a
+  previously returned `seq` as `since` to also receive the ids evicted after
+  that point.
+- **`reset_history_overflow()`** clears the tally and the id log (`seq` keeps
+  counting — it is a cursor clients hold, and rewinding it would make a stale
+  cursor look current). `DELETE /api/jobs/completed` calls it, and reports
+  `history_forgotten` / `total_cleared` alongside the deleted row count.
+
+Transport: `GET /api/jobs/history-overflow` for hydration and the polling
+fallback, plus a `history` event on `/api/jobs/events`, emitted on connect and
+whenever the totals change. Additive — clients that don't listen for it drop it
+silently, as with `snapshot`.
+
+**The two invariants a client must preserve** (`src/lib/stores/jobs.svelte.js`):
+
+1. **Displayed total = retained + evicted.** Apply the same filters to both
+   halves; the tally is keyed by mode precisely so the external-scan filter
+   (`metadata_scan` / `dat_match` hidden unless asked for) can be applied to
+   evicted jobs too.
+2. **Drop `evicted_ids` before taking the new tally.** A completion reaches the
+   client over SSE *before* the prune it triggers, so the client briefly holds a
+   row the backend has already deleted. Counting it as retained *and* as evicted
+   inflates every badge by one per completion for as long as a batch runs past
+   the cap.
+
+Where retained rows exist but the total exceeds them, say so in the UI rather
+than let a badge and a list disagree — `JobsPanel` renders *"Showing the 500
+most recent of 1,153"*, and a distinct empty state for a tab whose jobs have all
+aged out.
+
 ### 3.4 `registry.py`
 
 ```python

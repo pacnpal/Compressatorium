@@ -1159,13 +1159,17 @@ async def job_events():
         # that don't subscribe to "snapshot" events drop them silently (SSE
         # listener semantics), preserving backwards compatibility.
         snapshot_sent = False
-        # Last `history` payload pushed to this client. The history cap
-        # deletes finished jobs behind the client's back, so a client that
-        # only ever sees live jobs has no way to know its Completed/Failed
-        # counts have stopped tracking reality. Emitting the evicted totals
-        # whenever they change (absolute values, never deltas, so a dropped
-        # frame or a reconnect can't skew the count) keeps them true.
+        # Last `history` state pushed to this client. The history cap deletes
+        # finished jobs behind the client's back, so a client that only ever
+        # sees live jobs has no way to know its Completed/Failed counts have
+        # stopped tracking reality. Emitting the evicted totals whenever they
+        # change (absolute values, never deltas, so a dropped frame or a
+        # reconnect can't skew the count) keeps them true. `last_seq` is the
+        # client's cursor into the eviction log: it rides along so each event
+        # also names the jobs evicted since the previous one, which the client
+        # must drop or it would count them twice (stale row + tally).
         last_history = None
+        last_seq = None
 
         try:
             while True:
@@ -1195,9 +1199,11 @@ async def job_events():
                     # Emit the evicted-history totals on connect and on every
                     # subsequent change. Legacy clients that don't listen for
                     # "history" drop it silently, as with "snapshot".
-                    history = job_manager.get_history_overflow()
-                    if history != last_history:
-                        last_history = history
+                    history = job_manager.get_history_overflow(since=last_seq)
+                    counts = (history["evicted"], history["seq"])
+                    if counts != last_history:
+                        last_history = counts
+                        last_seq = history["seq"]
                         yield {
                             "event": "history",
                             "data": json.dumps({"type": "history", "history": history}),
@@ -1283,15 +1289,25 @@ async def delete_completed_jobs(request: Request):
                 deleted_ids.append(job.id)
     # Clear wipes history wholesale, so the record of what the cap evicted
     # goes with it: otherwise the tab badges would still count jobs that are
-    # gone from every list, on an empty Completed tab.
+    # gone from every list, on an empty Completed tab. Report those alongside
+    # the deleted rows — with history capped at 500, clearing a 1,153-job run
+    # deletes 500 rows but clears 1,153 jobs' worth of history, and a
+    # "Removed 500" toast under a "Remove 1,153?" prompt reads like a failure.
+    forgotten = job_manager.history_overflow_total()
     job_manager.reset_history_overflow()
     client_host = request.client.host if request.client else "unknown"
     logger.info(
-        "Clear completed requested from %s; deleted=%d",
+        "Clear completed requested from %s; deleted=%d history_forgotten=%d",
         client_host,
         len(deleted_ids),
+        forgotten,
     )
-    return {"deleted": deleted_ids, "count": len(deleted_ids)}
+    return {
+        "deleted": deleted_ids,
+        "count": len(deleted_ids),
+        "history_forgotten": forgotten,
+        "total_cleared": len(deleted_ids) + forgotten,
+    }
 
 
 @router.post("/jobs/cancel-all")

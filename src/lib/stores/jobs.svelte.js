@@ -253,9 +253,33 @@ class JobsStore {
     for (const job of jobs) this._byId.set(job.id, job);
   }
 
-  /** Absolute evicted-history totals from the backend ({evicted, max_job_history}). */
+  /**
+   * Absolute evicted-history totals from the backend
+   * ({evicted, max_job_history, evicted_ids}).
+   *
+   * `evicted_ids` (SSE only) names jobs the cap deleted since our last event.
+   * We must drop those rows before taking the new tally: a completion reaches
+   * us over SSE *before* the prune it triggers, so for a moment we hold a row
+   * the backend has already deleted, and counting it as retained *and* as
+   * evicted would inflate every badge — by one per completion for as long as
+   * a batch runs past the cap, until refresh()'s deletion reconcile caught up.
+   */
   _applyHistoryOverflow(payload) {
     if (!payload || typeof payload !== 'object') return;
+    const evictedIds = payload.evicted_ids;
+    if (Array.isArray(evictedIds) && evictedIds.length > 0) {
+      // Plain object as an id→true map, matching refresh(): the svelte-eslint
+      // `prefer-svelte-reactivity` rule flags raw Set usage even for locals.
+      const gone = Object.create(null);
+      for (const id of evictedIds) gone[id] = true;
+      this.jobs = this.jobs.filter((j) => {
+        if (gone[j.id]) {
+          this._byId.delete(j.id);
+          return false;
+        }
+        return true;
+      });
+    }
     this.historyOverflow = payload.evicted ?? {};
     this.historyLimit = payload.max_job_history ?? 0;
   }
