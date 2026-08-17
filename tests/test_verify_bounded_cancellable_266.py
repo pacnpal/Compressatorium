@@ -1713,3 +1713,179 @@ async def _cancelled_read_takes_no_slot(monkeypatch):
         await runner_mod.run_detached(_should_not_run, cancel_event=cancel_event)
 
     assert started == [], "a cancelled read still started its thread"
+
+
+def test_the_verify_lane_is_freed_when_the_verifier_stops(tmp_path, monkeypatch):
+    """A peer that stops reading must not hold the one-slot lane for good.
+
+    The token was released by the generator's `finally`, which a parked
+    consumer never reaches — so once the deadline moved into the producer, the
+    verifier could end while the lane stayed held until the client disconnected.
+    With `MAX_VERIFY_CONCURRENCY=1` that refuses every later verification.
+    """
+    asyncio.run(_lane_freed_with_a_parked_reader(tmp_path, monkeypatch))
+
+
+async def _lane_freed_with_a_parked_reader(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "verification_store", Mock(mark_verified=AsyncMock()),
+    )
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    async def _endless(path, *, cancel_event=None):
+        while True:
+            yield {"type": "progress", "progress": 1, "message": "working"}
+            await asyncio.sleep(0.01)
+
+    service = Mock()
+    service.verify_stream = _endless
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.3
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    before = info_routes.workload_limiter.in_use("verify")
+    response = await info_routes.verify_jwud_events(path=str(target))
+    iterator = response.body_iterator.__aiter__()
+    await iterator.__anext__()
+    assert info_routes.workload_limiter.in_use("verify") == before + 1
+
+    # Read nothing further: the consumer is parked while the producer expires.
+    await asyncio.sleep(1.5)
+
+    assert info_routes.workload_limiter.in_use("verify") == before, (
+        "the verify lane stayed held after the verifier stopped"
+    )
+    await response.body_iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_does_not_hold_the_lane_between_files(tmp_path, monkeypatch):
+    """Between files nothing is verifying, so nothing is owed the slot."""
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "verification_store", Mock(mark_verified=AsyncMock()),
+    )
+
+    targets = []
+    for name in ("one.wux", "two.wux"):
+        target = tmp_path / name
+        target.write_bytes(b"WUX0" + b"\0" * 1024)
+        targets.append(str(target))
+
+    async def _quick(path, *, cancel_event=None):
+        yield {"type": "complete", "valid": True, "message": "ok"}
+
+    service = Mock()
+    service.verify_stream = _quick
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _bound(_path):
+        return 30
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _bound)
+
+    baseline = info_routes.workload_limiter.in_use("verify")
+    token = await info_routes.workload_limiter.try_acquire("verify")
+    response = info_routes._sse_batch_from_verify_stream(
+        info_routes.registry.get("jwud"),
+        info_routes._VERIFY_CONFIG["jwud"],
+        targets,
+        token,
+    )
+
+    between: list[int] = []
+    async for event in response.body_iterator:
+        if isinstance(event, dict) and event["event"] == "verify_batch_file_complete":
+            # Delivered while the generator is suspended between files.
+            between.append(info_routes.workload_limiter.in_use("verify"))
+
+    assert between and all(n == baseline for n in between), between
+    assert info_routes.workload_limiter.in_use("verify") == baseline
+
+
+def test_a_cancel_during_sizing_never_spawns_the_verifier(tmp_path, monkeypatch):
+    """Resolving the bound can take seconds; don't spawn into a cancelled run.
+
+    The resolver returns the flat baseline when the cancel wins the race, and
+    the verify then spawned anyway — on storage that had just failed to answer,
+    where the pointless child can block immediately and outlive SIGKILL.
+    """
+    asyncio.run(_cancel_during_sizing_skips_the_spawn(tmp_path, monkeypatch))
+
+
+async def _cancel_during_sizing_skips_the_spawn(tmp_path: Path, monkeypatch):
+    service = ChdmanService()
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "should_not_run.py",
+        "import pathlib\npathlib.Path(sys.argv[-1]).write_text('spawned')\n",
+    )
+    runner_mod = _runner_module(service)
+    marker = tmp_path / "spawned.marker"
+
+    cancel_event = asyncio.Event()
+
+    async def _bound_then_cancel(_path, _owner=None, *, cancel_event=None):
+        # Exactly what the resolver does when the cancel wins its race: give
+        # back the flat baseline, having observed the event.
+        cancel_event.set()
+        return 30
+
+    monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _bound_then_cancel)
+
+    result = await asyncio.wait_for(
+        service.verify(str(marker), cancel_event=cancel_event), timeout=10,
+    )
+
+    assert result["cancelled"] is True
+    assert not marker.exists(), "a cancelled verify still spawned its verifier"
+    assert service.active_pids() == []
+
+
+def test_reap_records_the_child_it_had_to_abandon(monkeypatch):
+    """The one place that learns a child outlived SIGKILL remembers it.
+
+    An outer deadline cancels the verify generator instead of letting it reach
+    a terminal event, so the flag cannot ride out on the event. The runner
+    records it, and the routes fold it into the timeout verdict — which is what
+    lets a batch stop instead of opening the next file.
+    """
+    asyncio.run(_reap_records_abandonment(monkeypatch))
+
+
+async def _reap_records_abandonment(monkeypatch):
+    from app.services import subprocess_runner as runner_mod
+
+    runner = runner_mod.SubprocessRunner(owner="chdman")
+
+    class _Unkillable:
+        returncode = None
+        pid = os.getpid()  # a pid that is certainly still alive
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(runner_mod, "_TERM_GRACE", 0.01)
+    monkeypatch.setattr(runner_mod, "_KILL_GRACE", 0.01)
+
+    assert await runner.reap(_Unkillable(), exit_timeout=0) is False
+    assert runner.abandoned_pids() == [os.getpid()]
+
+    # And it reads through to the route's verdict helper.
+    service = Mock()
+    service.abandoned_pids = runner.abandoned_pids
+    assert info_routes._abandonment(service) == {"abandoned": True}
+    assert info_routes._abandonment(Mock(spec=[])) == {}

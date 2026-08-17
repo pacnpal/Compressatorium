@@ -130,6 +130,10 @@ class MakePs3IsoService:
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
+
     # ----- output paths -----------------------------------------------------
 
     @staticmethod

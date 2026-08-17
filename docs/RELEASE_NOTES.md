@@ -71,6 +71,13 @@
     every remaining file in the batch is on that same storage — so continuing
     used to leave one unkillable verifier behind per file. The batch ends with
     an explanation instead.
+  - Closing the browser tab mid-verify, or leaving it on a stalled connection,
+    no longer costs the verification slot. It used to be handed back only when
+    the page came back for the next event, so a client that went quiet at the
+    wrong moment left every later verification refused as at-capacity until a
+    restart. The slot now follows the verifier: it is returned when the check
+    stops, and a **Verify all** run holds it for the file being checked rather
+    than for the whole list.
   - The bound applies to verification started from the Verify buttons too, not
     just to delete-on-verify jobs. Those run through the same verifiers and hold
     the same verification lane, so a wedged one used to keep that lane occupied

@@ -92,6 +92,10 @@ class Z3DSCompressService:
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
+
     @staticmethod
     async def _get_verify_payload_offset(
         file_path: str, *, cancel_event: asyncio.Event | None = None,
@@ -388,6 +392,18 @@ class Z3DSCompressService:
             overall_timeout = await resolve_verify_timeout(
                 file_path, "z3ds", cancel_event=cancel_event,
             )
+
+            if cancel_event is not None and cancel_event.is_set():
+                # Re-checked after the bound: resolving it can take the full
+                # probe bound on storage that stopped answering, and spawning
+                # into that risks a child that blocks and outlives SIGKILL.
+                yield {
+                    "type": "error",
+                    "valid": False,
+                    "cancelled": True,
+                    "message": "Verification cancelled",
+                }
+                return
 
             # Start zstd -t process reading from stdin
             process = await asyncio.create_subprocess_exec(

@@ -124,6 +124,23 @@ async def _offer_verify_update(queue: asyncio.Queue, update: dict) -> None:
     queue.put_nowait(update)
 
 
+def _abandonment(service: object) -> dict:
+    """``{"abandoned": True}`` when this tool has a child that outlived SIGKILL.
+
+    An outer deadline cancels the verify generator rather than letting it reach
+    a terminal event, so the flag cannot ride out on the event the way it does
+    when the runner's own bound fires. The runner records the fact instead (see
+    ``SubprocessRunner.abandoned_pids``) and it is folded into the timeout
+    verdict here, which is what lets the batch walk stop rather than open the
+    next file against a mount that just proved it can wedge a process.
+
+    Asked of the service rather than switched on the tool: a verifier that never
+    spawns anything simply has nothing to report.
+    """
+    probe = getattr(service, "abandoned_pids", None)
+    return {"abandoned": True} if probe and probe() else {}
+
+
 async def _acquire_verify_lane_or_429() -> WorkloadToken:
     token = await workload_limiter.try_acquire("verify")
     if token is None:
@@ -1318,7 +1335,12 @@ def _sse_from_verify_stream(
                     await _pump()
             except asyncio.TimeoutError:
                 await _offer_verify_update(
-                    queue, {"type": "error", **_verify_timed_out(bound)},
+                    queue,
+                    {
+                        "type": "error",
+                        **_verify_timed_out(bound),
+                        **_abandonment(cfg.service()),
+                    },
                 )
             except Exception as exc:
                 await _offer_verify_update(
@@ -1326,6 +1348,13 @@ def _sse_from_verify_stream(
                 )
             finally:
                 done.set()
+                # The lane covers verification, and verification is over: the
+                # consumer below may still be parked at its `yield` on a peer
+                # that stopped reading, and holding the one-slot lane until it
+                # resumes would refuse every later verification for good.
+                # Releasing twice is a no-op, so the generator's own finally
+                # stays as the backstop for the paths that never start this.
+                verify_token.release()
 
         # Everything after the token is acquired runs inside the try, including
         # resolving the bound: that await is a filesystem probe, and a client
@@ -1378,6 +1407,16 @@ def _sse_batch_from_verify_stream(
     verify_token: WorkloadToken,
 ) -> EventSourceResponse:
     """Batch verify SSE stream over an already-validated list of paths."""
+
+    # The lane is held per *file*, not for the whole walk. The walk only
+    # advances when events are delivered, so a peer that stays connected
+    # without reading parks this generator between files -- with no verifier
+    # running and, if the token were held for the batch, the one-slot lane
+    # locked out for good. Between files nothing is verifying, so nothing is
+    # owed a slot; the next file waits for the lane again, which terminates
+    # because every verify is now bounded. The route hands us the slot it
+    # already took for the first file.
+    lane: dict[str, WorkloadToken | None] = {"token": verify_token}
 
     async def event_generator():
         total = len(valid_paths)
@@ -1451,7 +1490,10 @@ def _sse_batch_from_verify_stream(
                         else:
                             await _pump()
                     except asyncio.TimeoutError:
-                        final_result = _verify_timed_out(bound)
+                        final_result = {
+                            **_verify_timed_out(bound),
+                            **_abandonment(cfg.service()),
+                        }
                         await _offer_verify_update(
                             queue, {"type": "error", **final_result},
                         )
@@ -1464,6 +1506,9 @@ def _sse_batch_from_verify_stream(
                         await _offer_verify_update(queue, final_result)
                     finally:
                         done.set()
+
+                if lane["token"] is None:
+                    lane["token"] = await workload_limiter.acquire("verify")
 
                 start = time.monotonic()
                 verify_task = asyncio.create_task(run_verify())
@@ -1504,6 +1549,11 @@ def _sse_batch_from_verify_stream(
                     verify_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await verify_task
+                    # This file is done verifying; the slot goes back before
+                    # the generator suspends again to deliver the result.
+                    if lane["token"] is not None:
+                        lane["token"].release()
+                        lane["token"] = None
 
                 if final_result.get("valid"):
                     await verification_store.mark_verified(path)
@@ -1582,6 +1632,12 @@ def _sse_batch_from_verify_stream(
             async for event in event_generator():
                 yield event
         finally:
+            # Backstop for the paths that never reach a per-file release (an
+            # empty list, an early return, a disconnect before the first file).
+            # Releasing twice is a no-op.
+            if lane["token"] is not None:
+                lane["token"].release()
+                lane["token"] = None
             verify_token.release()
 
     return EventSourceResponse(wrapped_event_generator())

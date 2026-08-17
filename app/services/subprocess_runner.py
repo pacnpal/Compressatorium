@@ -614,6 +614,7 @@ class SubprocessRunner:
     def __init__(self, owner: str) -> None:
         self._owner = owner
         self._active_pids: set[int] = set()
+        self._abandoned_pids: set[int] = set()
         self._pid_lock = threading.Lock()
         self._logger = logging.getLogger(f"chd.{owner}")
 
@@ -633,6 +634,37 @@ class SubprocessRunner:
     def active_pids(self) -> list[int]:
         with self._pid_lock:
             return list(self._active_pids)
+
+    def abandoned_pids(self) -> list[int]:
+        """Children of this runner that outlived ``SIGKILL`` and are still alive.
+
+        Recorded in :meth:`reap`, the one place that discovers the fact, so it
+        survives paths that cannot report it in their own return value -- above
+        all a verify generator cancelled by an *outer* deadline, which unwinds
+        through its ``finally`` with no event left to carry the flag. A caller
+        working through a list (the batch verify route) asks here before opening
+        the next file, since a wedged mount would otherwise cost it one
+        unkillable process per file.
+
+        Entries are dropped once the pid is gone: the kernel does eventually
+        unblock most of these, and a permanent entry would stop every later
+        batch. A pid the OS has since reused reads as still-abandoned, which
+        errs toward stopping early -- the safe direction here.
+        """
+        with self._pid_lock:
+            candidates = list(self._abandoned_pids)
+        gone = []
+        for pid in candidates:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                gone.append(pid)
+            except PermissionError:  # pragma: no cover - not ours any more
+                gone.append(pid)
+        if gone:
+            with self._pid_lock:
+                self._abandoned_pids.difference_update(gone)
+        return [pid for pid in candidates if pid not in gone]
 
     async def reap(self, process, *, exit_timeout: float = _EXIT_GRACE) -> bool:
         """Wait for ``process`` to exit, bounded at every step. True if reaped.
@@ -683,6 +715,8 @@ class SubprocessRunner:
             "abandoning it so the job fails instead of stalling the queue",
             self._owner, process.pid,
         )
+        with self._pid_lock:
+            self._abandoned_pids.add(process.pid)
         return False
 
     async def run_capture(
@@ -846,6 +880,11 @@ class SubprocessRunner:
         timeout = await resolve_verify_timeout(
             path, self._owner, cancel_event=cancel_event,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            # Same re-check as run_verify: resolving the bound above can take
+            # the full probe bound on unresponsive storage.
+            yield self._verify_error("Verification cancelled", cancelled=True)
+            return
         abandoned_pid: list[int] = []
         returncode, stdout, _ = await self.run_capture(
             cmd,
@@ -928,6 +967,14 @@ class SubprocessRunner:
             path, self._owner, cancel_event=cancel_event,
         )
         stall_timeout = verify_stall_timeout(self._owner)
+        if cancel_event is not None and cancel_event.is_set():
+            # Re-checked after the bound is resolved, because resolving it can
+            # take the full probe bound on storage that has stopped answering
+            # -- and spawning into that would mean a child that immediately
+            # blocks and may outlive SIGKILL, turning a prompt cancellation
+            # into an abandoned process for no work gained.
+            yield self._verify_error("Verification cancelled", cancelled=True)
+            return
 
         process = await asyncio.create_subprocess_exec(  # nosemgrep
             cmd[0], *cmd[1:],

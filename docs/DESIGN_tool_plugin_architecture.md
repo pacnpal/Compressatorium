@@ -550,7 +550,12 @@ Three pieces, none of them per-tool:
    let a peer that stays connected without reading buffer events for the whole
    of the bound. Progress is dropped under backpressure — it is a level, not a
    log — while a terminal event always lands, making room by discarding progress
-   the verdict has just made stale. A route-level timeout reports the
+   the verdict has just made stale. The **workload token follows the same rule**:
+   it is released when the verifier stops, not when the generator unwinds, and
+   the batch route holds it per file rather than for the whole walk. A peer that
+   stays connected without reading parks the consumer indefinitely, and a
+   one-slot lane released only on that path is a lane lost for the life of the
+   process. A route-level timeout reports the
    tool's own timeout shape (`{"valid": False, "message": "Verification timed
    out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
    the file is not known bad, the check just did not finish.
@@ -585,8 +590,17 @@ Three rules follow for any code that runs a verifier:
   on it rather than opening the next file against the same mount and abandoning
   one more process per file. The captured verifiers get there through
   `run_capture`'s `on_abandoned` hook, since a `None` return code alone cannot
-  tell an abort from a failed ladder. Issue #268 argues abandonment should be an
-  exception rather than a flag; when that lands, it replaces exactly these.
+  tell an abort from a failed ladder. An *outer* deadline (the route's or the
+  job's) is the one case that cannot carry the flag on an event at all — it
+  cancels the generator rather than letting it reach one — so `reap` records the
+  pid it gave up on (`SubprocessRunner.abandoned_pids`) and the routes fold that
+  into the timeout verdict. Issue #268 argues abandonment should be an exception
+  rather than a flag; when that lands, it replaces exactly these.
+- **Re-check the cancel after resolving the bound, before spawning.** The
+  resolution is itself a probe that can take its full bound on storage that has
+  stopped answering, and spawning into that means a child that blocks
+  immediately and may outlive SIGKILL — a prompt cancellation turned into an
+  abandoned process, for work nobody wanted.
 - **Every bound resolution takes the `cancel_event` too.** Sizing the file is a
   stat of the same storage the verify is about to read, and it happens *before*
   the verify that would observe a cancel — at the call site
