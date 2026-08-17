@@ -172,7 +172,9 @@ class DolphinToolService:
         ]
         # Same size-scaled bound as verify(): this *is* a verify run, just one
         # whose output we read for a hash instead of a verdict.
-        timeout = await resolve_verify_timeout(path, self._runner.owner)
+        timeout = await resolve_verify_timeout(
+            path, self._runner.owner, cancel_event=cancel_event,
+        )
         returncode, stdout, _ = await self._runner.run_capture(
             cmd, timeout=timeout or None, cancel_event=cancel_event,
         )

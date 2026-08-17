@@ -470,7 +470,9 @@ async def collect_verify(
     wrapper, so it is written once here rather than eight times. The result is
     ``{"valid", "message"}`` plus ``"cancelled": True`` when the stream ended
     because the operator cancelled -- a distinction callers must keep, since a
-    cancelled verify proved nothing and must not be recorded as a failure.
+    cancelled verify proved nothing and must not be recorded as a failure --
+    and ``"abandoned": True`` when it ended with a child that outlived SIGKILL,
+    which tells a caller working through a list to stop.
     """
     final: dict = {"valid": False, "message": fallback_message}
     async for update in stream:
@@ -482,6 +484,8 @@ async def collect_verify(
     }
     if final.get("cancelled"):
         result["cancelled"] = True
+    if final.get("abandoned"):
+        result["abandoned"] = True
     return result
 
 
@@ -756,7 +760,9 @@ class SubprocessRunner:
     # ``cancel_event`` so pressing Cancel actually stops the verifier.
 
     @staticmethod
-    def _verify_error(message: str, *, cancelled: bool = False) -> dict:
+    def _verify_error(
+        message: str, *, cancelled: bool = False, abandoned: bool = False,
+    ) -> dict:
         event = {"type": "error", "valid": False, "message": message}
         if cancelled:
             # Distinguishes "the operator stopped this" from "this file is
@@ -764,6 +770,12 @@ class SubprocessRunner:
             # a failed one, and no caller may record a verification result from
             # a run that never finished.
             event["cancelled"] = True
+        if abandoned:
+            # Distinguishes "this file failed" from "cleanup itself failed":
+            # a verifier that outlived SIGKILL is still holding the storage,
+            # so a caller working through a list must stop rather than open the
+            # next file against it.
+            event["abandoned"] = True
         return event
 
     async def capture_verify(
@@ -781,13 +793,17 @@ class SubprocessRunner:
 
         For a verifier that prints nothing useful until it exits: the whole run
         is one :meth:`run_capture` bounded by :func:`resolve_verify_timeout` for
-        ``path`` and racing ``cancel_event``, wrapped in the 0%/100% progress
+        ``path`` and racing ``cancel_event`` -- which the bound resolution takes
+        too, since sizing the file is another stat of the same storage.
+        The whole is wrapped in the 0%/100% progress
         events the SSE routes expect. ``run_capture`` reports both an abort and
         a timeout as a ``None`` return code, so the two are told apart here by
         asking the cancel event which one happened.
         """
         yield {"type": "progress", "progress": 0, "message": start_message}
-        timeout = await resolve_verify_timeout(path, self._owner)
+        timeout = await resolve_verify_timeout(
+            path, self._owner, cancel_event=cancel_event,
+        )
         returncode, stdout, _ = await self.run_capture(
             cmd,
             timeout=timeout or None,
@@ -858,7 +874,9 @@ class SubprocessRunner:
         # cancellation (the verify SSE route cancels its task when the client
         # disconnects) unwinds this coroutine with the child already running and
         # tracked, but with nothing to reap or untrack it.
-        overall_timeout = await resolve_verify_timeout(path, self._owner)
+        overall_timeout = await resolve_verify_timeout(
+            path, self._owner, cancel_event=cancel_event,
+        )
         stall_timeout = verify_stall_timeout(self._owner)
 
         process = await asyncio.create_subprocess_exec(  # nosemgrep
@@ -964,15 +982,18 @@ class SubprocessRunner:
                 if not stopped and not await self.reap(process, exit_timeout=0):
                     reap_failed = True
                     # An abandoned child is reported as a terminal error event
-                    # here, matching run()'s message. Issue #268 argues an
-                    # abandonment should *raise* instead, so a batch stops
-                    # walking rather than opening the next file against the same
-                    # storage; when that lands this is the single line to swap
-                    # for the raising variant of reap.
+                    # here, matching run()'s message, flagged so a caller
+                    # working through a list stops instead of opening the next
+                    # file against storage that just proved it can wedge a
+                    # process past SIGKILL. Issue #268 argues an abandonment
+                    # should *raise* instead of being a flag on the event; when
+                    # that lands this is the single line to swap for the raising
+                    # variant of reap.
                     terminal = self._verify_error(
                         f"Verification did not exit and could not be killed "
                         f"(pid {process.pid}); it is likely blocked on "
                         "unresponsive storage.",
+                        abandoned=True,
                     )
 
             if self._logger.isEnabledFor(logging.DEBUG):

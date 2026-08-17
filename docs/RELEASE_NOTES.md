@@ -65,6 +65,11 @@
     on its own. Either way the job is reported as a
     **cancelled job, not a failed verification**: it reached no verdict, so the
     source is never deleted on the strength of it.
+  - A **Verify all** run now stops if one file's verifier cannot be stopped.
+    That only happens when storage has wedged a process past `SIGKILL`, and
+    every remaining file in the batch is on that same storage — so continuing
+    used to leave one unkillable verifier behind per file. The batch ends with
+    an explanation instead.
   - The bound applies to verification started from the Verify buttons too, not
     just to delete-on-verify jobs. Those run through the same verifiers and hold
     the same verification lane, so a wedged one used to keep that lane occupied

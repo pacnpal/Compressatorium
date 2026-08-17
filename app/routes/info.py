@@ -1489,6 +1489,28 @@ def _sse_batch_from_verify_stream(
                     ),
                 }
 
+                if final_result.get("abandoned"):
+                    # The verifier outlived SIGKILL, so it is still reading the
+                    # storage this batch is walking. Every remaining file lives
+                    # on that same storage, so continuing would spawn one more
+                    # unkillable verifier per file. Stop and say why.
+                    yield {
+                        "event": "verify_batch_complete",
+                        "data": json.dumps(
+                            {
+                                "total": total,
+                                "verified": verified_count,
+                                "failed": failed_count,
+                                "aborted": True,
+                                "message": (
+                                    "Batch stopped: a verifier could not be "
+                                    "stopped and is still holding the storage."
+                                ),
+                            },
+                        ),
+                    }
+                    return
+
             except Exception as exc:
                 failed_count += 1
                 yield {

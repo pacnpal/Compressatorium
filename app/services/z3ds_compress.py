@@ -384,7 +384,9 @@ class Z3DSCompressService:
             # (the verify SSE route cancels its task on client disconnect)
             # unwinds this generator with zstd already running and tracked, but
             # with nothing to reap or untrack it.
-            overall_timeout = await resolve_verify_timeout(file_path, "z3ds")
+            overall_timeout = await resolve_verify_timeout(
+                file_path, "z3ds", cancel_event=cancel_event,
+            )
 
             # Start zstd -t process reading from stdin
             process = await asyncio.create_subprocess_exec(

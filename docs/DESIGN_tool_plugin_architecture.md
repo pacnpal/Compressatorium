@@ -552,9 +552,11 @@ Three pieces, none of them per-tool:
 Three rules follow for any code that runs a verifier:
 
 - **Never offload a verify's blocking read to a shared pool** — including the
-  event loop's *default* executor (what `aiofiles` uses), and including the
-  route guards that run *before* the verify, which have their own bounded seam
-  in `bounded_path_check`. Nor wrap such a read in a context manager whose exit
+  event loop's *default* executor (what `aiofiles` uses), the route guards that
+  run *before* the verify (their own bounded seam is `bounded_path_check`), and
+  the searches a verify does before it reads anything: nsz resolves `prod.keys`
+  through `run_detached` because with `SWITCH_KEYS` unset that walks the game
+  volumes, inline and ahead of every bound meant to survive them. Nor wrap such a read in a context manager whose exit
   awaits a close: on a stuck read that close waits on the same lock, turning
   cleanup into a second unbounded wait, so an abandoned handle is left
   unclosed with its thread. Use `run_detached`, and pass it the `cancel_event`: cancellation abandons the
@@ -567,7 +569,19 @@ Three rules follow for any code that runs a verifier:
   request unwinds the coroutine with the child running, tracked, and nothing
   left to reap it.
 - **Never record a verification result from a run that did not reach a
-  verdict.**
+  verdict.** A verifier that outlived SIGKILL is one of those runs, and it is
+  worse than a failure: it is still holding the storage. Its terminal event
+  carries `abandoned: True` (through `collect_verify`, alongside `cancelled`),
+  and the batch route stops the walk on it rather than opening the next file
+  against the same mount and abandoning one more process per file. Issue #268
+  argues abandonment should be an exception rather than a flag; when that lands
+  this becomes a `raise` at the same point.
+- **Every bound resolution takes the `cancel_event` too.** Sizing the file is a
+  stat of the same storage the verify is about to read, and it happens *before*
+  the verify that would observe a cancel — at the call site
+  (`tool.verify_timeout(path, cancel_event=…)`) and again inside each verifier
+  (`run_verify`, `capture_verify`, z3ds). Miss one and a Cancel waits out the
+  probe bound with the dispatcher slot still held.
 - **Keep every wait under the same live checks.** A wait decided once, up front,
   answers only for the instant it was decided. `run_verify`'s post-EOF grace —
   waiting for a verifier that closed stdout to exit on its own — is therefore

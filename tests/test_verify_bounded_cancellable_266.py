@@ -372,7 +372,7 @@ async def _cancel_during_bound_resolution(tmp_path: Path, monkeypatch):
     runner_mod = _runner_module(service)
     resolving = asyncio.Event()
 
-    async def _slow_bound(_path, _owner=None):
+    async def _slow_bound(_path, _owner=None, *, cancel_event=None):
         resolving.set()
         await asyncio.sleep(30)
         return 0
@@ -398,7 +398,7 @@ async def _z3ds_cancel_during_bound_resolution(tmp_path: Path, monkeypatch):
     rom.write_bytes(b"Z3DS" + b"\0" * 4096)
     resolving = asyncio.Event()
 
-    async def _slow_bound(_path, _owner=None):
+    async def _slow_bound(_path, _owner=None, *, cancel_event=None):
         resolving.set()
         await asyncio.sleep(30)
         return 0
@@ -1092,7 +1092,7 @@ async def _post_eof_grace_bounded(tmp_path: Path, monkeypatch):
     )
     runner_mod = _runner_module(service)
 
-    async def _short_bound(_path, _owner=None):
+    async def _short_bound(_path, _owner=None, *, cancel_event=None):
         return 2
 
     monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _short_bound)
@@ -1333,3 +1333,186 @@ async def test_the_job_passes_its_cancel_event_into_bound_resolution(
 
     assert job.status == JobStatus.COMPLETED
     assert isinstance(seen.get("event"), asyncio.Event)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_stops_when_a_verifier_cannot_be_killed(tmp_path, monkeypatch):
+    """One unkillable verifier ends the walk instead of starting the next.
+
+    A child that outlived SIGKILL is still holding the storage, and every
+    remaining file in the batch lives on that same storage -- so continuing
+    spawned one more unkillable verifier per file. The terminal event carries
+    that fact (`abandoned`), and the batch stops on it.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(info_routes, "verification_store", Mock(mark_verified=AsyncMock()))
+
+    targets = []
+    for name in ("one.wux", "two.wux", "three.wux"):
+        target = tmp_path / name
+        target.write_bytes(b"WUX0" + b"\0" * 1024)
+        targets.append(str(target))
+
+    started: list[str] = []
+
+    async def _abandoned(path, *, cancel_event=None):
+        started.append(path)
+        yield {
+            "type": "error",
+            "valid": False,
+            "abandoned": True,
+            "message": (
+                "Verification did not exit and could not be killed (pid 1); it "
+                "is likely blocked on unresponsive storage."
+            ),
+        }
+
+    service = Mock()
+    service.verify_stream = _abandoned
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _bound(_path):
+        return 30
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _bound)
+
+    token = await info_routes.workload_limiter.try_acquire("verify")
+    response = info_routes._sse_batch_from_verify_stream(
+        info_routes.registry.get("jwud"),
+        info_routes._VERIFY_CONFIG["jwud"],
+        targets,
+        token,
+    )
+    events = [e async for e in response.body_iterator if isinstance(e, dict)]
+
+    assert started == targets[:1], f"the batch kept opening files: {started}"
+    finals = [e for e in events if e["event"] == "verify_batch_complete"]
+    assert finals, "the batch never emitted its terminal event"
+    assert '"aborted": true' in finals[-1]["data"].lower()
+
+
+def test_an_abandoned_verifier_is_flagged_not_just_reported(tmp_path, monkeypatch):
+    """`collect_verify` keeps the flag a caller needs to stop on."""
+
+    async def _stream():
+        yield {
+            "type": "error",
+            "valid": False,
+            "abandoned": True,
+            "message": "could not be killed",
+        }
+
+    result = asyncio.run(collect_verify(_stream(), fallback_message="nope"))
+    assert result == {
+        "valid": False,
+        "message": "could not be killed",
+        "abandoned": True,
+    }
+
+
+def test_nsz_key_discovery_stays_off_the_event_loop(tmp_path, monkeypatch):
+    """Finding prod.keys can walk the volumes; that must not block the loop.
+
+    With SWITCH_KEYS unset the key search recurses through the game volumes. It
+    ran inline in `verify_stream`, ahead of the bound and the cancel that exist
+    to survive exactly the mount this search would hang on -- and it ran twice,
+    since `_keys_home` resolved it again.
+    """
+    asyncio.run(_nsz_keys_off_loop(tmp_path, monkeypatch))
+
+
+async def _nsz_keys_off_loop(tmp_path: Path, monkeypatch):
+    import threading
+
+    from app.services.nsz import NszService
+
+    service = NszService()
+    target = tmp_path / "game.nsz"
+    target.write_bytes(b"\0" * 4096)
+
+    on_loop = asyncio.get_running_loop()
+    threads: list[str] = []
+    release = threading.Event()
+
+    def _wedged_key_search():
+        threads.append(threading.current_thread().name)
+        release.wait(30)
+        return None
+
+    monkeypatch.setattr(service, "resolved_keys_file", _wedged_key_search)
+
+    cancel_event = asyncio.Event()
+    on_loop.call_later(0.2, cancel_event.set)
+
+    stream = service.verify_stream(str(target), cancel_event=cancel_event)
+    # The search is wedged: without the detached seam this await never returns,
+    # and nothing else in the process runs either.
+    events = [e async for e in _drain(stream, timeout=5)]
+    release.set()
+
+    assert threads, "the key search never ran"
+    assert "MainThread" not in threads, "the key search ran on the event loop"
+    assert events[-1].get("cancelled") is True, events[-1]
+
+
+async def _drain(stream, *, timeout: float):
+    """Yield a stream's events under a hard deadline."""
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            yield await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+
+
+def test_a_streaming_verify_races_its_own_bound_sizing(tmp_path, monkeypatch):
+    """The event reaches the *inner* bound resolution, not just the job's.
+
+    Every verifier re-resolves the bound for itself before spawning. Forwarding
+    the cancel event to the outer resolver alone left that inner probe deaf, so
+    a Cancel pressed against a mount that had stopped answering still waited out
+    the probe bound before anything observed it.
+    """
+    asyncio.run(_streaming_verify_races_sizing(tmp_path, monkeypatch))
+
+
+async def _streaming_verify_races_sizing(tmp_path: Path, monkeypatch):
+    import threading
+    import time
+
+    service = ChdmanService()
+    # Long-running, so the cancel is observed by the read loop rather than
+    # overtaken by a child that had already exited.
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "slow_chdman.py",
+        "print('Verifying, 1% complete')\nsys.stdout.flush()\ntime.sleep(60)\n",
+    )
+    runner_mod = _runner_module(service)
+
+    release = threading.Event()
+
+    def _wedged_sizing(_path, _owner=None):
+        release.wait(30)
+        return 999
+
+    monkeypatch.setattr(runner_mod, "_verify_timeout_sync", _wedged_sizing)
+
+    cancel_event = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, cancel_event.set)
+
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            service.verify(str(tmp_path / "sample.chd"), cancel_event=cancel_event),
+            # Under the probe bound: waiting that out is the bug.
+            timeout=runner_mod._STAT_TIMEOUT / 2,
+        )
+    except asyncio.TimeoutError:  # pragma: no cover - fails the test below
+        release.set()
+        raise AssertionError("the verify's own bound sizing ignored the cancel") from None
+    elapsed = time.monotonic() - started
+    release.set()
+
+    assert result["cancelled"] is True
+    assert elapsed < runner_mod._STAT_TIMEOUT / 2

@@ -173,7 +173,7 @@ async def test_verify_times_out_when_process_hangs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
     monkeypatch.setattr(z3ds_module.asyncio, "create_subprocess_exec", _fake_exec)
     # Bound the verify subprocess at a tiny timeout so the hang trips it fast.
-    async def _tiny_bound(_path, _owner=None):
+    async def _tiny_bound(_path, _owner=None, *, cancel_event=None):
         return 0.05
 
     monkeypatch.setattr(z3ds_module, "resolve_verify_timeout", _tiny_bound)

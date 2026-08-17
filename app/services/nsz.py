@@ -30,10 +30,12 @@ from pathlib import Path
 
 from config import settings
 from services.subprocess_runner import (
+    ReadCancelled,
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    run_detached,
     verify_preflight,
 )
 from utils.junk import is_junk_entry
@@ -182,14 +184,19 @@ class NszService:
         return None
 
     @contextlib.contextmanager
-    def _keys_home(self):
+    def _keys_home(self, keys_file: str | None = None):
         """Yield an env dict whose HOME exposes the keys at ~/.switch/prod.keys.
 
         nsz reads keys at import from ``$HOME/.switch/prod.keys``; we symlink the
         configured key file there in a throwaway HOME so the child finds it no
         matter where the operator mounted it.
+
+        ``keys_file`` may be supplied by a caller that already resolved it off
+        the event loop -- finding it can walk the game volumes, which is exactly
+        the kind of blocking search a verify must not do inline (see
+        ``verify_stream``). Omitted, it is resolved here as before.
         """
-        keys_file = self.resolved_keys_file()
+        keys_file = keys_file or self.resolved_keys_file()
         if not keys_file:
             raise RuntimeError(
                 "nsz needs prod.keys to (de)compress Switch content. Mount your "
@@ -446,7 +453,25 @@ class NszService:
         if problem is not None:
             yield problem
             return
-        if not self.keys_available():
+        # Off the event loop, for the same reason as the preflight above:
+        # with SWITCH_KEYS unset this walks the game volumes looking for
+        # prod.keys, and a volume that has stopped answering would block every
+        # task in the process -- including the bound and the cancel meant to
+        # rescue this very verify. Resolved once here and handed to
+        # ``_keys_home``, which would otherwise repeat the same search.
+        try:
+            keys_file = await run_detached(
+                self.resolved_keys_file, cancel_event=cancel_event,
+            )
+        except ReadCancelled:
+            yield {
+                "type": "error",
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
+            return
+        if not keys_file:
             yield {
                 "type": "error",
                 "valid": False,
@@ -459,7 +484,7 @@ class NszService:
             return
 
         try:
-            with self._keys_home() as env:
+            with self._keys_home(keys_file) as env:
                 verify_cmd = (
                     nice_prefix("nsz")
                     + ioprio_prefix("nsz")

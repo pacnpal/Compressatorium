@@ -331,7 +331,7 @@ async def test_verify_times_out_when_process_hangs(tmp_path, monkeypatch, keys_p
 
     # The verify bound is now resolved inside the shared runner, so patch it
     # there (the runner module the service's SubprocessRunner came from).
-    async def _tiny_bound(_path, _owner=None):
+    async def _tiny_bound(_path, _owner=None, *, cancel_event=None):
         return 0.05
 
     runner_module = sys.modules[type(nsz_module.nsz_service._runner).__module__]
