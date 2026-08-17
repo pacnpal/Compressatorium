@@ -209,6 +209,50 @@ async def test_routes_require_configuration() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_does_not_leak_romm_response_body() -> None:
+    """RomM's response body must not be echoed into our API response.
+
+    The client puts it in the exception message for the log, but that text is
+    remote-controlled; the response carries a message derived from the status
+    code instead. (CodeQL: information exposure through an exception.)
+    """
+    exc = RommError(
+        "RomM GET /api/heartbeat failed: HTTP 401 — "
+        "Traceback: /srv/romm/backend/auth.py line 42, secret=hunter2",
+        status=401,
+    )
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", ""), \
+            patch.object(romm_routes.romm_client, "heartbeat", side_effect=exc), \
+            patch.object(romm_routes, "_count_pending", return_value=0):
+        status = await romm_routes.romm_status()
+
+    assert "hunter2" not in status["error"]
+    assert "Traceback" not in status["error"]
+    assert "/srv/romm" not in status["error"]
+    # Still actionable: it names what to go fix.
+    assert "ROMM_TOKEN" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_route_error_does_not_leak_romm_response_body() -> None:
+    """Same guarantee on the raising routes, not just the status endpoint."""
+    from fastapi import HTTPException
+
+    exc = RommError("RomM GET /api/platforms failed: HTTP 500 — secret=hunter2",
+                    status=500)
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", "/library"), \
+            patch.object(romm_routes.romm_client, "platforms", side_effect=exc), \
+            pytest.raises(HTTPException) as caught:
+        await romm_routes.romm_platforms()
+
+    assert caught.value.status_code == 502
+    assert "hunter2" not in caught.value.detail
+    assert "500" in caught.value.detail
+
+
+@pytest.mark.asyncio
 async def test_status_reports_unreachable_romm_as_data() -> None:
     """The view renders the problem, so an unreachable RomM is not a 500."""
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
@@ -222,7 +266,8 @@ async def test_status_reports_unreachable_romm_as_data() -> None:
 
     assert status["configured"] is True
     assert status["connected"] is False
-    assert "Connection refused" in status["error"]
+    # No HTTP status on the error means we never reached RomM at all.
+    assert "Could not reach RomM" in status["error"]
     # SSOT: the frontend renders its warning from this, not its own copy.
     assert status["dat_safe_output_exts"] == sorted(DAT_SAFE_OUTPUT_EXTS)
 

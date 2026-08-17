@@ -75,7 +75,17 @@ METADATA_ID_FIELDS = (
 
 
 class RommError(RuntimeError):
-    """A RomM request failed, or RomM is not configured."""
+    """A RomM request failed, or RomM is not configured.
+
+    ``status`` carries RomM's HTTP status when there was one, so callers can
+    describe the failure ("token rejected", "not reachable") from a value we
+    own rather than by echoing the exception text. The message itself may quote
+    RomM's response body and is for the log, not for an API response.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class RommNotConfigured(RommError):
@@ -189,6 +199,7 @@ class RommClient:
             raise RommError(
                 f"RomM {method} {path} failed: HTTP {exc.code}"
                 + (f" — {detail}" if detail else ""),
+                status=exc.code,
             ) from exc
         except urllib.error.URLError as exc:
             raise RommError(f"RomM {method} {path} failed: {exc.reason}") from exc

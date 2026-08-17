@@ -72,15 +72,37 @@ def _require_configured() -> None:
         )
 
 
-def _romm_call(exc: RommError) -> HTTPException:
+def _safe_error(exc: RommError) -> str:
+    """A message describing *exc* without echoing the exception text.
+
+    The exception message can quote RomM's response body and OS-level detail.
+    That belongs in our log, not in an HTTP response — so the wording here is
+    derived from ``RommError.status``, a value we set ourselves. It is also
+    more useful than the raw text: it names the thing to go fix.
+    """
+    status = getattr(exc, "status", None)
+    if status in (401, 403):
+        return "RomM rejected the API token. Check ROMM_TOKEN and its scopes."
+    if status == 404:
+        return "RomM returned 404. Check that ROMM_URL points at the API root."
+    if status is not None:
+        return f"RomM returned HTTP {status}."
+    return "Could not reach RomM. Check ROMM_URL and that the instance is up."
+
+
+def _romm_call(exc: RommError, *, context: str) -> HTTPException:
     """Translate a client error into the right status.
 
     502, not 500: the failure is upstream, and a caller retrying against a
     healthy RomM would succeed.
     """
+    logger.warning("romm: %s failed: %s", context, exc)
     if isinstance(exc, RommNotConfigured):
-        return HTTPException(status_code=503, detail=str(exc))
-    return HTTPException(status_code=502, detail=str(exc))
+        return HTTPException(
+            status_code=503,
+            detail="RomM is not configured. Set ROMM_URL (and ROMM_TOKEN).",
+        )
+    return HTTPException(status_code=502, detail=_safe_error(exc))
 
 
 # ----------------------------------------------------------------------
@@ -116,17 +138,26 @@ async def romm_status() -> dict:
             result["library_root_mounted"] = bool(
                 await bounded_path_check(os.path.isdir, library_root),
             )
-        except (asyncio.TimeoutError, OSError) as exc:
+        except (asyncio.TimeoutError, OSError):
             # A dead mount is exactly what this probe exists to survive: report
-            # it as status rather than failing the request.
-            result["error"] = f"Could not stat ROMM_LIBRARY_ROOT: {exc}"
+            # it as status rather than failing the request. The reason goes to
+            # the log; the response carries a fixed message, since OSError text
+            # can include host paths and errno detail.
+            logger.warning(
+                "romm: could not stat ROMM_LIBRARY_ROOT", exc_info=True,
+            )
+            result["error"] = (
+                "Could not read ROMM_LIBRARY_ROOT. Check the mount is present "
+                "and readable."
+            )
     if configured:
         try:
             heartbeat = await run_in_threadpool(romm_client.heartbeat)
             result["connected"] = True
             result["version"] = (heartbeat.get("VERSION") or heartbeat.get("version"))
         except RommError as exc:
-            result["error"] = str(exc)
+            logger.warning("romm: heartbeat failed: %s", exc)
+            result["error"] = _safe_error(exc)
     result["pending_repins"] = await run_in_threadpool(_count_pending)
     return result
 
@@ -138,7 +169,7 @@ async def romm_platforms() -> list[dict]:
     try:
         platforms = await run_in_threadpool(romm_client.platforms)
     except RommError as exc:
-        raise _romm_call(exc) from exc
+        raise _romm_call(exc, context="listing platforms") from exc
     out = [
         {
             "id": p.get("id"),
@@ -173,7 +204,7 @@ async def romm_roms(
     try:
         roms = await run_in_threadpool(romm_client.roms, platform_id)
     except RommError as exc:
-        raise _romm_call(exc) from exc
+        raise _romm_call(exc, context="listing roms") from exc
 
     entries = await run_in_threadpool(_build_entries, roms)
     return DirectoryListing(
@@ -258,7 +289,7 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     try:
         platform_roms = await run_in_threadpool(_roms_by_local_path, payload.paths)
     except RommError as exc:
-        raise _romm_call(exc) from exc
+        raise _romm_call(exc, context="reading the catalog") from exc
 
     recorded = 0
     skipped = 0
