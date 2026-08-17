@@ -35,7 +35,6 @@ from services.subprocess_runner import (
     SubprocessRunner,
     ioprio_prefix,
     nice_prefix,
-    output_size_progress,
     verify_timeout,
 )
 
@@ -91,8 +90,6 @@ MAXCSO_OUTPUT_BY_MODE = {
 }
 
 # Rough output:input size ratios, used only to smooth the progress bar.
-_COMPRESS_RATIO = 0.5    # compressed output is ~50% of the source
-_DECOMPRESS_RATIO = 2.0  # decompressed .iso is ~2x the compressed source
 
 # Compression-effort presets. The UI sends one of these tokens (see the `cso`
 # entry in src/lib/tools/registry.js); each maps to the maxcso trial flags that
@@ -209,25 +206,12 @@ class MaxcsoService:
         # delete a pre-existing output_path, since maxcso has written nothing.
         cmd = self._build_command(input_path, output_path, mode, compression)
 
-        try:
-            input_size = os.path.getsize(input_path)
-        except OSError:
-            input_size = 0
-        ratio = _DECOMPRESS_RATIO if decompress else _COMPRESS_RATIO
-        expected_size = max(1, int(input_size * ratio))
-
-        def _size_progress(size: int) -> dict:
-            return {
-                "progress": output_size_progress(size, expected_size),
-                "message": f"Working... ({size // (1024 * 1024)} MB)",
-            }
-
         yield {"progress": 1, "message": f"Starting CSO {verb}..."}
 
         # maxcso applies nice/ionice as command wrappers in _build_command
         # (nice_via_wrapper) to avoid preexec_fn, and prints no parseable percent
-        # (its TTY bar goes silent on a pipe), so size_progress estimates the bar
-        # from the growing -o file.
+        # (its TTY bar goes silent on a pipe), so the runner's size-growth
+        # fallback reports status from the growing -o file.
         try:
             async for update in self._runner.run(
                 cmd,
@@ -238,7 +222,7 @@ class MaxcsoService:
                 cancel_event=cancel_event,
                 fail_label="maxcso",
                 complete_message=f"CSO {verb} complete",
-                size_progress=_size_progress,
+                mode=mode,
                 nice_via_wrapper=True,
             ):
                 yield update

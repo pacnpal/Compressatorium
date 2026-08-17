@@ -708,11 +708,37 @@ class NszipTool(BaseTool):
 - **Always** support `cancel_event`: spawn a watcher task that
   `process.terminate()`s (then `kill()`s after a timeout), clean up the partial
   output file, and raise `ConversionCancelled`. See `z3ds_compress.py`.
+- **Never wait on a child process unbounded** — not after EOF, not in a
+  `finally`. Use `SubprocessRunner.reap()`, which escalates TERM -> KILL and then
+  gives up. A process blocked in uninterruptible I/O (a stalled mount, a drive
+  that stopped answering) survives SIGKILL, and because `MAX_CONCURRENT_JOBS`
+  defaults to 1 and runs jobs inline in the dispatcher, one unbounded wait
+  freezes the entire queue rather than just its own job (issue #263).
 - **Always** apply a stall timeout via `compute_progress_stall_timeout(...)` so a
   wedged binary can't hang a job forever.
-- **Progress** is a 0 to 100 int. If the binary doesn't report percentages,
-  estimate from output-file growth like z3ds does, or emit an elapsed-seconds
-  heartbeat via the shared `SubprocessRunner` like dolphin does.
+- **Progress** is a 0 to 100 int, and **every tool reports status whether or not
+  its binary cooperates** — you do not implement this, the shared
+  `SubprocessRunner` does. It uses your `parse_progress` whenever that returns a
+  real percent, and otherwise falls back automatically to the output file
+  growing on disk, emitting MB written and a MB/min rate. So:
+  - Doing nothing already gets you bytes + rate. There is no per-tool progress
+    code to write and none to copy.
+  - Pass `mode=` to `run()` to also get a percentage bar, and add a row for your
+    modes to `SIZE_RATIOS` in `services/subprocess_runner.py` (expected output
+    size as a multiple of the input — approximate is fine, it only smooths the
+    bar). A mode with no row still reports bytes and rate.
+  - `parse_progress` must return **`None`**, never `0`, for a line carrying no
+    percentage. The runner reads "a percent was parsed" as proof the tool
+    reports its own progress and stands the fallback down for the rest of the
+    run, so a `0` sentinel on the first banner line silently disables status
+    reporting entirely. chdman did exactly this.
+  - Implement `parse_progress` only if the binary prints a percentage **that
+    survives being piped**. Check this against a real conversion rather than
+    against `--help`: several of these tools draw a progress bar only on a TTY
+    and go completely silent on a pipe. dolphin-tool does exactly that, which is
+    why it once showed nothing but a spinning elapsed counter (issue #263).
+  - Never hand-roll a size-growth estimator in a service. That logic lives in
+    the runner precisely so all nine tools behave the same way.
 - Respect the shared priority policy via the `services.subprocess_runner`
   helpers (`ioprio_prefix(owner)`, `nice_prefix(owner)`, `apply_nice(owner)`,
   `info_timeout(owner)`, `verify_timeout(owner)`). These read the tool-neutral
@@ -1129,6 +1155,9 @@ SERVICE (app/services/<tool>.py)
 [ ] *_CONVERTIBLE_EXTENSIONS, *_OUTPUT_FORMATS, module-level singleton
 [ ] convert(): exec (no shell), progress yields, cancel_event, stall timeout,
     nice/ionice, PID tracking, ConversionCancelled, final 100%
+[ ] convert(): pass mode= to run() (+ a SIZE_RATIOS row) so the bar has a
+    percentage; status itself is automatic -- never hand-roll size progress
+[ ] no unbounded process.wait() anywhere; reap() owns TERM->KILL->give up
 [ ] verify() + verify_stream(), info(), get_output_path()
 
 PLUGIN (app/services/tools/<tool>.py)

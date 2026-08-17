@@ -33,7 +33,6 @@ from services.subprocess_runner import (
     SubprocessRunner,
     ioprio_prefix,
     nice_prefix,
-    output_size_progress,
     verify_timeout,
 )
 from utils.junk import is_junk_entry
@@ -50,8 +49,6 @@ NSZ_OUTPUT_FORMATS = {
 }
 
 # Rough output:input size ratios, used only to smooth the progress bar.
-_COMPRESS_RATIO = 0.6   # compressed output is ~60% of the source
-_DECOMPRESS_RATIO = 1.7  # decompressed output is ~1.7x the source
 
 # Key filenames nsz/homebrew tools use.
 _KEY_FILENAMES = ("prod.keys", "keys.txt")
@@ -351,25 +348,12 @@ class NszService:
                            env, cancel_event, compression=None) -> AsyncGenerator[dict, None]:
         cmd = self._build_command(input_path, work_dir, mode, compression)
 
-        try:
-            input_size = os.path.getsize(input_path)
-        except OSError:
-            input_size = 0
-        ratio = _DECOMPRESS_RATIO if mode == "nsz_decompress" else _COMPRESS_RATIO
-        expected_size = max(1, int(input_size * ratio))
-
-        def _size_progress(size: int) -> dict:
-            return {
-                "progress": output_size_progress(size, expected_size),
-                "message": f"Working... ({size // (1024 * 1024)} MB)",
-            }
-
         yield {"progress": 1, "message": f"Starting Switch {verb}..."}
 
         # nsz names the file itself inside work_dir, so the runner watches
         # produced_path for growth/stall. nice/ionice are command wrappers in
         # _build_command (nice_via_wrapper) and the private keys-home env is
-        # forwarded; nsz prints no parseable percent, so size_progress drives the
+        # forwarded; nsz prints no parseable percent, so the runner's fallback drives the
         # bar. The terminal 100% is held back — convert() emits it after the
         # os.replace onto the real output_path. require_output makes the runner
         # raise (with the stdout tail) when nsz exits 0 but leaves no produced
@@ -383,7 +367,7 @@ class NszService:
             cancel_event=cancel_event,
             fail_label="nsz",
             complete_message=f"Switch {verb} complete",
-            size_progress=_size_progress,
+            mode=mode,
             nice_via_wrapper=True,
             env=env,
             require_output=True,

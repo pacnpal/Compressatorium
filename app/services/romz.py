@@ -432,6 +432,7 @@ class RomzService:
                 cwd=run_cwd,
                 fail_label="7z",
                 complete_message=complete_message,
+                mode=mode,
             ):
                 yield update
             if mode == ROMZ_EXTRACT_MODE:

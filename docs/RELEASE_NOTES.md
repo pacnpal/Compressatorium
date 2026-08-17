@@ -2,6 +2,38 @@
 
 ## 4.4.2 (unreleased)
 
+### Fixed
+
+- **Every tool now reports real status, not just a spinning clock.** Dolphin
+  conversions showed `Converting... (1134s)` against a progress bar pinned at
+  0%, because dolphin-tool draws its progress bar only to a terminal and goes
+  silent the moment we capture its output to a pipe. With no signal at all,
+  there was no way to tell a conversion crawling against a busy array from one
+  that had stopped dead — the two looked identical, indefinitely. Progress
+  reporting is now shared infrastructure rather than something each tool wires
+  up for itself: a tool's own percentages are used whenever it prints any, and
+  when it doesn't, status falls back automatically to the output file growing on
+  disk, reporting **MB written and a MB/min rate**. A slow job now visibly reads
+  as slow — bytes climbing, rate collapsing — instead of as a hang. This applies
+  to all nine tools, including the six that previously had no fallback at all.
+- **A slow conversion is no longer mistaken for a stalled one.** The stall
+  watchdog scales with input size (about 19 minutes without output growth for a
+  4.4 GB image). Tools with no parseable progress fed it nothing but the output
+  file, so a genuinely slow conversion could be killed as if it had wedged. The
+  same size-growth signal now feeds the watchdog for every tool.
+- **One wedged conversion can no longer freeze the whole queue.** A process
+  blocked on unresponsive storage survives both `SIGTERM` and `SIGKILL`, and the
+  code waited for it to exit with no time limit. Since jobs run serially by
+  default, that single job never failed, never cancelled — Cancel sat on
+  *Cancelling...* forever — and every job behind it waited with it. All waits on
+  a subprocess are now bounded and escalate to giving up: the stuck job fails
+  with an explanation and the queue carries on.
+- **A wedged job now says so in the log.** Stuck-queue detection only fired when
+  jobs were queued and *none* were processing, so a job frozen mid-conversion —
+  exactly the case above — was the one state it could not see, and the only
+  record of it was logged at debug level where nobody would find it. It is now a
+  warning at the default log level.
+
 The counting half of the fix 4.4.1 started. 4.4.1 stopped a deep queue from
 *deleting* your job history; this one stops the retention cap from *lying* about
 how much work finished, which is what you notice on a run of thousands.

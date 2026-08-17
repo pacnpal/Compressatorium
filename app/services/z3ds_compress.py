@@ -15,7 +15,6 @@ from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
     ioprio_prefix,
-    output_size_progress,
     verify_timeout,
 )
 
@@ -171,30 +170,14 @@ class Z3DSCompressService:
         """
         decompress = mode == "z3ds_decompress"
         verb = "decompression" if decompress else "compression"
-        verb_ing = "Decompressing" if decompress else "Compressing"
-        # Rough output:input size ratio, only to smooth the size-based progress
-        # bar (z3ds_compressor prints no parseable percent): compressed output is
-        # ~50% of the source, a decompressed ROM ~2x the compressed container.
-        expected_ratio = 2.0 if decompress else 0.5
-        input_size = (
-            os.path.getsize(input_path) if os.path.exists(input_path) else 0
-        )
-        expected_size = max(1, int(input_size * expected_ratio))
-
-        def _size_progress(size: int) -> dict:
-            return {
-                "progress": output_size_progress(size, expected_size),
-                "message": f"{verb_ing}... ({size // (1024 * 1024)} MB)",
-            }
-
         cmd = self._build_command(input_path, output_path, mode)
         yield {"progress": 5, "message": f"Starting 3DS {verb}..."}
 
         # Delegate the streaming spawn / stall / cancel / PID loop to the shared
         # runner. z3ds keeps preexec nice (owner "z3ds") and folds ionice into
         # _build_command, so nice_via_wrapper stays False. parse_progress is a
-        # no-op — there is no parseable percent — so size_progress drives the bar
-        # from the growing output file.
+        # no-op — there is no parseable percent — so the runner's size-growth
+        # fallback drives the bar from the growing output file.
         try:
             async for update in self._runner.run(
                 cmd,
@@ -205,7 +188,7 @@ class Z3DSCompressService:
                 cancel_event=cancel_event,
                 fail_label="z3ds_compressor",
                 complete_message=f"3DS {verb} complete",
-                size_progress=_size_progress,
+                mode=mode,
             ):
                 yield update
         except (ConversionCancelled, RuntimeError, asyncio.CancelledError, GeneratorExit):

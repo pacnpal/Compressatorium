@@ -354,9 +354,10 @@ def stub_runner(monkeypatch):
     """Replace the service's SubprocessRunner.run/run_capture with recorders."""
     calls: dict[str, object] = {}
 
-    async def fake_run(cmd, *, input_path, output_path, parse_progress,
+    async def fake_run(cmd, *, input_path, output_path, parse_progress, mode=None,
                        cancel_event=None, cwd=None, fail_label="",
                        complete_message=""):
+        calls["mode"] = mode
         calls["run_cmd"] = cmd
         calls["output_path"] = output_path
         calls["cwd"] = cwd
@@ -396,6 +397,7 @@ def test_convert_compress_builds_7z_command_and_clears_stale_output(
     # 7z runs from the ROM's directory and adds only the basename, so the
     # archive stores a root-level `Game.gba`, not the absolute volume path.
     assert calls["cwd"] == str(tmp_path)
+    assert calls["mode"] == "romz_7z"
     # The basename is added with a `./` prefix (literal-safe vs 7z's `@`
     # list-file syntax) and never the absolute path.
     assert os.path.join(".", "Game.gba") in cmd and str(rom) not in cmd
@@ -499,9 +501,10 @@ def test_convert_cleans_partial_output_on_failure(tmp_path, monkeypatch):
     rom.write_bytes(b"ROM")
     out = tmp_path / "Game.gba.7z"
 
-    async def boom(cmd, *, input_path, output_path, parse_progress,
+    async def boom(cmd, *, input_path, output_path, parse_progress, mode=None,
                    cancel_event=None, cwd=None, fail_label="",
                    complete_message=""):
+        assert mode == "romz_7z"
         Path(output_path).write_bytes(b"PARTIAL")
         raise RuntimeError("7z failed")
         yield  # pragma: no cover - makes this an async generator

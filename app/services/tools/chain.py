@@ -288,10 +288,17 @@ class ChainTool(BaseTool):
                         caveats.append(last_message)
                     raw = update.get("progress") or 0
                     aggregate = int(round(base + span * (raw / 100.0)))
-                    yield {
+                    step_update = {
                         "progress": min(max(aggregate, 0), 100),
                         "message": f"[{i + 1}/{n}] {last_message}",
                     }
+                    # Forward the runner's liveness signal. A chained job runs
+                    # far longer than a single one, so dropping it here would
+                    # have every chain reported stalled once it passed
+                    # debug_progress_timeout while making steady progress.
+                    if update.get("activity"):
+                        step_update["activity"] = True
+                    yield step_update
                 cumulative += weights[i]
                 current_in = step_out
 
