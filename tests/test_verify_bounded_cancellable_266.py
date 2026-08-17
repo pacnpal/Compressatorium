@@ -1887,8 +1887,9 @@ async def _reap_records_abandonment(monkeypatch):
     # And it reads through to the route's verdict helper.
     service = Mock()
     service.abandoned_pids = runner.abandoned_pids
-    assert info_routes._abandonment(service) == {"abandoned": True}
-    assert info_routes._abandonment(Mock(spec=[])) == {}
+    detached = runner_mod.detached_abandon_count()
+    assert info_routes._abandonment(service, detached) == {"abandoned": True}
+    assert info_routes._abandonment(Mock(spec=[]), detached) == {}
 
 
 def test_a_batch_frees_the_lane_when_the_reader_parks_mid_file(tmp_path, monkeypatch):
@@ -1952,3 +1953,81 @@ async def _batch_frees_lane_mid_file(tmp_path: Path, monkeypatch):
         "the batch held the verify lane after the file's verifier stopped"
     )
     await response.body_iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_batch_validation_stops_at_the_first_unresponsive_path(
+    tmp_path, monkeypatch,
+):
+    """One dead mount must not cost a probe per selected path.
+
+    Validation bounded each path check but then moved on to the next, so a
+    selection of 64 files on the same unresponsive storage meant 64 sequential
+    probe bounds before any verify started — and 64 written-off threads, which
+    is the entire process-wide ceiling, after which path checks on healthy
+    volumes fail too.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+
+    checked: list[str] = []
+
+    async def _wedged_check(func, *args, **kwargs):
+        checked.append(str(args[0]) if args else "")
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(info_routes, "bounded_path_check", _wedged_check)
+
+    paths = [str(tmp_path / f"game{i}.wux") for i in range(8)]
+
+    with pytest.raises(info_routes.HTTPException) as excinfo:
+        await info_routes.verify_jwud_batch_events(
+            info_routes.BulkVerifyRequest(paths=paths),
+        )
+
+    assert excinfo.value.status_code == 503
+    assert len(checked) == 1, f"kept probing a dead mount: {checked}"
+
+
+def test_an_abandoned_detached_read_stops_the_batch_too(tmp_path, monkeypatch):
+    """A pure-Python verify leaves no pid — but it can still strand a thread.
+
+    The WUX index walk, an archive listing and the key search have no child for
+    `abandoned_pids` to report, so a batch on dead storage saw a plain timeout
+    and moved on, stranding one blocked thread per file until the detached-probe
+    ceiling was gone.
+    """
+    asyncio.run(_detached_abandonment_stops_the_batch(tmp_path, monkeypatch))
+
+
+async def _detached_abandonment_stops_the_batch(tmp_path: Path, monkeypatch):
+    import threading
+
+    # The module *the route reads*: `app.services.x` and `services.x` are
+    # distinct module objects here, so the counter has to be driven through the
+    # same one info.py imported from (see `_runner_module`).
+    runner_mod = sys.modules[info_routes.detached_abandon_count.__module__]
+
+    release = threading.Event()
+
+    def _wedged_read():
+        release.wait(30)
+        return b""
+
+    before = runner_mod.detached_abandon_count()
+    task = asyncio.ensure_future(runner_mod.run_detached(_wedged_read))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    release.set()
+
+    assert runner_mod.detached_abandon_count() == before + 1
+
+    # A service with no subprocess to report still yields the stop signal,
+    # because the stranded thread is evidence enough.
+    assert info_routes._abandonment(Mock(spec=[]), before) == {"abandoned": True}
+    # ...and a read that was never abandoned does not raise a false alarm.
+    assert info_routes._abandonment(
+        Mock(spec=[]), runner_mod.detached_abandon_count(),
+    ) == {}

@@ -65,6 +65,29 @@ _STAT_TIMEOUT = 10.0
 _MAX_DETACHED_PROBES = 64
 _probe_slots = threading.Semaphore(_MAX_DETACHED_PROBES)
 
+# Monotonic count of detached calls whose awaiter gave up while the call was
+# still blocked -- one written-off thread each, holding a probe slot until the
+# kernel unblocks it. Not an error on its own (it is the deliberate trade for
+# never hanging), but it is the only evidence a *pure-Python* verify leaves
+# behind when an outer deadline cancels it: no child, so nothing for
+# ``abandoned_pids`` to report. A caller walking a list compares the count
+# across a file to decide whether the storage just cost it a thread, and stops
+# rather than spending one more per remaining path.
+_detached_abandoned = 0
+_detached_abandoned_lock = threading.Lock()
+
+
+def detached_abandon_count() -> int:
+    """How many detached calls have been abandoned mid-flight, process-wide."""
+    with _detached_abandoned_lock:
+        return _detached_abandoned
+
+
+def _note_detached_abandon() -> None:
+    global _detached_abandoned
+    with _detached_abandoned_lock:
+        _detached_abandoned += 1
+
 
 class ProbeCapacityExceeded(asyncio.TimeoutError):
     """Too many filesystem probes are already stuck to start another.
@@ -385,10 +408,17 @@ async def run_detached(
         # exhaust the ceiling and start failing path checks on healthy volumes.
         raise ReadCancelled("Read cancelled")
     future = _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
-    if cancel_event is None:
-        return await future
-    waiter = asyncio.ensure_future(cancel_event.wait())
+    waiter = (
+        asyncio.ensure_future(cancel_event.wait())
+        if cancel_event is not None
+        else None
+    )
     try:
+        if waiter is None:
+            # No event to race, but still inside the try: an *outer* deadline
+            # cancelling this await abandons the thread just the same, and that
+            # has to be noticed and counted like any other abandonment.
+            return await future
         done, _pending = await asyncio.wait(
             [future, waiter], return_when=asyncio.FIRST_COMPLETED,
         )
@@ -396,14 +426,22 @@ async def run_detached(
             return future.result()
         raise ReadCancelled("Read cancelled")
     finally:
-        if not waiter.done():
+        if waiter is not None and not waiter.done():
             waiter.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await waiter
         if not future.done():
             # Abandons the thread, not the syscall: nothing can stop the latter,
-            # and the thread dies with the process.
+            # and the thread dies with the process. Counted, because for a
+            # verify that spawns no child this is the only trace left when an
+            # outer deadline cancels it.
             future.cancel()
+            _note_detached_abandon()
+        elif future.cancelled():
+            # Cancelling the awaiting task propagates straight into the future
+            # it is awaiting, so it is already "done" here -- cancelled, not
+            # answered. The thread is every bit as stuck; count it the same.
+            _note_detached_abandon()
 
 
 async def verify_preflight(

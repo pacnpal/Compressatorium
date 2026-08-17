@@ -41,7 +41,7 @@ from services.jwudtool import (
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
-from services.subprocess_runner import bounded_path_check
+from services.subprocess_runner import bounded_path_check, detached_abandon_count
 from services.workload_limiter import WorkloadToken, workload_limiter
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.maxcso import (
@@ -124,21 +124,31 @@ async def _offer_verify_update(queue: asyncio.Queue, update: dict) -> None:
     queue.put_nowait(update)
 
 
-def _abandonment(service: object) -> dict:
-    """``{"abandoned": True}`` when this tool has a child that outlived SIGKILL.
+def _abandonment(service: object, detached_before: int) -> dict:
+    """``{"abandoned": True}`` when this verify left something stuck behind.
 
     An outer deadline cancels the verify generator rather than letting it reach
     a terminal event, so the flag cannot ride out on the event the way it does
-    when the runner's own bound fires. The runner records the fact instead (see
-    ``SubprocessRunner.abandoned_pids``) and it is folded into the timeout
-    verdict here, which is what lets the batch walk stop rather than open the
-    next file against a mount that just proved it can wedge a process.
+    when the runner's own bound fires. Two kinds of wreckage can be left, and
+    both are checked here because both mean the same thing to a caller walking
+    a list -- the storage just cost us a resource we cannot get back, so stop:
 
-    Asked of the service rather than switched on the tool: a verifier that never
-    spawns anything simply has nothing to report.
+    * a **child that outlived SIGKILL** (``SubprocessRunner.abandoned_pids``),
+      which the runner records when its reap ladder gives up; and
+    * an **abandoned detached read** -- the only trace a pure-Python verify
+      (the WUX index walk, an archive listing, the key search) leaves, since it
+      has no child at all. Compared against a count taken before this file so a
+      thread stranded by some earlier request is not blamed on this one.
+
+    Asked of the service rather than switched on the tool: a verifier that
+    spawns nothing simply has no pids to report.
     """
-    probe = getattr(service, "abandoned_pids", None)
-    return {"abandoned": True} if probe and probe() else {}
+    pids = getattr(service, "abandoned_pids", None)
+    if pids and pids():
+        return {"abandoned": True}
+    if detached_abandon_count() > detached_before:
+        return {"abandoned": True}
+    return {}
 
 
 async def _acquire_verify_lane_or_429() -> WorkloadToken:
@@ -1324,6 +1334,8 @@ def _sse_from_verify_stream(
             delivery backpressure, and no terminal result can arrive after the
             timeout has been reported, because the same task decides both.
             """
+            detached_before = detached_abandon_count()
+
             async def _pump() -> None:
                 async for update in cfg.service().verify_stream(path):
                     await _offer_verify_update(queue, update)
@@ -1339,7 +1351,7 @@ def _sse_from_verify_stream(
                     {
                         "type": "error",
                         **_verify_timed_out(bound),
-                        **_abandonment(cfg.service()),
+                        **_abandonment(cfg.service(), detached_before),
                     },
                 )
             except Exception as exc:
@@ -1481,6 +1493,7 @@ def _sse_batch_from_verify_stream(
                     the timeout because one task produces both.
                     """
                     nonlocal final_result
+                    detached_before = detached_abandon_count()
 
                     async def _pump() -> None:
                         nonlocal final_result
@@ -1500,7 +1513,7 @@ def _sse_batch_from_verify_stream(
                     except asyncio.TimeoutError:
                         final_result = {
                             **_verify_timed_out(bound),
-                            **_abandonment(cfg.service()),
+                            **_abandonment(cfg.service(), detached_before),
                         }
                         await _offer_verify_update(
                             queue, {"type": "error", **final_result},
@@ -1714,8 +1727,6 @@ def register_verify_routes(router_: APIRouter, tool: ToolPlugin) -> tuple:
         for path in request.paths:
             # Bounded, like the single-file guard: one unreachable path in a
             # batch must not hang the whole request before any verify starts.
-            # It is dropped from the batch (the same outcome as any other path
-            # that fails validation here) and named in the log.
             try:
                 if not await bounded_path_check(
                     is_within_configured_volumes, path, treat_archives=False,
@@ -1723,11 +1734,26 @@ def register_verify_routes(router_: APIRouter, tool: ToolPlugin) -> tuple:
                     continue
                 if not await bounded_path_check(os.path.isfile, path):
                     continue
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
+                # The *first* timeout ends validation rather than dropping this
+                # path and probing the next. A batch is a list of paths on the
+                # same storage: carrying on means one more abandoned thread and
+                # one more probe bound per path -- minutes of delay before any
+                # verify starts, and enough of them to exhaust the process-wide
+                # probe ceiling, which then fails path checks on volumes that
+                # are answering perfectly well.
                 logger.warning(
-                    "Batch verify: skipping %s, storage did not respond", path,
+                    "Batch verify: storage did not respond for %s; "
+                    "abandoning validation of %d path(s)",
+                    path, len(request.paths),
                 )
-                continue
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Storage is not responding. Verification was not "
+                        "started for any of the selected files."
+                    ),
+                ) from exc
             if os.path.splitext(path)[1].lower() not in tool.verify_extensions:
                 continue
             valid_paths.append(path)

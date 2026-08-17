@@ -132,7 +132,11 @@ class VerificationStore {
           currentPath: null,
           currentFilename: null,
           currentPercent: 100,
-          message: 'Batch complete',
+          // A batch the backend stopped early is not a completed batch: say so
+          // rather than reporting 'Batch complete' over an unfinished list.
+          message: result?.aborted
+            ? (result.message ?? 'Batch stopped')
+            : 'Batch complete',
         };
       }
       return result;

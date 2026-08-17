@@ -593,12 +593,24 @@ Three rules follow for any code that runs a verifier:
   on it rather than opening the next file against the same mount and abandoning
   one more process per file. The captured verifiers get there through
   `run_capture`'s `on_abandoned` hook, since a `None` return code alone cannot
-  tell an abort from a failed ladder. An *outer* deadline (the route's or the
+  tell an abort from a failed ladder. A verify with **no child at all** still
+  leaves a trace when an outer deadline cancels it — the detached read it
+  abandoned — so `run_detached` counts those (`detached_abandon_count`) and the
+  routes compare the count across a file. Both kinds of wreckage mean the same
+  thing to a caller walking a list: the storage just cost us something we cannot
+  get back, so stop. An *outer* deadline (the route's or the
   job's) is the one case that cannot carry the flag on an event at all — it
   cancels the generator rather than letting it reach one — so `reap` records the
   pid it gave up on (`SubprocessRunner.abandoned_pids`) and the routes fold that
   into the timeout verdict. Issue #268 argues abandonment should be an exception
   rather than a flag; when that lands, it replaces exactly these.
+- **Stop a list at the first unresponsive path, don't survey them all.** The
+  batch route's path validation bounds each check, but bounding is not enough on
+  its own: a batch is a list of paths on *one* storage, so carrying on after a
+  timeout costs another probe bound and another written-off thread per path —
+  minutes before any verify starts, and enough abandoned threads to exhaust the
+  process-wide ceiling, which then fails path checks on volumes that are
+  answering. The first timeout ends validation with a 503.
 - **Re-check the cancel after resolving the bound, before spawning.** The
   resolution is itself a probe that can take its full bound on storage that has
   stopped answering, and spawning into that means a child that blocks
