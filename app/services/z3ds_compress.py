@@ -14,6 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
+    reraise_if_abandoned,
     ioprio_prefix,
     verify_timeout,
 )
@@ -443,7 +444,14 @@ class Z3DSCompressService:
                     else:
                         _stdout, stderr = await _stream_and_wait()
                 except asyncio.TimeoutError:
-                    # Process is killed in the finally block below.
+                    # Bounded teardown through the shared ladder rather than the
+                    # finally below, which cannot report anything: it raises when
+                    # the child outlived SIGKILL, and a clean "timed out" while
+                    # zstd is still reading the file is the lie that let a batch
+                    # open the next one and strand another process (issue #268).
+                    await self._runner.reap_or_raise(
+                        process, fail_label="zstd -t", wait_for_exit=False,
+                    )
                     yield {
                         "type": "error",
                         "valid": False,
@@ -466,14 +474,18 @@ class Z3DSCompressService:
                         "message": f"Integrity check failed: {stderr_text}"
                     }
             finally:
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
+                # Plain reap(), never the raising variant: an exception thrown
+                # from a finally replaces whatever was already propagating.
+                # Repeating it after the ladder gave up is free (the runner
+                # remembers), so no caller-side bookkeeping is needed.
+                await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
 
         except Exception as e:
+            # An abandoned child is not a verdict about this file -- it is still
+            # running against the same storage, so a batch has to stop rather
+            # than record "verification error" and open the next one (#268).
+            reraise_if_abandoned(e)
             logger.exception("Error during 3DS verification: %s", e)
             yield {
                 "type": "error",

@@ -38,6 +38,7 @@ class _FakeProcess:
         self.stdout = None
         self.stderr = None
         self.returncode = None
+        self.terminated = False
         self.killed = False
         self.wait_called = False
 
@@ -45,6 +46,12 @@ class _FakeProcess:
         if self.returncode is None:
             self.returncode = -9 if self.killed else 0
         return b"", b""
+
+    def terminate(self) -> None:
+        # Teardown runs through the shared reap() ladder, which tries SIGTERM
+        # before SIGKILL. A healthy child dies here, so kill() is never reached.
+        self.terminated = True
+        self.returncode = -15
 
     def kill(self) -> None:
         self.killed = True
@@ -177,7 +184,9 @@ async def test_verify_times_out_when_process_hangs(tmp_path: Path, monkeypatch):
 
     assert result["valid"] is False
     assert "timed out" in result["message"].lower()
-    assert process.killed is True
+    # Reaped rather than leaked. The shared ladder signals TERM first, so a
+    # child that dies there never reaches SIGKILL.
+    assert process.terminated is True
     assert process.pid not in set(service.active_pids())
 
 

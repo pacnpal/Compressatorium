@@ -380,6 +380,13 @@ class SubprocessRunner:
     def __init__(self, owner: str) -> None:
         self._owner = owner
         self._active_pids: set[int] = set()
+        # PIDs the ladder has already given up on. Re-running TERM/KILL on a
+        # child known to survive SIGKILL costs both grace periods again and can
+        # never succeed, and the teardown paths that would repeat it are spread
+        # across five verify loops plus run()/run_capture(). Remembering it here
+        # makes a second reap() free everywhere instead of asking every caller
+        # to carry a "did I already give up?" flag (issue #268).
+        self._abandoned_pids: set[int] = set()
         self._pid_lock = threading.Lock()
         self._logger = logging.getLogger(f"chd.{owner}")
 
@@ -391,6 +398,9 @@ class SubprocessRunner:
     def track_pid(self, pid: int) -> None:
         with self._pid_lock:
             self._active_pids.add(pid)
+            # A fresh spawn on this pid means the kernel reused it, so the old
+            # abandonment no longer describes this process.
+            self._abandoned_pids.discard(pid)
 
     def untrack_pid(self, pid: int) -> None:
         with self._pid_lock:
@@ -421,6 +431,11 @@ class SubprocessRunner:
         """
         if process.returncode is not None:
             return True
+        with self._pid_lock:
+            if process.pid in self._abandoned_pids:
+                # Already escalated to SIGKILL and given up on. Repeating the
+                # ladder would spend both graces again for no possible gain.
+                return False
 
         async def _wait(timeout: float) -> bool:
             if timeout <= 0:
@@ -444,12 +459,58 @@ class SubprocessRunner:
         if await _wait(_KILL_GRACE):
             return True
 
+        with self._pid_lock:
+            self._abandoned_pids.add(process.pid)
         self._logger.error(
             "%s pid=%s survived SIGKILL (likely blocked in uninterruptible I/O); "
             "abandoning it so the job fails instead of stalling the queue",
             self._owner, process.pid,
         )
         return False
+
+    def abandoned_error(self, fail_label: str, pid: int | None) -> SubprocessAbandoned:
+        """Build the shared abandonment error for ``fail_label``/``pid``.
+
+        One wording for every spawn path, and the escape hatch for a caller that
+        already ran the ladder and recorded the outcome: re-reaping a child known
+        to be unkillable just spends the TERM+KILL graces again for no possible
+        gain. :meth:`reap_or_raise` is the common case.
+        """
+        return SubprocessAbandoned(
+            f"{fail_label} did not exit and could not be killed (pid {pid}); it is "
+            "likely blocked on unresponsive storage and is still running.",
+            owner=self._owner,
+            pid=pid,
+        )
+
+    async def reap_or_raise(
+        self, process, *, fail_label: str, wait_for_exit: bool = True,
+    ) -> None:
+        """:meth:`reap`, but raise :class:`SubprocessAbandoned` if it gives up.
+
+        The raising counterpart for callers that drive their own subprocess loop
+        instead of going through :meth:`run` / :meth:`run_capture` -- the
+        streaming ``verify_stream`` in each tool service. They previously
+        hand-rolled the TERM/KILL ladder and finished it with a bare
+        ``await process.wait()``, which is unbounded on a child wedged in
+        uninterruptible I/O, so a stuck verifier hung the stream instead of
+        signalling anything (issue #263's failure on the verify path). Routing
+        them through here bounds the wait *and* gives them the same abandonment
+        signal every other spawn path has, which is what lets a batch verify
+        stop walking (issue #268).
+
+        ``wait_for_exit=False`` skips the voluntary-exit grace and goes straight
+        to signalling -- for callers that have already stopped reading the
+        child's output, or already ran the ladder once, where waiting it out
+        again only holds the caller for another minute.
+
+        Never call this from a ``finally``: an exception raised there replaces
+        whatever was already propagating. Use plain :meth:`reap` for teardown.
+        """
+        if not await self.reap(
+            process, exit_timeout=_EXIT_GRACE if wait_for_exit else 0,
+        ):
+            raise self.abandoned_error(fail_label, process.pid)
 
     async def run_capture(
         self,
@@ -550,12 +611,7 @@ class SubprocessRunner:
         # already logged the abandonment at ERROR, and the original exception is
         # the one the caller needs to see.
         if abandoned:
-            raise SubprocessAbandoned(
-                f"{label} did not exit and could not be killed (pid {process.pid}); "
-                "it is likely blocked on unresponsive storage and is still running.",
-                owner=self._owner,
-                pid=process.pid,
-            )
+            raise self.abandoned_error(label, process.pid)
         return result
 
     async def run(

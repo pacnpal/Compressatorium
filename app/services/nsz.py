@@ -31,6 +31,7 @@ from pathlib import Path
 from config import settings
 from services.subprocess_runner import (
     SubprocessRunner,
+    reraise_if_abandoned,
     ioprio_prefix,
     nice_prefix,
     verify_timeout,
@@ -480,7 +481,14 @@ class NszService:
                         else:
                             stdout, _ = await process.communicate()
                     except asyncio.TimeoutError:
-                        # Process is killed in the finally block below.
+                        # Bounded teardown through the shared ladder. It raises
+                        # when the child outlived SIGKILL: reporting a clean
+                        # "timed out" while the verifier is still reading the
+                        # file is the lie that let a batch open the next one and
+                        # strand another process (issue #268).
+                        await self._runner.reap_or_raise(
+                            process, fail_label="nsz -V", wait_for_exit=False,
+                        )
                         yield {
                             "type": "error",
                             "valid": False,
@@ -510,13 +518,17 @@ class NszService:
                             "message": f"Integrity check failed: {tail}",
                         }
                 finally:
-                    if process.returncode is None:
-                        with contextlib.suppress(ProcessLookupError):
-                            process.kill()
-                        with contextlib.suppress(Exception):
-                            await process.wait()
+                    # Plain reap(), never the raising variant: an exception
+                    # thrown from a finally replaces whatever was already
+                    # propagating. Repeating it after the ladder gave up is free
+                    # (the runner remembers), so no bookkeeping is needed here.
+                    await self._runner.reap(process, exit_timeout=0)
                     self._runner.untrack_pid(process.pid)
         except Exception as e:
+            # An abandoned child is not a verdict about this file -- it is still
+            # running against the same storage, so a batch has to stop rather
+            # than record "verification error" and open the next one (#268).
+            reraise_if_abandoned(e)
             logger.exception("Error during Switch verification: %s", e)
             yield {"type": "error", "valid": False, "message": f"Verification error: {e}"}
 

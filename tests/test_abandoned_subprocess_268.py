@@ -357,3 +357,125 @@ async def test_romz_verify_does_not_report_an_abandoned_child_as_a_timeout(
         async for _update in svc.verify_stream(str(archive)):
             pass
 
+
+
+# ---------------------------------------------------------------------------
+# The verify loops signal it for real (not only via an injected mock)
+# ---------------------------------------------------------------------------
+
+
+class _UnkillableVerifier:
+    """A verifier whose output ends but which never dies.
+
+    Stands in for a child wedged in uninterruptible I/O: a real one cannot be
+    simulated, since SIGKILL always works on a healthy process.
+    """
+
+    def __init__(self, pid: int = -7):
+        self.pid = pid
+        self.returncode = None
+        self.signals: list[str] = []
+        self.stdout = self
+
+    async def read(self, _n: int) -> bytes:
+        return b""  # immediate EOF: the read loop falls through to teardown
+
+    def terminate(self) -> None:
+        self.signals.append("TERM")
+
+    def kill(self) -> None:
+        self.signals.append("KILL")
+
+    async def wait(self) -> int:
+        await asyncio.sleep(3600)  # never returns; every caller must bound it
+        return 0
+
+
+@pytest.mark.parametrize(
+    ("module_name", "service_attr", "suffix"),
+    [
+        ("services.chdman", "chdman_service", ".chd"),
+        ("services.dolphin_tool", "dolphin_tool_service", ".iso"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_streaming_verify_signals_abandonment(
+    module_name, service_attr, suffix, tmp_path, monkeypatch,
+):
+    """The real chdman/dolphin verify loops raise it, so the batch policy fires.
+
+    These loops used to finish with a bare ``await process.wait()`` and their
+    own TERM/KILL ladder, so an unkillable verifier hung the stream and could
+    never reach the batch route's abort branch. They now go through the shared
+    bounded teardown.
+    """
+    import importlib
+
+    from services import subprocess_runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_EXIT_GRACE", 0.01)
+    monkeypatch.setattr(runner_module, "_TERM_GRACE", 0.01)
+    monkeypatch.setattr(runner_module, "_KILL_GRACE", 0.01)
+
+    module = importlib.import_module(module_name)
+    service = getattr(module, service_attr)
+    process = _UnkillableVerifier()
+
+    async def fake_exec(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", fake_exec)
+    target = tmp_path / f"game{suffix}"
+    target.write_bytes(b"x")
+
+    with pytest.raises(SubprocessAbandoned):
+        async for _update in service.verify_stream(str(target)):
+            pass
+
+    assert process.signals == ["TERM", "KILL"], "expected the shared ladder"
+    # Teardown must not run the ladder a second time on a child already known
+    # to be unkillable, and must still release the PID.
+    assert process.pid not in service.active_pids()
+
+
+class _UnkillableHang(_UnkillableVerifier):
+    """Never produces output and never dies: trips the verify timeout first."""
+
+    async def communicate(self):
+        await asyncio.sleep(3600)
+        return b"", b""
+
+
+@pytest.mark.asyncio
+async def test_capture_style_verify_does_not_swallow_abandonment(
+    tmp_path, monkeypatch,
+):
+    """maxcso's outer ``except Exception`` must not turn it into an error dict.
+
+    The capture-shaped verifiers (maxcso/nsz/z3ds) wrap the whole body in a
+    broad handler that reports "Verification error: ..." and returns normally.
+    That is the shape that let a batch keep walking; ``reraise_if_abandoned``
+    is what stops it.
+    """
+    import services.maxcso as maxcso_module
+    from services import subprocess_runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_TERM_GRACE", 0.01)
+    monkeypatch.setattr(runner_module, "_KILL_GRACE", 0.01)
+    monkeypatch.setattr(maxcso_module, "verify_timeout", lambda _owner=None: 0.05)
+
+    process = _UnkillableHang(pid=-9)
+
+    async def fake_exec(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(maxcso_module.asyncio, "create_subprocess_exec", fake_exec)
+    target = tmp_path / "game.cso"
+    target.write_bytes(b"x")
+
+    with pytest.raises(SubprocessAbandoned):
+        async for _update in maxcso_module.maxcso_service.verify_stream(str(target)):
+            pass
+
+    assert process.signals == ["TERM", "KILL"], "expected the shared ladder, once"
+    assert process.pid not in maxcso_module.maxcso_service.active_pids()

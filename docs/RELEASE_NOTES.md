@@ -37,6 +37,13 @@
   stopped tracking them. An abandoned process is now its own distinct outcome,
   and everything that walks a list of files **stops** on it and says why,
   instead of working through your library one stranded process at a time.
+- **A stuck verification no longer hangs the verify stream.** Every tool's
+  verify waited for its subprocess to exit with no time limit after signalling
+  it, so a verifier blocked on unresponsive storage left the progress stream
+  open indefinitely with nothing to report — the conversion path's fixed
+  behaviour on a path that had kept the old one. All six now use the same
+  bounded teardown as conversions, so a verification that cannot be stopped
+  ends with an explanation instead of hanging.
 - **A wedged job now says so in the log.** Stuck-queue detection only fired when
   jobs were queued and *none* were processing, so a job frozen mid-conversion —
   exactly the case above — was the one state it could not see, and the only

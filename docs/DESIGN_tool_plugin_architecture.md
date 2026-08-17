@@ -446,6 +446,31 @@ except Exception as exc:
 A tool that spawns its own capture inherits all of this by using
 `run_capture()`; there is nothing per-tool to wire up.
 
+**Every subprocess-backed verifier signals it too.** Each tool's streaming
+`verify_stream()` drives its own child rather than going through `run()`, and
+each used to hand-roll the TERM/KILL ladder and finish with a bare
+`await process.wait()` — unbounded on a wedged child, so a stuck verifier hung
+the stream and could never reach the batch route's abort branch. They now share
+the runner's teardown:
+
+```python
+    async def reap_or_raise(self, process, *, fail_label: str,
+                            wait_for_exit: bool = True) -> None: ...
+    def abandoned_error(self, fail_label: str, pid) -> SubprocessAbandoned: ...
+```
+
+`reap_or_raise()` is `reap()` plus the raise, for a caller driving its own
+subprocess loop. `wait_for_exit=False` skips the voluntary-exit grace when the
+caller has already stopped reading the child's output. **Never call it from a
+`finally`** — an exception raised there replaces whatever was already
+propagating; use plain `reap()` for teardown.
+
+No call site carries a "did I already give up?" flag: `reap()` remembers the
+PIDs it abandoned, so a second call returns False immediately instead of
+spending both grace periods again, and `track_pid()` forgets a PID the kernel
+has reused. That is what keeps the five verify loops' teardown a single line
+each.
+
 Per-tool `convert()` becomes ~15 lines: build argv, then
 `async for u in self._runner.run(cmd, ..., parse_progress=self._parse_progress): yield u`.
 Tools with no parseable percent (maxcso/nsz/z3ds) additionally pass

@@ -122,7 +122,13 @@ class ChdmanService:
             else:
                 stdout, stderr = await process.communicate()
         except asyncio.TimeoutError as exc:
-            await self._terminate_process(process)
+            # Bounded teardown via the shared ladder: an unresponsive child must
+            # not turn this timeout into an unbounded wait. If it survives
+            # SIGKILL, reap_or_raise reports the abandonment instead -- that is
+            # the fact the caller has to act on, not the timeout.
+            await self._runner.reap_or_raise(
+                process, fail_label="chdman info", wait_for_exit=False,
+            )
             raise RuntimeError(f"chdman info timed out after {timeout}s") from exc
 
         if process.returncode != 0:
@@ -170,19 +176,18 @@ class ChdmanService:
         )
         overall_timeout = verify_timeout(self._runner.owner)
         timeout_error = None
-
         async def _check_timeouts(now: float) -> bool:
             nonlocal timeout_error
             if overall_timeout > 0 and now - start >= overall_timeout:
                 timeout_error = f"Verification timed out after {overall_timeout}s"
-                await self._terminate_process(process)
+                await self._runner.reap(process, exit_timeout=0)
                 return True
             if stall_timeout > 0 and now - last_output_at >= stall_timeout:
                 timeout_error = (
                     "Verification stalled: no output for "
                     f"{stall_timeout}s"
                 )
-                await self._terminate_process(process)
+                await self._runner.reap(process, exit_timeout=0)
                 return True
             return False
 
@@ -236,7 +241,17 @@ class ChdmanService:
                 progress = self._parse_progress(line) or 0
                 yield {"type": "progress", "progress": progress, "message": line}
 
-            await process.wait()
+            # Bounded, and it raises rather than reporting a verdict when the
+            # child outlived SIGKILL: that verifier is still reading the image,
+            # so a batch has to stop instead of moving to the next file (issue
+            # #268). A timeout above already ran the ladder, so skip the
+            # voluntary-exit grace in that case; if it gave up there, the runner
+            # remembers and this call re-reports it without re-signalling.
+            await self._runner.reap_or_raise(
+                process,
+                fail_label="chdman verify",
+                wait_for_exit=not timeout_error,
+            )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "chdman verify pid=%s exit=%s", process.pid, process.returncode,
@@ -261,24 +276,11 @@ class ChdmanService:
                     "message": output or "CHD verification failed",
                 }
         finally:
-            if process.returncode is None:
-                await self._terminate_process(process)
+            # Plain reap(), never reap_or_raise(): an exception raised from a
+            # finally replaces whatever was already propagating. Repeating it
+            # after the ladder already gave up is free (the runner remembers).
+            await self._runner.reap(process, exit_timeout=0)
             self._runner.untrack_pid(process.pid)
-
-    @staticmethod
-    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-        try:
-            if process.returncode is not None:
-                return
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            # The process has already exited or no longer exists; nothing left to terminate.
-            pass
 
     def _parse_progress(self, line: str) -> int | None:
         """Parse chdman output for progress percentage, None if the line has none.

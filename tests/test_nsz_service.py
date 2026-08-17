@@ -297,11 +297,18 @@ class _HangingProcess:
     def __init__(self, pid: int = 99):
         self.pid = pid
         self.returncode = None
+        self.terminated = False
         self.killed = False
 
     async def communicate(self):
         await asyncio.sleep(10)
         return b"", b""
+
+    def terminate(self) -> None:
+        # Teardown runs through the shared reap() ladder, which tries SIGTERM
+        # before SIGKILL. A healthy child dies here, so kill() is never reached.
+        self.terminated = True
+        self.returncode = -15
 
     def kill(self) -> None:
         self.killed = True
@@ -330,8 +337,9 @@ async def test_verify_times_out_when_process_hangs(tmp_path, monkeypatch, keys_p
     result = await nsz_module.nsz_service.verify(str(nsz_path))
     assert result["valid"] is False
     assert "timed out" in result["message"].lower()
-    # The runner must reap the hung child rather than leak it.
-    assert proc.killed is True
+    # The runner must reap the hung child rather than leak it. The shared
+    # ladder signals TERM first, so a child that dies there never reaches KILL.
+    assert proc.terminated is True
     assert proc.pid not in set(nsz_module.nsz_service.active_pids())
 
 
