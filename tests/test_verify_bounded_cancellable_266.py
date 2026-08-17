@@ -1102,3 +1102,50 @@ async def _post_eof_grace_bounded(tmp_path: Path, monkeypatch):
     assert graces, "reap was never called"
     assert _DEFAULTED not in graces, "a reap used the default 60s grace"
     assert max(graces) <= 2, f"grace exceeded the remaining bound: {graces}"
+
+
+def test_stuck_probes_are_capped_rather_than_accumulating(monkeypatch):
+    """A dead volume must not turn into an unbounded pile of stuck threads.
+
+    Abandoning one thread per wedged syscall is the deliberate trade — nothing
+    can cancel a syscall — but a request-driven probe can be retried forever,
+    and one leaked thread per attempt eventually takes the process with it.
+    Past the ceiling the next probe is refused instead of started.
+    """
+    asyncio.run(_stuck_probes_are_capped(monkeypatch))
+
+
+async def _stuck_probes_are_capped(monkeypatch):
+    import threading
+
+    from app.services import subprocess_runner as runner_mod
+
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def _wedged():
+        started.release()
+        release.wait(30)
+        return 0
+
+    monkeypatch.setattr(runner_mod, "_MAX_DETACHED_PROBES", 4)
+    monkeypatch.setattr(runner_mod, "_probe_slots", threading.Semaphore(4))
+
+    futures = [runner_mod._probe_in_daemon_thread(_wedged) for _ in range(4)]
+    for _ in range(4):
+        assert started.acquire(timeout=5), "probe threads did not start"
+
+    # The fifth is refused, promptly, instead of adding another stuck thread.
+    with pytest.raises(runner_mod.ProbeCapacityExceeded):
+        runner_mod._probe_in_daemon_thread(_wedged)
+
+    # And it reads as a timeout to every existing handler.
+    assert issubclass(runner_mod.ProbeCapacityExceeded, asyncio.TimeoutError)
+
+    release.set()
+    for future in futures:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(future, timeout=5)
+
+    # Slots come back once the calls actually return.
+    runner_mod._probe_in_daemon_thread(lambda: 0)

@@ -1363,6 +1363,9 @@ def _sse_batch_from_verify_stream(
 
         for idx, path in enumerate(valid_paths):
             filename = os.path.basename(path)
+            # Set again just before the verify task starts (below): the clock
+            # must measure verification, not the time this generator spends
+            # suspended on a slow client between events.
             start = time.monotonic()
 
             # Send file start event
@@ -1408,6 +1411,7 @@ def _sse_batch_from_verify_stream(
                         done.set()
 
                 bound = await tool.verify_timeout(path)
+                start = time.monotonic()
 
                 def _expired(start=start, bound=bound) -> bool:
                     return bound > 0 and time.monotonic() - start >= bound
@@ -1427,7 +1431,12 @@ def _sse_batch_from_verify_stream(
                                     # Same bound the job pipeline applies, per
                                     # file: one wedged verify must not hold the
                                     # batch (and the verify lane) open forever.
-                                    final_result = _verify_timed_out(bound)
+                                    # Only when no verdict exists yet -- a
+                                    # backlogged queue can hold progress events
+                                    # from before a terminal one that already
+                                    # landed, and that answer is the real result.
+                                    if not done.is_set():
+                                        final_result = _verify_timed_out(bound)
                                     break
                                 yield {
                                     "event": "verify_batch_file_progress",
@@ -1445,7 +1454,8 @@ def _sse_batch_from_verify_stream(
                                 break
                         except asyncio.TimeoutError:
                             if _expired():
-                                final_result = _verify_timed_out(bound)
+                                if not done.is_set():
+                                    final_result = _verify_timed_out(bound)
                                 break
                             elapsed = int(time.monotonic() - start)
                             yield {

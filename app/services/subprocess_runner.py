@@ -54,6 +54,29 @@ class ConversionCancelled(Exception):
 # stall loop yet to rescue a wait that never returns.
 _STAT_TIMEOUT = 10.0
 
+# Ceiling on how many abandoned probes may be outstanding at once. Writing off a
+# thread per wedged syscall is the deliberate trade below, but it has to have a
+# floor under it: a request-driven probe (a verify route's path guard) can be
+# retried indefinitely against a dead volume, and one leaked thread per attempt
+# eventually exhausts memory or the process thread limit -- turning a broken
+# mount into a dead application, which is the outcome all of this exists to
+# prevent. In healthy operation these probes finish in microseconds and the
+# count sits at zero, so reaching the ceiling is itself the diagnosis.
+_MAX_DETACHED_PROBES = 64
+_probe_slots = threading.Semaphore(_MAX_DETACHED_PROBES)
+
+
+class ProbeCapacityExceeded(TimeoutError):
+    """Too many filesystem probes are already stuck to start another.
+
+    Deliberately a ``TimeoutError`` (which ``asyncio.TimeoutError`` aliases in
+    3.11+): to every caller this means exactly what a timeout means -- "the
+    filesystem did not answer" -- so each existing bounded-probe handler treats
+    it correctly with no new branch. Only the message differs, because the cause
+    an operator has to act on is different: the volume has been unresponsive for
+    a while and probes have been piling up against it.
+    """
+
 
 def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
     """Run a blocking filesystem call on a throwaway daemon thread.
@@ -65,7 +88,17 @@ def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
     up nothing at exit and occupies no shared capacity. A call that never
     returns simply costs one written-off thread that dies with the process,
     which is the unavoidable price of a syscall Python cannot cancel.
+
+    Bounded by :data:`_MAX_DETACHED_PROBES` outstanding at a time: the price is
+    per-probe, so an unbounded number of attempts against a dead volume would
+    otherwise be an unbounded number of threads. Raises
+    :class:`ProbeCapacityExceeded` instead of starting the next one.
     """
+    if not _probe_slots.acquire(blocking=False):
+        raise ProbeCapacityExceeded(
+            f"{_MAX_DETACHED_PROBES} filesystem probes are already blocked; "
+            "the volume is not responding",
+        )
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
 
@@ -75,14 +108,19 @@ def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
 
     def _worker() -> None:
         try:
-            result = func()
-        except BaseException as exc:  # noqa: BLE001 - relayed to the awaiter
-            setter, value = future.set_exception, exc
-        else:
-            setter, value = future.set_result, result
-        with contextlib.suppress(RuntimeError):
-            # RuntimeError: the loop closed while this thread was blocked.
-            loop.call_soon_threadsafe(_settle, setter, value)
+            try:
+                result = func()
+            except BaseException as exc:  # noqa: BLE001 - relayed to the awaiter
+                setter, value = future.set_exception, exc
+            else:
+                setter, value = future.set_result, result
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError: the loop closed while this thread was blocked.
+                loop.call_soon_threadsafe(_settle, setter, value)
+        finally:
+            # Released only when the call actually returns, so the count
+            # reflects probes that are *stuck*, not probes that were started.
+            _probe_slots.release()
 
     threading.Thread(target=_worker, daemon=True, name="fs-probe").start()
     return future
@@ -1190,7 +1228,14 @@ class SubprocessRunner:
                 now = time.monotonic()
                 if size_probe is None and now - last_probe_at >= _PROBE_INTERVAL:
                     last_probe_at = now
-                    size_probe = _probe_in_daemon_thread(_measure_output_sync)
+                    try:
+                        size_probe = _probe_in_daemon_thread(_measure_output_sync)
+                    except ProbeCapacityExceeded:
+                        # No sample this tick. The growth signal degrades to
+                        # "nothing observed", which the stall watchdog already
+                        # handles -- and which is the correct reading anyway
+                        # when that many probes are stuck on this storage.
+                        size_probe = None
                 return probed_size
 
             def _update_output_activity(now: float):
