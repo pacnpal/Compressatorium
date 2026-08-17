@@ -119,6 +119,7 @@
     // store update still drives the in-flight UI.
     let verifiedTotal = 0;
     let failedTotal = 0;
+    let aborted = null;
     try {
       for (let i = 0; i < groups.groups.length; i += 1) {
         groupIndex = i;
@@ -127,10 +128,21 @@
         verifiedTotal += result?.verified ?? 0;
         failedTotal += result?.failed ?? 0;
         runResults = { verified: verifiedTotal, failed: failedTotal };
+        if (result?.aborted) {
+          // A verifier could not be stopped and is still running. The next
+          // group is a different tool but the same storage, so starting it
+          // would strand another process. Stop the whole run.
+          aborted = result.message ?? 'Verification stopped early';
+          break;
+        }
       }
-      toast.success(
-        `Verified ${verifiedTotal} of ${totalPaths} file${totalPaths === 1 ? '' : 's'}`,
-      );
+      if (aborted) {
+        toast.error(aborted);
+      } else {
+        toast.success(
+          `Verified ${verifiedTotal} of ${totalPaths} file${totalPaths === 1 ? '' : 's'}`,
+        );
+      }
     } catch (e) {
       if (e?.name !== 'AbortError') {
         toast.error(e?.message ?? 'Batch verify failed');

@@ -581,11 +581,19 @@ class RomzService:
         # run_capture applies the shared nice/ionice policy and honors the
         # verify timeout (0 disables); a heavy `7z t` is throttled like a convert.
         # `--` keeps an archive name beginning with `-` a positional filename.
+        #
+        # SubprocessAbandoned is deliberately not caught. Every outcome below is
+        # a verdict about this archive; a `7z t` that outlived SIGKILL is not —
+        # it is still reading the same storage, so a batch verify has to stop
+        # instead of reporting "timed out" and opening the next archive (issue
+        # #268). Reporting it as a timeout here would be a lie of exactly the
+        # kind that stranded one process per file.
         timeout = verify_timeout(_OWNER)
         returncode, stdout, _ = await self._runner.run_capture(
             [self.sevenzip_path, "t", "--", file_path],
             timeout=timeout or None,
             stderr_to_stdout=True,
+            fail_label="7z t",
         )
         output = (stdout or b"").decode("utf-8", errors="replace").strip()
         if returncode == 0:

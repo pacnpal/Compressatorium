@@ -367,7 +367,7 @@ def stub_runner(monkeypatch):
         yield {"progress": 100, "message": complete_message}
 
     async def fake_capture(cmd, *, timeout=None, cancel_event=None,
-                           stderr_to_stdout=False):
+                           stderr_to_stdout=False, fail_label=None):
         calls["capture_cmd"] = cmd
         return calls.get("capture_rc", 0), calls.get("capture_out", b"Everything is Ok"), b""
 

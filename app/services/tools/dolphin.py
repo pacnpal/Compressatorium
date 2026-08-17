@@ -16,6 +16,7 @@ from services.dolphin_tool import (
     dolphin_tool_service,
 )
 from services.lock_manager import lock_manager
+from services.subprocess_runner import reraise_if_abandoned
 from services.workload_limiter import workload_limiter
 
 from .base import BaseTool, EmbeddedHashUnavailable
@@ -185,6 +186,12 @@ class DolphinTool(BaseTool):
                     path, cancel_event=cancel_event,
                 )
         except Exception as e:
+            # One exception is not a fact about this file: a verify child that
+            # outlived SIGKILL is still running and still hammering the same
+            # mount, so folding it into EmbeddedHashUnavailable would tell the
+            # caller to record an error and move on, stranding another full-disc
+            # reconstruction on every remaining file (issue #268).
+            reraise_if_abandoned(e)
             # Spawn failure (e.g. binary missing) or unexpected error: treat as
             # a transient inability to derive the hash, not "no hash exists".
             raise EmbeddedHashUnavailable(

@@ -39,6 +39,7 @@ from services.jwudtool import (
     JWUD_DECOMPRESS_EXTENSIONS,
     jwudtool_service,
 )
+from services.subprocess_runner import SubprocessAbandoned
 from services.tools import registry
 from services.tools.base import ToolPlugin
 from services.workload_limiter import WorkloadToken, workload_limiter
@@ -181,6 +182,17 @@ async def _scan_phase_dat_match(
                 if result.get("matched"):
                     matched += 1
             except ExternalJobCancelled:
+                raise
+            except SubprocessAbandoned:
+                # A hash helper survived SIGKILL and is still running. This is
+                # the one failure that must not be retried on the next path:
+                # every remaining file goes to the same mount and would strand
+                # another process, one per file, each invisible because its PID
+                # has already been untracked (issue #268). Fail the scan.
+                logger.error(
+                    "Phase 3: aborting the scan at %s, a hash subprocess could "
+                    "not be stopped and is still running", path,
+                )
                 raise
             except Exception:
                 # _match_single_file turns expected file-level problems into
@@ -1286,6 +1298,10 @@ def _sse_batch_from_verify_stream(
         total = len(valid_paths)
         verified_count = 0
         failed_count = 0
+        # Set when a verifier outlived SIGKILL. Not a per-file failure: that
+        # child is still running against the same storage, so opening the next
+        # archive strands another one (issue #268). The loop stops instead.
+        abandoned: str | None = None
 
         # Send initial status
         yield {
@@ -1320,7 +1336,7 @@ def _sse_batch_from_verify_stream(
                 final_result = {"valid": False, "message": "Unknown error"}
 
                 async def run_verify(path=path):
-                    nonlocal final_result
+                    nonlocal final_result, abandoned
                     try:
                         async for update in cfg.service().verify_stream(path):
                             # Record the terminal result before enqueueing so a
@@ -1330,6 +1346,12 @@ def _sse_batch_from_verify_stream(
                                 final_result = update
                             await queue.put(update)
                     except Exception as exc:
+                        if isinstance(exc, SubprocessAbandoned):
+                            # Report this file as failed like any other error,
+                            # but flag the batch so the loop below stops after
+                            # it rather than starting another verifier the same
+                            # unresponsive storage will also refuse to release.
+                            abandoned = str(exc)
                         final_result = {
                             "type": "error",
                             "valid": False,
@@ -1420,12 +1442,28 @@ def _sse_batch_from_verify_stream(
                     ),
                 }
 
-        # Send final completion event
+            if abandoned:
+                logger.error("Batch verify aborted after %s: %s", path, abandoned)
+                break
+
+        # Send final completion event. ``aborted``/``message`` are only present
+        # when the batch stopped early, so a normal run's payload is unchanged.
+        completion = {
+            "total": total,
+            "verified": verified_count,
+            "failed": failed_count,
+        }
+        if abandoned:
+            completion["aborted"] = True
+            completion["skipped"] = total - (verified_count + failed_count)
+            completion["message"] = (
+                f"Verification stopped: {abandoned} Remaining files were not "
+                "verified because each would start another process against the "
+                "same storage."
+            )
         yield {
             "event": "verify_batch_complete",
-            "data": json.dumps(
-                {"total": total, "verified": verified_count, "failed": failed_count},
-            ),
+            "data": json.dumps(completion),
         }
 
     async def wrapped_event_generator():

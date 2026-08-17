@@ -167,13 +167,23 @@ class DolphinToolService:
         rather than blocking until the disc finishes reconstructing. The
         cancel/timeout/terminate handling lives in the shared
         ``SubprocessRunner.run_capture``.
+
+        The one failure this does **not** absorb is
+        :class:`~services.subprocess_runner.SubprocessAbandoned`: a verify that
+        outlived ``SIGKILL`` is still reading the disc, so reporting "no hash,
+        try the next file" would strand one full-disc reconstruction per file
+        for the rest of the scan (issue #268). That propagates to the caller,
+        which stops walking.
         """
         cmd = [
             self.dolphin_tool_path, "verify", "-i", path, "--algorithm", "sha1",
         ]
         timeout = verify_timeout(self._runner.owner)
         returncode, stdout, _ = await self._runner.run_capture(
-            cmd, timeout=timeout or None, cancel_event=cancel_event,
+            cmd,
+            timeout=timeout or None,
+            cancel_event=cancel_event,
+            fail_label="dolphin-tool verify",
         )
         if returncode is None:
             logger.warning(

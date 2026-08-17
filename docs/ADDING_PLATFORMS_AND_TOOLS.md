@@ -253,7 +253,12 @@ nice/ioprio policy) rather than re-implementing the spawn loop — see
 
 `ConversionCancelled` is defined once in `app/services/subprocess_runner.py` and
 re-exported through `services.chdman` and `services.tools.runner`. Import it,
-don't define your own.
+don't define your own. The same module owns `SubprocessAbandoned`, which `run()`
+and `run_capture()` raise when a child survives `SIGKILL` and is therefore still
+running. Don't catch it to report a per-file failure: any caller iterating over
+files has to stop, or it strands one live process per remaining file (issue
+#268). If your handler must catch broadly, call `reraise_if_abandoned(exc)`
+first — one line, a no-op for everything else.
 
 ---
 

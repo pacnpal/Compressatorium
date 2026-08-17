@@ -16,6 +16,7 @@ from models import ConversionMode
 from services.dat_store import dat_store
 from services.file_hasher import compute_file_sha1
 from services.job_manager import ExternalJobCancelled, job_manager
+from services.subprocess_runner import SubprocessAbandoned, reraise_if_abandoned
 from services.tools import registry
 from services.tools.base import EmbeddedHashUnavailable
 from services.workload_limiter import workload_limiter
@@ -175,7 +176,15 @@ async def match_file(request: MatchRequest):
     if not await run_in_threadpool(os.path.isfile, normalized_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    result = await _match_single_file(normalized_path)
+    try:
+        result = await _match_single_file(normalized_path)
+    except SubprocessAbandoned as exc:
+        # The hash helper for this file could not be killed and is still
+        # running, so the machine is in a state a retry cannot fix yet. 503
+        # rather than a bare 500: it is a transient resource condition, and the
+        # message names the pid an operator has to deal with (issue #268).
+        logger.error("DAT match aborted for %s: %s", normalized_path, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     return result
 
 
@@ -245,14 +254,26 @@ async def match_batch(request: MatchBatchRequest):
 
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
-    for normalized_path in to_compute:
+    abandoned: SubprocessAbandoned | None = None
+    stopped_at = len(to_compute)
+    for idx, normalized_path in enumerate(to_compute):
         exists = await run_in_threadpool(os.path.isfile, normalized_path)
         if not exists:
             result = {"path": normalized_path, "matched": False}
             # Don't cache missing-file results: the file may appear later and
             # a stale negative entry would not be cleared by prune_missing.
         else:
-            result = await _match_single_file(normalized_path)
+            try:
+                result = await _match_single_file(normalized_path)
+            except SubprocessAbandoned as exc:
+                # A hash subprocess outlived SIGKILL and is still running. Every
+                # remaining path would go to the same unresponsive storage and
+                # strand another one, so stop here and report the rest as errors
+                # rather than working through the list (issue #268).
+                logger.error("DAT match batch aborted: %s", exc)
+                abandoned = exc
+                stopped_at = idx
+                break
             # Don't cache size-cap skips: the result is configuration-dependent.
             # If MATCH_MAX_FILE_SIZE is later raised or disabled the file must
             # be re-hashed rather than being served a stale "too large" entry.
@@ -262,6 +283,18 @@ async def match_batch(request: MatchBatchRequest):
                 new_matches[normalized_path] = result
         for original_path in normalized_to_originals[normalized_path]:
             results[original_path] = result
+
+    if abandoned is not None:
+        # Non-cacheable by construction (they carry "error"), so the abort
+        # leaves nothing stale behind and a retry re-hashes them.
+        for skipped in to_compute[stopped_at:]:
+            result = {
+                "path": skipped,
+                "matched": False,
+                "error": "aborted: a hash subprocess could not be stopped",
+            }
+            for original_path in normalized_to_originals[skipped]:
+                results[original_path] = result
 
     # Cache new results using normalized path keys
     if new_matches:
@@ -550,6 +583,12 @@ async def _hash_one_for_job(
     try:
         result = await _match_single_file(normalized_path, cancel_event=cancel_event)
     except Exception as exc:  # pragma: no cover, isolated per-path
+        # One failure is deliberately NOT isolated per-path: a hash subprocess
+        # that survived SIGKILL is still running, so continuing the loop would
+        # strand another against the same unresponsive storage for every
+        # remaining file. Let it out to _run_match_job, which fails the job
+        # (issue #268).
+        reraise_if_abandoned(exc)
         # logger.exception rather than logger.warning: a KeyError /
         # AttributeError from a refactor bug should surface with a full
         # traceback at ERROR level, not be buried as a one-line warning.
@@ -924,11 +963,19 @@ async def _try_embedded_hash_match(
     """
     try:
         candidates = await tool.embedded_hashes(file_path, cancel_event=cancel_event)
-    except EmbeddedHashUnavailable:
+    except EmbeddedHashUnavailable as exc:
         # Transient "couldn't derive the hash" — let the caller decide it's a
         # non-cacheable error rather than falling back to a file-level hash.
+        # Unless it wraps an abandonment: a child that survived SIGKILL is not a
+        # fact about *this* file, it is still running against the same storage,
+        # and the caller must stop walking rather than log a miss (issue #268).
+        reraise_if_abandoned(exc)
         raise
     except Exception as exc:  # pragma: no cover - unexpected tool failure
+        # Same rule for an unexpected failure, and it matters more here: the
+        # non-exhaustive branch below *swallows* the error and falls back to a
+        # file-level hash, which would hide the stranded process completely.
+        reraise_if_abandoned(exc)
         logger.warning("embedded_hashes failed for %s", file_path, exc_info=True)
         if tool.embedded_hash_is_exhaustive:
             # For exhaustive tools (e.g. Dolphin) the container's file-level

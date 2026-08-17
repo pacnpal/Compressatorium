@@ -124,15 +124,23 @@ class VerificationStore {
         },
       });
       if (this.batchRun) {
+        // `aborted` means the backend stopped early because a verifier
+        // survived SIGKILL and is still running: every remaining file lives on
+        // the same storage and would strand another process. Reporting the run
+        // as complete would hide that, so keep the real counts and say why.
+        const aborted = Boolean(result?.aborted);
+        const done = (result?.verified ?? 0) + (result?.failed ?? 0);
         this.batchRun = {
           ...this.batchRun,
-          done: this.batchRun.total,
+          done: aborted ? done : this.batchRun.total,
           verified: result?.verified ?? this.batchRun.verified,
           failed: result?.failed ?? this.batchRun.failed,
           currentPath: null,
           currentFilename: null,
-          currentPercent: 100,
-          message: 'Batch complete',
+          currentPercent: aborted ? this.batchRun.currentPercent : 100,
+          message: aborted
+            ? (result?.message ?? 'Batch stopped early')
+            : 'Batch complete',
         };
       }
       return result;

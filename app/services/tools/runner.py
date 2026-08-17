@@ -9,6 +9,16 @@ module re-exports the names so ``services.tools.runner`` resolves as designed.
 """
 from __future__ import annotations
 
-from services.subprocess_runner import ConversionCancelled, SubprocessRunner
+from services.subprocess_runner import (
+    ConversionCancelled,
+    SubprocessAbandoned,
+    SubprocessRunner,
+    reraise_if_abandoned,
+)
 
-__all__ = ["ConversionCancelled", "SubprocessRunner"]
+__all__ = [
+    "ConversionCancelled",
+    "SubprocessAbandoned",
+    "SubprocessRunner",
+    "reraise_if_abandoned",
+]

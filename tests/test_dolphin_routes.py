@@ -396,7 +396,8 @@ async def test_disc_hashes_empty_on_abort(monkeypatch):
     """When run_capture reports an abort (returncode None), disc_hashes is empty."""
     from app.services.dolphin_tool import dolphin_tool_service
 
-    async def fake_run_capture(cmd, *, timeout=None, cancel_event=None, stderr_to_stdout=False):
+    async def fake_run_capture(cmd, *, timeout=None, cancel_event=None,
+                               stderr_to_stdout=False, fail_label=None):
         return None, b"", b""
 
     monkeypatch.setattr(dolphin_tool_service._runner, "run_capture", fake_run_capture)
@@ -411,7 +412,8 @@ async def test_disc_hashes_forwards_cancel_event(monkeypatch):
     seen = {}
     event = asyncio.Event()
 
-    async def fake_run_capture(cmd, *, timeout=None, cancel_event=None, stderr_to_stdout=False):
+    async def fake_run_capture(cmd, *, timeout=None, cancel_event=None,
+                               stderr_to_stdout=False, fail_label=None):
         seen["cancel_event"] = cancel_event
         return 0, b"SHA-1: " + b"a" * 40, b""
 

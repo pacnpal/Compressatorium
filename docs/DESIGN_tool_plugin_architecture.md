@@ -384,18 +384,67 @@ class SubprocessRunner:
         """
 
     async def run_capture(self, cmd: list[str], *, timeout=None,
-                          cancel_event=None, stderr_to_stdout=False
-                          ) -> tuple[int | None, bytes, bytes]:
+                          cancel_event=None, stderr_to_stdout=False,
+                          fail_label=None) -> tuple[int | None, bytes, bytes]:
         """One-shot counterpart to run(): buffered (returncode, stdout, stderr)
         for tools that need a result rather than streamed lines (info / header /
         embedded-hash extraction). Same PID tracking; races communicate()
         against cancel_event + timeout and terminates (TERM->KILL) on either,
-        reporting returncode None to signal the abort. Used by
-        `dolphin_tool.disc_hashes` so `dolphin-tool verify --algorithm sha1`
+        reporting returncode None to signal the abort. Raises
+        SubprocessAbandoned when reap() cannot kill the child (see below). Used
+        by `dolphin_tool.disc_hashes` so `dolphin-tool verify --algorithm sha1`
         (the Dolphin disc-hash source for `embedded_hashes`) aborts promptly
         when a scan/match job is cancelled.
         """
 ```
+
+### An abandoned child is its own signal (issue #268)
+
+`reap()` returning False means the child outlived `SIGKILL` and **is still
+running** — it keeps its pipes, its PID and its grip on whatever storage wedged
+it, and the app can no longer see it because the PID has been untracked. That is
+categorically different from an ordinary timeout or cancellation, which leave
+the child dead, so it gets its own type rather than sharing a return value:
+
+```python
+class SubprocessAbandoned(RuntimeError):  # services.subprocess_runner
+    owner: str | None
+    pid: int | None
+
+def reraise_if_abandoned(exc: BaseException) -> None: ...
+```
+
+Both `run()` and `run_capture()` raise it, and it subclasses `RuntimeError` so
+every existing `except RuntimeError` / `except Exception` behaves exactly as
+before — only call sites that want the distinction name the type. Without it,
+`run_capture()`'s `(None, b"", b"")` meant both outcomes, and callers reasonably
+read it as "this attempt didn't work, move on".
+
+**The policy it enables: a caller walking a list of files must stop walking.**
+Every subsequent file hits the same unresponsive mount and strands another
+process, so treating an abandonment as a per-file failure turns one stuck child
+into one per file. The loops that enforce this are the DAT match job and its
+`/dat/match-batch` sibling, the library scan's Phase 3, and batch verify; the
+single-file endpoints report it (503 / an SSE `verify_error`) since there is no
+walk to stop.
+
+`reraise_if_abandoned(exc)` is the one line an `except` clause needs to keep that
+policy intact. Layers between the runner and the loop legitimately wrap failures
+in their own type — `raise EmbeddedHashUnavailable(...) from exc` is the
+documented contract for "the attempt failed" — and that wrapper reads as an
+ordinary per-file problem. The helper walks `__cause__`/`__context__`, so the
+policy holds for **every** tool instead of requiring each intermediate layer to
+re-raise by hand. It is a no-op for any other failure, so a handler keeps its
+existing behaviour by calling it first:
+
+```python
+except Exception as exc:
+    reraise_if_abandoned(exc)
+    ...  # unchanged per-file handling
+```
+
+A tool that spawns its own capture inherits all of this by using
+`run_capture()`; there is nothing per-tool to wire up.
 
 Per-tool `convert()` becomes ~15 lines: build argv, then
 `async for u in self._runner.run(cmd, ..., parse_progress=self._parse_progress): yield u`.

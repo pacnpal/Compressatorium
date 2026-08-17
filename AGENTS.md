@@ -23,8 +23,10 @@ A quick execution guide for agents working in this repo. Treat it as an operatio
   copy-pasted per tool. Prefer registry-driven behavior over branching on tool
   identity or hard-coded extensions. Examples of the shared seams to extend
   before reaching for per-tool code: `SubprocessRunner.run` (streaming) and
-  `SubprocessRunner.run_capture` (one-shot capture with cancel/timeout),
-  `ToolPlugin.embedded_hashes` (DAT-match content hashes), and the
+  `SubprocessRunner.run_capture` (one-shot capture with cancel/timeout — raises
+  `SubprocessAbandoned` when a child survives `SIGKILL`; any loop over files must
+  stop on it, see the design doc), `ToolPlugin.embedded_hashes` (DAT-match
+  content hashes), and the
   `ToolRegistry` extension helpers (`output_extensions` / `verify_extensions` /
   `scannable_extensions`).
 - **Document shared machinery in the proper doc.** When you add or change a

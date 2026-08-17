@@ -28,6 +28,15 @@
   *Cancelling...* forever — and every job behind it waited with it. All waits on
   a subprocess are now bounded and escalate to giving up: the stuck job fails
   with an explanation and the queue carries on.
+- **A batch against dead storage no longer leaves one stuck process per file.**
+  When a hash or verify helper had to be abandoned — it survived `SIGKILL` and
+  kept running — the app reported it exactly like an ordinary timeout, so a DAT
+  match, a library scan, or a batch verify treated it as "this one file didn't
+  work" and opened the next file on the same unresponsive share. Each step
+  stranded another live process, invisible to the app because it had already
+  stopped tracking them. An abandoned process is now its own distinct outcome,
+  and everything that walks a list of files **stops** on it and says why,
+  instead of working through your library one stranded process at a time.
 - **A wedged job now says so in the log.** Stuck-queue detection only fired when
   jobs were queued and *none* were processing, so a job frozen mid-conversion —
   exactly the case above — was the one state it could not see, and the only

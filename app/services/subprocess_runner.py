@@ -21,6 +21,12 @@ and adds cancel-event + timeout handling (terminate -> kill), so an expensive
 capture such as ``dolphin-tool verify --algorithm sha1`` aborts promptly when
 a background scan/match job is cancelled instead of running to completion.
 
+``SubprocessAbandoned`` is the shared signal for the one outcome neither of
+those return shapes can express: a child that outlived ``SIGKILL`` and is still
+running. Both ``run()`` and ``run_capture()`` raise it, so "the attempt failed"
+and "the process is still out there holding the mount" are never the same value
+(issue #268).
+
 ``ConversionCancelled`` is defined here (rather than in ``services.chdman``) so
 the runner can raise it without importing back into the service that uses the
 runner.  ``services.chdman`` re-exports it from this module, so its identity and
@@ -45,6 +51,67 @@ from services.timeout_policy import compute_progress_stall_timeout
 
 class ConversionCancelled(Exception):
     """Raised when a conversion is cancelled before completion."""
+
+
+class SubprocessAbandoned(RuntimeError):
+    """A child outlived ``SIGKILL`` and was abandoned; it is **still running**.
+
+    The one signal that says "this subprocess did not stop" -- raised by both
+    :meth:`SubprocessRunner.run` and :meth:`SubprocessRunner.run_capture` when
+    :meth:`SubprocessRunner.reap` gives up, so no caller has to infer it from a
+    ``None`` return code (issue #268). It is deliberately distinct from an
+    ordinary timeout or cancellation, which *do* leave the child dead: an
+    abandoned child keeps its pipes, its PID and its grip on whatever storage
+    wedged it, and this process can no longer see or stop it because its PID has
+    already been untracked.
+
+    A ``RuntimeError`` subclass so every existing ``except RuntimeError`` /
+    ``except Exception`` handler keeps behaving exactly as before; only call
+    sites that *want* the distinction have to name it.
+
+    The policy it exists to enable: a caller walking a list of files (a metadata
+    scan, a batch match, a batch verify) must **stop walking**. Every subsequent
+    file hits the same unresponsive mount and strands another process, so
+    treating it as an ordinary per-file failure turns one stuck child into one
+    per file.
+    """
+
+    def __init__(self, message: str, *, owner: str | None = None, pid: int | None = None):
+        super().__init__(message)
+        self.owner = owner
+        self.pid = pid
+
+
+def _abandonment_in(exc: BaseException | None) -> SubprocessAbandoned | None:
+    """Return the :class:`SubprocessAbandoned` in ``exc``'s chain, or ``None``."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, SubprocessAbandoned):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def reraise_if_abandoned(exc: BaseException) -> None:
+    """Re-raise the :class:`SubprocessAbandoned` buried in ``exc``, if any.
+
+    The one line an ``except`` clause needs to keep the stop-walking policy
+    intact. Layers between the runner and the loop legitimately wrap failures in
+    their own type (``raise EmbeddedHashUnavailable(...) from exc`` is the
+    documented plugin contract for "the attempt failed"), and that wrapper reads
+    as an ordinary per-file problem even though the child is still running. This
+    walks ``__cause__``/``__context__`` so the policy holds for *every* tool
+    rather than requiring each intermediate layer to re-raise by hand -- the
+    same reason the runner owns reaping instead of each service (issue #268).
+
+    A no-op for every other failure, so a handler keeps its existing behaviour
+    by just calling this first.
+    """
+    abandoned = _abandonment_in(exc)
+    if abandoned is not None:
+        raise abandoned
 
 
 # Hard bound on a filesystem probe taken on the spawn path, where there is no
@@ -391,6 +458,7 @@ class SubprocessRunner:
         timeout: float | None = None,
         cancel_event: asyncio.Event | None = None,
         stderr_to_stdout: bool = False,
+        fail_label: str | None = None,
     ) -> tuple[int | None, bytes, bytes]:
         """Run ``cmd`` to completion and capture ``(returncode, stdout, stderr)``.
 
@@ -405,12 +473,22 @@ class SubprocessRunner:
         returncode is reported as ``None`` to signal the abort. ``stderr`` is
         folded into ``stdout`` when ``stderr_to_stdout`` is set (and the
         returned ``stderr`` is then empty).
+
+        **A ``None`` return code means the child is dead.** When the teardown
+        ladder cannot kill it, this raises :class:`SubprocessAbandoned` instead
+        of returning, because those two outcomes call for opposite behaviour and
+        a shared ``None`` cannot express the difference (issue #268): after an
+        ordinary timeout the caller may move on to the next file, but after an
+        abandonment the previous child is still running against the same storage
+        and the caller must stop. ``fail_label`` names the tool in that error
+        (default: the command's basename).
         """
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
         # (e.g. dolphin-tool verify reconstructing a full disc for DAT hashing)
         # is just as heavy as a conversion, so it must respect TOOL_NICE /
         # TOOL_IOPRIO_* instead of running at normal priority.
+        label = fail_label or os.path.basename(cmd[0])
         cmd = ioprio_prefix(self._owner) + cmd
 
         def _preexec():
@@ -433,6 +511,7 @@ class SubprocessRunner:
             if cancel_event is not None
             else None
         )
+        abandoned = False
         try:
             waiters = [comm] + ([cancel_wait] if cancel_wait is not None else [])
             done, _pending = await asyncio.wait(
@@ -442,10 +521,11 @@ class SubprocessRunner:
             )
             if comm in done:
                 stdout, stderr = comm.result()
-                return process.returncode, stdout or b"", stderr or b""
-            # Cancelled or timed out before the process exited; the finally
-            # block below terminates it and drains ``comm``.
-            return None, b"", b""
+                result = (process.returncode, stdout or b"", stderr or b"")
+            else:
+                # Cancelled or timed out before the process exited; the finally
+                # block below terminates it and drains ``comm``.
+                result = (None, b"", b"")
         finally:
             if cancel_wait is not None and not cancel_wait.done():
                 cancel_wait.cancel()
@@ -453,7 +533,7 @@ class SubprocessRunner:
                     await cancel_wait
             # exit_timeout=0: nothing is reading the child's output any more, so
             # go straight to signalling instead of waiting out a voluntary exit.
-            await self.reap(process, exit_timeout=0)
+            abandoned = not await self.reap(process, exit_timeout=0)
             if not comm.done():
                 comm.cancel()
             # CancelledError is a BaseException, so it is NOT covered by
@@ -463,6 +543,20 @@ class SubprocessRunner:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm
             self.untrack_pid(process.pid)
+        # Raised *after* the finally rather than inside it: an exception thrown
+        # from a finally block replaces whatever was already propagating, so
+        # signalling abandonment there would swallow a real error (or the task
+        # cancellation) that reached the teardown first. On that path reap() has
+        # already logged the abandonment at ERROR, and the original exception is
+        # the one the caller needs to see.
+        if abandoned:
+            raise SubprocessAbandoned(
+                f"{label} did not exit and could not be killed (pid {process.pid}); "
+                "it is likely blocked on unresponsive storage and is still running.",
+                owner=self._owner,
+                pid=process.pid,
+            )
+        return result
 
     async def run(
         self,
@@ -943,8 +1037,10 @@ class SubprocessRunner:
                 # Abandonment outranks the stall that triggered it: the child is
                 # still alive and still holding its output, which is the part an
                 # operator has to act on.
-                raise RuntimeError(
-                    f"{stall_error} {abandoned_error}" if stall_error else abandoned_error
+                raise SubprocessAbandoned(
+                    f"{stall_error} {abandoned_error}" if stall_error else abandoned_error,
+                    owner=self._owner,
+                    pid=process.pid,
                 )
 
             if stall_error:
@@ -959,15 +1055,19 @@ class SubprocessRunner:
                 if abandoned_error:
                     # Reporting a clean CANCELLED would be a lie: the child is
                     # still running and still holding its output.
-                    raise RuntimeError(
-                        f"Cancellation did not stop {fail_label}. {abandoned_error}"
+                    raise SubprocessAbandoned(
+                        f"Cancellation did not stop {fail_label}. {abandoned_error}",
+                        owner=self._owner,
+                        pid=process.pid,
                     )
                 raise ConversionCancelled("Conversion cancelled")
 
             # Nothing below can be trusted for an abandoned child: it has no
             # return code and never will.
             if abandoned_error:
-                raise RuntimeError(abandoned_error)
+                raise SubprocessAbandoned(
+                    abandoned_error, owner=self._owner, pid=process.pid,
+                )
 
             if process.returncode != 0:
                 tail = "\n".join(output_lines[-6:])
