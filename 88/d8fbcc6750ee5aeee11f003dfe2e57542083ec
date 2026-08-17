@@ -1,0 +1,43 @@
+app/services/disc_id.py
+  s_6c976e0a175de9::t_55e2a4aa1f1731 52-57
+  s_6c976e0a175de9::t_5e043c8ec56c3c 73
+app/services/subprocess_runner.py
+  s_6c976e0a175de9::t_5a29f29f0b2dcc 813-816,1094-1099
+  s_6c976e0a175de9::t_5e043c8ec56c3c 105-117
+tests/test_abandoned_match_scan_268.py
+  s_6c976e0a175de9::t_5a29f29f0b2dcc 641-643,659,661-670
+app/services/chdman.py
+  s_6c976e0a175de9::t_946e644923b815 145-146
+  s_6c976e0a175de9::t_6d198350e79540 11-12,164
+  s_6c976e0a175de9::t_5e043c8ec56c3c 143-144,147-158
+app/routes/info.py
+  s_6c976e0a175de9::t_7c35fb2a354f2c 45-49,804,806-810
+  s_6c976e0a175de9::t_7277065c019873 958-962
+app/services/dolphin_tool.py
+  s_6c976e0a175de9::t_abd7900a856490 7,19
+  s_6c976e0a175de9::t_946e644923b815 145-146
+  s_6c976e0a175de9::t_6d198350e79540 9
+  s_6c976e0a175de9::t_5e043c8ec56c3c 143-144,147-158
+  s_6c976e0a175de9::t_845c554506adeb 20
+app/routes/dat.py
+  s_6c976e0a175de9::t_225421f973e8f1 671-683
+  s_6c976e0a175de9::t_5a011691e63a61 292-304
+  s_6c976e0a175de9::t_4f15a565147470 198-214,315-320
+  s_6c976e0a175de9::t_a3eff2eb7f2808 282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "88d8fbcc6750ee5aeee11f003dfe2e57542083ec",
+  "prompts": {},
+  "sessions": {
+    "s_6c976e0a175de9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24d5a97d-772a-4b32-b5c3-50d0c48bb4e0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "pacnpal <183241239+pacnpal@users.noreply.github.com>"
+    }
+  }
+}
