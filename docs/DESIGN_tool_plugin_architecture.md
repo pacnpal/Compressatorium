@@ -522,8 +522,10 @@ Three pieces, none of them per-tool:
    PARAM.SFO readback) check it between steps. A cancelled run returns
    `cancelled: True`, which `job_manager` turns into a CANCELLED job — never a
    verification failure, and never a reason to delete a source.
-3. **A backstop at every call site.** `job_manager` wraps the whole `verify()`
-   in `asyncio.wait_for(tool.verify_timeout(path))`, so the guarantee holds even
+3. **A backstop at every call site.** `job_manager` resolves the bound first
+   (`bound = await tool.verify_timeout(path)`) and then wraps the whole
+   `verify()` in `asyncio.wait_for(tool.verify(…), timeout=bound or None)`, so
+   the guarantee holds even
    for a tool whose verify spawns nothing for a subprocess timeout to bound. The
    generated verify routes (`register_verify_routes`: sync, SSE, batch SSE) are
    the *other* entry point into the same verifiers, and they hold the `verify`
@@ -1205,8 +1207,10 @@ def register_verify_routes(router, tool: ToolPlugin):
         _guard(path, tool.verify_extensions)
         token = await _acquire_verify_lane_or_429()
         try:
-            # Inside the try: an await between taking the token and installing
-            # this finally leaks the lane's only slot if the client disconnects.
+            # Every await that follows the token lives inside this try, so the
+            # finally is already registered when the first one runs: a client
+            # disconnecting during tool.verify_timeout(path) still releases the
+            # lane's only slot.
             bound = await tool.verify_timeout(path)          # issue #266
             r = await asyncio.wait_for(tool.verify(path), timeout=bound or None)
             # `valid` alone, so neither a timeout nor a cancelled run (which

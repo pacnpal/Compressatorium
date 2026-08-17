@@ -1385,7 +1385,7 @@ def _sse_batch_from_verify_stream(
 
                 bound = await tool.verify_timeout(path)
 
-                async def run_verify(path=path, bound=bound):
+                async def run_verify(path=path, bound=bound, queue=queue, done=done):
                     """Same producer-side bound as the single-file stream.
 
                     A batch client that stops draining suspends the loop below,

@@ -66,15 +66,21 @@ _MAX_DETACHED_PROBES = 64
 _probe_slots = threading.Semaphore(_MAX_DETACHED_PROBES)
 
 
-class ProbeCapacityExceeded(TimeoutError):
+class ProbeCapacityExceeded(asyncio.TimeoutError):
     """Too many filesystem probes are already stuck to start another.
 
-    Deliberately a ``TimeoutError`` (which ``asyncio.TimeoutError`` aliases in
-    3.11+): to every caller this means exactly what a timeout means -- "the
-    filesystem did not answer" -- so each existing bounded-probe handler treats
-    it correctly with no new branch. Only the message differs, because the cause
-    an operator has to act on is different: the volume has been unresponsive for
-    a while and probes have been piling up against it.
+    Deliberately an ``asyncio.TimeoutError``: to every caller this means exactly
+    what a timeout means -- "the filesystem did not answer" -- so each existing
+    bounded-probe handler treats it correctly with no new branch. Only the
+    message differs, because the cause an operator has to act on is different:
+    the volume has been unresponsive for a while and probes have been piling up
+    against it.
+
+    ``asyncio.TimeoutError`` and not the builtin, because they are only the same
+    class from 3.11 on; on 3.10 (which ``pyproject.toml`` still targets) the
+    builtin is an ``OSError`` subclass that ``except asyncio.TimeoutError`` does
+    not catch -- and every handler here catches the asyncio one. Inheriting both
+    is not an option either: their C layouts conflict.
     """
 
 

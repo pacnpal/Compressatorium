@@ -45,8 +45,10 @@
   - The bound scales with the file, because verify reads all of it: 30 minutes
     plus 10 minutes per GiB, capped at 24 hours
     (`COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` / `…_PER_GIB` / `…_CAP`). That is
-    deliberately loose — roughly a 1.7 MB/s floor — so a slow verify on tired
-    storage still finishes; the point is that a wedged one ends. Tools that
+    deliberately loose — the per-GiB allowance alone works out to about
+    1.7 MB/s, on top of the half-hour baseline and under the 24-hour cap — so a
+    slow verify on tired storage still finishes; the point is that a wedged one
+    ends. Tools that
     stream progress (chdman, Dolphin) also get a 10-minute no-output stall bound
     (`COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT`), which catches a hang much
     sooner. The two are independent knobs: setting the first to `0` switches off
