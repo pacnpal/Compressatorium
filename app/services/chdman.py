@@ -8,11 +8,14 @@ from pathlib import Path
 
 from config import settings
 from services.subprocess_runner import (
+    StorageAbandoned,
+    abandonment_checkpoint,
     ConversionCancelled,
     SubprocessRunner,
     collect_verify,
     info_timeout,
     ioprio_prefix,
+    nice_prefix,
 )
 
 # Re-exported for backwards compatibility: ``ConversionCancelled`` historically
@@ -106,31 +109,60 @@ class ChdmanService:
         ):
             yield update
 
-    async def info(self, chd_path: str) -> dict:
-        """Get information about a CHD file."""
-        process = await asyncio.create_subprocess_exec(
-            self.chdman_path,
-            "info",
-            "-i",
-            chd_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            await self._terminate_process(process)
-            raise RuntimeError(f"chdman info timed out after {timeout}s") from exc
+    @property
+    def runner(self) -> SubprocessRunner:
+        """This tool's runner, shared with helpers that spawn chdman children.
 
-        if process.returncode != 0:
+        ``services.disc_id`` shells out to chdman for the GAME/NAME tag work, so
+        it goes through this same instance rather than one of its own: one PID
+        set that ``active_pids()`` fully describes, and one place that records a
+        child the teardown ladder had to give up on.
+        """
+        return self._runner
+
+    async def info(self, chd_path: str) -> dict:
+        """Get information about a CHD file.
+
+        Goes through the shared capture rather than a hand-rolled spawn: that
+        tracks the PID, bounds the teardown (the old path ended in an unbounded
+        ``wait()`` after ``kill()``), applies the tool priority policy, and
+        reports an unkillable child into any open ``collect_abandonment()`` sink
+        so a scan walking a library can stop rather than strand one per file
+        (issue #268).
+        """
+        timeout = info_timeout(self._runner.owner)
+        # Priority via command wrappers, never a preexec_fn: this process is
+        # multithreaded, and forking a Python callable from a multithreaded
+        # parent can deadlock the child before it exec()s -- and a child wedged
+        # there never returns from create_subprocess_exec at all, so the bound
+        # and the PID tracking below it would never be reached. `run_verify` and
+        # the wrapper-nice tools avoid preexec for the same reason; `nice` and
+        # `ionice` only exec. The hand-rolled spawn this replaces used no
+        # preexec_fn, so this keeps that property.
+        owner = self._runner.owner
+        with abandonment_checkpoint() as abandoned:
+            returncode, stdout, stderr = await self._runner.run_capture(
+                nice_prefix(owner) + ioprio_prefix(owner)
+                + [self.chdman_path, "info", "-i", chd_path],
+                timeout=timeout or None,
+                nice_via_wrapper=True,
+            )
+        # An ordinary timeout leaves the child dead; this one does not, and the
+        # caller's answer differs (retry vs. tell the client the storage is not
+        # answering). Folding both into one RuntimeError makes it a generic 500
+        # and invites a refresh that strands another child (issue #268).
+        if abandoned:
+            raise StorageAbandoned(
+                f"chdman info on the file left {', '.join(abandoned)} stuck on "
+                "unresponsive storage; it is still running"
+            )
+        if returncode is None:
+            raise RuntimeError(f"chdman info timed out after {timeout}s")
+
+        if returncode != 0:
             raise RuntimeError(
-                stderr.decode() or f"chdman info failed with code {process.returncode}",
+                stderr.decode(errors="replace").strip()
+                or f"chdman info failed with code {returncode}",
             )
 
         return self._parse_info(stdout.decode())
@@ -169,20 +201,6 @@ class ChdmanService:
             cancel_event=cancel_event,
         )
 
-    @staticmethod
-    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-        try:
-            if process.returncode is not None:
-                return
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            # The process has already exited or no longer exists; nothing left to terminate.
-            pass
 
     def _parse_progress(self, line: str) -> int | None:
         """Parse chdman output for progress percentage, None if the line has none.

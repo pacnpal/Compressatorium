@@ -16,6 +16,7 @@ from models import ConversionMode
 from services.dat_store import dat_store
 from services.file_hasher import compute_file_sha1
 from services.job_manager import ExternalJobCancelled, job_manager
+from services.subprocess_runner import collect_abandonment
 from services.tools import registry
 from services.tools.base import EmbeddedHashUnavailable
 from services.workload_limiter import workload_limiter
@@ -175,8 +176,40 @@ async def match_file(request: MatchRequest):
     if not await run_in_threadpool(os.path.isfile, normalized_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    result = await _match_single_file(normalized_path)
+    # A hash helper that outlived SIGKILL is still reading this file, and the
+    # match result cannot say so -- an embedded-hash miss and an abandoned
+    # verify both come back as "unmatched" (issue #268). 503 rather than a
+    # cheerful 200: it is a transient resource condition, and a caller that
+    # retries immediately just spawns a second one against the same storage.
+    with collect_abandonment() as abandoned:
+        result = await _match_single_file(normalized_path)
+    if abandoned:
+        logger.error("DAT match abandoned %s for %s", abandoned, normalized_path)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Matching left a process stuck on unresponsive storage "
+                f"({', '.join(abandoned)}); it is still running."
+            ),
+        )
     return result
+
+
+def _abandoned_match_result(path: str, abandoned: list) -> dict:
+    """The result a path gets when matching left a process stuck on its storage.
+
+    Carries ``error``, so it is non-cacheable by the same rule that keeps
+    transient failures out of ``dat_matches`` -- a retry re-hashes it once the
+    storage answers again (issue #268).
+    """
+    return {
+        "path": path,
+        "matched": False,
+        "error": (
+            "aborted: matching left a process stuck on this storage "
+            f"({', '.join(abandoned)})"
+        ),
+    }
 
 
 def _resolve_and_group_paths(
@@ -245,14 +278,30 @@ async def match_batch(request: MatchBatchRequest):
 
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
-    for normalized_path in to_compute:
+    stopped_at = len(to_compute)
+    abandoned_detail: list[str] = []
+    for index, normalized_path in enumerate(to_compute):
         exists = await run_in_threadpool(os.path.isfile, normalized_path)
         if not exists:
             result = {"path": normalized_path, "matched": False}
             # Don't cache missing-file results: the file may appear later and
             # a stale negative entry would not be cleared by prune_missing.
         else:
-            result = await _match_single_file(normalized_path)
+            with collect_abandonment() as abandoned:
+                result = await _match_single_file(normalized_path)
+            # Checked *before* the cache write below, not after. An abandoned
+            # helper comes back as an ordinary unmatched result -- no `reason`,
+            # no `error` -- so it passes the cacheability test, and a stale
+            # negative would reach `dat_matches` and survive until the file's
+            # mtime changed: matching stays broken for that path long after the
+            # storage recovers. `stopped_at = index` puts the offending file at
+            # the head of the untouched tail, so one code path marks it and
+            # everything after it (issue #268).
+            if abandoned:
+                logger.error("DAT match batch stopped, abandoned %s", abandoned)
+                stopped_at = index
+                abandoned_detail = list(abandoned)
+                break
             # Don't cache size-cap skips: the result is configuration-dependent.
             # If MATCH_MAX_FILE_SIZE is later raised or disabled the file must
             # be re-hashed rather than being served a stale "too large" entry.
@@ -262,6 +311,13 @@ async def match_batch(request: MatchBatchRequest):
                 new_matches[normalized_path] = result
         for original_path in normalized_to_originals[normalized_path]:
             results[original_path] = result
+
+    # Paths the abort never reached, marked the same way.
+    if abandoned_detail:
+        for skipped in to_compute[stopped_at:]:
+            result = _abandoned_match_result(skipped, abandoned_detail)
+            for original_path in normalized_to_originals[skipped]:
+                results[original_path] = result
 
     # Cache new results using normalized path keys
     if new_matches:
@@ -608,9 +664,23 @@ async def _run_match_job(
                 message=f"[{idx}/{total}] {display_name}",
             )
 
-            result, cacheable = await _hash_one_for_job(
-                normalized_path, cancel_event=cancel_event,
-            )
+            with collect_abandonment() as abandoned:
+                result, cacheable = await _hash_one_for_job(
+                    normalized_path, cancel_event=cancel_event,
+                )
+            # Before `set_match` and the counters, for the same reason as the
+            # batch route: an abandoned helper's result is an ordinary unmatched
+            # one, so persisting it writes a stale negative that outlives the
+            # outage. Also before the cancellation re-check below -- a cancel is
+            # usually what triggered the teardown that then failed to kill the
+            # child, so both are true at once and a clean CANCELLED would be the
+            # more misleading report. `run()` makes the same call (issue #268).
+            if abandoned:
+                raise RuntimeError(
+                    f"matching {display_name} left a process stuck on "
+                    f"unresponsive storage ({', '.join(abandoned)}); "
+                    "it is still running, so the remaining files were skipped"
+                )
             if cacheable:
                 hashed += 1
                 # Per-file writes are intentional: persist each completed

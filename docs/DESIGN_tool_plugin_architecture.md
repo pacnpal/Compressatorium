@@ -623,8 +623,84 @@ Three rules follow for any code that runs a verifier:
   job's) is the one case that cannot carry the flag on an event at all — it
   cancels the generator rather than letting it reach one — so `reap` records the
   pid it gave up on (`SubprocessRunner.abandoned_pids`) and the routes fold that
-  into the timeout verdict. Issue #268 argues abandonment should be an exception
-  rather than a flag; when that lands, it replaces exactly these.
+  into the timeout verdict. Issue #268 proposed replacing this with an exception;
+  it was tried and rejected, because an exception cannot be raised from the
+  `finally` an outer deadline unwinds through without masking what is already
+  propagating — the very case the sink exists for. **The sink is the mechanism;
+  there is no second one.**
+- **Every loop that walks a list opens a sink (#268).** The verify routes were
+  the first, but they are not special: the DAT-match paths and all three library
+  scan phases walk a caller-supplied list of files on one storage in exactly the
+  same way, and none of their return values can carry the fact — `disc_hashes`
+  returns `list[str]`, `embedded_hashes` returns `list[tuple]`, and a match
+  result has no field for it, so an unkillable `dolphin-tool verify` was
+  indistinguishable from "this disc has no embedded hash". Because `reap()`
+  reports into whatever sink is open and `run_capture` always reaps, the loop
+  needs only the `with` block — no hook argument, and no change to the four
+  layers between it and the child:
+
+  ```python
+  with collect_abandonment() as abandoned:
+      result = await _match_single_file(path)
+  if abandoned:
+      ...  # stop walking; the next file is on the same mount
+  ```
+
+  Where the loop has a per-file `except` that swallows failures, the sink goes
+  **outside** the handler, not inside: a corrupt file stays isolated to itself,
+  while an unkillable child escapes. Scan Phase 2 is the sharpest case — its
+  handler only logs at `debug`, so a stranded child there previously left no
+  trace at all. A single-file endpoint has no walk to stop, so it reports instead
+  (`/dat/match` answers 503).
+- **A sink checked only at the loop is too late for a compound operation
+  (#268).** The loop-level `with` is enough when the operation just succeeds or
+  fails, but not when it *acts* on an intermediate result: two steps here decided
+  something on a value that no longer meant what it said. Sizing the file for the
+  verify bound is a read of the same storage, and when that probe is abandoned
+  the resolver falls back to the flat baseline — so `disc_hashes` would spawn
+  `dolphin-tool verify` into a mount already proven unresponsive, buying a full
+  verify timeout and likely a second written-off resource. And an abandoned
+  `chdman dumpmeta` reports "no GAME tag", which is indistinguishable from a
+  genuinely untagged CHD — so `post_convert` answered it by firing `addmeta` at a
+  file the abandoned reader still held, and `ensure_disc_id_embedded` fell
+  through to a whole-disc sector read on the default executor with no bound of
+  its own.
+
+  `abandonment_checkpoint()` is the seam for this: it yields a list for the
+  immediate decision and then forwards whatever it caught to the enclosing sink,
+  so the step aborts *and* the caller's walk still stops. A naive nested
+  `collect_abandonment()` would shadow the outer sink and silently defeat the
+  loop. Where the value itself is the trap, the deciding helper raises instead of
+  returning it — `services.disc_id` raises `DiscIdStorageAbandoned` rather than
+  the `None` that invites a write. This is the design rule *"re-check the cancel
+  after resolving the bound, before spawning"* extended to abandonment, and the
+  reward for ignoring it is larger: a child that blocks immediately and may
+  outlive SIGKILL.
+- **`post_convert` is best-effort about tagging, not about storage.** Its
+  contract is that a tagging failure never fails the job, because a missing
+  disc-ID tag is cosmetic. An abandoned chdman child is not that: it says the
+  output's storage stopped answering, and every step after the hook reads that
+  storage -- `_compute_output_size` is an unbounded `run_in_threadpool`, and
+  delete-on-verify spawns a verifier. Swallowing it trades a skipped tag for a
+  hung job, which is #263's original failure, so `DiscIdStorageAbandoned` alone
+  propagates and `JobManager` lets it reach the handler that fails the job.
+- **One volume's failure stops the whole pass, deliberately.** A scan or batch is
+  one user-initiated walk, and the loops do not resolve which configured volume
+  each path belongs to, so the first abandonment ends all of it — including
+  paths on volumes that are answering fine. That is the safe direction: stopping
+  early costs a re-run, while carrying on costs one stranded process per
+  remaining file. Note this does **not** transfer to the job queue, which is why
+  the dispatcher deliberately keeps going (#265): queue entries are independent
+  jobs that may target unrelated volumes, whereas one scan is a single pass the
+  user asked for as a unit.
+- **One-shot chdman/dolphin captures go through `run_capture`.** `chdman info`,
+  `dolphin-tool header`, and the `chdman addmeta` / `delmeta` / `dumpmeta`
+  helpers in `services.disc_id` used to spawn directly, untracked, and finish
+  with an unbounded wait after `kill()` — `dumpmeta` could hang the scan's Phase
+  2 outright. They now share the capture path, so they are PID-tracked, bounded,
+  subject to the tool priority policy, and able to report abandonment.
+  `services.disc_id` uses `chdman_service.runner` rather than a runner of its
+  own, so `active_pids()` still describes every chdman child.
 - **Stop a list at the first unresponsive path, don't survey them all.** The
   batch route's path validation bounds each check, but bounding is not enough on
   its own: a batch is a list of paths on *one* storage, so carrying on after a

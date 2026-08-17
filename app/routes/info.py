@@ -27,6 +27,7 @@ from services.archive import ARCHIVE_EXTENSIONS
 from services.chd_metadata_store import chd_metadata_store
 from services.chdman import chdman_service
 from services.disc_id import (
+    DiscIdStorageAbandoned,
     ensure_disc_id_embedded as disc_id_ensure_embedded,
     extract_from_chd as disc_id_extract_from_chd,
 )
@@ -41,7 +42,11 @@ from services.jwudtool import (
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
-from services.subprocess_runner import bounded_path_check, collect_abandonment
+from services.subprocess_runner import (
+    StorageAbandoned,
+    bounded_path_check,
+    collect_abandonment,
+)
 from services.workload_limiter import WorkloadToken, workload_limiter
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.maxcso import (
@@ -212,7 +217,24 @@ async def _scan_phase_dat_match(
                 matched += 1
         else:
             try:
-                result = await _match_single_file(path, cancel_event=cancel_event)
+                with collect_abandonment() as abandoned:
+                    result = await _match_single_file(
+                        path, cancel_event=cancel_event,
+                    )
+                # Abandonment before cancellation: a cancel is usually what
+                # triggered the teardown that then could not kill the child, so
+                # both are true at once and a clean CANCELLED would be the more
+                # misleading report -- the process is still running.
+                if abandoned:
+                    # Not a fact about this file: the hash helper outlived
+                    # SIGKILL and is still reading the volume the rest of the
+                    # library is on, so every remaining path would strand
+                    # another one (issue #268). Fail the scan here.
+                    raise RuntimeError(
+                        f"Phase 3: matching {os.path.basename(path)} left a "
+                        f"process stuck on unresponsive storage "
+                        f"({', '.join(abandoned)}); it is still running"
+                    )
                 # A cancellable hook (dolphin verify) may have been aborted
                 # mid-file, returning a non-cacheable error. Treat that as
                 # cancellation rather than deleting/keeping a stale row or
@@ -395,32 +417,46 @@ async def scan_metadata_task(
                 phase1_total,
                 os.path.basename(path),
             )
-            try:
-                info = await chdman_service.info(path)
-                record = await chd_metadata_store.set_metadata(path, info, persist=False)
-                count += 1
-                logger.info(
-                    "Phase 1 [%d/%d]: Metadata cached for %s",
-                    idx,
-                    phase1_total,
-                    os.path.basename(path),
-                )
-                logger.debug(
-                    "Phase 1 [%d/%d]: Metadata for %s: game_id=%r, title=%r, info=%s",
-                    idx,
-                    phase1_total,
-                    os.path.basename(path),
-                    record.get("game_id"),
-                    record.get("title"),
-                    info,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Phase 1 [%d/%d]: Failed to extract metadata from %s: %s",
-                    idx,
-                    phase1_total,
-                    path,
-                    e,
+            # The sink wraps the handler, not the reverse: a corrupt or
+            # unreadable CHD stays isolated to its own file, but an info child
+            # we could not kill has to escape it. That child is still reading
+            # the volume the rest of the library is on, so continuing costs one
+            # stuck process per remaining file (issue #268).
+            with collect_abandonment() as abandoned:
+                try:
+                    info = await chdman_service.info(path)
+                    record = await chd_metadata_store.set_metadata(
+                        path, info, persist=False,
+                    )
+                    count += 1
+                    logger.info(
+                        "Phase 1 [%d/%d]: Metadata cached for %s",
+                        idx,
+                        phase1_total,
+                        os.path.basename(path),
+                    )
+                    logger.debug(
+                        "Phase 1 [%d/%d]: Metadata for %s: game_id=%r, title=%r, info=%s",
+                        idx,
+                        phase1_total,
+                        os.path.basename(path),
+                        record.get("game_id"),
+                        record.get("title"),
+                        info,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Phase 1 [%d/%d]: Failed to extract metadata from %s: %s",
+                        idx,
+                        phase1_total,
+                        path,
+                        e,
+                    )
+            if abandoned:
+                raise RuntimeError(
+                    f"Phase 1: reading {os.path.basename(path)} left a process "
+                    f"stuck on unresponsive storage ({', '.join(abandoned)}); "
+                    "it is still running"
                 )
             if phase1_total > 0:
                 await job_manager.update_external_job(
@@ -456,42 +492,52 @@ async def scan_metadata_task(
         for idx2, path in enumerate(chd_all_paths, start=1):
             if job_manager.is_cancelled(scan_job_id):
                 raise ExternalJobCancelled()
-            try:
-                if await chd_metadata_store.is_disc_id_checked(path):
-                    already_checked += 1
-                    # Still update progress so the scan doesn't appear stuck at 45%
-                    if phase2_total > 0:
-                        await job_manager.update_external_job(
-                            scan_job_id,
-                            progress=45 + int(20 * idx2 / phase2_total),
-                            message=(
-                                f"Phase 2 [{idx2}/{phase2_total}]: "
-                                f"{os.path.basename(path)} (already checked)"
-                            ),
+            # Sink outside the handler: this one only logs at *debug*, so an
+            # abandoned chdman child would otherwise leave no trace at all
+            # while the scan walked the rest of the library (issue #268).
+            with collect_abandonment() as abandoned:
+                try:
+                    if await chd_metadata_store.is_disc_id_checked(path):
+                        already_checked += 1
+                        # Still update progress so the scan doesn't appear stuck at 45%
+                        if phase2_total > 0:
+                            await job_manager.update_external_job(
+                                scan_job_id,
+                                progress=45 + int(20 * idx2 / phase2_total),
+                                message=(
+                                    f"Phase 2 [{idx2}/{phase2_total}]: "
+                                    f"{os.path.basename(path)} (already checked)"
+                                ),
+                            )
+                        continue
+                    logger.info("Phase 2: Scanning disc ID for %s", os.path.basename(path))
+                    result = await disc_id_ensure_embedded(path, settings.chdman_path)
+                    if result and result.get("game_id"):
+                        await chd_metadata_store.update_disc_id_info(
+                            path, result["game_id"], result.get("title"), persist=False
                         )
-                    continue
-                logger.info("Phase 2: Scanning disc ID for %s", os.path.basename(path))
-                result = await disc_id_ensure_embedded(path, settings.chdman_path)
-                if result and result.get("game_id"):
-                    await chd_metadata_store.update_disc_id_info(
-                        path, result["game_id"], result.get("title"), persist=False
-                    )
-                await chd_metadata_store.mark_disc_id_checked(path)
-                newly_checked += 1
-                if result:
-                    embed_count += 1
-                    logger.info(
-                        "Phase 2: Disc ID found for %s (game_id=%r)",
-                        os.path.basename(path),
-                        result.get("game_id"),
-                    )
-                else:
-                    logger.info(
-                        "Phase 2: No disc ID found for %s, file marked as checked",
-                        os.path.basename(path),
-                    )
-            except Exception as e:
-                logger.debug("Phase 2: disc_id ensure skipped for %s: %s", path, e)
+                    await chd_metadata_store.mark_disc_id_checked(path)
+                    newly_checked += 1
+                    if result:
+                        embed_count += 1
+                        logger.info(
+                            "Phase 2: Disc ID found for %s (game_id=%r)",
+                            os.path.basename(path),
+                            result.get("game_id"),
+                        )
+                    else:
+                        logger.info(
+                            "Phase 2: No disc ID found for %s, file marked as checked",
+                            os.path.basename(path),
+                        )
+                except Exception as e:
+                    logger.debug("Phase 2: disc_id ensure skipped for %s: %s", path, e)
+            if abandoned:
+                raise RuntimeError(
+                    f"Phase 2: reading {os.path.basename(path)} left a process "
+                    f"stuck on unresponsive storage ({', '.join(abandoned)}); "
+                    "it is still running"
+                )
             if phase2_total > 0:
                 await job_manager.update_external_job(
                     scan_job_id,
@@ -697,8 +743,30 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
         elif not await chd_metadata_store.is_disc_id_checked(path):
             # Not yet attempted, run the extractor and cache the outcome (even
             # "nothing found") so subsequent /api/info calls skip the subprocess.
+            # Caching the outcome is what makes later requests skip the
+            # subprocess -- including a "nothing found" outcome. That is right
+            # for a CHD the extractor actually inspected, and wrong for one it
+            # never got to look at: an abandoned chdman child is a fact about the
+            # storage, not the file, so marking it checked would suppress
+            # extraction for good after the share recovers, until the mtime
+            # changes (issue #268). Raising past the cache write below is what
+            # keeps that case retryable.
             try:
                 disc_info = await disc_id_extract_from_chd(path, settings.chdman_path) or {}
+            except DiscIdStorageAbandoned as e:
+                # Not cached (above), which on its own would make every refresh
+                # retry and strand another child while the client saw a perfectly
+                # ordinary response with no game ID. So say it: 503, matching
+                # /dat/match, rather than presenting an abandoned read as a
+                # successful partial lookup (issue #268).
+                logger.error("disc_id extraction abandoned for %s: %s", path, e)
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Reading the disc ID left a process stuck on "
+                        f"unresponsive storage: {e}"
+                    ),
+                ) from None
             except Exception as e:
                 logger.debug("disc_id extraction failed for %s: %s", path, e)
             await chd_metadata_store.update_disc_id_info(
@@ -732,6 +800,14 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
             title=title,
         )
 
+    except HTTPException:
+        # Already carries its own status (e.g. the 503s above); don't relabel it.
+        raise
+    except StorageAbandoned as e:
+        # A metadata read that left a child running is transient, not a broken
+        # CHD: 500 would invite a refresh that strands another one (issue #268).
+        logger.error("CHD info abandoned for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to read CHD info: {e!s}",
@@ -879,6 +955,11 @@ async def get_dolphin_info(
             file_size=info.get("file_size"),
             raw_data=info.get("raw_data", ""),
         )
+    except StorageAbandoned as e:
+        # Transient, not a broken disc image: a 500 invites a refresh that
+        # strands another child (issue #268). Ordered before the broad handler.
+        logger.error("Dolphin header abandoned for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(
             status_code=500,

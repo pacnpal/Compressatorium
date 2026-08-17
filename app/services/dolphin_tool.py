@@ -1,18 +1,22 @@
 import asyncio
-from logging_setup import get_logger
 import re
 import shutil
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from config import settings
+from logging_setup import get_logger
 from services.subprocess_runner import (
+    StorageAbandoned,
     SubprocessRunner,
+    abandonment_checkpoint,
     collect_verify,
     info_timeout,
     ioprio_prefix,
+    nice_prefix,
     resolve_verify_timeout,
 )
+
+from config import settings
 
 DOLPHIN_CONVERTIBLE_EXTENSIONS = {".iso", ".gcz", ".wia", ".rvz", ".wbfs"}
 
@@ -122,32 +126,43 @@ class DolphinToolService:
             yield update
 
     async def header(self, path: str) -> dict:
-        """Get header information about a disc image."""
-        process = await asyncio.create_subprocess_exec(
-            self.dolphin_tool_path,
-            "header",
-            "-i", path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            await self._terminate_process(process)
-            raise RuntimeError(
-                f"dolphin-tool header timed out after {timeout}s",
-            ) from exc
+        """Get header information about a disc image.
 
-        if process.returncode != 0:
+        Goes through the shared capture rather than a hand-rolled spawn, for the
+        same reasons as ``chdman.info``: PID tracking, a bounded teardown in
+        place of an unbounded ``wait()`` after ``kill()``, the tool priority
+        policy, and an unkillable child reported into any open
+        ``collect_abandonment()`` sink (issue #268).
+        """
+        timeout = info_timeout(self._runner.owner)
+        # Wrapper-based priority, not preexec_fn -- see the note in
+        # ``chdman.info``: a fork of a Python callable from this multithreaded
+        # parent can deadlock the child before exec, and then
+        # create_subprocess_exec never returns to apply the bound at all.
+        owner = self._runner.owner
+        with abandonment_checkpoint() as abandoned:
+            returncode, stdout, stderr = await self._runner.run_capture(
+                nice_prefix(owner) + ioprio_prefix(owner)
+                + [self.dolphin_tool_path, "header", "-i", path],
+                timeout=timeout or None,
+                nice_via_wrapper=True,
+            )
+        # An ordinary timeout leaves the child dead; this one does not, and the
+        # caller's answer differs (retry vs. tell the client the storage is not
+        # answering). Folding both into one RuntimeError makes it a generic 500
+        # and invites a refresh that strands another child (issue #268).
+        if abandoned:
+            raise StorageAbandoned(
+                f"dolphin-tool header on the file left {', '.join(abandoned)} stuck on "
+                "unresponsive storage; it is still running"
+            )
+        if returncode is None:
+            raise RuntimeError(f"dolphin-tool header timed out after {timeout}s")
+
+        if returncode != 0:
             raise RuntimeError(
                 stderr.decode()
-                or f"dolphin-tool header failed with code {process.returncode}",
+                or f"dolphin-tool header failed with code {returncode}",
             )
 
         return self._parse_header(stdout.decode())
@@ -176,9 +191,27 @@ class DolphinToolService:
         ]
         # Same size-scaled bound as verify(): this *is* a verify run, just one
         # whose output we read for a hash instead of a verdict.
-        timeout = await resolve_verify_timeout(
-            path, self._runner.owner, cancel_event=cancel_event,
-        )
+        #
+        # Checked before spawning, not after: sizing the file is a read of the
+        # same storage this verify is about to reconstruct, and when that probe
+        # has to be abandoned the resolver quietly falls back to the flat
+        # baseline. Spawning anyway would buy a full verify timeout against a
+        # mount already proven unresponsive, and likely a second written-off
+        # resource -- the design's "re-check the cancel after resolving the
+        # bound, before spawning" rule, applied to abandonment (issue #268).
+        # The checkpoint still forwards to the caller's sink, so a scan or batch
+        # walking a list stops too.
+        with abandonment_checkpoint() as probe_abandoned:
+            timeout = await resolve_verify_timeout(
+                path, self._runner.owner, cancel_event=cancel_event,
+            )
+        if probe_abandoned:
+            logger.warning(
+                "dolphin-tool verify (hash) not started for %s: sizing it "
+                "abandoned %s, so the storage is not answering",
+                path, ", ".join(probe_abandoned),
+            )
+            return []
         returncode, stdout, _ = await self._runner.run_capture(
             cmd, timeout=timeout or None, cancel_event=cancel_event,
         )
@@ -222,22 +255,6 @@ class DolphinToolService:
             cancel_event=cancel_event,
         )
 
-    @staticmethod
-    async def _terminate_process(
-        process: asyncio.subprocess.Process,
-    ) -> None:
-        try:
-            if process.returncode is not None:
-                return
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            # Process is already gone; nothing left to terminate.
-            logger.debug("Process already exited before termination completed.")
 
     def _parse_progress(self, line: str) -> int | None:
         """Parse dolphin-tool output for progress percentage."""

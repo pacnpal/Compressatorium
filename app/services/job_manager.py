@@ -19,6 +19,7 @@ from models import ConversionJob, ConversionMode, InputKind, JobStatus
 from services.archive import archive_service
 from services.chd_metadata_store import chd_metadata_store
 from services.chdman import ConversionCancelled, chdman_service
+from services.disc_id import DiscIdStorageAbandoned
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
 from services.tools import ModeKind, registry
@@ -2334,6 +2335,13 @@ class JobManager:
                     await registry.for_mode(job.mode.value).post_convert(
                         input_path, job.output_path, job.mode.value,
                     )
+                except DiscIdStorageAbandoned:
+                    # Deliberately not swallowed with the rest. Everything below
+                    # touches job.output_path on the same storage -- the output
+                    # size probe is an unbounded run_in_threadpool, and
+                    # delete-on-verify spawns a verifier -- so let the outer
+                    # handler fail this job now rather than hang it (#263/#268).
+                    raise
                 except Exception as e:
                     logger.debug(
                         "Job %s post-convert hook skipped: %s", job_id, e

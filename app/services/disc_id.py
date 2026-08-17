@@ -49,6 +49,13 @@ import zlib as _zlib
 from pathlib import Path
 from typing import Optional
 
+from services.subprocess_runner import (
+    StorageAbandoned,
+    abandonment_checkpoint,
+    ioprio_prefix,
+    nice_prefix,
+)
+
 logger = get_logger("disc_id")
 
 # ---------------------------------------------------------------------------
@@ -63,7 +70,67 @@ _MAX_CHD_HUNK_BYTES = 8 * 1024 * 1024
 _MAX_CHD_COMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_CHD_LZMA_DICT_BYTES = 16 * 1024 * 1024
 _MAX_DUMPMETA_BYTES = 1 * 1024 * 1024
+class DiscIdStorageAbandoned(StorageAbandoned):
+    """A chdman child for this CHD outlived SIGKILL and is still running.
+
+    Distinct from "no tag found" because the two demand opposite behaviour: the
+    latter invites a write, the former forbids touching the file at all. Raised
+    rather than folded into the ``None`` these helpers otherwise return, since
+    every caller acts on that ``None`` immediately -- before any enclosing
+    ``collect_abandonment()`` sink is inspected (issue #268).
+    """
+
+
+def _abort_if_abandoned(abandoned: list, action: str, chd_path: str) -> None:
+    """Raise if ``action`` on ``chd_path`` left a chdman child running.
+
+    Called by the three capture helpers rather than by their callers, because
+    every one of them reduces the outcome to a bare ``None``/``False`` that means
+    "no such tag" or "nothing to delete" -- and there are a dozen call sites, each
+    of which answers that by reading or writing the same CHD again. Guarding the
+    callers one at a time is how you miss one; the ambiguity has to be impossible
+    at the point the value is produced (issue #268).
+    """
+    if abandoned:
+        raise DiscIdStorageAbandoned(
+            f"{action} on {chd_path} left {', '.join(abandoned)} stuck on "
+            "unresponsive storage; it is still running, so touching the file "
+            "again would race it"
+        )
+
+
 _DUMPMETA_TIMEOUT_SECONDS = 15
+
+
+def _chdman_runner():
+    """The chdman service's ``SubprocessRunner``, imported lazily.
+
+    These helpers shell out to chdman, so they belong on that tool's runner:
+    one PID set ``active_pids()`` fully describes, one nice/ionice policy, and
+    one bounded teardown instead of three hand-rolled spawns whose waits after
+    ``kill()`` were unbounded -- ``dumpmeta`` in particular could hang the
+    library scan's Phase 2 outright on unresponsive storage. Going through
+    ``run_capture`` also reports an unkillable child into any open
+    ``collect_abandonment()`` sink, which is what lets the scan stop instead of
+    stranding one per file (issue #268). The import is deferred to keep this
+    module free of a load-order dependency on the service singletons.
+    """
+    from services.chdman import chdman_service
+    return chdman_service.runner
+
+
+def _chdman_cmd(chdman_path: str, *args: str) -> list[str]:
+    """chdman argv with the tool priority policy applied as command wrappers.
+
+    Wrappers, never ``run_capture``'s ``preexec_fn``: this process is
+    multithreaded, and forking a Python callable from a multithreaded parent can
+    deadlock the child before it ``exec()``s -- and a child wedged there never
+    returns from ``create_subprocess_exec``, so the bound these calls exist to
+    get would never be applied. ``nice``/``ionice`` only exec. The hand-rolled
+    spawns this replaces used no ``preexec_fn`` either.
+    """
+    owner = _chdman_runner().owner
+    return nice_prefix(owner) + ioprio_prefix(owner) + [chdman_path, *args]
 
 # ---------------------------------------------------------------------------
 # ISO 9660 constants
@@ -1143,6 +1210,9 @@ async def read_embedded_game_id(
     conversion-time embed idempotent: re-running it on an already-tagged CHD
     can be skipped instead of appending a duplicate GAME tag.
     """
+    # `_dumpmeta_text` raises DiscIdStorageAbandoned rather than returning the
+    # None that would read as "untagged" here -- which is what callers answer by
+    # *writing* a tag (issue #268).
     raw = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
     if raw and raw.strip():
         return raw.strip()
@@ -1206,6 +1276,10 @@ async def ensure_disc_id_embedded(
     Returns None only when no disc ID could be found at all.
     """
     # --- Fast path: GAME tag already present ---------------------------------
+    # `_dumpmeta_text` raises rather than reporting "no tag", so the strategies
+    # below -- which write a tag, or fall through to a whole-disc sector read on
+    # the default executor with no bound of its own -- are never reached against
+    # storage that has stopped answering (issue #268).
     existing = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
     if existing and existing.strip():
         game_id = existing.strip()
@@ -1329,26 +1403,29 @@ async def _addmeta_text(
             value,
             chd_path,
         )
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "addmeta",
-            "-i", chd_path,
-            "-t", tag,
-            "-vt", value,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        # Bounded like dumpmeta below; addmeta writes one small tag, so the
+        # same 15s ceiling is generous. It previously had no bound at all.
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
+            )
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman addmeta", chd_path)
+        if returncode != 0:
             logger.warning(
                 "disc_id: addmeta tag=%s failed (rc=%s): %s",
                 tag,
-                proc.returncode,
+                returncode,
                 stderr.decode(errors="replace").strip(),
             )
             return False
         logger.debug("disc_id: addmeta tag=%s written successfully in %s", tag, chd_path)
         return True
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.warning("disc_id: addmeta tag=%s error: %s", tag, e)
         return False
@@ -1362,27 +1439,29 @@ async def _delmeta(chd_path: str, tag: str, chdman_path: str) -> bool:
     guarantee the tag is absent before a fresh addmeta writes the current value.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "delmeta",
-            "-i", chd_path,
-            "-t", tag,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "delmeta", "-i", chd_path, "-t", tag),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
+            )
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman delmeta", chd_path)
+        if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "disc_id: delmeta tag=%s not present or failed (rc=%s) in %s: %s",
                     tag,
-                    proc.returncode,
+                    returncode,
                     chd_path,
                     stderr.decode(errors="replace").strip(),
                 )
             return False
         logger.debug("disc_id: delmeta tag=%s removed from %s", tag, chd_path)
         return True
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.warning("disc_id: delmeta tag=%s error: %s", tag, e)
         return False
@@ -1413,22 +1492,19 @@ async def _dumpmeta_raw(
     tmp_path = tmp.name
     tmp.close()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "dumpmeta",
-            "-i", chd_path,
-            "-t", tag,
-            "-o", tmp_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_DUMPMETA_TIMEOUT_SECONDS
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman dumpmeta", chd_path)
+        if returncode is None:
+            # The shared teardown already bounded the kill; the old path killed
+            # the child and then waited for it with no limit, which is what
+            # could hang a scan on a dead mount.
             logger.debug(
                 "disc_id: dumpmeta tag=%s timed out after %ss in %s",
                 tag,
@@ -1436,13 +1512,13 @@ async def _dumpmeta_raw(
                 chd_path,
             )
             return None
-        if proc.returncode != 0:
+        if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 stderr_text = stderr.decode(errors="replace").strip()
                 logger.debug(
                     "disc_id: dumpmeta tag=%s not found or failed (rc=%d) in %s: %s",
                     tag,
-                    proc.returncode,
+                    returncode,
                     chd_path,
                     stderr_text,
                 )
@@ -1457,6 +1533,8 @@ async def _dumpmeta_raw(
             return None
         with open(tmp_path, "rb") as f:
             return f.read(_MAX_DUMPMETA_BYTES + 1)
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.debug("disc_id: dumpmeta tag=%s error: %s", tag, e)
         return None

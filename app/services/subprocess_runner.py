@@ -102,6 +102,55 @@ def collect_abandonment():
         _abandon_sink.reset(token)
 
 
+class StorageAbandoned(RuntimeError):
+    """A child for this file outlived SIGKILL and is still running.
+
+    Raised by a *caller* at the point it would otherwise act on a value that
+    cannot distinguish "the storage stopped answering" from an ordinary result --
+    a metadata read that came back empty, a tag that appears absent. The runner
+    itself never raises it: an exception thrown from the ``finally`` an outer
+    deadline unwinds through would mask whatever is already propagating, which is
+    the case ``collect_abandonment()`` exists for. Deciding helpers raise it after
+    an ``abandonment_checkpoint()`` tells them what just happened (issue #268).
+    """
+
+
+@contextlib.contextmanager
+def abandonment_checkpoint():
+    """Observe what *this step* abandoned, without hiding it from the caller.
+
+    ``collect_abandonment()`` shadows an enclosing sink, so a compound operation
+    cannot simply open one to make a mid-flight decision: the outer loop would
+    stop seeing the abandonment and its stop-walking policy would never fire.
+    This yields a list for the immediate decision and then forwards whatever it
+    caught to the enclosing sink, so both fire.
+
+    It exists because checking the sink only once, after a whole per-file
+    operation returns, is too late whenever that operation *acts* on an
+    intermediate result. Two cases in this codebase (issue #268):
+
+    * A size probe for the verify bound is abandoned, the resolver falls back to
+      the flat baseline, and the caller spawns the verifier anyway -- into
+      storage already proven unresponsive. The design rule "re-check the cancel
+      after resolving the bound, before spawning" applies to abandonment for the
+      same reason, and more so: the reward is a child that blocks immediately
+      and may outlive SIGKILL.
+    * ``chdman dumpmeta`` is abandoned and reports "no GAME tag", which is
+      indistinguishable from a genuinely untagged CHD -- so the caller writes a
+      tag to a file the abandoned reader still holds, or falls through to a
+      whole-disc sector read of the same dead mount.
+    """
+    outer = _abandon_sink.get()
+    sink: list[str] = []
+    token = _abandon_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _abandon_sink.reset(token)
+        if outer is not None:
+            outer.extend(sink)
+
+
 def _note_abandoned(detail: str) -> None:
     sink = _abandon_sink.get()
     if sink is not None:
@@ -761,9 +810,10 @@ def abandoned_verify_error(pid: int) -> dict:
     comes from. The ``abandoned`` flag is the part that matters: it outranks
     "cancelled" and "timed out", because the child is still running and still
     holding the storage, and a caller working through a list has to stop rather
-    than open the next file against it. Issue #268 argues abandonment should
-    *raise* rather than be a flag on an event; when that lands, this is what the
-    exception replaces.
+    than open the next file against it. Issue #268 considered replacing this
+    flag with an exception and rejected it: the sink is the mechanism, and a
+    deciding helper raises ``StorageAbandoned`` only where the value it would
+    otherwise return cannot express the difference.
     """
     return {
         "type": "error",
@@ -1041,9 +1091,25 @@ class SubprocessRunner:
         was reading. Without it that fact is invisible here: an abandoned child
         and a clean cancellation both come back as a ``None`` returncode, and a
         caller working through a list would open the next file against the same
-        storage. Issue #268 replaces this hook with an exception from
-        ``run_capture`` itself.
+        storage. Retained for a caller that must name the pid in its own
+        terminal event (``capture_verify``); every other caller reads the same
+        fact from an open ``collect_abandonment()`` sink, which ``reap`` always
+        fills. Raising from ``run_capture`` itself was tried for issue #268 and
+        rejected: it cannot be raised from the ``finally`` an outer deadline
+        unwinds through without masking what already propagates.
         """
+        # Don't spawn into an already-cancelled operation. The race is real
+        # rather than theoretical: the child is created *before* the
+        # cancel_event becomes a waiter below, so a caller that resolved a
+        # size-scaled bound (itself a probe that can take its full time on
+        # storage that stopped answering) and only then reached here would start
+        # a verifier nobody wants -- and on that storage it is exactly the child
+        # that blocks immediately and may outlive SIGKILL. Checked in the shared
+        # seam so every capture caller gets it, not just the ones that remember.
+        # Reported as the ordinary abort, which is what a cancel is.
+        if cancel_event is not None and cancel_event.is_set():
+            return None, b"", b""
+
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
         # (e.g. dolphin-tool verify reconstructing a full disc for DAT hashing)
