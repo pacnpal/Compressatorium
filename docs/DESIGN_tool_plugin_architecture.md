@@ -426,7 +426,10 @@ process, so treating an abandonment as a per-file failure turns one stuck child
 into one per file. The loops that enforce this are the DAT match job and its
 `/dat/match-batch` sibling, the library scan's Phase 3, and batch verify; the
 single-file endpoints report it (503 / an SSE `verify_error`) since there is no
-walk to stop.
+walk to stop. The library scan enforces it in **all three** phases — the
+metadata refresh and disc-ID passes walk the same file list as the DAT-match
+pass, and their per-file handlers (one of which only logs at debug) would
+otherwise hide a stranded child completely.
 
 `reraise_if_abandoned(exc)` is the one line an `except` clause needs to keep that
 policy intact. Layers between the runner and the loop legitimately wrap failures

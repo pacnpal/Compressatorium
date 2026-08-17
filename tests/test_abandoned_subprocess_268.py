@@ -479,3 +479,45 @@ async def test_capture_style_verify_does_not_swallow_abandonment(
 
     assert process.signals == ["TERM", "KILL"], "expected the shared ladder, once"
     assert process.pid not in maxcso_module.maxcso_service.active_pids()
+
+
+@pytest.mark.asyncio
+async def test_scan_phase1_metadata_aborts_the_scan(tmp_path, monkeypatch):
+    """Phase 1 isolates every per-file metadata failure -- except this one.
+
+    ``chdman info`` now reports an unkillable child, and Phase 1's broad handler
+    would otherwise log it as an ordinary "couldn't read this CHD" and walk on
+    to the next file on the same unresponsive volume.
+    """
+    for name in ("a.chd", "b.chd", "c.chd"):
+        (tmp_path / name).write_text("x")
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+
+    calls: list[str] = []
+
+    async def fake_info(path):
+        calls.append(path)
+        raise _abandoned("chdman info")
+
+    async def fake_stale(_path):
+        return True
+
+    monkeypatch.setattr(info_routes.chdman_service, "info", fake_info)
+    monkeypatch.setattr(info_routes.chd_metadata_store, "is_stale", fake_stale)
+
+    finished: dict = {}
+
+    async def fake_finish(job_id, *, success=True, error_message=None, **_kw):
+        finished["success"] = success
+        finished["error"] = error_message or ""
+
+    monkeypatch.setattr(info_routes.job_manager, "finish_external_job", fake_finish)
+
+    # scan_metadata_task catches at the top level and finalises the job, so the
+    # abandonment surfaces as a failed scan rather than a raise.
+    await info_routes.scan_metadata_task(force=True)
+
+    assert len(calls) == 1, "the scan must stop at the first stranded process"
+    assert finished.get("success") is False
+    assert "could not be killed" in finished.get("error", "")

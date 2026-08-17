@@ -39,7 +39,7 @@ from services.jwudtool import (
     JWUD_DECOMPRESS_EXTENSIONS,
     jwudtool_service,
 )
-from services.subprocess_runner import SubprocessAbandoned
+from services.subprocess_runner import SubprocessAbandoned, reraise_if_abandoned
 from services.tools import registry
 from services.tools.base import ToolPlugin
 from services.workload_limiter import WorkloadToken, workload_limiter
@@ -377,6 +377,11 @@ async def scan_metadata_task(
                     info,
                 )
             except Exception as e:
+                # Per-file isolation is right for a corrupt or unreadable CHD,
+                # but not for an info child we could not kill: it is still
+                # running against the same storage, so continuing the walk
+                # strands another one on every remaining file (issue #268).
+                reraise_if_abandoned(e)
                 logger.warning(
                     "Phase 1 [%d/%d]: Failed to extract metadata from %s: %s",
                     idx,
@@ -453,6 +458,10 @@ async def scan_metadata_task(
                         os.path.basename(path),
                     )
             except Exception as e:
+                # Same rule as Phase 1, and it matters more here because this
+                # handler only logs at debug: a stranded child would leave no
+                # visible trace at all (issue #268).
+                reraise_if_abandoned(e)
                 logger.debug("Phase 2: disc_id ensure skipped for %s: %s", path, e)
             if phase2_total > 0:
                 await job_manager.update_external_job(
