@@ -652,6 +652,39 @@ Three rules follow for any code that runs a verifier:
   handler only logs at `debug`, so a stranded child there previously left no
   trace at all. A single-file endpoint has no walk to stop, so it reports instead
   (`/dat/match` answers 503).
+- **A sink checked only at the loop is too late for a compound operation
+  (#268).** The loop-level `with` is enough when the operation just succeeds or
+  fails, but not when it *acts* on an intermediate result: two steps here decided
+  something on a value that no longer meant what it said. Sizing the file for the
+  verify bound is a read of the same storage, and when that probe is abandoned
+  the resolver falls back to the flat baseline — so `disc_hashes` would spawn
+  `dolphin-tool verify` into a mount already proven unresponsive, buying a full
+  verify timeout and likely a second written-off resource. And an abandoned
+  `chdman dumpmeta` reports "no GAME tag", which is indistinguishable from a
+  genuinely untagged CHD — so `post_convert` answered it by firing `addmeta` at a
+  file the abandoned reader still held, and `ensure_disc_id_embedded` fell
+  through to a whole-disc sector read on the default executor with no bound of
+  its own.
+
+  `abandonment_checkpoint()` is the seam for this: it yields a list for the
+  immediate decision and then forwards whatever it caught to the enclosing sink,
+  so the step aborts *and* the caller's walk still stops. A naive nested
+  `collect_abandonment()` would shadow the outer sink and silently defeat the
+  loop. Where the value itself is the trap, the deciding helper raises instead of
+  returning it — `services.disc_id` raises `DiscIdStorageAbandoned` rather than
+  the `None` that invites a write. This is the design rule *"re-check the cancel
+  after resolving the bound, before spawning"* extended to abandonment, and the
+  reward for ignoring it is larger: a child that blocks immediately and may
+  outlive SIGKILL.
+- **One volume's failure stops the whole pass, deliberately.** A scan or batch is
+  one user-initiated walk, and the loops do not resolve which configured volume
+  each path belongs to, so the first abandonment ends all of it — including
+  paths on volumes that are answering fine. That is the safe direction: stopping
+  early costs a re-run, while carrying on costs one stranded process per
+  remaining file. Note this does **not** transfer to the job queue, which is why
+  the dispatcher deliberately keeps going (#265): queue entries are independent
+  jobs that may target unrelated volumes, whereas one scan is a single pass the
+  user asked for as a unit.
 - **One-shot chdman/dolphin captures go through `run_capture`.** `chdman info`,
   `dolphin-tool header`, and the `chdman addmeta` / `delmeta` / `dumpmeta`
   helpers in `services.disc_id` used to spawn directly, untracked, and finish

@@ -8,6 +8,7 @@ from pathlib import Path
 from config import settings
 from services.subprocess_runner import (
     SubprocessRunner,
+    abandonment_checkpoint,
     collect_verify,
     info_timeout,
     ioprio_prefix,
@@ -178,9 +179,27 @@ class DolphinToolService:
         ]
         # Same size-scaled bound as verify(): this *is* a verify run, just one
         # whose output we read for a hash instead of a verdict.
-        timeout = await resolve_verify_timeout(
-            path, self._runner.owner, cancel_event=cancel_event,
-        )
+        #
+        # Checked before spawning, not after: sizing the file is a read of the
+        # same storage this verify is about to reconstruct, and when that probe
+        # has to be abandoned the resolver quietly falls back to the flat
+        # baseline. Spawning anyway would buy a full verify timeout against a
+        # mount already proven unresponsive, and likely a second written-off
+        # resource -- the design's "re-check the cancel after resolving the
+        # bound, before spawning" rule, applied to abandonment (issue #268).
+        # The checkpoint still forwards to the caller's sink, so a scan or batch
+        # walking a list stops too.
+        with abandonment_checkpoint() as probe_abandoned:
+            timeout = await resolve_verify_timeout(
+                path, self._runner.owner, cancel_event=cancel_event,
+            )
+        if probe_abandoned:
+            logger.warning(
+                "dolphin-tool verify (hash) not started for %s: sizing it "
+                "abandoned %s, so the storage is not answering",
+                path, ", ".join(probe_abandoned),
+            )
+            return []
         returncode, stdout, _ = await self._runner.run_capture(
             cmd, timeout=timeout or None, cancel_event=cancel_event,
         )

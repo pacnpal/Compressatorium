@@ -17,6 +17,7 @@ from logging_setup import get_logger
 from models import CHDInfo, OutputStatus
 from services.chdman import CHDMAN_CONVERTIBLE_EXTENSIONS, chdman_service
 from services.disc_id import (
+    DiscIdStorageAbandoned,
     clear_embedded_disc_id,
     embed_in_chd,
     extract_from_source,
@@ -225,6 +226,12 @@ class ChdmanTool(BaseTool):
                     "Failed to embed disc ID %r in %s",
                     game_id, Path(output_path).name,
                 )
+        except DiscIdStorageAbandoned as exc:
+            # Still best-effort -- tagging never fails the job -- but this is not
+            # an ordinary "couldn't tag it": a chdman child is still running
+            # against this CHD, which is why the embed was skipped rather than
+            # attempted (issue #268). At debug it would leave no trace at all.
+            logger.error("Disc ID embed skipped for %s: %s", output_path, exc)
         except Exception as exc:  # best effort; tagging never fails the job
             logger.debug("Disc ID embed skipped for %s: %s", output_path, exc)
 

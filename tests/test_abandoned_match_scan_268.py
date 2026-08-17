@@ -425,3 +425,128 @@ async def test_scan_phase3_aborts_the_scan(tmp_path, monkeypatch):
         await info_routes._scan_phase_dat_match("scan-job", paths, force=True)
 
     assert calls == paths[:1], "the scan must stop at the first stranded process"
+
+
+# ---------------------------------------------------------------------------
+# Checking the sink only at the loop is too late for compound operations
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_forwards_to_the_enclosing_sink():
+    """A mid-flight check must not hide the fact from the caller's loop.
+
+    ``collect_abandonment()`` shadows an enclosing sink, so a naive nested block
+    would let a step abort locally while the outer walk sailed on none the wiser.
+    """
+    with runner_mod.collect_abandonment() as outer:
+        with runner_mod.abandonment_checkpoint() as inner:
+            _note("pid 1")
+        assert inner == ["pid 1"], "the step sees it immediately"
+    assert outer == ["pid 1"], "and the loop still sees it afterwards"
+
+
+@pytest.mark.asyncio
+async def test_disc_hashes_does_not_spawn_after_an_abandoned_size_probe(monkeypatch):
+    """Sizing the file reads the same storage the verify would reconstruct.
+
+    When that probe has to be abandoned the resolver falls back to the flat
+    baseline, so spawning anyway buys a full verify timeout against a mount
+    already known to be unresponsive -- and likely a second written-off resource.
+    """
+    from app.services import dolphin_tool as dolphin_mod
+
+    spawned = []
+
+    async def fake_resolve(path, owner, *, cancel_event=None):
+        _note("detached read")          # what run_detached records
+        return 1800
+
+    async def fake_capture(cmd, **kwargs):
+        spawned.append(cmd)
+        return 0, b"", b""
+
+    monkeypatch.setattr(dolphin_mod, "resolve_verify_timeout", fake_resolve)
+    monkeypatch.setattr(
+        dolphin_mod.dolphin_tool_service._runner, "run_capture", fake_capture,
+    )
+
+    with runner_mod.collect_abandonment() as abandoned:
+        result = await dolphin_mod.dolphin_tool_service.disc_hashes("/data/g.rvz")
+
+    assert result == []
+    assert not spawned, "must not spawn the verifier into dead storage"
+    assert abandoned, "and the caller's loop still learns about it"
+
+
+@pytest.mark.asyncio
+async def test_reading_a_tag_that_was_abandoned_is_not_reported_as_untagged(
+    tmp_path, monkeypatch,
+):
+    """The conflation that let post_convert write to a CHD still being read.
+
+    ``read_embedded_game_id`` returning None means "no GAME tag", and
+    ``post_convert`` answers that by firing ``addmeta`` at the file. An abandoned
+    read must therefore not come back as None.
+    """
+    from services import disc_id
+
+    async def fake_dumpmeta(chd_path, tag, chdman_path):
+        _note("pid 99")
+
+    monkeypatch.setattr(disc_id, "_dumpmeta_text", fake_dumpmeta)
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"x")
+
+    with pytest.raises(disc_id.DiscIdStorageAbandoned):
+        await disc_id.read_embedded_game_id(str(chd), "chdman")
+
+    # ensure_disc_id_embedded guards the same read, before the strategies that
+    # write a tag or fall through to the unbounded sector read.
+    with pytest.raises(disc_id.DiscIdStorageAbandoned):
+        await disc_id.ensure_disc_id_embedded(str(chd), "chdman")
+
+
+@pytest.mark.asyncio
+async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
+    """Best-effort still holds -- the job must not fail -- but not silently.
+
+    The harm was `addmeta` landing on a CHD an abandoned reader still holds; the
+    secondary harm was reporting that at debug, where nobody would find it.
+    """
+    from services import disc_id
+    from services.tools import registry
+
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"x")
+    chdman = registry.get("chdman")
+    # The plugin the registry holds lives in `services.tools.chdman`, which is a
+    # different module object than `app.services.tools.chdman`; patching the
+    # latter would make every assertion below pass vacuously.
+    plugin_mod = sys.modules[type(chdman).__module__]
+
+    monkeypatch.setattr(
+        disc_id, "_dumpmeta_text", AsyncMock(side_effect=lambda *a, **k: _note("pid 7")),
+    )
+    wrote = []
+    monkeypatch.setattr(
+        plugin_mod, "embed_in_chd",
+        AsyncMock(side_effect=lambda *a, **k: wrote.append(a)),
+    )
+    monkeypatch.setattr(
+        plugin_mod, "extract_from_source", lambda _p: {"game_id": "SLUS-123"},
+    )
+
+    # The project logger does not propagate to caplog, so watch it directly.
+    errors: list[str] = []
+    monkeypatch.setattr(
+        plugin_mod.logger, "error",
+        lambda msg, *args, **kw: errors.append(str(msg) % args if args else str(msg)),
+    )
+
+    # Never raises: tagging is best-effort and must not fail the job.
+    await chdman.post_convert(str(chd), str(chd), "createcd")
+
+    assert not wrote, "must not write to a CHD an abandoned reader still holds"
+    assert errors and "still running" in errors[0], (
+        "the skip must be visible, not debug-only"
+    )

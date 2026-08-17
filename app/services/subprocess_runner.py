@@ -102,6 +102,42 @@ def collect_abandonment():
         _abandon_sink.reset(token)
 
 
+@contextlib.contextmanager
+def abandonment_checkpoint():
+    """Observe what *this step* abandoned, without hiding it from the caller.
+
+    ``collect_abandonment()`` shadows an enclosing sink, so a compound operation
+    cannot simply open one to make a mid-flight decision: the outer loop would
+    stop seeing the abandonment and its stop-walking policy would never fire.
+    This yields a list for the immediate decision and then forwards whatever it
+    caught to the enclosing sink, so both fire.
+
+    It exists because checking the sink only once, after a whole per-file
+    operation returns, is too late whenever that operation *acts* on an
+    intermediate result. Two cases in this codebase (issue #268):
+
+    * A size probe for the verify bound is abandoned, the resolver falls back to
+      the flat baseline, and the caller spawns the verifier anyway -- into
+      storage already proven unresponsive. The design rule "re-check the cancel
+      after resolving the bound, before spawning" applies to abandonment for the
+      same reason, and more so: the reward is a child that blocks immediately
+      and may outlive SIGKILL.
+    * ``chdman dumpmeta`` is abandoned and reports "no GAME tag", which is
+      indistinguishable from a genuinely untagged CHD -- so the caller writes a
+      tag to a file the abandoned reader still holds, or falls through to a
+      whole-disc sector read of the same dead mount.
+    """
+    outer = _abandon_sink.get()
+    sink: list[str] = []
+    token = _abandon_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _abandon_sink.reset(token)
+        if outer is not None:
+            outer.extend(sink)
+
+
 def _note_abandoned(detail: str) -> None:
     sink = _abandon_sink.get()
     if sink is not None:

@@ -23,6 +23,13 @@
   on the first one and says why: the metadata, disc-ID and DAT-match phases of a
   scan, the background match job, and `/dat/match-batch`. A single-file match
   reports it rather than answering with a silent "no match".
+- **A stuck read can no longer be mistaken for "this disc has no ID".** If
+  reading a CHD's GAME tag had to be abandoned, the answer came back identical to
+  a disc that genuinely has no tag — so the tagger wrote a new tag to a file the
+  stuck reader was still holding, and the scan fell through to reading the whole
+  disc from the same unresponsive share. Both now stop instead, and the skip is
+  reported rather than buried. A DAT match likewise no longer starts a full-disc
+  verify on a share that already failed to answer a simple size check.
 - **Reading CHD metadata can no longer hang a scan.** `chdman info` and the
   GAME/NAME tag helpers spawned their own processes and, after giving up on a
   stuck one, waited for it with no time limit — so a scan could stop partway

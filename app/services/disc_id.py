@@ -49,6 +49,8 @@ import zlib as _zlib
 from pathlib import Path
 from typing import Optional
 
+from services.subprocess_runner import abandonment_checkpoint
+
 logger = get_logger("disc_id")
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,17 @@ _MAX_CHD_HUNK_BYTES = 8 * 1024 * 1024
 _MAX_CHD_COMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_CHD_LZMA_DICT_BYTES = 16 * 1024 * 1024
 _MAX_DUMPMETA_BYTES = 1 * 1024 * 1024
+class DiscIdStorageAbandoned(RuntimeError):
+    """A chdman child for this CHD outlived SIGKILL and is still running.
+
+    Distinct from "no tag found" because the two demand opposite behaviour: the
+    latter invites a write, the former forbids touching the file at all. Raised
+    rather than folded into the ``None`` these helpers otherwise return, since
+    every caller acts on that ``None`` immediately -- before any enclosing
+    ``collect_abandonment()`` sink is inspected (issue #268).
+    """
+
+
 _DUMPMETA_TIMEOUT_SECONDS = 15
 
 
@@ -1175,7 +1188,20 @@ async def read_embedded_game_id(
     conversion-time embed idempotent: re-running it on an already-tagged CHD
     can be skipped instead of appending a duplicate GAME tag.
     """
-    raw = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
+    # An abandoned read must not read as "untagged". Callers use this to decide
+    # whether to *write* a tag, and `post_convert` does exactly that -- so a
+    # dumpmeta child that outlived SIGKILL would otherwise get an `addmeta`
+    # fired at the same CHD while it is still holding it (issue #268). Raise so
+    # the decision cannot be made on a value that does not mean what it says;
+    # the checkpoint still forwards to any enclosing sink so a walking caller
+    # stops as well.
+    with abandonment_checkpoint() as abandoned:
+        raw = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
+    if abandoned:
+        raise DiscIdStorageAbandoned(
+            f"reading the GAME tag of {chd_path} left {', '.join(abandoned)} "
+            "stuck on unresponsive storage; it is still running"
+        )
     if raw and raw.strip():
         return raw.strip()
     return None
@@ -1238,7 +1264,18 @@ async def ensure_disc_id_embedded(
     Returns None only when no disc ID could be found at all.
     """
     # --- Fast path: GAME tag already present ---------------------------------
-    existing = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
+    # Checked before the strategies below, which either write a tag or fall
+    # through to a whole-disc sector read -- both against the same storage, and
+    # the sector read goes to the default executor with no bound of its own. An
+    # abandoned tag read means "the storage stopped answering", never "this CHD
+    # has no GAME tag", so neither is safe to attempt (issue #268).
+    with abandonment_checkpoint() as abandoned:
+        existing = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
+    if abandoned:
+        raise DiscIdStorageAbandoned(
+            f"reading the GAME tag of {chd_path} left {', '.join(abandoned)} "
+            "stuck on unresponsive storage; it is still running"
+        )
     if existing and existing.strip():
         game_id = existing.strip()
         name_raw = await _dumpmeta_text(chd_path, TAG_NAME, chdman_path)
