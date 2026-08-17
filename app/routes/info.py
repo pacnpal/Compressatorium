@@ -27,6 +27,7 @@ from services.archive import ARCHIVE_EXTENSIONS
 from services.chd_metadata_store import chd_metadata_store
 from services.chdman import chdman_service
 from services.disc_id import (
+    DiscIdStorageAbandoned,
     ensure_disc_id_embedded as disc_id_ensure_embedded,
     extract_from_chd as disc_id_extract_from_chd,
 )
@@ -738,14 +739,26 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
         elif not await chd_metadata_store.is_disc_id_checked(path):
             # Not yet attempted, run the extractor and cache the outcome (even
             # "nothing found") so subsequent /api/info calls skip the subprocess.
+            # Caching the outcome is what makes later requests skip the
+            # subprocess -- including a "nothing found" outcome. That is right
+            # for a CHD the extractor actually inspected, and wrong for one it
+            # never got to look at: an abandoned chdman child is a fact about the
+            # storage, not the file, so marking it checked would suppress
+            # extraction for good after the share recovers, until the mtime
+            # changes (issue #268). Leave the cache untouched in that case.
+            cache_the_outcome = True
             try:
                 disc_info = await disc_id_extract_from_chd(path, settings.chdman_path) or {}
+            except DiscIdStorageAbandoned as e:
+                logger.error("disc_id extraction abandoned for %s: %s", path, e)
+                cache_the_outcome = False
             except Exception as e:
                 logger.debug("disc_id extraction failed for %s: %s", path, e)
-            await chd_metadata_store.update_disc_id_info(
-                path, disc_info.get("game_id"), disc_info.get("title")
-            )
-            await chd_metadata_store.mark_disc_id_checked(path)
+            if cache_the_outcome:
+                await chd_metadata_store.update_disc_id_info(
+                    path, disc_info.get("game_id"), disc_info.get("title")
+                )
+                await chd_metadata_store.mark_disc_id_checked(path)
 
         game_id = disc_info.get("game_id")
         # Only surface a distinct human-readable title; skip when it equals

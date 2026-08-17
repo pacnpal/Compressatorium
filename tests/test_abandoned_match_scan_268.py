@@ -570,3 +570,54 @@ async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
     assert errors and "still running" in errors[0], (
         "the skip must be visible, not debug-only"
     )
+
+
+@pytest.mark.asyncio
+async def test_abandoned_disc_id_read_stays_retryable(tmp_path, monkeypatch):
+    """A fact about the storage must not be cached as a fact about the file.
+
+    `/api/info` caches the extraction outcome -- including "nothing found" -- so
+    later requests skip the subprocess. Doing that for a CHD the extractor never
+    got to inspect would suppress extraction for good once the share recovers,
+    until the file's mtime changed.
+    """
+    from services.disc_id import DiscIdStorageAbandoned
+
+    marked: list[str] = []
+    updated: list[tuple] = []
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "get_disc_id_info",
+        AsyncMock(return_value=(None, None)),
+    )
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "is_disc_id_checked",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "mark_disc_id_checked",
+        AsyncMock(side_effect=marked.append),
+    )
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "update_disc_id_info",
+        AsyncMock(side_effect=lambda *a, **k: updated.append(a)),
+    )
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "is_stale", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        info_routes.chd_metadata_store, "get_full_info",
+        AsyncMock(return_value=({"raw_data": ""}, "cd")),
+    )
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "disc_id_extract_from_chd",
+        AsyncMock(side_effect=DiscIdStorageAbandoned("pid 5 still running")),
+    )
+
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"x")
+    await info_routes.get_chd_info(path=str(chd))
+
+    assert not marked, "an unexamined CHD must stay eligible for a retry"
+    assert not updated, "and nothing may be persisted about its disc ID"
