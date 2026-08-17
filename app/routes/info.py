@@ -1264,13 +1264,28 @@ def _sse_from_verify_stream(
         start = time.monotonic()
         bound = 0
 
-        def _expired() -> bool:
-            return bound > 0 and time.monotonic() - start >= bound
-
         async def run_verify():
-            try:
+            """Produce the verify events, under the bound, whoever is reading.
+
+            The deadline lives here rather than in the consuming loop below: a
+            client that stops draining suspends that loop at its `yield`, and a
+            deadline it cannot evaluate is no deadline at all -- the verifier
+            would run on with the verify lane held. Bounding the producer also
+            means the elapsed clock measures verification instead of SSE
+            delivery backpressure, and no terminal result can arrive after the
+            timeout has been reported, because the same task decides both.
+            """
+            async def _pump() -> None:
                 async for update in cfg.service().verify_stream(path):
                     await queue.put(update)
+
+            try:
+                if bound > 0:
+                    await asyncio.wait_for(_pump(), timeout=bound)
+                else:
+                    await _pump()
+            except asyncio.TimeoutError:
+                await queue.put({"type": "error", **_verify_timed_out(bound)})
             except Exception as exc:
                 await queue.put({"type": "error", "valid": False, "message": str(exc)})
             finally:
@@ -1298,31 +1313,9 @@ def _sse_from_verify_stream(
                     }
                     if done.is_set() and queue.empty():
                         break
-                    if _expired():
-                        yield {
-                            "event": "verify_error",
-                            "data": json.dumps(
-                                {"type": "error", **_verify_timed_out(bound)},
-                            ),
-                        }
-                        break
                     continue
 
                 if update.get("type") == "progress":
-                    # The expiry check lives on the *progress* branch, after a
-                    # terminal update has had its chance: a verifier that keeps
-                    # printing progress forever never reaches the heartbeat
-                    # branch above and is exactly the run this bounds, but a
-                    # verdict that lands in the same instant the bound expires is
-                    # a real answer and must not be thrown away as a timeout.
-                    if _expired():
-                        yield {
-                            "event": "verify_error",
-                            "data": json.dumps(
-                                {"type": "error", **_verify_timed_out(bound)},
-                            ),
-                        }
-                        break
                     yield {"event": "verify_progress", "data": json.dumps(update)}
                 elif update.get("type") == "complete":
                     if update.get("valid"):
@@ -1390,9 +1383,22 @@ def _sse_batch_from_verify_stream(
                 done = asyncio.Event()
                 final_result = {"valid": False, "message": "Unknown error"}
 
-                async def run_verify(path=path):
+                bound = await tool.verify_timeout(path)
+
+                async def run_verify(path=path, bound=bound):
+                    """Same producer-side bound as the single-file stream.
+
+                    A batch client that stops draining suspends the loop below,
+                    so a deadline evaluated there would stop being evaluated
+                    exactly when it matters. Here it holds regardless of the
+                    reader, the clock measures verification rather than delivery
+                    backpressure, and the terminal result cannot disagree with
+                    the timeout because one task produces both.
+                    """
                     nonlocal final_result
-                    try:
+
+                    async def _pump() -> None:
+                        nonlocal final_result
                         async for update in cfg.service().verify_stream(path):
                             # Record the terminal result before enqueueing so a
                             # consumer that breaks on the "complete"/"error"
@@ -1400,6 +1406,15 @@ def _sse_batch_from_verify_stream(
                             if update.get("type") in ("complete", "error"):
                                 final_result = update
                             await queue.put(update)
+
+                    try:
+                        if bound > 0:
+                            await asyncio.wait_for(_pump(), timeout=bound)
+                        else:
+                            await _pump()
+                    except asyncio.TimeoutError:
+                        final_result = _verify_timed_out(bound)
+                        await queue.put({"type": "error", **final_result})
                     except Exception as exc:
                         final_result = {
                             "type": "error",
@@ -1410,34 +1425,13 @@ def _sse_batch_from_verify_stream(
                     finally:
                         done.set()
 
-                bound = await tool.verify_timeout(path)
                 start = time.monotonic()
-
-                def _expired(start=start, bound=bound) -> bool:
-                    return bound > 0 and time.monotonic() - start >= bound
-
                 verify_task = asyncio.create_task(run_verify())
                 try:
-                    # The bound is applied on both arms below rather than at the
-                    # top of the loop: gating it on an empty queue (so a verdict
-                    # arriving at the same instant still wins) would let a
-                    # verifier that prints progress faster than this drains it
-                    # keep the queue non-empty and never expire at all.
                     while not done.is_set() or not queue.empty():
                         try:
                             update = await asyncio.wait_for(queue.get(), timeout=2)
                             if update.get("type") == "progress":
-                                if _expired():
-                                    # Same bound the job pipeline applies, per
-                                    # file: one wedged verify must not hold the
-                                    # batch (and the verify lane) open forever.
-                                    # Only when no verdict exists yet -- a
-                                    # backlogged queue can hold progress events
-                                    # from before a terminal one that already
-                                    # landed, and that answer is the real result.
-                                    if not done.is_set():
-                                        final_result = _verify_timed_out(bound)
-                                    break
                                 yield {
                                     "event": "verify_batch_file_progress",
                                     "data": json.dumps(
@@ -1453,10 +1447,6 @@ def _sse_batch_from_verify_stream(
                             elif update.get("type") in ("complete", "error"):
                                 break
                         except asyncio.TimeoutError:
-                            if _expired():
-                                if not done.is_set():
-                                    final_result = _verify_timed_out(bound)
-                                break
                             elapsed = int(time.monotonic() - start)
                             yield {
                                 "event": "verify_batch_file_progress",

@@ -528,7 +528,12 @@ Three pieces, none of them per-tool:
    generated verify routes (`register_verify_routes`: sync, SSE, batch SSE) are
    the *other* entry point into the same verifiers, and they hold the `verify`
    workload lane while they run — so they apply the same per-path bound, once,
-   in the shared factory rather than per tool. A route-level timeout reports the
+   in the shared factory rather than per tool. On the two SSE routes that bound
+   lives in the **producing task**, never in the consuming loop: a client that
+   stops draining suspends the consumer at its `yield`, and a deadline it cannot
+   evaluate is no deadline at all. Bounding the producer also makes the clock
+   measure verification instead of delivery backpressure, and makes a verdict
+   disagreeing with a timeout impossible — one task decides both. A route-level timeout reports the
    tool's own timeout shape (`{"valid": False, "message": "Verification timed
    out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
    the file is not known bad, the check just did not finish.

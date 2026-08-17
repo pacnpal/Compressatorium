@@ -717,15 +717,18 @@ def test_verify_paths_never_use_the_shared_threadpool():
 
 
 @pytest.mark.asyncio
-async def test_a_verdict_landing_at_the_bound_is_not_reported_as_a_timeout(
+async def test_a_verdict_within_the_bound_is_reported_not_timed_out(
     tmp_path, monkeypatch,
 ):
-    """The deadline must not discard an answer that already arrived.
+    """A verify that finishes inside its bound reports its verdict.
 
-    The expiry check ran before the dequeued update was classified, so a
-    `complete` landing in the same instant the bound expired was thrown away:
-    the route reported a timeout and skipped `mark_verified` for a file that had
-    just verified successfully.
+    This replaces an earlier test for a race the design has since removed. When
+    the deadline lived in the *consuming* loop, a `complete` already sitting in
+    the queue could be discarded by an expiry checked a moment later; the test
+    pinned that the verdict won. The deadline now lives in the producing task,
+    so one task decides both and that disagreement cannot arise — what is worth
+    pinning is the outcome: finish in time and your verdict stands, overrun and
+    you get a timeout with nothing recorded.
     """
     monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
     monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
@@ -736,26 +739,38 @@ async def test_a_verdict_landing_at_the_bound_is_not_reported_as_a_timeout(
     target = tmp_path / "game.wux"
     target.write_bytes(b"WUX0" + b"\0" * 1024)
 
-    service = Mock()
+    delay = 0.05
 
     async def _verify_stream(path, *, cancel_event=None):
-        # Outlive the bound, then answer: the verdict is real and must win.
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(delay)
         yield {"type": "complete", "valid": True, "message": "verified"}
 
+    service = Mock()
     service.verify_stream = _verify_stream
     monkeypatch.setattr(info_routes, "jwudtool_service", service)
 
-    async def _tiny_bound(_path):
-        return 0.1
+    async def _bound(_path):
+        return 1
 
-    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _bound)
 
     response = await info_routes.verify_jwud_events(path=str(target))
     events = [e async for e in response.body_iterator if isinstance(e, dict)]
 
     assert events[-1]["event"] == "verify_complete"
     store.mark_verified.assert_called_once_with(str(target))
+
+    # And the other side of the line: overrun the bound and the verdict never
+    # arrives, because the producer itself was stopped.
+    store.mark_verified.reset_mock()
+    delay = 5
+
+    response = await info_routes.verify_jwud_events(path=str(target))
+    events = [e async for e in response.body_iterator if isinstance(e, dict)]
+
+    assert events[-1]["event"] == "verify_error"
+    assert "timed out" in events[-1]["data"].lower()
+    store.mark_verified.assert_not_called()
 
 
 def test_cancel_reaches_a_detached_verify_read(tmp_path, monkeypatch):
@@ -1149,3 +1164,50 @@ async def _stuck_probes_are_capped(monkeypatch):
 
     # Slots come back once the calls actually return.
     runner_mod._probe_in_daemon_thread(lambda: 0)
+
+
+@pytest.mark.asyncio
+async def test_the_bound_holds_when_the_sse_client_stops_reading(tmp_path, monkeypatch):
+    """A stalled reader must not suspend the deadline along with the loop.
+
+    The consuming loop is suspended at its `yield` whenever the client stops
+    draining — so a deadline evaluated there stops being evaluated exactly when
+    it matters, and the verifier runs on holding the verify lane. The producer
+    task carries the bound now, so it fires with nobody reading.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "verification_store", Mock(mark_verified=AsyncMock()),
+    )
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    stopped = asyncio.Event()
+
+    async def _endless(path, *, cancel_event=None):
+        try:
+            while True:
+                yield {"type": "progress", "progress": 1, "message": "working"}
+                await asyncio.sleep(0.01)
+        finally:
+            # Reached when the producer's own deadline cancels the pump.
+            stopped.set()
+
+    service = Mock()
+    service.verify_stream = _endless
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.3
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    response = await info_routes.verify_jwud_events(path=str(target))
+    iterator = response.body_iterator.__aiter__()
+
+    # Read one event, then stop reading entirely — the loop is now parked at its
+    # yield and cannot check any clock.
+    await iterator.__anext__()
+    await asyncio.wait_for(stopped.wait(), timeout=5)
