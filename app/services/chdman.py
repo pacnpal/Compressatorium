@@ -161,7 +161,8 @@ class ChdmanService:
 
         if returncode != 0:
             raise RuntimeError(
-                stderr.decode(errors="replace").strip() or f"chdman info failed with code {returncode}",
+                stderr.decode(errors="replace").strip()
+                or f"chdman info failed with code {returncode}",
             )
 
         return self._parse_info(stdout.decode())
