@@ -223,6 +223,17 @@
   height: 900
   wait: 1800
   javascript: *js_theme_light
+# Laptop width sits in the 900-1279px band: two-column grid, volumes rail +
+# file list on top, convert/jobs panel stacked full-width below. Kept in the
+# set because this band had no coverage when its layout regressed (the
+# convert panel collapsed into the 220px rail column, unseen by the 1280px
+# and 768px shots).
+- url: http://127.0.0.1:8099/?s=docs-laptop-view#/workspace/chdman
+  output: docs/screenshots/docs-laptop-view.png
+  width: 1100
+  height: 900
+  wait: 1800
+  javascript: *js_theme_light
 - url: http://127.0.0.1:8099/?s=docs-tablet-view#/workspace/chdman
   output: docs/screenshots/docs-tablet-view.png
   width: 768
