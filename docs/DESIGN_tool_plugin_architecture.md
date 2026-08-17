@@ -503,7 +503,10 @@ Three pieces, none of them per-tool:
    the whole file, so its runtime scales with size and a flat number cannot
    serve both a 400 MB CIA and a 90 GB PS3 ISO. Streaming verifiers additionally
    get `COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT` (600s of no output at
-   all), which catches a wedge far sooner. Set the baseline to 0 to opt out.
+   all), which catches a wedge far sooner. The two are independent: zeroing the
+   overall baseline does not zero the stall bound, deliberately — an operator
+   who removes the overall bound for a huge image still wants a verifier that
+   has gone completely silent to be caught. Zero both for no bound at all.
 2. **`cancel_event` through the contract.** `ToolPlugin.verify()` /
    `verify_stream()` take it and `job_manager` passes the job's own event.
    Tools that spawn a child get cancellation from `run_verify` /

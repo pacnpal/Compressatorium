@@ -56,6 +56,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    verify_preflight,
 )
 
 # Compress takes the raw dump, decompress takes the compressed container.
@@ -627,20 +628,14 @@ class JwudToolService:
             "message": "Verification cancelled",
         }
 
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            file_size = os.path.getsize(file_path)
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if file_size == 0:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in JWUD_DECOMPRESS_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        # It also hands back the size the truncation check below compares against.
+        problem, file_size = await verify_preflight(
+            file_path, JWUD_DECOMPRESS_EXTENSIONS,
+        )
+        if problem is not None:
+            yield problem
             return
 
         try:

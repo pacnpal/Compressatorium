@@ -36,6 +36,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    verify_preflight,
 )
 
 # SubprocessRunner "owner" for the shared priority/timeout policy. An optional
@@ -305,20 +306,11 @@ class MaxcsoService:
         :meth:`SubprocessRunner.capture_verify`, which applies the size-scaled
         verify bound and honours ``cancel_event``.
         """
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            is_empty = os.path.getsize(file_path) == 0
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if is_empty:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in MAXCSO_DECOMPRESS_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(file_path, MAXCSO_DECOMPRESS_EXTENSIONS)
+        if problem is not None:
+            yield problem
             return
 
         # Throttle verify the same way conversions are: `maxcso --crc` fully

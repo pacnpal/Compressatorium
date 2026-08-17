@@ -1244,7 +1244,7 @@ def _sse_from_verify_stream(
         queue: asyncio.Queue = asyncio.Queue()
         done = asyncio.Event()
         start = time.monotonic()
-        bound = await tool.verify_timeout(path)
+        bound = 0
 
         def _expired() -> bool:
             return bound > 0 and time.monotonic() - start >= bound
@@ -1258,8 +1258,15 @@ def _sse_from_verify_stream(
             finally:
                 done.set()
 
-        verify_task = asyncio.create_task(run_verify())
+        # Everything after the token is acquired runs inside the try, including
+        # resolving the bound: that await is a filesystem probe, and a client
+        # disconnecting during it would otherwise unwind this generator with the
+        # verify lane's only token still held -- permanently, so every later
+        # verification would be refused as at-capacity.
+        verify_task = None
         try:
+            bound = await tool.verify_timeout(path)
+            verify_task = asyncio.create_task(run_verify())
             while True:
                 try:
                     update = await asyncio.wait_for(queue.get(), timeout=2)
@@ -1305,9 +1312,10 @@ def _sse_from_verify_stream(
                     yield {"event": "verify_error", "data": json.dumps(update)}
                     break
         finally:
-            verify_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await verify_task
+            if verify_task is not None:
+                verify_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await verify_task
             verify_token.release()
 
     return EventSourceResponse(event_generator())
@@ -1502,8 +1510,11 @@ def register_verify_routes(router_: APIRouter, tool: ToolPlugin) -> tuple:
     async def _verify(path: str = Query(..., description="Path to file to verify")) -> dict:
         await _guard_verify_path(path, tool, cfg)
         verify_token = await _acquire_verify_lane_or_429()
-        bound = await tool.verify_timeout(path)
+        bound = 0
         try:
+            # Inside the try, so a client that disconnects while this
+            # filesystem probe is pending cannot strand the verify lane's token.
+            bound = await tool.verify_timeout(path)
             result = await asyncio.wait_for(
                 cfg.service().verify(path), timeout=bound or None,
             )

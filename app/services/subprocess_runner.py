@@ -262,6 +262,49 @@ async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
         return verify_timeout(owner)
 
 
+async def verify_preflight(
+    path: str, extensions: frozenset[str] | set[str],
+) -> tuple[dict | None, int]:
+    """The missing / empty / wrong-extension gate every ``verify_stream`` opens with.
+
+    Returns ``(error_event_or_None, size_in_bytes)``: an event to yield and
+    return on, or ``None`` plus the size when the file is worth verifying.
+
+    Five services opened with the identical three checks, so they are written
+    once here — and, more to the point, the stat is **bounded**. These checks run
+    on the event loop before the verify's first real await, and ``getsize`` on an
+    unresponsive mount blocks in uninterruptible I/O: inline, that freezes every
+    task in the process, including the ``asyncio.wait_for`` that is supposed to
+    bound this very verify (the issue #263 failure mode, reached through the
+    verify path). Off the loop, an unresponsive mount fails this one verify.
+    """
+    try:
+        size = await _bounded_probe(os.path.getsize, path)
+    except asyncio.TimeoutError:
+        return {
+            "type": "error",
+            "valid": False,
+            "message": (
+                f"File stopped responding (no answer in {_STAT_TIMEOUT:.0f}s); "
+                "the volume may be offline"
+            ),
+        }, 0
+    except FileNotFoundError:
+        return {"type": "error", "valid": False, "message": "File not found"}, 0
+    except OSError as e:
+        return {
+            "type": "error", "valid": False, "message": f"Error reading file: {e}",
+        }, 0
+    if size == 0:
+        return {"type": "error", "valid": False, "message": "File is empty"}, 0
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in extensions:
+        return {
+            "type": "error", "valid": False, "message": f"Invalid extension: {ext}",
+        }, size
+    return None, size
+
+
 async def collect_verify(
     stream: AsyncGenerator[dict, None], *, fallback_message: str,
 ) -> dict:

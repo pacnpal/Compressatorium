@@ -773,7 +773,11 @@ class NszipTool(BaseTool):
   **before** spawning the child: an `await` between the spawn and the
   `try/finally` is a window where a cancelled SSE request (the verify routes
   cancel their task on client disconnect) unwinds your coroutine with the child
-  running and tracked, and nothing left to reap it.
+  running and tracked, and nothing left to reap it. Open with the shared
+  `verify_preflight(path, extensions)` rather than your own
+  `os.path.exists`/`getsize`: those run on the event loop before your first
+  await, and a stat that blocks on a dead mount there freezes every task in the
+  process — including the timeout meant to bound your verify.
 - Track PIDs so the debug heartbeat can report them.
 
 ### 5.4 Register the plugin: `app/services/tools/__init__.py`

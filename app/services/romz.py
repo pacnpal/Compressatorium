@@ -38,6 +38,7 @@ from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
+    verify_preflight,
 )
 from utils.junk import is_junk_path
 
@@ -548,20 +549,11 @@ class RomzService:
         shared :meth:`SubprocessRunner.capture_verify`, which applies the shared
         nice/ionice policy, the size-scaled verify bound, and ``cancel_event``.
         """
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            is_empty = os.path.getsize(file_path) == 0
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if is_empty:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in ROMZ_ARCHIVE_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(file_path, ROMZ_ARCHIVE_EXTENSIONS)
+        if problem is not None:
+            yield problem
             return
 
         # Verify only certifies this tool's own single-ROM archives. Routing is

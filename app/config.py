@@ -257,9 +257,12 @@ class Settings(BaseSettings):
     # i.e. a ~1.7 MB/s floor, capped at 24h): the point is that a verify wedged
     # on dead storage *ends*, not that a slow one is policed. Set
     # COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_PER_GIB=0 for a flat bound, or
-    # COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT=0 to disable the bound entirely
-    # (issue #266 -- it used to default to 0, so a verify that never returned
-    # never ended, freezing the whole queue behind it).
+    # COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT=0 to disable *this* bound (issue #266
+    # -- it used to default to 0, so a verify that never returned never ended,
+    # freezing the whole queue behind it). The stall bound below is a separate
+    # knob and stays on when this is zeroed, deliberately: an operator raising
+    # or removing the overall bound for a huge image still wants a verifier that
+    # has gone completely silent to be caught. Zero both for no bound at all.
     tool_verify_timeout: int = Field(
         default=1800,
         alias="COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT",
@@ -278,8 +281,10 @@ class Settings(BaseSettings):
     # Stall bound for verifiers that stream progress (chdman, dolphin-tool):
     # no output at all for this long means wedged, and it catches a hang far
     # sooner than the size-scaled overall bound above. Mirrors the conversion
-    # path's CHD_PROGRESS_TIMEOUT default. Named `tool_*` so per-tool overrides
-    # resolve through the same policy as every other knob here.
+    # path's CHD_PROGRESS_TIMEOUT default, and is independent of it in the same
+    # way -- zeroing the overall verify timeout does not zero this. Named
+    # `tool_*` so per-tool overrides resolve through the same policy as every
+    # other knob here.
     tool_verify_progress_timeout: int = Field(
         default=600,
         alias="COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT",

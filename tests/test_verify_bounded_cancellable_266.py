@@ -468,3 +468,181 @@ async def test_verify_route_applies_the_bound(tmp_path, monkeypatch):
     assert "timed out" in result["message"].lower()
     # A verify that never finished proves nothing, so nothing is recorded.
     store.mark_verified.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disconnecting_during_bound_resolution_frees_the_verify_lane(
+    tmp_path, monkeypatch,
+):
+    """The verify lane's token survives a client disconnect at any point.
+
+    The SSE generator takes the token, then resolves the bound (a filesystem
+    probe), then installs its cleanup. Resolving outside that cleanup meant a
+    disconnect landing on the probe leaked the token — permanently, with the
+    default one-slot lane, so every later verification was refused as
+    at-capacity.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    resolving = asyncio.Event()
+
+    async def _slow_bound(_path):
+        resolving.set()
+        await asyncio.sleep(30)
+        return 0
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _slow_bound)
+
+    limiter = info_routes.workload_limiter
+    before = limiter.in_use("verify")
+
+    response = await info_routes.verify_jwud_events(path=str(target))
+
+    async def _consume():
+        async for _event in response.body_iterator:
+            pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.wait_for(resolving.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert limiter.in_use("verify") == before
+
+
+@pytest.mark.asyncio
+async def test_verify_preflight_is_bounded_and_shared(tmp_path, monkeypatch):
+    """The missing/empty/extension gate every verify opens with runs off the loop.
+
+    These checks used to `os.path.exists`/`getsize` inline. On an unresponsive
+    mount that blocks the event loop itself, so the `wait_for` meant to bound the
+    verify never gets to fire — the bound is only as good as the first syscall.
+    """
+    from app.services import subprocess_runner as runner_mod
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"x" * 16)
+
+    # Fine: a real file passes the gate and reports its size.
+    problem, size = await runner_mod.verify_preflight(str(target), {".wux"})
+    assert problem is None and size == 16
+
+    # Missing / empty / wrong extension keep their existing verdicts.
+    missing, _ = await runner_mod.verify_preflight(str(tmp_path / "nope.wux"), {".wux"})
+    assert missing["message"] == "File not found"
+    (tmp_path / "empty.wux").write_bytes(b"")
+    empty, _ = await runner_mod.verify_preflight(str(tmp_path / "empty.wux"), {".wux"})
+    assert empty["message"] == "File is empty"
+    wrong, _ = await runner_mod.verify_preflight(str(target), {".chd"})
+    assert "extension" in wrong["message"]
+
+    # A stat that never answers gives up instead of blocking the loop forever.
+    def _never_returns(_path):
+        import time as _time
+
+        _time.sleep(30)
+
+    monkeypatch.setattr(runner_mod, "_STAT_TIMEOUT", 0.2)
+    monkeypatch.setattr(runner_mod.os.path, "getsize", _never_returns)
+    wedged, _ = await asyncio.wait_for(
+        runner_mod.verify_preflight(str(target), {".wux"}), timeout=10,
+    )
+    assert "stopped responding" in wedged["message"]
+
+
+class _StubStdin:
+    def write(self, _chunk: bytes) -> None:
+        return None
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class _HangingChild:
+    """Accepts the whole payload, then never finishes."""
+
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.stdin = _StubStdin()
+        self.stdout = None
+        self.stderr = None
+        self.returncode = None
+
+    async def communicate(self):
+        await asyncio.sleep(120)
+        return b"", b""
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = -15
+        return self.returncode
+
+
+def test_z3ds_disconnect_leaves_no_orphan_feeder(tmp_path, monkeypatch):
+    """Cancelling the z3ds verify tears down its stdin feeder too.
+
+    The feeder is a task of its own. Cancellation entering the wait's cleanup
+    used to stop only the cancel watcher, leaving the feeder reading the image
+    (or failing later against a closed stdin with nobody awaiting it) — one
+    orphan per disconnect.
+    """
+    asyncio.run(_z3ds_disconnect_leaves_no_orphan_feeder(tmp_path, monkeypatch))
+
+
+async def _z3ds_disconnect_leaves_no_orphan_feeder(tmp_path: Path, monkeypatch):
+    rom = tmp_path / "game.z3ds"
+    rom.write_bytes(b"Z3DS" + b"\0" * 65536)
+    child = _HangingChild()
+
+    async def _fake_exec(*_args, **_kwargs):
+        return child
+
+    async def _offset(_path):
+        return 0
+
+    monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
+    monkeypatch.setattr(z3ds_module.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        z3ds_module.z3ds_compress_service, "_get_verify_payload_offset", _offset,
+    )
+
+    service = z3ds_module.z3ds_compress_service
+
+    async def _drain():
+        async for _update in service.verify_stream(str(rom)):
+            pass
+
+    task = asyncio.create_task(_drain())
+    for _ in range(100):
+        if child.pid in set(service.active_pids()):
+            break
+        await asyncio.sleep(0.05)
+    assert child.pid in set(service.active_pids()), "verify did not start in time"
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    feeders = [
+        t for t in asyncio.all_tasks()
+        if "_stream_and_wait" in str(t.get_coro()) and not t.done()
+    ]
+    assert feeders == []
+    assert child.pid not in set(service.active_pids())

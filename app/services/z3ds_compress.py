@@ -17,6 +17,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     resolve_verify_timeout,
+    verify_preflight,
 )
 
 # Compress inputs (raw 3DS ROMs). The upstream fork
@@ -341,29 +342,11 @@ class Z3DSCompressService:
         to validate the ZStandard compression stream. This ensures the compressed
         data is not corrupted and can be successfully decompressed.
         """
-        if not os.path.exists(file_path):
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": "File not found"
-            }
-            return
-
-        if os.path.getsize(file_path) == 0:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": "File is empty"
-            }
-            return
-
-        ext = Path(file_path).suffix.lower()
-        if ext not in Z3DS_DECOMPRESS_EXTENSIONS:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Invalid extension: {ext}"
-            }
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(file_path, Z3DS_DECOMPRESS_EXTENSIONS)
+        if problem is not None:
+            yield problem
             return
 
         # Perform deep verification using zstd -t.
@@ -464,10 +447,19 @@ class Z3DSCompressService:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
-                    if cancel_wait is not None and not cancel_wait.done():
-                        cancel_wait.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await cancel_wait
+                    # Both helper tasks are torn down here, not just the cancel
+                    # watcher: if this generator is closed while the wait is
+                    # pending (the verify SSE route cancels its task on client
+                    # disconnect), the normal cleanup below never runs, and a
+                    # feeder left reading the image -- or failing later against
+                    # a closed stdin with nobody awaiting it -- accumulates one
+                    # orphan per disconnect. A task that already completed is
+                    # unaffected, so the success path still reads feed.result().
+                    for helper in (cancel_wait, feed):
+                        if helper is not None and not helper.done():
+                            helper.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await helper
 
                 if feed not in done:
                     # Cancelled or timed out: stop zstd, drain the feeder, and

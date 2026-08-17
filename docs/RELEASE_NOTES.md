@@ -44,13 +44,14 @@
   cancellable, for every tool:
   - The bound scales with the file, because verify reads all of it: 30 minutes
     plus 10 minutes per GiB, capped at 24 hours
-    (`COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` / `…_PER_GIB` / `…_CAP`; set the
-    first to `0` for the old unbounded behaviour). That is deliberately loose —
-    roughly a 1.7 MB/s floor — so a slow verify on tired storage still finishes;
-    the point is that a wedged one ends. Tools that stream progress (chdman,
-    Dolphin) also get a 10-minute no-output stall bound
+    (`COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` / `…_PER_GIB` / `…_CAP`). That is
+    deliberately loose — roughly a 1.7 MB/s floor — so a slow verify on tired
+    storage still finishes; the point is that a wedged one ends. Tools that
+    stream progress (chdman, Dolphin) also get a 10-minute no-output stall bound
     (`COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT`), which catches a hang much
-    sooner.
+    sooner. The two are independent knobs: setting the first to `0` switches off
+    the overall bound but leaves the stall bound running, so zero both for the
+    old fully unbounded behaviour.
   - Cancel terminates the verifier, and a cancelled verify is reported as a
     **cancelled job, not a failed verification** — it reached no verdict, so the
     source is never deleted on the strength of it.

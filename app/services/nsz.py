@@ -34,6 +34,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    verify_preflight,
 )
 from utils.junk import is_junk_entry
 
@@ -437,20 +438,11 @@ class NszService:
         nice/ionice -- forking a Python callable via ``preexec_fn`` in this
         multithreaded process can deadlock the child before ``exec``.
         """
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            is_empty = os.path.getsize(file_path) == 0
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if is_empty:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in NSZ_DECOMPRESS_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(file_path, NSZ_DECOMPRESS_EXTENSIONS)
+        if problem is not None:
+            yield problem
             return
         if not self.keys_available():
             yield {
