@@ -76,6 +76,24 @@ class DiscIdStorageAbandoned(RuntimeError):
     """
 
 
+def _abort_if_abandoned(abandoned: list, action: str, chd_path: str) -> None:
+    """Raise if ``action`` on ``chd_path`` left a chdman child running.
+
+    Called by the three capture helpers rather than by their callers, because
+    every one of them reduces the outcome to a bare ``None``/``False`` that means
+    "no such tag" or "nothing to delete" -- and there are a dozen call sites, each
+    of which answers that by reading or writing the same CHD again. Guarding the
+    callers one at a time is how you miss one; the ambiguity has to be impossible
+    at the point the value is produced (issue #268).
+    """
+    if abandoned:
+        raise DiscIdStorageAbandoned(
+            f"{action} on {chd_path} left {', '.join(abandoned)} stuck on "
+            "unresponsive storage; it is still running, so touching the file "
+            "again would race it"
+        )
+
+
 _DUMPMETA_TIMEOUT_SECONDS = 15
 
 
@@ -1188,20 +1206,10 @@ async def read_embedded_game_id(
     conversion-time embed idempotent: re-running it on an already-tagged CHD
     can be skipped instead of appending a duplicate GAME tag.
     """
-    # An abandoned read must not read as "untagged". Callers use this to decide
-    # whether to *write* a tag, and `post_convert` does exactly that -- so a
-    # dumpmeta child that outlived SIGKILL would otherwise get an `addmeta`
-    # fired at the same CHD while it is still holding it (issue #268). Raise so
-    # the decision cannot be made on a value that does not mean what it says;
-    # the checkpoint still forwards to any enclosing sink so a walking caller
-    # stops as well.
-    with abandonment_checkpoint() as abandoned:
-        raw = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
-    if abandoned:
-        raise DiscIdStorageAbandoned(
-            f"reading the GAME tag of {chd_path} left {', '.join(abandoned)} "
-            "stuck on unresponsive storage; it is still running"
-        )
+    # `_dumpmeta_text` raises DiscIdStorageAbandoned rather than returning the
+    # None that would read as "untagged" here -- which is what callers answer by
+    # *writing* a tag (issue #268).
+    raw = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
     if raw and raw.strip():
         return raw.strip()
     return None
@@ -1264,18 +1272,11 @@ async def ensure_disc_id_embedded(
     Returns None only when no disc ID could be found at all.
     """
     # --- Fast path: GAME tag already present ---------------------------------
-    # Checked before the strategies below, which either write a tag or fall
-    # through to a whole-disc sector read -- both against the same storage, and
-    # the sector read goes to the default executor with no bound of its own. An
-    # abandoned tag read means "the storage stopped answering", never "this CHD
-    # has no GAME tag", so neither is safe to attempt (issue #268).
-    with abandonment_checkpoint() as abandoned:
-        existing = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
-    if abandoned:
-        raise DiscIdStorageAbandoned(
-            f"reading the GAME tag of {chd_path} left {', '.join(abandoned)} "
-            "stuck on unresponsive storage; it is still running"
-        )
+    # `_dumpmeta_text` raises rather than reporting "no tag", so the strategies
+    # below -- which write a tag, or fall through to a whole-disc sector read on
+    # the default executor with no bound of its own -- are never reached against
+    # storage that has stopped answering (issue #268).
+    existing = await _dumpmeta_text(chd_path, TAG_GAME, chdman_path)
     if existing and existing.strip():
         game_id = existing.strip()
         name_raw = await _dumpmeta_text(chd_path, TAG_NAME, chdman_path)
@@ -1400,11 +1401,15 @@ async def _addmeta_text(
         )
         # Bounded like dumpmeta below; addmeta writes one small tag, so the
         # same 15s ceiling is generous. It previously had no bound at all.
-        returncode, _, stderr = await _chdman_runner().run_capture(
-            _chdman_cmd(chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value),
-            timeout=_DUMPMETA_TIMEOUT_SECONDS,
-            nice_via_wrapper=True,
-        )
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
+            )
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman addmeta", chd_path)
         if returncode != 0:
             logger.warning(
                 "disc_id: addmeta tag=%s failed (rc=%s): %s",
@@ -1415,6 +1420,8 @@ async def _addmeta_text(
             return False
         logger.debug("disc_id: addmeta tag=%s written successfully in %s", tag, chd_path)
         return True
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.warning("disc_id: addmeta tag=%s error: %s", tag, e)
         return False
@@ -1428,11 +1435,15 @@ async def _delmeta(chd_path: str, tag: str, chdman_path: str) -> bool:
     guarantee the tag is absent before a fresh addmeta writes the current value.
     """
     try:
-        returncode, _, stderr = await _chdman_runner().run_capture(
-            _chdman_cmd(chdman_path, "delmeta", "-i", chd_path, "-t", tag),
-            timeout=_DUMPMETA_TIMEOUT_SECONDS,
-            nice_via_wrapper=True,
-        )
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "delmeta", "-i", chd_path, "-t", tag),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
+            )
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman delmeta", chd_path)
         if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1445,6 +1456,8 @@ async def _delmeta(chd_path: str, tag: str, chdman_path: str) -> bool:
             return False
         logger.debug("disc_id: delmeta tag=%s removed from %s", tag, chd_path)
         return True
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.warning("disc_id: delmeta tag=%s error: %s", tag, e)
         return False
@@ -1475,11 +1488,15 @@ async def _dumpmeta_raw(
     tmp_path = tmp.name
     tmp.close()
     try:
-        returncode, _, stderr = await _chdman_runner().run_capture(
-            _chdman_cmd(chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path),
-            timeout=_DUMPMETA_TIMEOUT_SECONDS,
-            nice_via_wrapper=True,
-        )
+        with abandonment_checkpoint() as abandoned:
+            returncode, _, stderr = await _chdman_runner().run_capture(
+                _chdman_cmd(chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path),
+                timeout=_DUMPMETA_TIMEOUT_SECONDS,
+                nice_via_wrapper=True,
+            )
+        # Before the result is reduced to False/None below, which would read as
+        # "tag absent" / "nothing to delete" and invite the next read or write.
+        _abort_if_abandoned(abandoned, "chdman dumpmeta", chd_path)
         if returncode is None:
             # The shared teardown already bounded the kill; the old path killed
             # the child and then waited for it with no limit, which is what
@@ -1512,6 +1529,8 @@ async def _dumpmeta_raw(
             return None
         with open(tmp_path, "rb") as f:
             return f.read(_MAX_DUMPMETA_BYTES + 1)
+    except DiscIdStorageAbandoned:
+        raise
     except Exception as e:
         logger.debug("disc_id: dumpmeta tag=%s error: %s", tag, e)
         return None

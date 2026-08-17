@@ -489,21 +489,39 @@ async def test_reading_a_tag_that_was_abandoned_is_not_reported_as_untagged(
     read must therefore not come back as None.
     """
     from services import disc_id
+    from services.chdman import chdman_service
 
-    async def fake_dumpmeta(chd_path, tag, chdman_path):
+    # Patched *below* the guard, so the real _dumpmeta_text -> _dumpmeta_raw ->
+    # run_capture chain runs and the helper itself is what raises.
+    async def fake_capture(cmd, **kwargs):
         _note("pid 99")
+        return None, b"", b""
 
-    monkeypatch.setattr(disc_id, "_dumpmeta_text", fake_dumpmeta)
+    monkeypatch.setattr(chdman_service.runner, "run_capture", fake_capture)
     chd = tmp_path / "game.chd"
     chd.write_bytes(b"x")
 
+    # Every consumer of these helpers reduces the outcome to None/False and then
+    # reads or writes the same CHD again, so the guard lives in the helpers --
+    # not in the handful of callers someone remembered to patch.
     with pytest.raises(disc_id.DiscIdStorageAbandoned):
         await disc_id.read_embedded_game_id(str(chd), "chdman")
 
-    # ensure_disc_id_embedded guards the same read, before the strategies that
-    # write a tag or fall through to the unbounded sector read.
     with pytest.raises(disc_id.DiscIdStorageAbandoned):
         await disc_id.ensure_disc_id_embedded(str(chd), "chdman")
+
+    # The mutation chain: delmeta GAME then NAME, after which post_convert would
+    # embed regardless of either result.
+    with pytest.raises(disc_id.DiscIdStorageAbandoned):
+        await disc_id.clear_embedded_disc_id(str(chd), "chdman")
+
+    # And the /api/info path, which fell through to an unbounded sector read.
+    with pytest.raises(disc_id.DiscIdStorageAbandoned):
+        await disc_id.extract_from_chd(str(chd), "chdman")
+
+    # Writes are guarded too, so a retag cannot start against a held CHD.
+    with pytest.raises(disc_id.DiscIdStorageAbandoned):
+        await disc_id.embed_in_chd(str(chd), "SLUS-1", "T", "chdman")
 
 
 @pytest.mark.asyncio
@@ -513,7 +531,7 @@ async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
     The harm was `addmeta` landing on a CHD an abandoned reader still holds; the
     secondary harm was reporting that at debug, where nobody would find it.
     """
-    from services import disc_id
+    from services.chdman import chdman_service
     from services.tools import registry
 
     chd = tmp_path / "game.chd"
@@ -524,9 +542,11 @@ async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
     # latter would make every assertion below pass vacuously.
     plugin_mod = sys.modules[type(chdman).__module__]
 
-    monkeypatch.setattr(
-        disc_id, "_dumpmeta_text", AsyncMock(side_effect=lambda *a, **k: _note("pid 7")),
-    )
+    async def fake_capture(cmd, **kwargs):
+        _note("pid 7")
+        return None, b"", b""
+
+    monkeypatch.setattr(chdman_service.runner, "run_capture", fake_capture)
     wrote = []
     monkeypatch.setattr(
         plugin_mod, "embed_in_chd",
