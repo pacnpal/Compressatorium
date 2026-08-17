@@ -65,7 +65,8 @@
     on its own. Either way the job is reported as a
     **cancelled job, not a failed verification**: it reached no verdict, so the
     source is never deleted on the strength of it.
-  - A **Verify all** run now stops if one file's verifier cannot be stopped.
+  - A **Verify all** run now stops if one file's verifier cannot be stopped —
+    for any tool, and whether the stop was a cancel or a timeout.
     That only happens when storage has wedged a process past `SIGKILL`, and
     every remaining file in the batch is on that same storage — so continuing
     used to leave one unkillable verifier behind per file. The batch ends with

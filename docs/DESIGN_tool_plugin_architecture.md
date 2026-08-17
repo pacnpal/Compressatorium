@@ -544,7 +544,13 @@ Three pieces, none of them per-tool:
    stops draining suspends the consumer at its `yield`, and a deadline it cannot
    evaluate is no deadline at all. Bounding the producer also makes the clock
    measure verification instead of delivery backpressure, and makes a verdict
-   disagreeing with a timeout impossible — one task decides both. A route-level timeout reports the
+   disagreeing with a timeout impossible — one task decides both. The other half
+   of that independence is a **bounded** hand-off (`_offer_verify_update` over a
+   capped queue): a producer that no longer waits for the socket would otherwise
+   let a peer that stays connected without reading buffer events for the whole
+   of the bound. Progress is dropped under backpressure — it is a level, not a
+   log — while a terminal event always lands, making room by discarding progress
+   the verdict has just made stale. A route-level timeout reports the
    tool's own timeout shape (`{"valid": False, "message": "Verification timed
    out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
    the file is not known bad, the check just did not finish.
@@ -570,12 +576,17 @@ Three rules follow for any code that runs a verifier:
   left to reap it.
 - **Never record a verification result from a run that did not reach a
   verdict.** A verifier that outlived SIGKILL is one of those runs, and it is
-  worse than a failure: it is still holding the storage. Its terminal event
-  carries `abandoned: True` (through `collect_verify`, alongside `cancelled`),
-  and the batch route stops the walk on it rather than opening the next file
-  against the same mount and abandoning one more process per file. Issue #268
-  argues abandonment should be an exception rather than a flag; when that lands
-  this becomes a `raise` at the same point.
+  worse than a failure: it is still holding the storage. Every verify path
+  builds that terminal event from one place (`abandoned_verify_error`) and gives
+  it **precedence over the reason the stop was asked for** — a cancel or a
+  timeout that ends with an unkillable child is an abandonment first, because
+  the child is still running either way. The flag reaches callers through
+  `collect_verify` (alongside `cancelled`), and the batch route stops the walk
+  on it rather than opening the next file against the same mount and abandoning
+  one more process per file. The captured verifiers get there through
+  `run_capture`'s `on_abandoned` hook, since a `None` return code alone cannot
+  tell an abort from a failed ladder. Issue #268 argues abandonment should be an
+  exception rather than a flag; when that lands, it replaces exactly these.
 - **Every bound resolution takes the `cancel_event` too.** Sizing the file is a
   stat of the same storage the verify is about to read, and it happens *before*
   the verify that would observe a cancel — at the call site

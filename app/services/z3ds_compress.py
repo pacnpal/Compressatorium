@@ -12,6 +12,7 @@ from config import settings
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
+    abandoned_verify_error,
     collect_verify,
     ioprio_prefix,
     ReadCancelled,
@@ -524,6 +525,12 @@ class Z3DSCompressService:
                     feed.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await feed
+                    if reap_failed:
+                        # Outranks both branches below, as it does in the shared
+                        # runner: zstd outlived SIGKILL and is still holding the
+                        # image, whoever asked for the stop.
+                        yield abandoned_verify_error(process.pid)
+                        return
                     if cancel_event is not None and cancel_event.is_set():
                         yield {
                             "type": "error",

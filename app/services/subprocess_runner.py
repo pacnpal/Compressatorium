@@ -378,6 +378,12 @@ async def run_detached(
     or archive listing left the job (and the single-slot dispatcher behind it)
     on "Cancelling..." until the outer bound expired, possibly hours later.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        # Before taking a probe slot, not after: starting the call would write
+        # off a thread (and one of the process-wide slots) on a dead mount for a
+        # result nobody wants, and enough cancelled attempts that way would
+        # exhaust the ceiling and start failing path checks on healthy volumes.
+        raise ReadCancelled("Read cancelled")
     future = _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
     if cancel_event is None:
         return await future
@@ -459,6 +465,31 @@ async def verify_preflight(
             "type": "error", "valid": False, "message": f"Invalid extension: {ext}",
         }, size
     return None, size
+
+
+def abandoned_verify_error(pid: int) -> dict:
+    """The one terminal event for a verifier that outlived ``SIGKILL``.
+
+    Written once because every verify path can reach it -- the streaming loop's
+    cancel/timeout/stall ladder, its post-EOF grace, the captured one-shot
+    verifiers through ``run_capture``'s ``on_abandoned`` hook, and z3ds's
+    hand-rolled zstd loop -- and because it has to read the same wherever it
+    comes from. The ``abandoned`` flag is the part that matters: it outranks
+    "cancelled" and "timed out", because the child is still running and still
+    holding the storage, and a caller working through a list has to stop rather
+    than open the next file against it. Issue #268 argues abandonment should
+    *raise* rather than be a flag on an event; when that lands, this is what the
+    exception replaces.
+    """
+    return {
+        "type": "error",
+        "valid": False,
+        "abandoned": True,
+        "message": (
+            f"Verification did not exit and could not be killed (pid {pid}); "
+            "it is likely blocked on unresponsive storage."
+        ),
+    }
 
 
 async def collect_verify(
@@ -663,6 +694,7 @@ class SubprocessRunner:
         stderr_to_stdout: bool = False,
         nice_via_wrapper: bool = False,
         env: Mapping[str, str] | None = None,
+        on_abandoned: Callable[[int], None] | None = None,
     ) -> tuple[int | None, bytes, bytes]:
         """Run ``cmd`` to completion and capture ``(returncode, stdout, stderr)``.
 
@@ -684,6 +716,14 @@ class SubprocessRunner:
         Python callable in this multithreaded process can deadlock the child
         before ``exec``), the second forwards a private environment (nsz runs
         with its own keys home).
+
+        ``on_abandoned`` is called with the pid when the TERM/KILL ladder gives
+        up -- the child outlived ``SIGKILL`` and is still holding whatever it
+        was reading. Without it that fact is invisible here: an abandoned child
+        and a clean cancellation both come back as a ``None`` returncode, and a
+        caller working through a list would open the next file against the same
+        storage. Issue #268 replaces this hook with an exception from
+        ``run_capture`` itself.
         """
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
@@ -737,7 +777,8 @@ class SubprocessRunner:
                     await cancel_wait
             # exit_timeout=0: nothing is reading the child's output any more, so
             # go straight to signalling instead of waiting out a voluntary exit.
-            await self.reap(process, exit_timeout=0)
+            if not await self.reap(process, exit_timeout=0) and on_abandoned:
+                on_abandoned(process.pid)
             if not comm.done():
                 comm.cancel()
             # CancelledError is a BaseException, so it is NOT covered by
@@ -778,6 +819,7 @@ class SubprocessRunner:
             event["abandoned"] = True
         return event
 
+
     async def capture_verify(
         self,
         cmd: list[str],
@@ -804,6 +846,7 @@ class SubprocessRunner:
         timeout = await resolve_verify_timeout(
             path, self._owner, cancel_event=cancel_event,
         )
+        abandoned_pid: list[int] = []
         returncode, stdout, _ = await self.run_capture(
             cmd,
             timeout=timeout or None,
@@ -811,7 +854,14 @@ class SubprocessRunner:
             stderr_to_stdout=True,
             nice_via_wrapper=nice_via_wrapper,
             env=env,
+            on_abandoned=abandoned_pid.append,
         )
+        if abandoned_pid:
+            # Outranks both branches below: the child outlived SIGKILL, so it is
+            # still holding the storage whether the operator cancelled or the
+            # bound expired, and a caller walking a list has to stop.
+            yield abandoned_verify_error(abandoned_pid[0])
+            return
         if returncode == 0:
             yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
             yield {"type": "complete", "valid": True, "message": success_message}
@@ -923,6 +973,13 @@ class SubprocessRunner:
             else:
                 return False
             await _stop()
+            if reap_failed:
+                # Abandonment outranks whatever prompted the stop. The child is
+                # still running and still holding the storage, which is a
+                # bigger fact than "the operator cancelled" -- and the caller
+                # walking a list has to know to stop. Same precedence run()
+                # gives it.
+                terminal = abandoned_verify_error(process.pid)
             return True
 
         try:
@@ -981,20 +1038,7 @@ class SubprocessRunner:
                         )
                 if not stopped and not await self.reap(process, exit_timeout=0):
                     reap_failed = True
-                    # An abandoned child is reported as a terminal error event
-                    # here, matching run()'s message, flagged so a caller
-                    # working through a list stops instead of opening the next
-                    # file against storage that just proved it can wedge a
-                    # process past SIGKILL. Issue #268 argues an abandonment
-                    # should *raise* instead of being a flag on the event; when
-                    # that lands this is the single line to swap for the raising
-                    # variant of reap.
-                    terminal = self._verify_error(
-                        f"Verification did not exit and could not be killed "
-                        f"(pid {process.pid}); it is likely blocked on "
-                        "unresponsive storage.",
-                        abandoned=True,
-                    )
+                    terminal = abandoned_verify_error(process.pid)
 
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(

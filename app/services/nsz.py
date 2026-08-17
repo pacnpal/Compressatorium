@@ -25,7 +25,7 @@ from logging_setup import get_logger
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator, Mapping
 from pathlib import Path
 
 from config import settings
@@ -184,7 +184,7 @@ class NszService:
         return None
 
     @contextlib.contextmanager
-    def _keys_home(self, keys_file: str | None = None):
+    def _keys_home(self, keys_file: str | None = None) -> Iterator[Mapping[str, str]]:
         """Yield an env dict whose HOME exposes the keys at ~/.switch/prod.keys.
 
         nsz reads keys at import from ``$HOME/.switch/prod.keys``; we symlink the

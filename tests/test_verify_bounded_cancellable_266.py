@@ -1516,3 +1516,200 @@ async def _streaming_verify_races_sizing(tmp_path: Path, monkeypatch):
 
     assert result["cancelled"] is True
     assert elapsed < runner_mod._STAT_TIMEOUT / 2
+
+
+def test_abandonment_outranks_the_cancel_that_prompted_it(tmp_path, monkeypatch):
+    """Cancel a verifier that can't be killed, and the answer is "abandoned".
+
+    The cancel/timeout/stall ladder built its terminal event *before* running
+    the reap, so a child that outlived SIGKILL was reported as a clean
+    cancellation: `job_manager` recorded a tidy CANCELLED job and a batch opened
+    the next file, both while the verifier was still reading the storage.
+    """
+    asyncio.run(_abandonment_outranks_cancel(tmp_path, monkeypatch))
+
+
+async def _abandonment_outranks_cancel(tmp_path: Path, monkeypatch):
+    service = ChdmanService()
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "unkillable.py",
+        "print('Verifying, 1% complete')\nsys.stdout.flush()\ntime.sleep(60)\n",
+    )
+
+    # A child wedged in uninterruptible I/O cannot be simulated with a real
+    # process, so the ladder still runs (and really does clean up, so the test
+    # leaves nothing behind) but reports the failure it would report there.
+    real_reap = type(service._runner).reap
+
+    async def _reports_a_failed_ladder(self, process, *, exit_timeout=0):
+        await real_reap(self, process, exit_timeout=exit_timeout)
+        return False
+
+    monkeypatch.setattr(type(service._runner), "reap", _reports_a_failed_ladder)
+
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(
+        service.verify(str(tmp_path / "sample.chd"), cancel_event=cancel_event),
+    )
+    for _ in range(100):
+        if service.active_pids():
+            break
+        await asyncio.sleep(0.05)
+    assert service.active_pids(), "verify did not start in time"
+    cancel_event.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+
+    assert result["abandoned"] is True, result
+    assert result["valid"] is False
+    assert "could not be killed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_captured_verifier_reports_abandonment_too(monkeypatch):
+    """maxcso/nsz/romz share the streaming path's answer, not a bare timeout.
+
+    `run_capture` reports an abort and a failed reap identically (a `None`
+    return code), so without the hook a captured verifier that outlived SIGKILL
+    read as an ordinary timeout and the batch kept walking.
+    """
+    from app.services import subprocess_runner as runner_mod
+
+    runner = runner_mod.SubprocessRunner(owner="maxcso")
+
+    async def _fake_capture(cmd, **kwargs):
+        kwargs["on_abandoned"](4242)
+        return None, b"", b""
+
+    monkeypatch.setattr(runner, "run_capture", _fake_capture)
+
+    async def _bound(_path, _owner=None, *, cancel_event=None):
+        return 30
+
+    monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _bound)
+
+    events = [
+        event
+        async for event in runner.capture_verify(
+            ["/bin/true"],
+            path="/vol/game.cso",
+            success_message="ok",
+            start_message="Verifying...",
+        )
+    ]
+
+    assert events[-1]["abandoned"] is True, events
+    assert "4242" in events[-1]["message"]
+
+
+def test_a_stalled_reader_cannot_grow_the_verify_queue(tmp_path, monkeypatch):
+    """A peer that stays connected but stops reading must not cost memory.
+
+    Moving the deadline into the producer is what makes it enforceable, but it
+    also means the producer no longer waits for the socket: a chatty verifier
+    could queue events for the whole of its bound — hours — with nothing
+    bounding the buffer.
+    """
+    asyncio.run(_stalled_reader_bounded_queue(tmp_path, monkeypatch))
+
+
+async def _stalled_reader_bounded_queue(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "verification_store", Mock(mark_verified=AsyncMock()),
+    )
+    monkeypatch.setattr(info_routes, "_VERIFY_QUEUE_LIMIT", 8)
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    emitted = 0
+
+    async def _chatty(path, *, cancel_event=None):
+        nonlocal emitted
+        while True:
+            emitted += 1
+            yield {"type": "progress", "progress": 1, "message": f"tick {emitted}"}
+            await asyncio.sleep(0)
+
+    service = Mock()
+    service.verify_stream = _chatty
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _bound(_path):
+        return 30
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _bound)
+
+    queues: list[asyncio.Queue] = []
+    real_offer = info_routes._offer_verify_update
+
+    async def _recording_offer(queue, update):
+        if queue not in queues:
+            queues.append(queue)
+        await real_offer(queue, update)
+
+    monkeypatch.setattr(info_routes, "_offer_verify_update", _recording_offer)
+
+    response = await info_routes.verify_jwud_events(path=str(target))
+    iterator = response.body_iterator.__aiter__()
+    await iterator.__anext__()
+
+    # Read nothing more: the producer runs on with the consumer parked.
+    await asyncio.sleep(0.2)
+
+    assert emitted > 100, f"the producer did not outrun the reader ({emitted})"
+    assert queues, "the route did not go through the bounded offer"
+    assert all(q.qsize() <= 8 for q in queues), [q.qsize() for q in queues]
+    await response.body_iterator.aclose()
+
+
+def test_a_terminal_event_is_never_dropped_by_the_bounded_queue():
+    """Progress is droppable under backpressure; a verdict never is."""
+    asyncio.run(_terminal_survives_a_full_queue())
+
+
+async def _terminal_survives_a_full_queue():
+    queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+    for i in range(10):
+        await info_routes._offer_verify_update(
+            queue, {"type": "progress", "progress": i, "message": f"tick {i}"},
+        )
+    assert queue.qsize() == 4
+
+    verdict = {"type": "complete", "valid": True, "message": "ok"}
+    await asyncio.wait_for(
+        info_routes._offer_verify_update(queue, verdict), timeout=1,
+    )
+    drained = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert verdict in drained, drained
+
+
+def test_an_already_cancelled_read_takes_no_probe_slot(monkeypatch):
+    """Cancel first, then a detached read: don't burn a thread on the answer.
+
+    The awaiter returned promptly either way, but the thread was already
+    started and — on a dead mount — stays stuck holding one of the process-wide
+    probe slots, so repeated cancelled attempts could exhaust the ceiling and
+    start refusing path checks on healthy volumes.
+    """
+    asyncio.run(_cancelled_read_takes_no_slot(monkeypatch))
+
+
+async def _cancelled_read_takes_no_slot(monkeypatch):
+    from app.services import subprocess_runner as runner_mod
+
+    started: list[str] = []
+
+    def _should_not_run():
+        started.append("ran")
+        return 1
+
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    with pytest.raises(runner_mod.ReadCancelled):
+        await runner_mod.run_detached(_should_not_run, cancel_event=cancel_event)
+
+    assert started == [], "a cancelled read still started its thread"

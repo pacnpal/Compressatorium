@@ -92,6 +92,38 @@ def _verification_backpressure_detail() -> str:
     )
 
 
+# How many verify events may sit undelivered before progress starts being
+# dropped. The producer runs independently of the socket (that is what makes the
+# bound enforceable), so a peer that stays connected without reading would
+# otherwise let a chatty verifier queue events for the whole of its bound --
+# hours, at the default -- with nothing to stop the buffer growing.
+_VERIFY_QUEUE_LIMIT = 64
+
+
+async def _offer_verify_update(queue: asyncio.Queue, update: dict) -> None:
+    """Enqueue a verify event without ever blocking or growing without bound.
+
+    Progress events are a *level*, not a log: a reader that has fallen behind
+    needs the latest one, not every one it missed, so under backpressure the
+    newest is simply dropped. A terminal event is the opposite -- losing it
+    would leave the consumer waiting on a verdict that already happened -- so it
+    makes room by discarding buffered progress, which the verdict has just made
+    stale anyway. Neither path awaits, because the producer must not be
+    suspended by a peer that stopped reading; that is the whole reason the
+    deadline lives in the producer.
+    """
+    if update.get("type") == "progress":
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(update)
+        return
+    while queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:  # pragma: no cover - single producer
+            break
+    queue.put_nowait(update)
+
+
 async def _acquire_verify_lane_or_429() -> WorkloadToken:
     token = await workload_limiter.try_acquire("verify")
     if token is None:
@@ -1259,7 +1291,7 @@ def _sse_from_verify_stream(
             }
             return
 
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_VERIFY_QUEUE_LIMIT)
         done = asyncio.Event()
         start = time.monotonic()
         bound = 0
@@ -1277,7 +1309,7 @@ def _sse_from_verify_stream(
             """
             async def _pump() -> None:
                 async for update in cfg.service().verify_stream(path):
-                    await queue.put(update)
+                    await _offer_verify_update(queue, update)
 
             try:
                 if bound > 0:
@@ -1285,9 +1317,13 @@ def _sse_from_verify_stream(
                 else:
                     await _pump()
             except asyncio.TimeoutError:
-                await queue.put({"type": "error", **_verify_timed_out(bound)})
+                await _offer_verify_update(
+                    queue, {"type": "error", **_verify_timed_out(bound)},
+                )
             except Exception as exc:
-                await queue.put({"type": "error", "valid": False, "message": str(exc)})
+                await _offer_verify_update(
+                    queue, {"type": "error", "valid": False, "message": str(exc)},
+                )
             finally:
                 done.set()
 
@@ -1379,13 +1415,15 @@ def _sse_batch_from_verify_stream(
 
             try:
                 # Use the streaming verify to get progress updates
-                queue: asyncio.Queue = asyncio.Queue()
+                queue: asyncio.Queue = asyncio.Queue(maxsize=_VERIFY_QUEUE_LIMIT)
                 done = asyncio.Event()
                 final_result = {"valid": False, "message": "Unknown error"}
 
                 bound = await tool.verify_timeout(path)
 
-                async def run_verify(path=path, bound=bound, queue=queue, done=done):
+                async def run_verify(
+                    path=path, bound=bound, queue=queue, done=done,
+                ) -> None:
                     """Same producer-side bound as the single-file stream.
 
                     A batch client that stops draining suspends the loop below,
@@ -1405,7 +1443,7 @@ def _sse_batch_from_verify_stream(
                             # event can't cancel this task mid-update.
                             if update.get("type") in ("complete", "error"):
                                 final_result = update
-                            await queue.put(update)
+                            await _offer_verify_update(queue, update)
 
                     try:
                         if bound > 0:
@@ -1414,14 +1452,16 @@ def _sse_batch_from_verify_stream(
                             await _pump()
                     except asyncio.TimeoutError:
                         final_result = _verify_timed_out(bound)
-                        await queue.put({"type": "error", **final_result})
+                        await _offer_verify_update(
+                            queue, {"type": "error", **final_result},
+                        )
                     except Exception as exc:
                         final_result = {
                             "type": "error",
                             "valid": False,
                             "message": str(exc),
                         }
-                        await queue.put(final_result)
+                        await _offer_verify_update(queue, final_result)
                     finally:
                         done.set()
 
