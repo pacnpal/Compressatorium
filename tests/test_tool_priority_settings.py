@@ -20,7 +20,13 @@ def test_neutral_defaults_match_chdman_era_values():
     assert s.tool_ioprio_class == 2
     assert s.tool_ioprio_level == 6
     assert s.tool_info_timeout == 60
-    assert s.tool_verify_timeout == 0
+    # Verify is bounded out of the box (issue #266): a generous baseline plus a
+    # per-GiB allowance, capped. It used to default to 0 -- no bound at all --
+    # so a verify that never returned froze the whole queue behind it.
+    assert s.tool_verify_timeout == 1800
+    assert s.tool_verify_timeout_per_gib == 600
+    assert s.tool_verify_timeout_cap == 86400
+    assert s.tool_verify_progress_timeout == 600
     # Per-tool overrides are unset by default -> fall back to the shared values.
     assert s.chdman_nice is None
     assert s.dolphin_tool_nice is None

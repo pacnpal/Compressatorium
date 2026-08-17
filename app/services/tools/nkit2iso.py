@@ -32,6 +32,7 @@ from .spec import ModeKind, ModeSpec
 
 class Nkit2IsoTool(BaseTool):
     id = "nkit"
+    policy_owner = "nkit2iso"
     display_name = "NKit"
     modes = (
         ModeSpec(

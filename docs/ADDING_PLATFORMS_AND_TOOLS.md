@@ -219,7 +219,7 @@ A plugin subclasses `BaseTool` and provides:
 | `modes` | a tuple of `ModeSpec` rows |
 | `output_extensions`, `verify_extensions` | produced extensions and verify-accepted extensions. `output_extensions` drives the "output exists" badges **and** the registry-driven library scan / DAT-matching discovery (`registry.scannable_extensions()` = the union of output + verify), so list every extension your tool actually writes (including sidecars like CHDMAN's extractcd `.bin`). |
 | `convert(input_path, output_path, mode, *, compression=None, split=False, cancel_event=None)` | async generator yielding `{"progress": int, "message": str}`, raising `ConversionCancelled` when `cancel_event` fires. `split` is honored only by modes that declare it (makeps3iso's `-s` 4 GB FAT32 split); every other tool accepts and ignores it, exactly as it does a `compression` it doesn't use. |
-| `verify(path)` / `verify_stream(path)` | deep integrity check, one-shot and streaming. **Optional in practice**: a tool with no user-facing verify (makeps3iso) simply registers no verify route. |
+| `verify(path, *, cancel_event=None)` / `verify_stream(path, *, cancel_event=None)` | deep integrity check, one-shot and streaming. **Optional in practice**: a tool with no user-facing verify (makeps3iso) simply registers no verify route. Both must honor `cancel_event` and must be **bounded** — see §5.3's verify rules; `BaseTool.verify_timeout(path)` supplies the bound and needs no override. |
 | `info(path)` / `info_model(raw, path)` | metadata dict + the Pydantic model it maps to. `BaseTool._basic_info_fields(raw)` maps the shared `BasicFileInfo` keys (`file`, `size`, `size_display`, `format`, `extension`, `compressed`, `compression_type`) in one place — the five "what is this file" tools (z3ds, nsz, cso, romz, makeps3iso) build their model from it instead of re-typing the mapping. |
 | `output_path(mode, input_path, output_dir=None, *, treat_as_stem=False)` | compute the output path |
 | `accepts_directory(path)` | the directory analogue of `ext in input_extensions`. Default `False`; a tool with an `InputKind.DIRECTORY` mode overrides it to run its source-layout detector. May do disk I/O — it runs off the event loop. |
@@ -630,8 +630,12 @@ class NszipService:
         # 8. finally yield {"progress": 100, "message": "Compression complete"}
         ...
 
-    async def verify(self, path) -> dict: ...
-    async def verify_stream(self, path) -> AsyncGenerator[dict, None]: ...
+    # Verify: don't hand-roll the loop, the bound or the cancel handling.
+    # Streaming verifier  -> self._runner.run_verify(cmd, path=path, ...)
+    # One-shot verifier   -> self._runner.capture_verify(cmd, path=path, ...)
+    # verify() is always collect_verify(self.verify_stream(...), fallback_message=...)
+    async def verify(self, path, *, cancel_event=None) -> dict: ...
+    async def verify_stream(self, path, *, cancel_event=None) -> AsyncGenerator[dict, None]: ...
     def info(self, path) -> dict: ...
 
     def get_output_path(self, input_path, output_dir=None) -> str:
@@ -658,6 +662,11 @@ from .spec import ModeKind, ModeSpec
 
 class NszipTool(BaseTool):
     id = "nszip"
+    # The SubprocessRunner owner your service runs under, which keys the
+    # per-tool COMPRESSATORIUM_<OWNER>_* overrides (and the verify bound
+    # `BaseTool.verify_timeout` resolves). Equal to `id` unless your service's
+    # historical owner name differs (dolphin/dolphin_tool, cso/maxcso).
+    policy_owner = "nszip"
     display_name = "Switch"
     modes = (
         ModeSpec(
@@ -688,8 +697,11 @@ class NszipTool(BaseTool):
                                      compression=compression, split=split,
                                      cancel_event=cancel_event)
 
-    async def verify(self, path): return await self._service.verify(path)
-    def verify_stream(self, path): return self._service.verify_stream(path)
+    async def verify(self, path, *, cancel_event=None):
+        return await self._service.verify(path, cancel_event=cancel_event)
+
+    def verify_stream(self, path, *, cancel_event=None):
+        return self._service.verify_stream(path, cancel_event=cancel_event)
     async def info(self, path): return await run_in_threadpool(self._service.info, path)
     def info_model(self, raw, path): return NszipInfo(**self._basic_info_fields(raw))
     def active_pids(self): return self._service.active_pids()
@@ -741,10 +753,43 @@ class NszipTool(BaseTool):
     the runner precisely so all nine tools behave the same way.
 - Respect the shared priority policy via the `services.subprocess_runner`
   helpers (`ioprio_prefix(owner)`, `nice_prefix(owner)`, `apply_nice(owner)`,
-  `info_timeout(owner)`, `verify_timeout(owner)`). These read the tool-neutral
+  `info_timeout(owner)`, `verify_timeout(owner)`,
+  `resolve_verify_timeout(path, owner)`). These read the tool-neutral
   `COMPRESSATORIUM_TOOL_*` settings (with optional per-tool
   `COMPRESSATORIUM_<TOOL>_*` overrides) in one place, so you never re-read a
   chdman-named setting in your service.
+- **Verify must be bounded and cancellable** (issue #266), and neither is your
+  code to write. Route a streaming verifier through
+  `self._runner.run_verify(...)` and a one-shot one through
+  `self._runner.capture_verify(...)`: both apply the size-scaled verify bound
+  (`resolve_verify_timeout`), the no-output stall bound, `cancel_event`, and the
+  bounded `reap()` ladder. `verify()` itself is
+  `collect_verify(self.verify_stream(path, cancel_event=cancel_event), ...)`. A
+  verify with no subprocess at all (a pure-Python container walk) still takes
+  `cancel_event` and checks it between steps, and still ends within its bound —
+  `job_manager` applies `tool.verify_timeout(path, cancel_event=…)` around the
+  whole call (the event goes in because resolving the bound stats the file). A run
+  cut short by the event yields `{"cancelled": True, "valid": False}` so the job
+  is cancelled rather than recorded as a failed verification. Resolve any bound
+  **before** spawning the child: an `await` between the spawn and the
+  `try/finally` is a window where a cancelled SSE request (the verify routes
+  cancel their task on client disconnect) unwinds your coroutine with the child
+  running and tracked, and nothing left to reap it. Open with the shared
+  `verify_preflight(path, extensions)` rather than your own
+  `os.path.exists`/`getsize`: those run on the event loop before your first
+  await, and a stat that blocks on a dead mount there freezes every task in the
+  process — including the timeout meant to bound your verify. For the heavy
+  reads themselves use `run_detached(..., cancel_event=cancel_event)`, not
+  `run_in_threadpool` / `asyncio.to_thread`: a cancelled read abandons its
+  thread either way, a pooled one is capacity the whole process shares, and the
+  event is what frees the awaiter mid-read (catch `ReadCancelled` and yield your
+  `{"cancelled": True}` terminal event). Don't wrap the handle in a context
+  manager either — its exit awaits a close that a stuck read blocks, which is
+  just the unbounded wait again in the cleanup path.
+- **Spawn with `nice`/`ionice` command wrappers, not `preexec_fn`.** This
+  process is multithreaded, and forking a Python callable from it can deadlock
+  the child before `exec` — inside `create_subprocess_exec`, before the PID is
+  tracked and before any bound is installed.
 - Track PIDs so the debug heartbeat can report them.
 
 ### 5.4 Register the plugin: `app/services/tools/__init__.py`

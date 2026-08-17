@@ -34,10 +34,13 @@ from services.archive_members import read_archive_members
 from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
+    ReadCancelled,
     remove_partial_output,
     remove_partial_tree,
-    verify_timeout,
+    run_detached,
+    verify_preflight,
 )
 from utils.junk import is_junk_path
 
@@ -318,6 +321,10 @@ class RomzService:
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
+
     # ----- output paths -----------------------------------------------------
 
     @classmethod
@@ -543,36 +550,31 @@ class RomzService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Verify an archive by running ``7z t`` (tests every member's CRC).
 
         A clean (exit 0) run proves the archive decompresses intact, the analog
-        of maxcso ``--crc`` / nsz ``-V`` / z3ds ``zstd -t``.
+        of maxcso ``--crc`` / nsz ``-V`` / z3ds ``zstd -t``. The run is the
+        shared :meth:`SubprocessRunner.capture_verify`, which applies the shared
+        nice/ionice policy, the size-scaled verify bound, and ``cancel_event``.
         """
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            is_empty = os.path.getsize(file_path) == 0
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if is_empty:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in ROMZ_ARCHIVE_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(
+            file_path, ROMZ_ARCHIVE_EXTENSIONS, cancel_event=cancel_event,
+        )
+        if problem is not None:
+            yield problem
             return
 
         # Verify only certifies this tool's own single-ROM archives. Routing is
@@ -581,8 +583,21 @@ class RomzService:
         # applies the shared archive size/entry/path limits before testing.
         # Off the event loop: listing a large/NAS-backed archive must not stall
         # the sync, SSE, and batch verify routes that consume this on the loop.
+        # Detached rather than pooled: a listing wedged on a dead mount cannot be
+        # stopped, only abandoned, and abandoning a *shared* worker per cancelled
+        # request would eventually starve every offload in the process.
         try:
-            await asyncio.to_thread(self._single_rom_member, file_path)
+            await run_detached(
+                self._single_rom_member, file_path, cancel_event=cancel_event,
+            )
+        except ReadCancelled:
+            yield {
+                "type": "error",
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
+            return
         except ValueError as exc:
             yield {"type": "error", "valid": False, "message": str(exc)}
             return
@@ -590,33 +605,14 @@ class RomzService:
             yield {"type": "error", "valid": False, "message": f"Cannot read archive: {exc}"}
             return
 
-        yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
-        # run_capture applies the shared nice/ionice policy and honors the
-        # verify timeout (0 disables); a heavy `7z t` is throttled like a convert.
         # `--` keeps an archive name beginning with `-` a positional filename.
-        timeout = verify_timeout(_OWNER)
-        returncode, stdout, _ = await self._runner.run_capture(
+        async for update in self._runner.capture_verify(
             [self.sevenzip_path, "t", "--", file_path],
-            timeout=timeout or None,
-            stderr_to_stdout=True,
-        )
-        output = (stdout or b"").decode("utf-8", errors="replace").strip()
-        if returncode == 0:
-            yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
-            yield {"type": "complete", "valid": True, "message": "File verified successfully"}
-        elif returncode is None:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Verification timed out after {timeout}s",
-            }
-        else:
-            tail = "\n".join(output.splitlines()[-5:]) if output else "verification failed"
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Integrity check failed: {tail}",
-            }
+            path=file_path,
+            success_message="File verified successfully",
+            cancel_event=cancel_event,
+        ):
+            yield update
 
 
 # Global service instance

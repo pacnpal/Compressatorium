@@ -77,8 +77,9 @@ def test_verify_dispatch_matches_legacy_ladder(mode, monkeypatch):
     called: dict[str, str] = {}
 
     def _record(tool_id):
-        async def _verify(path):
+        async def _verify(path, *, cancel_event=None):
             called["id"] = tool_id
+            called["cancel_event"] = cancel_event
             return {"valid": True, "message": "ok"}
 
         return _verify
@@ -88,10 +89,14 @@ def test_verify_dispatch_matches_legacy_ladder(mode, monkeypatch):
         if hasattr(service, "verify"):
             monkeypatch.setattr(service, "verify", _record(tool_id))
 
-    result = asyncio.run(registry.for_mode(mode).verify("/data/out"))
+    event = asyncio.Event()
+    result = asyncio.run(registry.for_mode(mode).verify("/data/out", cancel_event=event))
 
     assert result == {"valid": True, "message": "ok"}
     assert called["id"] == _legacy_dispatch_id(mode)
+    # The cancel event must survive the dispatch, or pressing Cancel during the
+    # delete-on-verify verify stage would go unobserved (issue #266).
+    assert called["cancel_event"] is event
 
 
 @pytest.mark.parametrize("mode", CONVERSION_MODES)
@@ -140,7 +145,7 @@ def test_chain_verify_delegates_to_final_step_tool(monkeypatch):
     """cso_to_chd verifies the final .chd via the verify_step tool (chdman)."""
     called: dict[str, str] = {}
 
-    async def _verify(path):
+    async def _verify(path, *, cancel_event=None):
         called["id"] = "chdman"
         return {"valid": True, "message": "ok"}
 

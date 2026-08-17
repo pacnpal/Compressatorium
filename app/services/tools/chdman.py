@@ -108,6 +108,7 @@ def _build_modes() -> list[ModeSpec]:
 
 class ChdmanTool(BaseTool):
     id = "chdman"
+    policy_owner = "chdman"
     display_name = "CHDMAN"
     modes = _build_modes()
     # All extensions chdman produces: .chd from create/copy, plus the extract
@@ -227,11 +228,15 @@ class ChdmanTool(BaseTool):
         except Exception as exc:  # best effort; tagging never fails the job
             logger.debug("Disc ID embed skipped for %s: %s", output_path, exc)
 
-    async def verify(self, path: str) -> dict:
-        return await self._service.verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._service.verify(path, cancel_event=cancel_event)
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._service.verify_stream(path)
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        return self._service.verify_stream(path, cancel_event=cancel_event)
 
     async def info(self, path: str) -> dict:
         return await self._service.info(path)

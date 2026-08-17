@@ -8,15 +8,18 @@ import struct
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-import aiofiles
 from config import settings
-from fastapi.concurrency import run_in_threadpool
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
+    abandoned_verify_error,
+    collect_verify,
     ioprio_prefix,
+    ReadCancelled,
     remove_partial_output,
-    verify_timeout,
+    resolve_verify_timeout,
+    run_detached,
+    verify_preflight,
 )
 
 # Compress inputs (raw 3DS ROMs). The upstream fork
@@ -90,9 +93,21 @@ class Z3DSCompressService:
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
+
     @staticmethod
-    async def _get_verify_payload_offset(file_path: str) -> int:
-        """Return the byte offset where the seekable zstd payload begins."""
+    async def _get_verify_payload_offset(
+        file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        """Return the byte offset where the seekable zstd payload begins.
+
+        Read on a detached thread rather than a pooled one: on an unresponsive
+        mount this open/read cannot be stopped, only abandoned, and abandoning a
+        *shared* worker for every cancelled verify would eventually starve the
+        pool the rest of the app offloads to.
+        """
 
         def _read_offset() -> int:
             with open(file_path, "rb") as fh:
@@ -123,7 +138,7 @@ class Z3DSCompressService:
                 raise ValueError("Invalid Z3DS file: payload offset is out of range")
             return payload_offset
 
-        return await run_in_threadpool(_read_offset)
+        return await run_detached(_read_offset, cancel_event=cancel_event)
 
     def get_output_path(self, input_path: str, output_dir: str | None = None) -> str:
         """Calculate output path for a 3DS file.
@@ -315,7 +330,9 @@ class Z3DSCompressService:
         return str(input_p.parent / filename)
 
 
-    async def verify(self, file_path: str) -> dict:
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Verify the integrity of a compressed 3DS file.
 
         Performs deep verification by streaming the compressed Z3DS/ZCCI/ZCIA file
@@ -324,45 +341,27 @@ class Z3DSCompressService:
         Returns:
             dict: {"valid": bool, "message": str}
         """
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Stream verification progress for a compressed 3DS file.
 
         Performs deep integrity verification by piping the file through `zstd -t`
         to validate the ZStandard compression stream. This ensures the compressed
         data is not corrupted and can be successfully decompressed.
         """
-        if not os.path.exists(file_path):
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": "File not found"
-            }
-            return
-
-        if os.path.getsize(file_path) == 0:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": "File is empty"
-            }
-            return
-
-        ext = Path(file_path).suffix.lower()
-        if ext not in Z3DS_DECOMPRESS_EXTENSIONS:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Invalid extension: {ext}"
-            }
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        problem, _size = await verify_preflight(
+            file_path, Z3DS_DECOMPRESS_EXTENSIONS, cancel_event=cancel_event,
+        )
+        if problem is not None:
+            yield problem
             return
 
         # Perform deep verification using zstd -t.
@@ -379,7 +378,32 @@ class Z3DSCompressService:
                 }
                 return
 
-            payload_offset = await self._get_verify_payload_offset(file_path)
+            payload_offset = await self._get_verify_payload_offset(
+                file_path, cancel_event=cancel_event,
+            )
+
+            # Size-scaled bound, resolved from the file actually being read, so
+            # this verify ends even if zstd never does (issue #266). Resolved
+            # *before* the spawn: it stats the file, and an await between the
+            # spawn and the try/finally below is a window where a cancellation
+            # (the verify SSE route cancels its task on client disconnect)
+            # unwinds this generator with zstd already running and tracked, but
+            # with nothing to reap or untrack it.
+            overall_timeout = await resolve_verify_timeout(
+                file_path, "z3ds", cancel_event=cancel_event,
+            )
+
+            if cancel_event is not None and cancel_event.is_set():
+                # Re-checked after the bound: resolving it can take the full
+                # probe bound on storage that stopped answering, and spawning
+                # into that risks a child that blocks and outlives SIGKILL.
+                yield {
+                    "type": "error",
+                    "valid": False,
+                    "cancelled": True,
+                    "message": "Verification cancelled",
+                }
+                return
 
             # Start zstd -t process reading from stdin
             process = await asyncio.create_subprocess_exec(
@@ -390,8 +414,11 @@ class Z3DSCompressService:
                 stderr=asyncio.subprocess.PIPE,
             )
             self._runner.track_pid(process.pid)
-            overall_timeout = verify_timeout("z3ds")
 
+            # Set once the TERM -> KILL ladder has run and given up; repeating
+            # it on a child that survived SIGKILL only burns another 15s of the
+            # verify lane for no possible new outcome.
+            reap_failed = False
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
 
@@ -399,7 +426,7 @@ class Z3DSCompressService:
                 # in one coroutine so an overall verify timeout can bound the
                 # whole feed-and-test cycle, not just the final wait.
                 async def _stream_and_wait():
-                    chunk_size = 1024 * 1024  # 1MB chunks
+                    chunk_size = 4 * 1024 * 1024  # 4MB per detached read
                     try:
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
@@ -408,11 +435,42 @@ class Z3DSCompressService:
                                 payload_offset,
                             )
 
-                        async with aiofiles.open(file_path, "rb") as f:
-                            await f.seek(payload_offset)
+                        # Plain file object read through the shared detached
+                        # seam, deliberately *not* an async file context (this
+                        # replaced the aiofiles one, the app's last user of it):
+                        # on an unresponsive volume the read can only be
+                        # abandoned, and a context manager's exit would then
+                        # await a close that waits on the very lock the stuck
+                        # read holds -- turning the cleanup below into another
+                        # unbounded wait. So the handle is closed only on the
+                        # paths that got that far, and simply abandoned (with
+                        # its thread) otherwise.
+                        def _open_payload():
+                            handle = open(file_path, "rb")  # noqa: SIM115
+                            handle.seek(payload_offset)
+                            return handle
 
+                        f = await run_detached(_open_payload, cancel_event=cancel_event)
+                        abandoned = False
+                        try:
                             while True:
-                                chunk = await f.read(chunk_size)
+                                if cancel_event is not None and cancel_event.is_set():
+                                    # Stop feeding immediately; the waiter below
+                                    # reports the cancel and the finally reaps
+                                    # zstd. One chunk of latency at most.
+                                    # Not `abandoned`: this break happens
+                                    # *between* reads, so no thread holds the
+                                    # handle and closing it is safe and bounded.
+                                    # Only a read still in flight makes close
+                                    # itself a wait we cannot afford.
+                                    break
+                                try:
+                                    chunk = await run_detached(
+                                        f.read, chunk_size, cancel_event=cancel_event,
+                                    )
+                                except ReadCancelled:
+                                    abandoned = True
+                                    break
                                 if not chunk:
                                     break
                                 try:
@@ -423,6 +481,19 @@ class Z3DSCompressService:
                                 except BrokenPipeError:
                                     # zstd closed stdin early due to integrity failure.
                                     break
+                        except (asyncio.CancelledError, GeneratorExit):
+                            # The feeder task itself was cancelled (SSE
+                            # disconnect, timeout, the cancel race below). Same
+                            # rule as ReadCancelled: a read may still hold the
+                            # handle's lock, so closing it here would block
+                            # behind that read and turn cleanup into one more
+                            # unbounded wait. Abandon it with its thread.
+                            abandoned = True
+                            raise
+                        finally:
+                            if not abandoned:
+                                with contextlib.suppress(Exception):
+                                    await run_detached(f.close)
 
                         if process.stdin is not None:
                             process.stdin.close()
@@ -435,21 +506,67 @@ class Z3DSCompressService:
                     # Wait for process to finish
                     return await process.communicate()
 
+                # This tool feeds the child on stdin, so it cannot use the shared
+                # capture_verify; it races the same three outcomes by hand.
+                feed = asyncio.ensure_future(_stream_and_wait())
+                cancel_wait = (
+                    asyncio.ensure_future(cancel_event.wait())
+                    if cancel_event is not None
+                    else None
+                )
                 try:
-                    if overall_timeout > 0:
-                        _stdout, stderr = await asyncio.wait_for(
-                            _stream_and_wait(), timeout=overall_timeout,
-                        )
+                    done, _pending = await asyncio.wait(
+                        [feed] + ([cancel_wait] if cancel_wait is not None else []),
+                        timeout=overall_timeout or None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    # Both helper tasks are torn down here, not just the cancel
+                    # watcher: if this generator is closed while the wait is
+                    # pending (the verify SSE route cancels its task on client
+                    # disconnect), the normal cleanup below never runs, and a
+                    # feeder left reading the image -- or failing later against
+                    # a closed stdin with nobody awaiting it -- accumulates one
+                    # orphan per disconnect. A task that already completed is
+                    # unaffected, so the success path still reads feed.result().
+                    for helper in (cancel_wait, feed):
+                        if helper is not None and not helper.done():
+                            helper.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await helper
+
+                if feed not in done:
+                    # Cancelled or timed out: stop zstd, drain the feeder, and
+                    # report which one it was. Remember whether the ladder gave
+                    # up, so the finally below doesn't spend another TERM/KILL
+                    # cycle on a child already known to be unkillable.
+                    if not await self._runner.reap(process, exit_timeout=0):
+                        reap_failed = True
+                    feed.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await feed
+                    if reap_failed:
+                        # Outranks both branches below, as it does in the shared
+                        # runner: zstd outlived SIGKILL and is still holding the
+                        # image, whoever asked for the stop.
+                        yield abandoned_verify_error(process.pid)
+                        return
+                    if cancel_event is not None and cancel_event.is_set():
+                        yield {
+                            "type": "error",
+                            "valid": False,
+                            "cancelled": True,
+                            "message": "Verification cancelled",
+                        }
                     else:
-                        _stdout, stderr = await _stream_and_wait()
-                except asyncio.TimeoutError:
-                    # Process is killed in the finally block below.
-                    yield {
-                        "type": "error",
-                        "valid": False,
-                        "message": f"Verification timed out after {overall_timeout}s",
-                    }
+                        yield {
+                            "type": "error",
+                            "valid": False,
+                            "message": f"Verification timed out after {overall_timeout}s",
+                        }
                     return
+
+                _stdout, stderr = feed.result()
 
                 if process.returncode == 0:
                     yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
@@ -466,13 +583,23 @@ class Z3DSCompressService:
                         "message": f"Integrity check failed: {stderr_text}"
                     }
             finally:
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
+                # Bounded TERM -> KILL ladder rather than kill()+wait(): a child
+                # blocked in uninterruptible I/O never answers either, and an
+                # unbounded wait here would hold the queue's only slot forever.
+                # Skipped when that ladder already exhausted itself above.
+                if not reap_failed:
+                    await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
 
+        except ReadCancelled:
+            # Cancelled while reading the header: no verdict, so report the
+            # cancellation rather than a verification error.
+            yield {
+                "type": "error",
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         except Exception as e:
             logger.exception("Error during 3DS verification: %s", e)
             yield {

@@ -202,8 +202,25 @@ class ToolPlugin(Protocol):
                 compression: str | None = None,
                 cancel_event: asyncio.Event | None = None) -> AsyncGenerator[dict, None]: ...
 
-    async def verify(self, path: str) -> dict: ...                  # {"valid","message"}
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]: ...
+    # Verify is bounded and cancellable on the same terms as convert (issue
+    # #266): cancel_event is the job's own event, so Cancel stops the verifier
+    # instead of being observed only after it finishes; a run cut short by it
+    # returns {"valid": False, "cancelled": True} — it reached no verdict, so no
+    # caller may record it as a verification failure or delete a source on it.
+    async def verify(self, path: str, *,                             # {"valid","message"}
+                     cancel_event: asyncio.Event | None = None) -> dict: ...
+    def verify_stream(self, path: str, *,
+                      cancel_event: asyncio.Event | None = None
+                      ) -> AsyncGenerator[dict, None]: ...
+    # Wall-clock bound for verifying this path (0 = unbounded). Default:
+    # BaseTool resolves the shared size-scaled policy for `policy_owner`, so a
+    # per-tool COMPRESSATORIUM_<OWNER>_VERIFY_TIMEOUT applies. Exposed so
+    # job_manager can bound the whole verify() call — including a tool whose
+    # verify spawns nothing (jwud's container walk, makeps3iso's PARAM.SFO
+    # readback) — without re-deriving which knob that tool reads.
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int: ...
     async def info(self, path: str) -> dict: ...                    # raw dict
     def info_model(self, raw: dict, path: str) -> BaseModel: ...    # typed model for the API
     # The five simple "what is this file" models (z3ds/nsz/cso/romz/makeps3iso)
@@ -264,7 +281,12 @@ class BaseTool:
 
     def __init__(self, binary_path: str):
         self.binary_path = binary_path
-        self._runner = SubprocessRunner(owner=self.id)
+        # `policy_owner or id`, never bare `id`: the owner keys the shared
+        # nice/ioprio/timeout policy's per-tool overrides, and it differs from
+        # the plugin id wherever the service kept its historical name
+        # (dolphin/dolphin_tool, cso/maxcso). In the tree today each *service*
+        # constructs its own runner with that owner as a literal.
+        self._runner = SubprocessRunner(owner=self.policy_owner or self.id)
 
     # derived sets (no per-tool duplication)
     @property
@@ -277,13 +299,27 @@ class BaseTool:
                 return m
         raise KeyError(mode)
 
-    # default verify() wraps verify_stream(), identical in all 3 services today
-    async def verify(self, path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for u in self.verify_stream(path):
-            if u.get("type") in ("complete", "error"):
-                final = u
-        return {"valid": bool(final.get("valid")), "message": final.get("message") or "Verification failed"}
+    # The SubprocessRunner "owner" this tool's service runs under, which keys
+    # the shared nice/ioprio/timeout policy's per-tool overrides. NOT always
+    # `id`: the plugin id is the routing/UI name ("dolphin", "cso") while the
+    # owner is the historical service name ("dolphin_tool", "maxcso").
+    policy_owner: str | None = None
+
+    # Default: the shared size-scaled verify bound for this tool's owner.
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        return await resolve_verify_timeout(
+            path, self.policy_owner, cancel_event=cancel_event,
+        )
+
+    # verify() is the same drain-verify_stream()-and-keep-the-terminal-event
+    # wrapper in every service, so it lives once in subprocess_runner as the
+    # shared `collect_verify(stream, fallback_message=...)` (it also carries the
+    # "cancelled" flag through to the result).
+    async def verify(self, path, *, cancel_event=None) -> dict:
+        return await collect_verify(self.verify_stream(path, cancel_event=cancel_event),
+                                    fallback_message="Verification failed")
 
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
@@ -384,7 +420,8 @@ class SubprocessRunner:
         """
 
     async def run_capture(self, cmd: list[str], *, timeout=None,
-                          cancel_event=None, stderr_to_stdout=False
+                          cancel_event=None, stderr_to_stdout=False,
+                          nice_via_wrapper=False, env=None
                           ) -> tuple[int | None, bytes, bytes]:
         """One-shot counterpart to run(): buffered (returncode, stdout, stderr)
         for tools that need a result rather than streamed lines (info / header /
@@ -393,7 +430,38 @@ class SubprocessRunner:
         reporting returncode None to signal the abort. Used by
         `dolphin_tool.disc_hashes` so `dolphin-tool verify --algorithm sha1`
         (the Dolphin disc-hash source for `embedded_hashes`) aborts promptly
-        when a scan/match job is cancelled.
+        when a scan/match job is cancelled. `nice_via_wrapper` / `env` mirror
+        run()'s, for the tools that must avoid preexec_fn or need a private
+        environment.
+        """
+
+    # --- verify: two shapes, no per-tool loops (issue #266) ---------------
+
+    async def run_verify(self, cmd: list[str], *, path: str, parse_progress,
+                         success_message: str, failure_message: str,
+                         cancel_event=None) -> AsyncGenerator[dict, None]:
+        """Streaming verifier (chdman, dolphin-tool): spawn, segment lines with
+        the shared `_split_stream_lines`, yield {"type","progress","message"}
+        and one terminal complete/error. Owns every bound the conversion path
+        has — the size-scaled overall bound from `resolve_verify_timeout(path)`,
+        the no-output stall bound, `cancel_event`, and the `reap()` ladder
+        instead of a bare `process.wait()` (which on a D-state child never
+        returns and freezes the queue). The post-EOF voluntary-exit grace is
+        capped by whatever is left of the verify's own bound — and skipped
+        entirely once a cancel has fired — so a verifier that closes its pipe
+        without exiting cannot hold the lane past its deadline. `parse_progress` is the only per-tool
+        knob; it replaced two near-identical ~120-line loops.
+        """
+
+    async def capture_verify(self, cmd: list[str], *, path: str,
+                             success_message: str, cancel_event=None,
+                             nice_via_wrapper=False, env=None,
+                             start_message="Verifying integrity..."
+                             ) -> AsyncGenerator[dict, None]:
+        """One-shot verifier (maxcso --crc, nsz -V, 7z t): the same event shape
+        around a single run_capture() with the same bound and cancel_event.
+        run_capture reports both an abort and a timeout as returncode None, so
+        the two are told apart by asking the cancel event which happened.
         """
 
 
@@ -412,6 +480,10 @@ async def remove_partial_tree(path: str, *, label="work directory",
                               timeout=None) -> bool:
     """The same bound for a private work/scratch dir (rmtree, errors ignored)."""
 ```
+
+`collect_verify(stream, *, fallback_message)` is the module-level reducer every
+`verify()` uses to turn one of those streams into `{"valid","message"}`
+(plus `"cancelled"`).
 
 Per-tool `convert()` becomes ~15 lines: build argv, then
 `async for u in self._runner.run(cmd, ..., parse_progress=self._parse_progress): yield u`.
@@ -441,6 +513,149 @@ The rate matters as much as the byte count: it is what distinguishes a job that
 is merely slow (bytes climbing, MB/min collapsing) from one that has stopped
 dead. Before this, dolphin-tool reported only elapsed seconds against a 0% bar,
 and users could not tell a crawling conversion from a hung one.
+
+### Verify is bounded and cancellable (issue #266)
+
+The conversion path was bounded first (#263/#265); verify had the same gap. A
+verify that never returned never ended, and because `MAX_CONCURRENT_JOBS`
+defaults to 1 and runs jobs inline in the dispatcher, it froze the whole queue —
+reachable through **Delete sources after verification**, a commonly used option.
+The delete-on-verify call site also passed no `cancel_event`, so Cancel set an
+event that the `await` never observed.
+
+Three pieces, none of them per-tool:
+
+1. **A bound, on by default.** `resolve_verify_timeout(path, owner)` is the one
+   source of truth: `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` (baseline, 1800s) plus
+   `…_PER_GIB` (600) for the file actually being read, capped by `…_CAP`
+   (86400) — the same baseline+per-GiB+cap shape as the conversion stall
+   watchdog, sharing `timeout_policy.compute_size_scaled_timeout`. Verify reads
+   the whole file, so its runtime scales with size and a flat number cannot
+   serve both a 400 MB CIA and a 90 GB PS3 ISO. Streaming verifiers additionally
+   get `COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT` (600s of no output at
+   all), which catches a wedge far sooner. The two are independent: zeroing the
+   overall baseline does not zero the stall bound, deliberately — an operator
+   who removes the overall bound for a huge image still wants a verifier that
+   has gone completely silent to be caught. Zero both for no bound at all.
+2. **`cancel_event` through the contract.** `ToolPlugin.verify()` /
+   `verify_stream()` take it and `job_manager` passes the job's own event.
+   Tools that spawn a child get cancellation from `run_verify` /
+   `capture_verify`; the pure-Python verifies (jwud's WUX walk, makeps3iso's
+   PARAM.SFO readback) check it between steps. A cancelled run returns
+   `cancelled: True`, which `job_manager` turns into a CANCELLED job — never a
+   verification failure, and never a reason to delete a source.
+3. **A backstop at every call site.** `job_manager` resolves the bound first
+   (`bound = await tool.verify_timeout(path, cancel_event=…)`) and then wraps
+   the whole `verify()` in `asyncio.wait_for(tool.verify(…), timeout=bound or
+   None)`, so the guarantee holds even
+   for a tool whose verify spawns nothing for a subprocess timeout to bound.
+   Resolving the bound sizes the file, which is itself a stat on the storage in
+   question, so it takes the cancel event too: it runs *before* the verify that
+   would otherwise observe one. The
+   generated verify routes (`register_verify_routes`: sync, SSE, batch SSE) are
+   the *other* entry point into the same verifiers, and they hold the `verify`
+   workload lane while they run — so they apply the same per-path bound, once,
+   in the shared factory rather than per tool. On the two SSE routes that bound
+   lives in the **producing task**, never in the consuming loop: a client that
+   stops draining suspends the consumer at its `yield`, and a deadline it cannot
+   evaluate is no deadline at all. Bounding the producer also makes the clock
+   measure verification instead of delivery backpressure, and makes a verdict
+   disagreeing with a timeout impossible — one task decides both. The other half
+   of that independence is a **bounded** hand-off (`_offer_verify_update` over a
+   capped queue): a producer that no longer waits for the socket would otherwise
+   let a peer that stays connected without reading buffer events for the whole
+   of the bound. Progress is dropped under backpressure — it is a level, not a
+   log — while a terminal event always lands, making room by discarding progress
+   the verdict has just made stale. The **workload token follows the same rule**:
+   it is released **beside the producer's `done.set()`**, not from the consumer's
+   `finally`, which a parked reader never reaches; and the batch route takes a
+   slot per file rather than carrying one across the walk (the route's admission
+   token is handed back before the first file, since a token held across the
+   suspensions *before* a verifier starts is lost the same way). A peer that
+   stays connected without reading parks the consumer indefinitely, and a
+   one-slot lane released only on that path is a lane lost for the life of the
+   process. A route-level timeout reports the
+   tool's own timeout shape (`{"valid": False, "message": "Verification timed
+   out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
+   the file is not known bad, the check just did not finish.
+
+Three rules follow for any code that runs a verifier:
+
+- **Never offload a verify's blocking read to a shared pool** — including the
+  event loop's *default* executor (what `aiofiles` uses), the route guards that
+  run *before* the verify (their own bounded seam is `bounded_path_check`), and
+  the searches a verify does before it reads anything: nsz resolves `prod.keys`
+  through `run_detached` because with `SWITCH_KEYS` unset that walks the game
+  volumes, inline and ahead of every bound meant to survive them. Nor wrap such a read in a context manager whose exit
+  awaits a close: on a stuck read that close waits on the same lock, turning
+  cleanup into a second unbounded wait, so an abandoned handle is left
+  unclosed with its thread. Use `run_detached`, and pass it the `cancel_event`: cancellation abandons the
+  thread either way, a pooled one is capacity the whole process shares, and
+  without the event a Cancel pressed mid-read is not observed until the read
+  finishes. Translate its `ReadCancelled` into the tool's own
+  `{"cancelled": True}` terminal event.
+- **Resolve the bound before the spawn.** It stats the file, and an `await`
+  between the spawn and the `try/finally` is a window where a cancelled SSE
+  request unwinds the coroutine with the child running, tracked, and nothing
+  left to reap it.
+- **Never record a verification result from a run that did not reach a
+  verdict.** A verifier that outlived SIGKILL is one of those runs, and it is
+  worse than a failure: it is still holding the storage. Every verify path
+  builds that terminal event from one place (`abandoned_verify_error`) and gives
+  it **precedence over the reason the stop was asked for** — a cancel or a
+  timeout that ends with an unkillable child is an abandonment first, because
+  the child is still running either way. The flag reaches callers through
+  `collect_verify` (alongside `cancelled`), and the batch route stops the walk
+  on it rather than opening the next file against the same mount and abandoning
+  one more process per file. The captured verifiers get there through
+  `run_capture`'s `on_abandoned` hook, since a `None` return code alone cannot
+  tell an abort from a failed ladder. A verify with **no child at all** still
+  leaves a trace when an outer deadline cancels it — the detached read it
+  abandoned — so `run_detached` reports those too. Both report into the sink
+  `collect_abandonment()` opens around *one file's* work rather than into global
+  state: a context variable, because `asyncio.create_task` copies the context,
+  so the producer task reports into its own caller's sink and no other. Global
+  tallies cannot answer "did **this** verify abandon something" once
+  `MAX_VERIFY_CONCURRENCY > 1` — one request's dead mount would stop another
+  request's batch on healthy storage. Both kinds of wreckage mean the same
+  thing to a caller walking a list: the storage just cost us something we cannot
+  get back, so stop. An *outer* deadline (the route's or the
+  job's) is the one case that cannot carry the flag on an event at all — it
+  cancels the generator rather than letting it reach one — so `reap` records the
+  pid it gave up on (`SubprocessRunner.abandoned_pids`) and the routes fold that
+  into the timeout verdict. Issue #268 argues abandonment should be an exception
+  rather than a flag; when that lands, it replaces exactly these.
+- **Stop a list at the first unresponsive path, don't survey them all.** The
+  batch route's path validation bounds each check, but bounding is not enough on
+  its own: a batch is a list of paths on *one* storage, so carrying on after a
+  timeout costs another probe bound and another written-off thread per path —
+  minutes before any verify starts, and enough abandoned threads to exhaust the
+  process-wide ceiling, which then fails path checks on volumes that are
+  answering. The first timeout ends validation with a 503.
+- **Re-check the cancel after resolving the bound, before spawning.** The
+  resolution is itself a probe that can take its full bound on storage that has
+  stopped answering, and spawning into that means a child that blocks
+  immediately and may outlive SIGKILL — a prompt cancellation turned into an
+  abandoned process, for work nobody wanted.
+- **Every bound resolution takes the `cancel_event` too.** Sizing the file is a
+  stat of the same storage the verify is about to read, and it happens *before*
+  the verify that would observe a cancel — at the call site
+  (`tool.verify_timeout(path, cancel_event=…)`) and again inside each verifier
+  (`run_verify`, `capture_verify`, z3ds). Miss one and a Cancel waits out the
+  probe bound with the dispatcher slot still held.
+- **Keep every wait under the same live checks.** A wait decided once, up front,
+  answers only for the instant it was decided. `run_verify`'s post-EOF grace —
+  waiting for a verifier that closed stdout to exit on its own — is therefore
+  sliced, and each slice re-asks what the read loop asked: has the cancel fired,
+  has either deadline passed. Capping that grace by the *remaining* overall
+  bound is not the same thing: it sees neither a cancel pressed a second later
+  nor the stall bound, which is the only bound a stall-only configuration has.
+
+With verify genuinely bounded, the stalled-job warning no longer *skips* jobs in
+the verify phase (it did, to avoid calling a long checksum stalled — at the cost
+of logging nothing for a job wedged **in** verify). It now reports them in their
+own words, timed from when the verify phase began rather than from the progress
+clock, which stopped when the conversion ended.
 
 **Adding a tool:** do nothing and it already reports bytes + rate. Add a
 `SIZE_RATIOS` row to also get a percentage bar. Implement `parse_progress` if
@@ -1152,9 +1367,18 @@ def register_verify_routes(router, tool: ToolPlugin):
         _guard(path, tool.verify_extensions)
         token = await _acquire_verify_lane_or_429()
         try:
-            r = await tool.verify(path)
+            # Every await that follows the token lives inside this try, so the
+            # finally is already registered when the first one runs: a client
+            # disconnecting during tool.verify_timeout(path) still releases the
+            # lane's only slot.
+            bound = await tool.verify_timeout(path)          # issue #266
+            r = await asyncio.wait_for(tool.verify(path), timeout=bound or None)
+            # `valid` alone, so neither a timeout nor a cancelled run (which
+            # reach no verdict) is ever recorded as a verification.
             if r.get("valid"): await verification_store.mark_verified(path)
             return r
+        except asyncio.TimeoutError:
+            return _verify_timed_out(bound)   # a verdict-shaped answer, not a 500
         finally: token.release()
     @router.get(f"/{base}-verify/events")
     async def _verify_events(path: str = Query(...)):

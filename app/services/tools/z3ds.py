@@ -33,6 +33,7 @@ _Z3DS_DECOMPRESSED = frozenset(Z3DS_DECOMPRESS_FORMATS.values())
 
 class Z3dsTool(BaseTool):
     id = "z3ds"
+    policy_owner = "z3ds"
     display_name = "3DS"
     modes = (
         ModeSpec(
@@ -117,11 +118,15 @@ class Z3dsTool(BaseTool):
             compression=compression, cancel_event=cancel_event,
         )
 
-    async def verify(self, path: str) -> dict:
-        return await self._service.verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._service.verify(path, cancel_event=cancel_event)
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._service.verify_stream(path)
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        return self._service.verify_stream(path, cancel_event=cancel_event)
 
     async def info(self, path: str) -> dict:
         return await run_in_threadpool(self._service.info, path)

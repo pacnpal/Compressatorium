@@ -49,13 +49,16 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from config import settings
-from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from services.subprocess_runner import (
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
     nice_prefix,
+    ReadCancelled,
     remove_partial_tree,
+    run_detached,
+    verify_preflight,
 )
 
 # Compress takes the raw dump, decompress takes the compressed container.
@@ -340,6 +343,10 @@ class JwudToolService:
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
+
     def binary_available(self) -> bool:
         """Whether the JWUDTool launcher is present and executable.
 
@@ -598,17 +605,17 @@ class JwudToolService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Validate a .wux container structurally.
 
         Checks the magic and header fields, then walks every sector-index entry
@@ -616,27 +623,44 @@ class JwudToolService:
         That is what catches the two failure modes a 25 GB image really hits — a
         truncated copy and a corrupt index table — and it is the deepest check
         the format allows: WUX carries no content checksums.
+
+        The two heavy steps are blocking reads on a throwaway daemon thread
+        (never a shared pool worker, which a wedged read would occupy for the
+        life of the process). A read
+        cannot be interrupted, but the *wait* on it can, so ``cancel_event`` is
+        raced against each one (and checked between them): pressing Cancel
+        returns here at once and abandons the read, instead of leaving the job
+        on "Cancelling..." until the index scan of a 25 GB image finishes.
         """
-        if not os.path.exists(file_path):
-            yield {"type": "error", "valid": False, "message": "File not found"}
-            return
-        try:
-            file_size = os.path.getsize(file_path)
-        except OSError as e:
-            yield {"type": "error", "valid": False, "message": f"Error reading file: {e}"}
-            return
-        if file_size == 0:
-            yield {"type": "error", "valid": False, "message": "File is empty"}
-            return
-        ext = Path(file_path).suffix.lower()
-        if ext not in JWUD_DECOMPRESS_EXTENSIONS:
-            yield {"type": "error", "valid": False, "message": f"Invalid extension: {ext}"}
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        cancelled_event = {
+            "type": "error",
+            "valid": False,
+            "cancelled": True,
+            "message": "Verification cancelled",
+        }
+
+        # Bounded, off the event loop: an unresponsive volume must fail this
+        # verify, not freeze every task in the process (see verify_preflight).
+        # It also hands back the size the truncation check below compares against.
+        problem, file_size = await verify_preflight(
+            file_path, JWUD_DECOMPRESS_EXTENSIONS, cancel_event=cancel_event,
+        )
+        if problem is not None:
+            yield problem
             return
 
         try:
+            if _cancelled():
+                yield cancelled_event
+                return
             yield {"type": "progress", "progress": 0, "message": "Reading WUX header..."}
             try:
-                header = await run_in_threadpool(read_wux_header, file_path)
+                header = await run_detached(
+                    read_wux_header, file_path, cancel_event=cancel_event,
+                )
             except ValueError as e:
                 yield {
                     "type": "error",
@@ -645,15 +669,24 @@ class JwudToolService:
                 }
                 return
 
+            if _cancelled():
+                yield cancelled_event
+                return
             yield {
                 "type": "progress",
                 "progress": 25,
                 "message": f"Checking {header['entry_count']} sector index entries...",
             }
             try:
-                highest = await run_in_threadpool(_scan_index_table, file_path, header)
+                highest = await run_detached(
+                    _scan_index_table, file_path, header, cancel_event=cancel_event,
+                )
             except ValueError as e:
                 yield {"type": "error", "valid": False, "message": f"Corrupt WUX: {e}"}
+                return
+
+            if _cancelled():
+                yield cancelled_event
                 return
 
             required = header["sector_array_offset"] + (highest + 1) * header["sector_size"]
@@ -678,6 +711,10 @@ class JwudToolService:
                     f"entries over {highest + 1} stored sectors"
                 ),
             }
+        except ReadCancelled:
+            # The operator cancelled mid-read: no verdict was reached, so this is
+            # a cancellation, not a verification failure.
+            yield cancelled_event
         except Exception as e:
             logger.exception("Error during Wii U verification: %s", e)
             yield {"type": "error", "valid": False, "message": f"Verification error: {e}"}

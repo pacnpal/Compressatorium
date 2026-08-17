@@ -25,6 +25,7 @@ from .spec import InputKind, ModeKind, ModeSpec
 
 class MakePs3IsoTool(BaseTool):
     id = "makeps3iso"
+    policy_owner = "makeps3iso"
     display_name = "PS3 ISO"
     modes = (
         ModeSpec(
@@ -156,8 +157,10 @@ class MakePs3IsoTool(BaseTool):
             split=split, cancel_event=cancel_event,
         )
 
-    async def verify(self, path: str) -> dict:
-        return await self._service.verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._service.verify(path, cancel_event=cancel_event)
 
     async def info(self, path: str) -> dict:
         return await run_in_threadpool(self._service.info, path)
