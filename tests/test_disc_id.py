@@ -887,36 +887,53 @@ def test_chd_reader_rejects_zlib_output_larger_than_hunk(tmp_path):
 
 
 def test_dumpmeta_raw_times_out(tmp_path, monkeypatch):
-    """chdman dumpmeta must not hang indefinitely."""
+    """chdman dumpmeta must not hang indefinitely.
+
+    The spawn goes through the shared runner now, so the timeout is enforced by
+    run_capture: it reports the abort as a None return code, which this helper
+    turns into "no metadata" rather than a hang.
+    """
     chd = tmp_path / "game.chd"
     chd.write_bytes(b"fake")
 
     class FakeProc:
-        returncode = 0
+        pid = 4242
+        returncode = None
         killed = False
 
         async def communicate(self):
-            if self.killed:
-                return b"", b""
-            await asyncio.sleep(1)
+            await asyncio.sleep(30)
             return b"", b""
+
+        def terminate(self):
+            self.returncode = -15
 
         def kill(self):
             self.killed = True
             self.returncode = -9
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        return FakeProc()
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = -9
+            return self.returncode
+
+    proc = FakeProc()
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return proc
 
     monkeypatch.setattr(
         "app.services.disc_id._DUMPMETA_TIMEOUT_SECONDS", 0.01
     )
     monkeypatch.setattr(
-        "app.services.disc_id.asyncio.create_subprocess_exec",
+        "app.services.subprocess_runner.asyncio.create_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
     assert asyncio.run(_dumpmeta_raw(str(chd), TAG_GAME, "chdman")) is None
+    # Proves the timeout path ran rather than the helper's catch-all: the child
+    # was signalled and reaped, not left behind.
+    assert proc.returncode is not None
 
 
 @pytest.mark.asyncio

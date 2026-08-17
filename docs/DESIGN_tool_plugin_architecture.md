@@ -472,7 +472,18 @@ No call site carries a "did I already give up?" flag: `reap()` remembers the
 PIDs it abandoned, so a second call returns False immediately instead of
 spending both grace periods again, and `track_pid()` forgets a PID the kernel
 has reused. That is what keeps the five verify loops' teardown a single line
-each.
+each — and it is why **every** spawn must register through `track_pid()`, which
+`run()` and `run_capture()` do for you. A hand-rolled spawn that skips it can
+leave a stale write-off behind and cost a later, killable child its ladder.
+
+**One-shot chdman/dolphin captures go through `run_capture()`.** `chdman info`,
+`dolphin-tool header`, and the `chdman addmeta` / `delmeta` / `dumpmeta` helpers
+in `services.disc_id` used to spawn directly, untracked, with waits after
+`kill()` that were unbounded — which could hang the library scan's Phase 2. They
+now share the capture path, so they are PID-tracked, bounded, subject to the
+tool nice/ionice policy, and able to signal abandonment. `services.disc_id` uses
+`chdman_service.runner` rather than a runner of its own, so `active_pids()`
+still describes every chdman child.
 
 Per-tool `convert()` becomes ~15 lines: build argv, then
 `async for u in self._runner.run(cmd, ..., parse_progress=self._parse_progress): yield u`.

@@ -103,37 +103,35 @@ class ChdmanService:
         ):
             yield update
 
+    @property
+    def runner(self) -> SubprocessRunner:
+        """This tool's runner, shared with helpers that spawn chdman children.
+
+        ``services.disc_id`` shells out to chdman for the GAME/NAME tag work, so
+        it goes through this same instance rather than its own: one PID set that
+        ``active_pids()`` fully describes, and one place that remembers a child
+        the ladder gave up on.
+        """
+        return self._runner
+
     async def info(self, chd_path: str) -> dict:
         """Get information about a CHD file."""
-        process = await asyncio.create_subprocess_exec(
-            self.chdman_path,
-            "info",
-            "-i",
-            chd_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            # Bounded teardown via the shared ladder: an unresponsive child must
-            # not turn this timeout into an unbounded wait. If it survives
-            # SIGKILL, reap_or_raise reports the abandonment instead -- that is
-            # the fact the caller has to act on, not the timeout.
-            await self._runner.reap_or_raise(
-                process, fail_label="chdman info", wait_for_exit=False,
-            )
-            raise RuntimeError(f"chdman info timed out after {timeout}s") from exc
+        # Shared capture rather than a hand-rolled spawn: it tracks the PID (so
+        # active_pids() sees info children, and the runner's abandonment memory
+        # is cleared when the kernel reuses that PID), bounds the teardown, and
+        # raises SubprocessAbandoned if the child outlives SIGKILL.
+        returncode, stdout, stderr = await self._runner.run_capture(
+            [self.chdman_path, "info", "-i", chd_path],
+            timeout=timeout or None,
+            fail_label="chdman info",
+        )
+        if returncode is None:
+            raise RuntimeError(f"chdman info timed out after {timeout}s")
 
-        if process.returncode != 0:
+        if returncode != 0:
             raise RuntimeError(
-                stderr.decode() or f"chdman info failed with code {process.returncode}",
+                stderr.decode() or f"chdman info failed with code {returncode}",
             )
 
         return self._parse_info(stdout.decode())

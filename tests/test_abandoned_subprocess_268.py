@@ -521,3 +521,102 @@ async def test_scan_phase1_metadata_aborts_the_scan(tmp_path, monkeypatch):
     assert len(calls) == 1, "the scan must stop at the first stranded process"
     assert finished.get("success") is False
     assert "could not be killed" in finished.get("error", "")
+
+
+# ---------------------------------------------------------------------------
+# The runner's abandonment memory must not outlive the PID
+# ---------------------------------------------------------------------------
+
+
+def test_abandonment_memory_is_cleared_when_the_pid_is_reused():
+    """A later child on a recycled PID must still get the full ladder.
+
+    reap() remembers the PIDs it gave up on so a repeat call is free. That memory
+    is only correct while the PID still refers to that process -- once the kernel
+    reuses it, a new (killable) child would otherwise be written off unreaped.
+    Every spawn path registers through track_pid(), which is what clears it.
+    """
+    runner = SubprocessRunner(owner="test")
+    doomed = _UnkillableVerifier(pid=1234)
+
+    import services.subprocess_runner as runner_module
+
+    async def go():
+        assert await runner.reap(doomed, exit_timeout=0) is False
+        # Same PID, different process: the ladder must run for real again.
+        runner.track_pid(1234)
+        fresh = _UnkillableVerifier(pid=1234)
+        await runner.reap(fresh, exit_timeout=0)
+        return fresh.signals
+
+    original = (runner_module._TERM_GRACE, runner_module._KILL_GRACE)
+    runner_module._TERM_GRACE = runner_module._KILL_GRACE = 0.01
+    try:
+        signals = asyncio.run(go())
+    finally:
+        runner_module._TERM_GRACE, runner_module._KILL_GRACE = original
+
+    assert signals == ["TERM", "KILL"], "a reused PID must not inherit the write-off"
+
+
+@pytest.mark.asyncio
+async def test_info_and_header_route_through_run_capture(monkeypatch):
+    """The last two hand-rolled capture spawns now use the shared one.
+
+    That is what gives them PID tracking -- and tracking is the only thing that
+    clears a stale abandonment when the kernel recycles a PID, so a spawn that
+    skipped it could write off a later, killable child (see the test above).
+    """
+    from services.chdman import chdman_service
+    from services.dolphin_tool import dolphin_tool_service
+
+    cases = [
+        (chdman_service.runner, lambda: chdman_service.info("/data/g.chd"), "info"),
+        (
+            dolphin_tool_service.runner,
+            lambda: dolphin_tool_service.header("/data/g.iso"),
+            "header",
+        ),
+    ]
+    for runner, call, subcommand in cases:
+        seen: list[list[str]] = []
+
+        async def fake_capture(cmd, *, timeout=None, cancel_event=None,
+                               stderr_to_stdout=False, fail_label=None, _seen=seen):
+            _seen.append(cmd)
+            return 0, b"", b""
+
+        monkeypatch.setattr(runner, "run_capture", fake_capture)
+        await call()
+
+        assert len(seen) == 1, "the hand-rolled spawn must be gone"
+        assert subcommand in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_disc_id_helpers_propagate_abandonment(tmp_path, monkeypatch):
+    """Phase 2's chdman children signal it, so the scan's guard can fire.
+
+    These helpers convert every failure to a False/None "best effort" result --
+    the shape that would hide a stranded child completely.
+    """
+    import services.chdman as chdman_module
+    import services.disc_id as disc_id_module
+
+    async def fake_capture(cmd, *, timeout=None, cancel_event=None,
+                           stderr_to_stdout=False, fail_label=None):
+        raise _abandoned(fail_label or "chdman")
+
+    monkeypatch.setattr(
+        chdman_module.chdman_service.runner, "run_capture", fake_capture,
+    )
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"x")
+
+    for helper in (
+        lambda: disc_id_module._addmeta_text(str(chd), "GAME", "SLUS-123", "chdman"),
+        lambda: disc_id_module._delmeta(str(chd), "GAME", "chdman"),
+        lambda: disc_id_module._dumpmeta_raw(str(chd), "GAME", "chdman"),
+    ):
+        with pytest.raises(SubprocessAbandoned):
+            await helper()

@@ -44,6 +44,13 @@
   behaviour on a path that had kept the old one. All six now use the same
   bounded teardown as conversions, so a verification that cannot be stopped
   ends with an explanation instead of hanging.
+- **The library scan can no longer hang on the disc-ID pass.** Reading and
+  writing a CHD's GAME/NAME tags spawned `chdman` directly and, after giving up
+  on a stuck child, waited for it with no time limit — so a scan could stop
+  partway through with no error and no way to tell it apart from a slow one.
+  Those calls now go through the same bounded machinery as everything else, and
+  a scan that hits storage it cannot recover from fails with the reason instead
+  of sitting there.
 - **A wedged job now says so in the log.** Stuck-queue detection only fired when
   jobs were queued and *none* were processing, so a job frozen mid-conversion —
   exactly the case above — was the one state it could not see, and the only

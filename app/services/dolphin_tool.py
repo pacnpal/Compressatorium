@@ -89,6 +89,11 @@ class DolphinToolService:
             return [stdbuf, "-oL", "-eL"] + cmd
         return cmd[:idx] + [stdbuf, "-oL", "-eL"] + cmd[idx:]
 
+    @property
+    def runner(self) -> SubprocessRunner:
+        """This tool's runner (its PID set, priority policy and teardown)."""
+        return self._runner
+
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
 
@@ -120,37 +125,23 @@ class DolphinToolService:
 
     async def header(self, path: str) -> dict:
         """Get header information about a disc image."""
-        process = await asyncio.create_subprocess_exec(
-            self.dolphin_tool_path,
-            "header",
-            "-i", path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            # Bounded teardown via the shared ladder: an unresponsive child must
-            # not turn this timeout into an unbounded wait. If it survives
-            # SIGKILL, reap_or_raise reports the abandonment instead -- that is
-            # the fact the caller has to act on, not the timeout.
-            await self._runner.reap_or_raise(
-                process, fail_label="dolphin-tool header", wait_for_exit=False,
-            )
-            raise RuntimeError(
-                f"dolphin-tool header timed out after {timeout}s",
-            ) from exc
+        # Shared capture rather than a hand-rolled spawn: it tracks the PID (so
+        # active_pids() sees header children, and the runner's abandonment
+        # memory is cleared when the kernel reuses that PID), bounds the
+        # teardown, and raises SubprocessAbandoned if the child outlives SIGKILL.
+        returncode, stdout, stderr = await self._runner.run_capture(
+            [self.dolphin_tool_path, "header", "-i", path],
+            timeout=timeout or None,
+            fail_label="dolphin-tool header",
+        )
+        if returncode is None:
+            raise RuntimeError(f"dolphin-tool header timed out after {timeout}s")
 
-        if process.returncode != 0:
+        if returncode != 0:
             raise RuntimeError(
                 stderr.decode()
-                or f"dolphin-tool header failed with code {process.returncode}",
+                or f"dolphin-tool header failed with code {returncode}",
             )
 
         return self._parse_header(stdout.decode())
