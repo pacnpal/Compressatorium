@@ -22,7 +22,6 @@ its CRC32, ignoring output; a clean exit means the container decompresses
 intact (the analog of nsz ``-V`` / z3ds ``zstd -t``).
 """
 import asyncio
-import contextlib
 import os
 import struct
 from collections.abc import AsyncGenerator
@@ -36,6 +35,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    remove_partial_output,
     verify_preflight,
 )
 
@@ -235,15 +235,15 @@ class MaxcsoService:
             # maxcso writes straight to output_path. These are exactly the
             # abnormal exits the runner can raise *after* it spawned the child — a
             # mid-run cancel, a non-zero/stall RuntimeError, or a task-cancellation
-            # / generator close — so a partial may be on disk. Remove it
-            # *synchronously* (a local unlink; awaiting during a cancellation could
-            # be re-cancelled and skip cleanup). A setup error (build_command,
-            # above this try) or a pre-spawn failure (FileNotFoundError from the
-            # runner) is NOT caught here, so a pre-existing output is never deleted
-            # for a conversion that wrote nothing.
-            if os.path.exists(output_path):
-                with contextlib.suppress(OSError):
-                    os.remove(output_path)
+            # / generator close — so a partial may be on disk. The shared helper
+            # bounds the unlink (a dead output mount must not freeze the queue
+            # here, after the runner already gave up) while still dispatching it
+            # even if this coroutine is torn down mid-wait. A setup error
+            # (build_command, above this try) or a pre-spawn failure
+            # (FileNotFoundError from the runner) is NOT caught here, so a
+            # pre-existing output is never deleted for a conversion that wrote
+            # nothing.
+            await remove_partial_output(output_path, label="maxcso output")
             raise
 
     # ----- info -------------------------------------------------------------

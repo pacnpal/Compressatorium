@@ -463,6 +463,22 @@ class SubprocessRunner:
         run_capture reports both an abort and a timeout as returncode None, so
         the two are told apart by asking the cancel event which happened.
         """
+
+
+# Module-level, not methods: cleanup runs after run() has already given up, and
+# chains (which own no runner) need the same bound. See "Cleaning up partial
+# output is bounded too" below.
+async def remove_partial_output(*paths: str, discover=None,
+                                label="partial output", timeout=None) -> bool:
+    """Bounded unlink of every file a failed run may have left behind.
+    True if the sweep finished, False if it timed out or failed. Raises only
+    CancelledError. `discover()` enumerates further paths from inside the
+    bounded worker, for a set only knowable by probing the disk.
+    """
+
+async def remove_partial_tree(path: str, *, label="work directory",
+                              timeout=None) -> bool:
+    """The same bound for a private work/scratch dir (rmtree, errors ignored)."""
 ```
 
 `collect_verify(stream, *, fallback_message)` is the module-level reducer every
@@ -666,6 +682,75 @@ it only after the output is derived and skip/locked collisions short-circuit,
 and the create/batch routes apply queue-depth backpressure (HTTP 429) *before*
 planning when the queue is already full — so a doomed submit never pays for the
 tree walk.
+
+### Cleaning up partial output is bounded too (issue #267)
+
+Every tool that writes its output in place sweeps the partial away when a run
+ends abnormally — a cancel, a stall, a non-zero exit, a task cancellation or
+generator close. That sweep is **not** a per-tool block: it goes through
+`remove_partial_output(*paths)` (files) or `remove_partial_tree(path)` (a
+private work dir), both module-level in `services/subprocess_runner.py` and
+re-exported from `services/tools/runner.py`.
+
+Why they exist at all: the sweep runs *after* the runner has given up, on the
+same storage the run just failed on. `stat`/`unlink`/`rmtree` on an
+unresponsive mount block in uninterruptible I/O and cannot be cancelled, so a
+hand-rolled `os.remove` there defeated the bounded reap ladder — the child was
+abandoned promptly (#263/#265) and then the job hung on cleanup instead, and at
+`MAX_CONCURRENT_JOBS=1` (the default, jobs inline in the dispatcher) the queue
+froze anyway. These helpers run the blocking call on a throwaway daemon thread
+(the `_bounded_probe` shape) with a hard `_CLEANUP_TIMEOUT`.
+
+The contract, which is what makes them safe to use everywhere:
+
+- **They never raise, except to cancel.** A cleanup problem must not replace the
+  exception that explains the job's outcome on an error path, and must not fail
+  an already-published conversion from the `finally` blocks that also run on
+  success. It is a logged warning and a `False` return — the job finishes with a
+  leftover partial file, a much smaller problem than a frozen queue. That
+  includes being unable to start the cleanup thread at all, which is plausible
+  precisely here since a run of dead-mount sweeps deliberately writes threads
+  off. `CancelledError` is the one exception that propagates, like from any
+  other `await`: swallowing it would defeat cancellation outright for the
+  `finally` callers, which have no pending exception to re-raise and would go on
+  to be marked complete.
+- **The removal is dispatched before the wait**, so a cancellation arriving
+  afterwards cannot take back work the sweep already did — the useful half of
+  what the old blocks bought by unlinking *synchronously* on the event loop
+  (awaiting during a cancellation could be re-cancelled and skip the cleanup),
+  without the unbounded block.
+- **Giving up stops the rest of the sweep.** Once the helper returns, the job
+  finalises and stops owning those paths, so an abandoned thread must not keep
+  deleting: the mount can recover minutes later, by which point a retry may own
+  the names, and the thread would delete the *new* job's good output. The
+  worker checks an `abandoned` flag before each unlink. The one unlink already
+  in flight when the bound expired can't be recalled — an in-flight syscall is
+  not cancellable — so that single path stays at risk and every path after it
+  does not. On responsive storage the sweep finishes long before any of this,
+  so the normal case pays nothing.
+- **An absent path is success**, so no caller needs a separate `os.path.exists`
+  round trip on the mount in question.
+- **One bad path does not stop the sweep**: the rest are still removed, and
+  everything that failed is named in one warning.
+
+Rules for a new tool:
+
+- Catch the abnormal exits *after* the spawn only. A setup or pre-spawn failure
+  wrote nothing, so deleting a pre-existing output there would destroy a good
+  file.
+- Pass **every** path the run could have written. When the set is only knowable
+  by probing the disk, pass `discover=` instead of enumerating first — it runs
+  *inside* the bounded worker. makeps3iso's split parts are the case: those
+  `isfile` probes hit the same volume the sweep is about to unlink from, so
+  enumerating on the event loop would reintroduce the exact unbounded block
+  this seam removes. It passes `output_artifacts()` as the discovery callable,
+  keeping the one enumeration that also backs `overwrite_targets`.
+- Where the result is load-bearing rather than best-effort, check it. romz
+  clears a stale archive *before* running `7z a` (which appends) and refuses to
+  start if that sweep reports failure. Note what the propagating `CancelledError`
+  buys that call: a job cancelled mid-sweep raises out of the helper instead of
+  reaching the "could not clear the existing archive" error, so it still reports
+  as cancelled rather than as that failure.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
@@ -974,7 +1059,7 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
     `output_artifacts`, which also backs its failure cleanup so the two can't
     drift) — wider than `companion_outputs`, which reports only the finished
     set. This used to be an `input_kind == DIRECTORY` branch calling
-    `makeps3iso_service.remove_outputs` directly, which meant a *second*
+    makeps3iso's own part-removal helper directly, which meant a *second*
     directory-input tool would have had its outputs swept by makeps3iso's
     part logic.
   - **Completed size:** the completion block sums `output_path` plus

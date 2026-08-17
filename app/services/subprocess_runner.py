@@ -38,9 +38,10 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 
 from config import settings
+from logging_setup import get_logger
 from services.timeout_policy import (
     compute_progress_stall_timeout,
     compute_size_scaled_timeout,
@@ -194,6 +195,229 @@ async def _bounded_probe(func: Callable, *args: object, **kwargs: object) -> obj
     return await asyncio.wait_for(
         _probe_in_daemon_thread(functools.partial(func, *args, **kwargs)),
         timeout=_STAT_TIMEOUT,
+    )
+
+
+# --- Bounded cleanup of partial output ------------------------------------
+#
+# Every tool that writes its output in place sweeps the partial away when a run
+# ends abnormally. That sweep runs *after* the runner has already given up, on
+# the same storage the run just failed on -- so on a dead mount the unlink or
+# rmtree blocks in uninterruptible I/O and the job never finalises. With
+# MAX_CONCURRENT_JOBS defaulting to 1 and jobs running inline, that freezes the
+# queue exactly the way the bounded reap (#263/#265) was written to prevent.
+# These helpers are the one bounded seam every tool's cleanup goes through.
+
+_cleanup_logger = get_logger("cleanup")
+
+# Hard bound on that sweep. Larger than _STAT_TIMEOUT because a sweep may unlink
+# several files in a row (a split makeps3iso build) or walk a work dir, and each
+# step is a separate round trip to storage that is, by assumption, already
+# unhappy. Still a bound: a leftover partial file is a far smaller problem than
+# a frozen queue, so cleanup gives up and the job finishes as failed.
+_CLEANUP_TIMEOUT = 30.0
+
+
+def _unlink_all(
+    paths: tuple[str, ...],
+    discover: Callable[[], Sequence[str]] | None,
+    abandoned: threading.Event,
+) -> None:
+    """Unlink each path, reporting what could not be removed.
+
+    Runs on the cleanup thread, which is also where ``discover`` is called:
+    enumerating a set (makeps3iso's numbered split parts) *stats the same
+    storage the sweep is about to unlink from*, so doing it on the event loop
+    would leave the exact unbounded block this seam exists to remove.
+
+    An absent path is the goal, not a failure, so ``FileNotFoundError`` is
+    skipped; every other ``OSError`` (a directory shadowing the output, a
+    permission problem) is collected and raised at the end so one bad path is
+    logged without stopping the sweep of the rest.
+
+    ``abandoned`` is checked before the discovery and before each unlink, and
+    stops the sweep once the waiter has given up (timed out, or was cancelled).
+    A sweep that outlives its bound must not keep deleting: the job has
+    finalised and released those paths, the mount can recover minutes later, and
+    by then a retry may own the names -- this thread would be deleting the *new*
+    job's good output. The one unlink already issued when the bound expired
+    cannot be recalled (an in-flight syscall is not cancellable), so that single
+    path stays at risk; every path after it does not. On a responsive filesystem
+    the whole sweep finishes long before either giving-up path is reached, so
+    this costs the normal case nothing.
+    """
+    if abandoned.is_set():
+        # Given up on before this thread even ran. Return without touching the
+        # storage: the paths are no longer this job's, and the discovery is
+        # itself a round trip to the volume in question -- one that would also
+        # hold a probe slot the next job's cleanup may need.
+        return
+    targets = list(paths)
+    if discover is not None:
+        targets.extend(discover())
+    failures: list[str] = []
+    for path in targets:
+        if abandoned.is_set():
+            _cleanup_logger.warning(
+                "Abandoned cleanup stopping before %s; it is no longer this "
+                "job's to delete.", path,
+            )
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failures.append(f"{path} ({exc})")
+    if failures:
+        raise OSError("; ".join(failures))
+
+
+def _rmtree_quietly(path: str, _abandoned: threading.Event) -> None:
+    """``rmtree`` ignoring errors. Takes the flag for the ``work`` signature.
+
+    Deliberately does *not* bail out when the flag is set, unlike
+    :func:`_unlink_all`. The two guard different risks. A sweep of output paths
+    stops because a retry can take those names and would lose real data; a work
+    dir comes from ``mkdtemp``, so its name is unique to this run and no later
+    job can ever own it -- there is nothing to protect, and skipping would only
+    orphan the temp dir. Which is the likely case, not the rare one: the flag is
+    set either by the full timeout (by which point ``rmtree`` has certainly
+    started, making a check a no-op) or by a cancel that can land microseconds
+    after dispatch -- and a cancelled job's work dir is exactly one that should
+    still be swept.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+
+
+async def _bounded_cleanup(
+    work: Callable[[threading.Event], None],
+    what: str,
+    timeout: float,
+) -> bool:
+    """Run a blocking cleanup call with a hard bound, raising only to cancel.
+
+    Returns ``True`` when the removal finished, ``False`` when it did not --
+    timed out, or failed. A cleanup problem is logged rather than raised: on an
+    error path it must not replace the exception that actually explains the
+    job's outcome, and in a ``finally`` after a *successful* conversion it must
+    not fail a job whose output is already published. It must also never hold up
+    finalising the job.
+
+    ``CancelledError`` is the one exception that does propagate, like from any
+    other ``await``. Swallowing it would defeat cancellation outright for the
+    callers that have no pending exception to re-raise -- nsz, JWUDTool, romz's
+    extract and chains all clean up in a ``finally`` that runs on the success
+    path too, where consuming the cancel lets the job go on to be marked
+    complete.
+
+    The blocking call is *dispatched* before the wait, so a cancellation
+    arriving afterwards cannot take back work the sweep already did -- the
+    useful half of what the per-tool blocks bought by unlinking synchronously on
+    the event loop (awaiting during a cancellation could be re-cancelled and
+    skip the cleanup), without the unbounded block. What giving up *does* stop
+    is the rest of the sweep: once this returns, the job finalises and stops
+    owning those paths, so ``abandoned`` tells the thread not to unlink anything
+    it has not already started. See :func:`_unlink_all`.
+    """
+    abandoned = threading.Event()
+
+    def _run_work() -> None:
+        try:
+            work(abandoned)
+        finally:
+            if abandoned.is_set():
+                _cleanup_logger.warning(
+                    "Cleanup of %s finished after it was abandoned", what,
+                )
+
+    try:
+        future = _probe_in_daemon_thread(_run_work)
+    except (RuntimeError, ProbeCapacityExceeded) as exc:
+        # Two ways the dispatch itself fails, both plausible precisely here
+        # because a run of dead-mount sweeps deliberately writes threads off:
+        # RuntimeError, the process cannot start another thread; and
+        # ProbeCapacityExceeded, _MAX_DETACHED_PROBES already wedged against the
+        # volume. (The latter is an asyncio.TimeoutError, not a RuntimeError, so
+        # it needs naming here rather than riding along.) Neither dispatched anything,
+        # so both are reported like any other cleanup failure rather than
+        # escaping to stand in for the conversion's own outcome -- which on the
+        # `finally` callers would fail a job whose output is already published.
+        _cleanup_logger.warning(
+            "Could not start the cleanup of %s: %s", what, exc,
+        )
+        return False
+    try:
+        await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        abandoned.set()
+        _cleanup_logger.warning(
+            "Giving up after %.0fs on removing %s; the job will finish and the "
+            "file is left on disk. The storage it lives on is most likely "
+            "unresponsive.",
+            timeout, what,
+        )
+        return False
+    except asyncio.CancelledError:
+        # Stop the sweep before re-raising: the job is going away, so anything
+        # it has not already started to unlink is no longer its to delete.
+        abandoned.set()
+        _cleanup_logger.warning("Interrupted while removing %s", what)
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup never raises at its caller
+        _cleanup_logger.warning("Could not remove %s: %s", what, exc)
+        return False
+    return True
+
+
+async def remove_partial_output(
+    *paths: str,
+    discover: Callable[[], Sequence[str]] | None = None,
+    label: str = "partial output",
+    timeout: float | None = None,
+) -> bool:
+    """Bounded unlink of the file(s) a failed run may have left behind.
+
+    Pass every path the run could have written. When the set is only knowable
+    by probing the disk (a split build leaves numbered parts alongside the
+    base), pass ``discover`` instead of enumerating first: it is called *inside*
+    the bounded worker, so the probing is bounded along with the unlinking.
+    ``label`` names the sweep in the log, and should carry the path when
+    ``discover`` means there is nothing static to print.
+
+    Returns ``True`` if the sweep finished, ``False`` if it did not; only
+    ``CancelledError`` propagates. ``timeout`` defaults to
+    :data:`_CLEANUP_TIMEOUT`, read at call time so the bound stays one knob
+    rather than a value frozen into each signature.
+    """
+    if discover is None and not paths:
+        return True
+    what = f"{label} {', '.join(paths)}" if paths else label
+    return await _bounded_cleanup(
+        functools.partial(_unlink_all, paths, discover),
+        what,
+        _CLEANUP_TIMEOUT if timeout is None else timeout,
+    )
+
+
+async def remove_partial_tree(
+    path: str,
+    *,
+    label: str = "work directory",
+    timeout: float | None = None,
+) -> bool:
+    """Bounded ``rmtree`` of a private work/scratch dir, errors ignored.
+
+    The file-level counterpart of :func:`remove_partial_output` for the tools
+    that name their own output inside a temp dir (nsz, JWUDTool, romz extract,
+    chains). ``ignore_errors`` matches what these call sites always wanted: the
+    dir is private to the run and a stray file in it must not fail the job.
+    """
+    what = f"{label} {path}"
+    return await _bounded_cleanup(
+        functools.partial(_rmtree_quietly, path),
+        what,
+        _CLEANUP_TIMEOUT if timeout is None else timeout,
     )
 
 

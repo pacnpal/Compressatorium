@@ -521,6 +521,36 @@ def test_convert_cleans_partial_output_on_failure(tmp_path, monkeypatch):
     assert not out.exists()  # partial archive removed
 
 
+def test_convert_refuses_to_start_if_a_stale_archive_cannot_be_cleared(
+    tmp_path, monkeypatch,
+):
+    """``7z a`` appends, so an uncleared archive would be silently merged into.
+
+    The pre-run sweep is the same bounded helper the failure path uses, and here
+    its result is load-bearing: if it reports the old archive is still there
+    (an unresponsive volume, or a directory squatting the name), starting would
+    produce a wrong output rather than a failed job.
+    """
+    svc = romz_mod.romz_service
+    rom = tmp_path / "Game.gba"
+    rom.write_bytes(b"ROM")
+    out = tmp_path / "Game.gba.7z"
+    out.mkdir()  # a directory shadowing the archive: os.remove can't clear it
+
+    async def never(*_args, **_kwargs):
+        raise AssertionError("7z must not be spawned")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(svc._runner, "run", never)
+
+    async def _drain():
+        return [u async for u in svc.convert(str(rom), str(out), "romz_7z")]
+
+    with pytest.raises(RuntimeError, match="Could not clear the existing archive"):
+        asyncio.run(_drain())
+    assert out.is_dir()
+
+
 def test_verify_pass(tmp_path, stub_runner):
     svc, calls = stub_runner
     archive = _make_zip(tmp_path / "Game.zip", {"Game.gba": b"ROM"})

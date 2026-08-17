@@ -14,7 +14,6 @@ is an ordinary Dolphin/CHDMAN source like any other.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import re
 import struct
@@ -28,6 +27,7 @@ from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
     ioprio_prefix,
+    remove_partial_output,
 )
 from utils.path_utils import match_extension
 
@@ -404,11 +404,11 @@ class Nkit2IsoService:
         ):
             # nkit2iso removes its own half-written output on a hard error, but
             # not when we kill it mid-run (cancel / stall), so sweep the partial
-            # here too. Setup failures above this try are not caught, so a
+            # here too — through the shared bounded helper, so a sweep on an
+            # unresponsive output mount gives up instead of holding the job (and
+            # the queue) open. Setup failures above this try are not caught, so a
             # pre-existing file is never removed for a run that wrote nothing.
-            with contextlib.suppress(OSError):
-                if os.path.exists(output_path):
-                    os.remove(output_path)
+            await remove_partial_output(output_path, label="nkit2iso output")
             raise
 
         if not_exact:

@@ -21,10 +21,8 @@ mirrors the reference ``-mx=9 -md=256m -mfb=273 -m0=lzma2`` profile.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import re
-import shutil
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -39,6 +37,8 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     ReadCancelled,
+    remove_partial_output,
+    remove_partial_tree,
     run_detached,
     verify_preflight,
 )
@@ -390,11 +390,21 @@ class RomzService:
         if mode in ROMZ_COMPRESS_MODES:
             complete_message = "Compression complete"
             # `7z a` APPENDS to an existing archive, so clear any stale/partial
-            # output first to avoid silently merging into it. suppress(OSError)
-            # covers the already-absent case (FileNotFoundError) without a
-            # separate stat on the event loop.
-            with contextlib.suppress(OSError):
-                await asyncio.to_thread(os.remove, output_path)
+            # output first to avoid silently merging into it. Same bounded sweep
+            # as the failure path (an already-absent file counts as cleared, and
+            # needs no separate stat on the event loop) — but here the result is
+            # load-bearing: if the stale archive is still there, appending to it
+            # would produce a silently wrong output, so refuse to start. (A job
+            # cancelled mid-sweep raises CancelledError out of the helper rather
+            # than reaching the RuntimeError below, so it still reports as
+            # cancelled and not as this failure.)
+            if not await remove_partial_output(
+                output_path, label="stale romz archive",
+            ):
+                raise RuntimeError(
+                    f"Could not clear the existing archive at {output_path}; "
+                    "7z would append to it. Remove it and retry.",
+                )
             # 7z stores the path *as given on the command line* (minus the
             # root). Run it from the ROM's directory and add only the basename so
             # the archive holds a single root-level ``Game.gba`` instead of the
@@ -457,18 +467,21 @@ class RomzService:
             # Any failure/cancel can leave a partial archive or ROM on disk; the
             # runner doesn't own output_path, so clean it up here so a retry
             # isn't blocked by (or silently trusts) a truncated file. Off the
-            # event loop like the rest of this method's filesystem ops.
-            # suppress(OSError) covers the already-absent case.
-            with contextlib.suppress(OSError):
-                await asyncio.to_thread(os.remove, runner_output)
+            # event loop like the rest of this method's filesystem ops, and
+            # bounded: this runs after the run already failed, potentially on
+            # the very mount that failed it, so an unlink that never returns
+            # would hold the job open indefinitely. Both paths go in one call —
+            # they're the same sweep, and on extract they differ (temp file plus
+            # the destination a partial os.replace may have created).
+            targets = [runner_output]
             if runner_output != output_path:
-                with contextlib.suppress(OSError):
-                    await asyncio.to_thread(os.remove, output_path)
+                targets.append(output_path)
+            await remove_partial_output(*targets, label="romz output")
             raise
         finally:
             if extract_tmp_dir is not None:
-                await asyncio.to_thread(
-                    shutil.rmtree, extract_tmp_dir, ignore_errors=True,
+                await remove_partial_tree(
+                    extract_tmp_dir, label="romz extract dir",
                 )
 
     # ----- info -------------------------------------------------------------

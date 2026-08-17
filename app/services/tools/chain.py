@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +31,7 @@ from models import OutputStatus
 from fastapi.concurrency import run_in_threadpool
 from services.disk import create_scratch_dir, ensure_headroom
 from services.lock_manager import lock_manager
+from services.subprocess_runner import remove_partial_tree
 from utils.path_utils import match_extension
 
 from .base import BaseTool
@@ -322,7 +322,11 @@ class ChainTool(BaseTool):
             else:
                 yield {"progress": 100, "message": complete}
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # Holds the intermediate a failed step left behind, so this is the
+            # chain's partial-output sweep: bounded like every tool's, and off
+            # the event loop, so a wedged scratch volume can't keep the job (and
+            # the inline queue) from finalising.
+            await remove_partial_tree(work_dir, label="chain work dir")
 
     def _preflight_headroom(
         self, input_path: str, output_path: str, spec: ChainSpec, work_dir: str,

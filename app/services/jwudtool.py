@@ -56,6 +56,7 @@ from services.subprocess_runner import (
     ioprio_prefix,
     nice_prefix,
     ReadCancelled,
+    remove_partial_tree,
     run_detached,
     verify_preflight,
 )
@@ -485,7 +486,11 @@ class JwudToolService:
             await asyncio.to_thread(os.replace, produced_path, output_path)
             yield {"progress": 100, "message": f"Wii U {verb} complete"}
         finally:
-            await asyncio.to_thread(shutil.rmtree, work_dir, True)
+            # Also the failure path's partial-output sweep (JWUDTool names the
+            # file inside work_dir), so it is bounded like every other tool's:
+            # an unresponsive destination mount leaves a stray temp dir rather
+            # than a job that never finalises.
+            await remove_partial_tree(work_dir, label="JWUDTool work dir")
 
     async def _run_convert(
         self, input_path, produced_path, work_dir, mode, verb, cancel_event,

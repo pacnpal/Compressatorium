@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 import pytest
 
@@ -863,3 +864,348 @@ def test_stall_timeout_is_clamped_to_the_sampling_floor(tmp_path, monkeypatch):
 
     assert updates[-1]["progress"] == 100
     assert not runner.active_pids()
+
+
+# --------------------------------------------------------------------------- #
+# Bounded partial-output cleanup (issue #267)
+# --------------------------------------------------------------------------- #
+
+
+def test_remove_partial_output_deletes_every_path(tmp_path):
+    """The sweep clears the whole set a failed run can leave behind."""
+    base = tmp_path / "Game.iso"
+    parts = [tmp_path / f"Game.iso.{n}" for n in range(3)]
+    for path in (base, *parts):
+        path.write_bytes(b"partial")
+
+    async def _go():
+        return await runner_module.remove_partial_output(
+            *[str(p) for p in (base, *parts)],
+        )
+
+    assert asyncio.run(_go()) is True
+    assert not any(p.exists() for p in (base, *parts))
+
+
+def test_remove_partial_output_treats_an_absent_path_as_done(tmp_path):
+    """Nothing to remove is the goal, not a failure -- and needs no extra stat."""
+    async def _go():
+        return await runner_module.remove_partial_output(str(tmp_path / "gone.iso"))
+
+    assert asyncio.run(_go()) is True
+
+
+def test_remove_partial_output_reports_what_it_could_not_remove(tmp_path):
+    """A path it cannot unlink is reported, and does not stop the rest.
+
+    A directory shadowing the output is the real case (makeps3iso would write
+    inside it): os.remove fails, the sweep says so, and the sibling partial is
+    still cleared rather than left behind by an early return.
+    """
+    blocked = tmp_path / "Game.iso"
+    blocked.mkdir()
+    partial = tmp_path / "Game.iso.1"
+    partial.write_bytes(b"partial")
+
+    async def _go():
+        return await runner_module.remove_partial_output(
+            str(blocked), str(partial),
+        )
+
+    assert asyncio.run(_go()) is False
+    assert blocked.is_dir()
+    assert not partial.exists()
+
+
+def test_remove_partial_output_gives_up_instead_of_freezing_the_queue(monkeypatch):
+    """An unlink wedged on a dead mount must not hold the job open.
+
+    The scenario #265 left open: the runner abandons the child (bounded), the
+    tool wrapper then tries to delete the partial *on the same dead mount*, and
+    with MAX_CONCURRENT_JOBS=1 running jobs inline, a cleanup that never
+    returns freezes the whole queue. Cleanup reports failure and the job
+    finalises instead.
+    """
+    release = threading.Event()
+    entered = threading.Event()
+
+    # Signature must match `_unlink_all` exactly: a stub that raises TypeError
+    # would be caught as an ordinary cleanup failure and return False without
+    # the timeout ever running, passing this test for the wrong reason.
+    def _wedged(_paths, _discover, _abandoned):
+        entered.set()
+        release.wait(30)  # stands in for an unlink in uninterruptible I/O
+
+    monkeypatch.setattr(runner_module, "_unlink_all", _wedged)
+
+    async def _go():
+        return await runner_module.remove_partial_output(
+            "/mnt/dead/game.cso", timeout=0.05,
+        )
+
+    try:
+        assert asyncio.run(_go()) is False
+        assert entered.is_set(), "the wedged sweep must actually have been run"
+    finally:
+        release.set()
+
+
+def test_cancellation_propagates_without_undoing_the_removal(tmp_path):
+    """A cancel is re-raised, but doesn't take back work the sweep already did.
+
+    Swallowing CancelledError here would defeat cancellation outright for the
+    callers that clean up in a ``finally`` which also runs after a *successful*
+    conversion (nsz, JWUDTool, romz extract, chains): with no pending exception
+    to re-raise, the job would go on to be marked complete. The other half still
+    holds — the removal is dispatched before the wait, so a cancel arriving
+    afterwards can't undo it. (What a cancel *does* stop is paths the sweep
+    hasn't started — see ``test_abandoned_sweep_stops_before_touching_later_paths``.)
+    """
+    partial = tmp_path / "game.cso"
+    partial.write_bytes(b"partial")
+    start = threading.Event()
+    release = threading.Event()
+    real_unlink_all = runner_module._unlink_all
+
+    def _slow(paths, discover, abandoned):
+        real_unlink_all(paths, discover, abandoned)  # the removal lands here
+        start.set()
+        release.wait(30)  # keep the thread alive so the cancel races it
+
+    async def _go():
+        task = asyncio.ensure_future(
+            runner_module.remove_partial_output(str(partial)),
+        )
+        await asyncio.get_running_loop().run_in_executor(None, start.wait, 5)
+        task.cancel()
+        return await task
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(runner_module, "_unlink_all", _slow)
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(_go())
+    finally:
+        release.set()
+    assert not partial.exists()
+
+
+@pytest.mark.parametrize(
+    "dispatch_error",
+    [
+        RuntimeError("can't start new thread"),
+        # ProbeCapacityExceeded is an asyncio.TimeoutError, not a RuntimeError,
+        # so it needs its own coverage: catching only the latter let it escape.
+        runner_module.ProbeCapacityExceeded("64 probes are already blocked"),
+    ],
+    ids=["no-threads", "probe-capacity"],
+)
+def test_cleanup_reports_failure_when_it_cannot_be_dispatched(
+    monkeypatch, dispatch_error,
+):
+    """A dispatch that fails is a cleanup failure, not the job's outcome.
+
+    Both are plausible precisely here: a run of dead-mount sweeps deliberately
+    writes threads off, which is what exhausts threads *and* what fills the
+    probe-capacity budget. Letting either escape would stand in for the
+    converter's real error on a failure path, and would fail an already-
+    published conversion from the success-path `finally` callers.
+    """
+    def _cannot_dispatch(_func):
+        raise dispatch_error
+
+    monkeypatch.setattr(runner_module, "_probe_in_daemon_thread", _cannot_dispatch)
+
+    async def _go():
+        return await runner_module.remove_partial_output("/vol/game.cso")
+
+    assert asyncio.run(_go()) is False
+
+
+def test_remove_partial_tree_clears_the_work_dir(tmp_path):
+    work_dir = tmp_path / ".nsz-abc"
+    (work_dir / "nested").mkdir(parents=True)
+    (work_dir / "nested" / "Game.nsz").write_bytes(b"partial")
+
+    async def _go():
+        return await runner_module.remove_partial_tree(str(work_dir))
+
+    assert asyncio.run(_go()) is True
+    assert not work_dir.exists()
+
+
+def test_remove_partial_tree_gives_up_on_an_unresponsive_volume(monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+
+    # *args/**kwargs, so how rmtree is called (ignore_errors positional or
+    # keyword) can't turn this into a TypeError that returns False before the
+    # timeout is ever exercised.
+    def _wedged(*_args, **_kwargs):
+        entered.set()
+        release.wait(30)
+
+    monkeypatch.setattr(runner_module.shutil, "rmtree", _wedged)
+
+    async def _go():
+        return await runner_module.remove_partial_tree(
+            "/mnt/dead/.nsz-abc", timeout=0.05,
+        )
+
+    try:
+        assert asyncio.run(_go()) is False
+        assert entered.is_set(), "the wedged rmtree must actually have been run"
+    finally:
+        release.set()
+
+
+def test_remove_partial_output_discovers_inside_the_bound(tmp_path):
+    """Enumerating the set to sweep must be bounded along with the unlinking.
+
+    A split build's parts are only knowable by probing the disk -- the same
+    disk the sweep is about to unlink from. Enumerating on the event loop first
+    would leave that probe unbounded, so `discover` runs on the cleanup thread.
+    """
+    base = tmp_path / "Game.iso"
+    parts = [tmp_path / f"Game.iso.{n}" for n in range(2)]
+    for path in (base, *parts):
+        path.write_bytes(b"partial")
+    probed_on: list[str] = []
+
+    def _discover() -> list[str]:
+        probed_on.append(threading.current_thread().name)
+        return [str(p) for p in (base, *parts)]
+
+    async def _go():
+        return await runner_module.remove_partial_output(discover=_discover)
+
+    assert asyncio.run(_go()) is True
+    assert not any(p.exists() for p in (base, *parts))
+    assert probed_on == ["fs-probe"]  # not the event loop's thread
+
+
+def test_an_already_abandoned_sweep_does_not_even_discover(tmp_path):
+    """Given up on before the thread ran: touch the storage at all.
+
+    Discovery is itself a round trip to the volume the sweep would unlink from,
+    and it holds a probe slot the next job's cleanup may need. Nothing here is
+    this job's any more, so the whole sweep is skipped rather than just its
+    unlinks.
+    """
+    partial = tmp_path / "Game.iso"
+    partial.write_bytes(b"a retry's valid output")
+    discovered = threading.Event()
+
+    def _discover() -> list[str]:
+        discovered.set()
+        return [str(partial)]
+
+    already = threading.Event()
+    already.set()
+    runner_module._unlink_all((), _discover, already)
+
+    assert not discovered.is_set()
+    assert partial.read_bytes() == b"a retry's valid output"
+
+
+def test_remove_partial_output_bounds_a_wedged_discovery():
+    """A discovery that never returns is given up on like a wedged unlink."""
+    release = threading.Event()
+
+    def _wedged_discover():
+        release.wait(30)
+        return []
+
+    async def _go():
+        return await runner_module.remove_partial_output(
+            discover=_wedged_discover, label="split set", timeout=0.05,
+        )
+
+    try:
+        assert asyncio.run(_go()) is False
+    finally:
+        release.set()
+
+
+def test_abandoned_sweep_stops_before_touching_later_paths(tmp_path):
+    """A sweep that outlived its bound must not keep deleting.
+
+    The mount can recover minutes after the job gave up, by which point a retry
+    may own those names — an abandoned sweep resuming through the rest of its
+    list would delete the *new* job's good output.
+    """
+    wedge = tmp_path / "Game.iso"
+    wedge.write_bytes(b"partial")
+    later = tmp_path / "Game.iso.1"
+    later.write_bytes(b"a retry's valid output")
+
+    release = threading.Event()
+    real_remove = os.remove
+
+    def _slow_remove(path):
+        if str(path) == str(wedge):
+            release.wait(30)  # still blocked when the caller gives up
+        real_remove(path)
+
+    async def _go():
+        return await runner_module.remove_partial_output(
+            str(wedge), str(later), timeout=0.05,
+        )
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(runner_module.os, "remove", _slow_remove)
+            assert asyncio.run(_go()) is False
+    finally:
+        release.set()
+
+    # The unlink already in flight can't be recalled, so `wedge` still goes...
+    for _ in range(100):
+        if not wedge.exists():
+            break
+        time.sleep(0.05)
+    assert not wedge.exists()
+    # ...but everything after it is left alone.
+    assert later.read_bytes() == b"a retry's valid output"
+
+
+def test_a_cancel_abandons_a_sweep_that_had_not_started_unlinking(tmp_path):
+    """A cancel stops a wedged sweep the same way a timeout does.
+
+    The counterpart of the timeout case: once the caller is gone the job stops
+    owning these paths, so a sweep still stuck when the cancel lands must not
+    unlink them when the storage eventually answers.
+    """
+    partial = tmp_path / "game.7z"
+    partial.write_bytes(b"stale")
+    start = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    real_unlink_all = runner_module._unlink_all
+
+    def _slow(paths, discover, abandoned):
+        start.set()
+        release.wait(30)  # still wedged when the cancel arrives
+        try:
+            real_unlink_all(paths, discover, abandoned)
+        finally:
+            done.set()
+
+    async def _go():
+        task = asyncio.ensure_future(
+            runner_module.remove_partial_output(str(partial)),
+        )
+        await asyncio.get_running_loop().run_in_executor(None, start.wait, 5)
+        task.cancel()
+        return await task
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(runner_module, "_unlink_all", _slow)
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(_go())
+    finally:
+        release.set()
+
+    assert done.wait(5)
+    assert partial.exists()  # abandoned before it reached the unlink

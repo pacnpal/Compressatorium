@@ -28,6 +28,21 @@
   *Cancelling...* forever — and every job behind it waited with it. All waits on
   a subprocess are now bounded and escalate to giving up: the stuck job fails
   with an explanation and the queue carries on.
+- **Cleaning up after a failed conversion can no longer freeze the queue
+  either.** Bounding every wait on the conversion itself left one unbounded step
+  right behind it: once a job failed, each tool deleted the half-written file it
+  left behind — on the same storage the conversion had just died on. A delete on
+  an unresponsive mount blocks in the kernel and cannot be interrupted, so the
+  worst case still ended the same way. The stuck process was abandoned in
+  seconds, and then the job hung forever tidying up, with every queued job
+  behind it. Partial-output cleanup is now bounded like everything else and
+  gives up out loud: the job finishes as failed, the log names the file that
+  could not be removed and says the storage is likely unresponsive, and the
+  queue moves on. A leftover partial file is a much smaller problem than a
+  frozen queue, and deleting it is a one-line fix an operator can actually
+  perform. Affects every tool that writes its output in place — maxcso, z3ds,
+  nkit2iso, nsz, romz, makeps3iso, JWUDTool — and the temporary directories
+  chained conversions work in.
 - **A wedged job now says so in the log.** Stuck-queue detection only fired when
   jobs were queued and *none* were processing, so a job frozen mid-conversion —
   exactly the case above — was the one state it could not see, and the only

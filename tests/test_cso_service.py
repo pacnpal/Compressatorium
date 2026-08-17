@@ -6,12 +6,19 @@ need neither the real ``maxcso`` binary nor real disc images.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
 
 from app.services import maxcso as maxcso_module
 from app.services.chdman import ConversionCancelled
+
+# ``services.subprocess_runner``, not ``app.services.subprocess_runner``: the
+# two are separate module objects (the app is imported with ``app`` on the path
+# and uses the former), so patching the latter would leave the code under test
+# untouched and quietly prove nothing.
+from services import subprocess_runner as runner_module
 
 service = maxcso_module.maxcso_service
 
@@ -109,6 +116,48 @@ async def test_convert_nonzero_exit_raises(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="return code 1"):
         await _drain(service.convert(str(src_path), str(out_path), "cso_compress"))
+
+
+@pytest.mark.asyncio
+async def test_convert_failure_finishes_even_if_cleanup_wedges(tmp_path, monkeypatch):
+    """A dead output mount must not turn a failed job into a frozen queue.
+
+    Issue #267: the runner's waits are bounded, but the partial-output sweep
+    that runs *after* it raises used to be an unbounded ``os.remove`` on the
+    very mount the conversion just died on. With MAX_CONCURRENT_JOBS defaulting
+    to 1 and jobs running inline, blocking there froze every queued job. The
+    conversion must still surface its own error, promptly.
+    """
+    src_path = tmp_path / "game.iso"
+    src_path.write_bytes(b"input")
+    out_path = tmp_path / "game.cso"
+
+    async def fake_exec(*_args, **_kwargs):
+        return _FakeProcess(pid=5, chunks=[b"bad input\n"], returncode=1)
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    # Signature must match `_unlink_all`: a stub that raises TypeError would be
+    # caught as an ordinary cleanup failure, and this would pass without the
+    # wedge or the timeout ever being exercised.
+    def _wedged(_paths, _discover, _abandoned):
+        entered.set()
+        release.wait(30)  # an unlink stuck in uninterruptible I/O
+
+    monkeypatch.setattr(maxcso_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(runner_module, "_unlink_all", _wedged)
+    monkeypatch.setattr(runner_module, "_CLEANUP_TIMEOUT", 0.05)
+
+    try:
+        with pytest.raises(RuntimeError, match="return code 1"):
+            await asyncio.wait_for(
+                _drain(service.convert(str(src_path), str(out_path), "cso_compress")),
+                timeout=10,
+            )
+        assert entered.is_set(), "the wedged sweep must actually have been run"
+    finally:
+        release.set()
 
 
 class _CancelStdout:

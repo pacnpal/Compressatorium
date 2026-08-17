@@ -16,6 +16,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     ReadCancelled,
+    remove_partial_output,
     resolve_verify_timeout,
     run_detached,
     verify_preflight,
@@ -210,14 +211,13 @@ class Z3DSCompressService:
             # z3ds_compressor writes the container in place. These are the
             # abnormal exits the runner can raise after it spawned the child — a
             # mid-run cancel, a non-zero/stall RuntimeError, or a task-cancellation
-            # / generator close — so a partial may be on disk. Remove it
-            # synchronously so a retry isn't blocked by a truncated file. Setup
-            # (above this try) and pre-spawn failures are not caught here, so a
-            # pre-existing output is never deleted for a conversion that wrote
-            # nothing.
-            with contextlib.suppress(OSError):
-                if os.path.exists(output_path):
-                    os.remove(output_path)
+            # / generator close — so a partial may be on disk. The shared helper
+            # removes it under a hard time bound, so a retry isn't blocked by a
+            # truncated file and an unresponsive mount can't hold the job (and
+            # with it the queue) here. Setup (above this try) and pre-spawn
+            # failures are not caught here, so a pre-existing output is never
+            # deleted for a conversion that wrote nothing.
+            await remove_partial_output(output_path, label="z3ds output")
             raise
 
     def info(self, file_path: str) -> dict:

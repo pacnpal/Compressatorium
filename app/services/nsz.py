@@ -35,6 +35,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    remove_partial_tree,
     run_detached,
     verify_preflight,
 )
@@ -354,7 +355,11 @@ class NszService:
             await asyncio.to_thread(os.replace, produced_path, output_path)
             yield {"progress": 100, "message": f"Switch {verb} complete"}
         finally:
-            await asyncio.to_thread(shutil.rmtree, work_dir, True)
+            # Runs on the failure path too, where the work dir still holds the
+            # partial nsz wrote — and where the mount it lives on may be exactly
+            # what the run just died on. Bounded, so a wedged rmtree leaves a
+            # stray temp dir instead of a job that never finalises.
+            await remove_partial_tree(work_dir, label="nsz work dir")
 
     async def _run_convert(self, input_path, produced_path, work_dir, mode, verb,
                            env, cancel_event, compression=None) -> AsyncGenerator[dict, None]:
