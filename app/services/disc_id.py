@@ -82,6 +82,21 @@ def _chdman_runner():
     from services.chdman import chdman_service
     return chdman_service.runner
 
+
+def _chdman_cmd(chdman_path: str, *args: str) -> list[str]:
+    """chdman argv with the tool priority policy applied as command wrappers.
+
+    Wrappers, never ``run_capture``'s ``preexec_fn``: this process is
+    multithreaded, and forking a Python callable from a multithreaded parent can
+    deadlock the child before it ``exec()``s -- and a child wedged there never
+    returns from ``create_subprocess_exec``, so the bound these calls exist to
+    get would never be applied. ``nice``/``ionice`` only exec. The hand-rolled
+    spawns this replaces used no ``preexec_fn`` either.
+    """
+    from services.subprocess_runner import ioprio_prefix, nice_prefix
+    owner = _chdman_runner().owner
+    return nice_prefix(owner) + ioprio_prefix(owner) + [chdman_path, *args]
+
 # ---------------------------------------------------------------------------
 # ISO 9660 constants
 # ---------------------------------------------------------------------------
@@ -1349,8 +1364,9 @@ async def _addmeta_text(
         # Bounded like dumpmeta below; addmeta writes one small tag, so the
         # same 15s ceiling is generous. It previously had no bound at all.
         returncode, _, stderr = await _chdman_runner().run_capture(
-            [chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value],
+            _chdman_cmd(chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value),
             timeout=_DUMPMETA_TIMEOUT_SECONDS,
+            nice_via_wrapper=True,
         )
         if returncode != 0:
             logger.warning(
@@ -1376,8 +1392,9 @@ async def _delmeta(chd_path: str, tag: str, chdman_path: str) -> bool:
     """
     try:
         returncode, _, stderr = await _chdman_runner().run_capture(
-            [chdman_path, "delmeta", "-i", chd_path, "-t", tag],
+            _chdman_cmd(chdman_path, "delmeta", "-i", chd_path, "-t", tag),
             timeout=_DUMPMETA_TIMEOUT_SECONDS,
+            nice_via_wrapper=True,
         )
         if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
@@ -1422,8 +1439,9 @@ async def _dumpmeta_raw(
     tmp.close()
     try:
         returncode, _, stderr = await _chdman_runner().run_capture(
-            [chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path],
+            _chdman_cmd(chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path),
             timeout=_DUMPMETA_TIMEOUT_SECONDS,
+            nice_via_wrapper=True,
         )
         if returncode is None:
             # The shared teardown already bounded the kill; the old path killed

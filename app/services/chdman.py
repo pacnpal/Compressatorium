@@ -13,6 +13,7 @@ from services.subprocess_runner import (
     collect_verify,
     info_timeout,
     ioprio_prefix,
+    nice_prefix,
 )
 
 # Re-exported for backwards compatibility: ``ConversionCancelled`` historically
@@ -128,9 +129,20 @@ class ChdmanService:
         (issue #268).
         """
         timeout = info_timeout(self._runner.owner)
+        # Priority via command wrappers, never a preexec_fn: this process is
+        # multithreaded, and forking a Python callable from a multithreaded
+        # parent can deadlock the child before it exec()s -- and a child wedged
+        # there never returns from create_subprocess_exec at all, so the bound
+        # and the PID tracking below it would never be reached. `run_verify` and
+        # the wrapper-nice tools avoid preexec for the same reason; `nice` and
+        # `ionice` only exec. The hand-rolled spawn this replaces used no
+        # preexec_fn, so this keeps that property.
+        owner = self._runner.owner
         returncode, stdout, stderr = await self._runner.run_capture(
-            [self.chdman_path, "info", "-i", chd_path],
+            nice_prefix(owner) + ioprio_prefix(owner)
+            + [self.chdman_path, "info", "-i", chd_path],
             timeout=timeout or None,
+            nice_via_wrapper=True,
         )
         if returncode is None:
             raise RuntimeError(f"chdman info timed out after {timeout}s")

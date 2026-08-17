@@ -11,6 +11,7 @@ from services.subprocess_runner import (
     collect_verify,
     info_timeout,
     ioprio_prefix,
+    nice_prefix,
     resolve_verify_timeout,
 )
 
@@ -131,9 +132,16 @@ class DolphinToolService:
         ``collect_abandonment()`` sink (issue #268).
         """
         timeout = info_timeout(self._runner.owner)
+        # Wrapper-based priority, not preexec_fn -- see the note in
+        # ``chdman.info``: a fork of a Python callable from this multithreaded
+        # parent can deadlock the child before exec, and then
+        # create_subprocess_exec never returns to apply the bound at all.
+        owner = self._runner.owner
         returncode, stdout, stderr = await self._runner.run_capture(
-            [self.dolphin_tool_path, "header", "-i", path],
+            nice_prefix(owner) + ioprio_prefix(owner)
+            + [self.dolphin_tool_path, "header", "-i", path],
             timeout=timeout or None,
+            nice_via_wrapper=True,
         )
         if returncode is None:
             raise RuntimeError(f"dolphin-tool header timed out after {timeout}s")
