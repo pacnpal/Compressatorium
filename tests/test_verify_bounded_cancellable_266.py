@@ -328,7 +328,7 @@ async def test_a_verify_that_never_returns_is_bounded_by_the_job(
         await asyncio.sleep(60)
         return {"valid": True, "message": "never"}
 
-    async def tiny_bound(_path):
+    async def tiny_bound(_path, *, cancel_event=None):
         return 0.2
 
     tool = job_manager_module.registry.for_mode("z3ds_compress")
@@ -1211,3 +1211,125 @@ async def test_the_bound_holds_when_the_sse_client_stops_reading(tmp_path, monke
     # yield and cannot check any clock.
     await iterator.__anext__()
     await asyncio.wait_for(stopped.wait(), timeout=5)
+
+
+def test_cancel_after_eof_does_not_wait_out_the_exit_grace(tmp_path, monkeypatch):
+    """The post-EOF grace keeps watching the cancel event, it doesn't snapshot it.
+
+    A verifier that closes stdout without exiting is waited on for a voluntary
+    exit. That wait used to be one blocking reap whose grace was decided *once*,
+    before it started: a Cancel pressed a moment later went unseen, and the job
+    (with the single-slot dispatcher behind it) sat on *Cancelling...* for the
+    rest of the grace. It also meant the stall bound, the only bound a
+    stall-only configuration has, was not applied to this window at all.
+    """
+    asyncio.run(_cancel_after_eof(tmp_path, monkeypatch))
+
+
+async def _cancel_after_eof(tmp_path: Path, monkeypatch):
+    service = ChdmanService()
+    # EOF immediately (both fds -- stderr shares the pipe), then lingers for
+    # much longer than the full 60s grace.
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "lingering_chdman.py",
+        "import os\nos.close(1)\nos.close(2)\ntime.sleep(120)\n",
+    )
+    runner_mod = _runner_module(service)
+
+    async def _no_bound(_path, _owner=None, *, cancel_event=None):
+        return 0
+
+    # Neither bound is what should end this: the cancel is.
+    monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _no_bound)
+    monkeypatch.setattr(runner_mod.settings, "tool_verify_progress_timeout", 0)
+
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(
+        service.verify(str(tmp_path / "sample.chd"), cancel_event=cancel_event),
+    )
+    # Let the read loop reach EOF and enter the grace, then cancel.
+    await asyncio.sleep(1)
+    assert not task.done(), "the verify ended before the cancel could be tested"
+    cancel_event.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+
+    assert result["cancelled"] is True
+    assert result["valid"] is False
+    assert service.active_pids() == []
+
+
+def test_sizing_the_verify_bound_races_the_cancel_event(monkeypatch):
+    """Cancel is observed while the bound is still being resolved.
+
+    Resolving the bound stats the file, and on a mount that has stopped
+    answering that stat blocks for its full probe bound. It runs *before* the
+    verify that would observe the cancel, so without racing the event here a
+    Cancel pressed at that moment held the job -- and the dispatcher slot --
+    until the probe gave up.
+    """
+    asyncio.run(_bound_sizing_races_cancel(monkeypatch))
+
+
+async def _bound_sizing_races_cancel(monkeypatch):
+    import threading
+    import time
+
+    from app.services import subprocess_runner as runner_mod
+
+    release = threading.Event()
+
+    def _wedged_sizing(_path, _owner=None):
+        release.wait(30)
+        return 999
+
+    monkeypatch.setattr(runner_mod, "_verify_timeout_sync", _wedged_sizing)
+
+    cancel_event = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, cancel_event.set)
+
+    started = time.monotonic()
+    try:
+        bound = await asyncio.wait_for(
+            runner_mod.resolve_verify_timeout(
+                "/does-not-answer/game.chd", "chdman", cancel_event=cancel_event,
+            ),
+            # Comfortably under _STAT_TIMEOUT: waiting that out is the bug.
+            timeout=runner_mod._STAT_TIMEOUT / 2,
+        )
+    except asyncio.TimeoutError:  # pragma: no cover - fails the test below
+        release.set()
+        raise AssertionError("sizing the bound ignored the cancel event") from None
+    elapsed = time.monotonic() - started
+    release.set()
+
+    # Falls back to the flat baseline: the caller is about to be told the run
+    # was cancelled, so the number only has to exist.
+    assert bound == runner_mod.verify_timeout("chdman")
+    assert elapsed < runner_mod._STAT_TIMEOUT / 2
+
+
+@pytest.mark.asyncio
+async def test_the_job_passes_its_cancel_event_into_bound_resolution(
+    tmp_path: Path, monkeypatch,
+):
+    """The job's event reaches ``verify_timeout``, not just ``verify``."""
+    seen: dict[str, object] = {}
+
+    async def fake_verify(path: str, *, cancel_event=None):
+        return {"valid": True, "message": "ok"}
+
+    tool = job_manager_module.registry.for_mode("z3ds_compress")
+
+    async def _recording_bound(_path, *, cancel_event=None):
+        seen["event"] = cancel_event
+        return 30
+
+    monkeypatch.setattr(tool, "verify_timeout", _recording_bound)
+
+    _manager, job, _source = await _run_delete_on_verify_job(
+        tmp_path, monkeypatch, fake_verify,
+    )
+
+    assert job.status == JobStatus.COMPLETED
+    assert isinstance(seen.get("event"), asyncio.Event)

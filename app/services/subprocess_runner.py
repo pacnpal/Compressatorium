@@ -179,6 +179,10 @@ _PROBE_INTERVAL = 2.0
 _MIN_STALL_TIMEOUT = 3 * _PROBE_INTERVAL
 
 _EXIT_GRACE = 60.0
+# How finely the post-EOF exit grace is sliced. Each slice re-checks the cancel
+# event and both verify deadlines, so this is the worst-case lag between a
+# Cancel and the streaming verifier acting on it once its output has stopped.
+_EXIT_POLL = 1.0
 _TERM_GRACE = 5.0
 _KILL_GRACE = 10.0
 
@@ -285,7 +289,12 @@ def _verify_timeout_sync(path: str, owner: str | None = None) -> int:
     )
 
 
-async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
+async def resolve_verify_timeout(
+    path: str,
+    owner: str | None = None,
+    *,
+    cancel_event: asyncio.Event | None = None,
+) -> int:
     """Effective wall-clock bound for verifying ``path`` (0 disables).
 
     The single source of truth for "how long may a verify run": the configured
@@ -297,12 +306,23 @@ async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
 
     Sizing ``path`` stats it, which on a dead mount blocks in uninterruptible
     I/O -- exactly the failure this bound exists to survive -- so the stat is
-    taken through :func:`_bounded_probe` and a probe that does not answer falls
-    back to the flat baseline. A bound that cannot be sized still applies.
+    taken through the bounded detached seam and a probe that does not answer
+    falls back to the flat baseline. A bound that cannot be sized still applies.
+
+    ``cancel_event`` is raced against the stat for the same reason
+    :func:`verify_preflight` races it: this runs *before* the verify that would
+    observe the cancel, so without it a Cancel pressed while sizing an output on
+    a dead mount left the job -- and the single-slot dispatcher behind it -- on
+    "Cancelling..." for the full probe bound. A cancelled sizing falls back to
+    the flat baseline too: the caller is about to be told the run was cancelled,
+    so the number only has to exist.
     """
     try:
-        return await _bounded_probe(_verify_timeout_sync, path, owner)
-    except asyncio.TimeoutError:
+        return await asyncio.wait_for(
+            run_detached(_verify_timeout_sync, path, owner, cancel_event=cancel_event),
+            timeout=_STAT_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, ReadCancelled):
         return verify_timeout(owner)
 
 
@@ -920,20 +940,28 @@ class SubprocessRunner:
                         "progress": parse_progress(line),
                         "message": line,
                     }
-                # The voluntary-exit grace is capped by what is actually left:
-                # a verifier that closed stdout without exiting must not hold
-                # the lane for the full default grace past its own deadline,
-                # and a cancel that has already fired means don't wait at all.
-                if cancel_event is not None and cancel_event.is_set():
-                    exit_grace = 0.0
-                elif overall_timeout > 0:
-                    exit_grace = max(
-                        0.0,
-                        min(_EXIT_GRACE, overall_timeout - (time.monotonic() - start)),
-                    )
-                else:
-                    exit_grace = _EXIT_GRACE
-                if not await self.reap(process, exit_timeout=exit_grace):
+                # The voluntary-exit grace runs under the same live checks the
+                # read loop ran, rather than as one blocking wait: a verifier
+                # that closed stdout without exiting is still subject to the
+                # cancel and to both deadlines. Deciding the grace once, up
+                # front, would cover neither a cancel pressed a second later
+                # nor a stall-only configuration -- so it is sliced, and each
+                # slice re-asks the same question the read loop asked.
+                grace_until = time.monotonic() + _EXIT_GRACE
+                stopped = False
+                while process.returncode is None:
+                    now = time.monotonic()
+                    if await _check_limits(now):
+                        stopped = True
+                        break
+                    if now >= grace_until:
+                        break
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=min(_EXIT_POLL, grace_until - now),
+                        )
+                if not stopped and not await self.reap(process, exit_timeout=0):
                     reap_failed = True
                     # An abandoned child is reported as a terminal error event
                     # here, matching run()'s message. Issue #268 argues an

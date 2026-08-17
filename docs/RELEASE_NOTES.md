@@ -59,7 +59,10 @@
     subprocess is terminated and reaped; a pure-Python one (the Wii U container
     walk, the PS3 title readback) stops at its next checkpoint, and a blocking
     read already in flight is abandoned rather than killed — the operating
-    system offers no way to interrupt one. Either way the job is reported as a
+    system offers no way to interrupt one. That holds at every point the verify
+    can be waiting: while the bound is still being sized from the file, and
+    while a verifier that has stopped printing is being given a moment to exit
+    on its own. Either way the job is reported as a
     **cancelled job, not a failed verification**: it reached no verdict, so the
     source is never deleted on the strength of it.
   - The bound applies to verification started from the Verify buttons too, not

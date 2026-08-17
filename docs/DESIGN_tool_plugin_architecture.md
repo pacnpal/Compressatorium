@@ -218,7 +218,9 @@ class ToolPlugin(Protocol):
     # job_manager can bound the whole verify() call — including a tool whose
     # verify spawns nothing (jwud's container walk, makeps3iso's PARAM.SFO
     # readback) — without re-deriving which knob that tool reads.
-    async def verify_timeout(self, path: str) -> int: ...
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int: ...
     async def info(self, path: str) -> dict: ...                    # raw dict
     def info_model(self, raw: dict, path: str) -> BaseModel: ...    # typed model for the API
     # The five simple "what is this file" models (z3ds/nsz/cso/romz/makeps3iso)
@@ -304,8 +306,12 @@ class BaseTool:
     policy_owner: str | None = None
 
     # Default: the shared size-scaled verify bound for this tool's owner.
-    async def verify_timeout(self, path: str) -> int:
-        return await resolve_verify_timeout(path, self.policy_owner)
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        return await resolve_verify_timeout(
+            path, self.policy_owner, cancel_event=cancel_event,
+        )
 
     # verify() is the same drain-verify_stream()-and-keep-the-terminal-event
     # wrapper in every service, so it lives once in subprocess_runner as the
@@ -523,10 +529,13 @@ Three pieces, none of them per-tool:
    `cancelled: True`, which `job_manager` turns into a CANCELLED job — never a
    verification failure, and never a reason to delete a source.
 3. **A backstop at every call site.** `job_manager` resolves the bound first
-   (`bound = await tool.verify_timeout(path)`) and then wraps the whole
-   `verify()` in `asyncio.wait_for(tool.verify(…), timeout=bound or None)`, so
-   the guarantee holds even
-   for a tool whose verify spawns nothing for a subprocess timeout to bound. The
+   (`bound = await tool.verify_timeout(path, cancel_event=…)`) and then wraps
+   the whole `verify()` in `asyncio.wait_for(tool.verify(…), timeout=bound or
+   None)`, so the guarantee holds even
+   for a tool whose verify spawns nothing for a subprocess timeout to bound.
+   Resolving the bound sizes the file, which is itself a stat on the storage in
+   question, so it takes the cancel event too: it runs *before* the verify that
+   would otherwise observe one. The
    generated verify routes (`register_verify_routes`: sync, SSE, batch SSE) are
    the *other* entry point into the same verifiers, and they hold the `verify`
    workload lane while they run — so they apply the same per-path bound, once,
@@ -559,6 +568,13 @@ Three rules follow for any code that runs a verifier:
   left to reap it.
 - **Never record a verification result from a run that did not reach a
   verdict.**
+- **Keep every wait under the same live checks.** A wait decided once, up front,
+  answers only for the instant it was decided. `run_verify`'s post-EOF grace —
+  waiting for a verifier that closed stdout to exit on its own — is therefore
+  sliced, and each slice re-asks what the read loop asked: has the cancel fired,
+  has either deadline passed. Capping that grace by the *remaining* overall
+  bound is not the same thing: it sees neither a cancel pressed a second later
+  nor the stall bound, which is the only bound a stall-only configuration has.
 
 With verify genuinely bounded, the stalled-job warning no longer *skips* jobs in
 the verify phase (it did, to avoid calling a long checksum stalled — at the cost

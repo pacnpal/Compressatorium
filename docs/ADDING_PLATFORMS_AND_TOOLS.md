@@ -767,7 +767,8 @@ class NszipTool(BaseTool):
   `collect_verify(self.verify_stream(path, cancel_event=cancel_event), ...)`. A
   verify with no subprocess at all (a pure-Python container walk) still takes
   `cancel_event` and checks it between steps, and still ends within its bound —
-  `job_manager` applies `tool.verify_timeout(path)` around the whole call. A run
+  `job_manager` applies `tool.verify_timeout(path, cancel_event=…)` around the
+  whole call (the event goes in because resolving the bound stats the file). A run
   cut short by the event yields `{"cancelled": True, "valid": False}` so the job
   is cancelled rather than recorded as a failed verification. Resolve any bound
   **before** spawning the child: an `await` between the spawn and the

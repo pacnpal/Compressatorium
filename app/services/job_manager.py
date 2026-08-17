@@ -2377,8 +2377,14 @@ class JobManager:
                     # subprocess timeout to hide behind, and with
                     # MAX_CONCURRENT_JOBS=1 a verify that never returns freezes
                     # every job queued behind it (issue #266). The tool resolves
-                    # the number so its own per-tool override applies.
-                    verify_bound = await tool.verify_timeout(job.output_path)
+                    # the number so its own per-tool override applies, and takes
+                    # the cancel event because sizing the output is a stat of
+                    # its own: on a mount that has stopped answering, a Cancel
+                    # pressed here must not wait out the probe bound before the
+                    # verify that would report it even starts.
+                    verify_bound = await tool.verify_timeout(
+                        job.output_path, cancel_event=cancel_event,
+                    )
                     self._verifying[job_id] = time.monotonic()
                     try:
                         verify_result = await asyncio.wait_for(

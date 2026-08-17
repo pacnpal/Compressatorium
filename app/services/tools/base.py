@@ -206,7 +206,9 @@ class ToolPlugin(Protocol):
         event carries ``valid`` and, on cancellation, ``cancelled``.
         """
 
-    async def verify_timeout(self, path: str) -> int:
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
         """Wall-clock bound for verifying ``path``, in seconds (0 = unbounded).
 
         The tool's own verify already enforces this; it is exposed so the job
@@ -390,11 +392,17 @@ class BaseTool:
         # is weaker than its conversion-time check (jwud) overrides this.
         return True
 
-    async def verify_timeout(self, path: str) -> int:
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
         # Default: the shared size-scaled verify bound, resolved for this tool's
         # policy owner so a per-tool COMPRESSATORIUM_<OWNER>_VERIFY_TIMEOUT
         # override applies here exactly as it does inside the tool's own verify.
-        return await resolve_verify_timeout(path, self.policy_owner)
+        # Sizing the file is itself a stat, so the cancel event is raced against
+        # it: this runs before the verify that would otherwise observe it.
+        return await resolve_verify_timeout(
+            path, self.policy_owner, cancel_event=cancel_event,
+        )
 
     def verifies_path(self, path: str) -> bool:
         # Default: a declared-extension match (suffix-based, so a compound
