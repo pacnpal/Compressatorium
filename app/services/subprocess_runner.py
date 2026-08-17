@@ -1080,6 +1080,18 @@ class SubprocessRunner:
         storage. Issue #268 replaces this hook with an exception from
         ``run_capture`` itself.
         """
+        # Don't spawn into an already-cancelled operation. The race is real
+        # rather than theoretical: the child is created *before* the
+        # cancel_event becomes a waiter below, so a caller that resolved a
+        # size-scaled bound (itself a probe that can take its full time on
+        # storage that stopped answering) and only then reached here would start
+        # a verifier nobody wants -- and on that storage it is exactly the child
+        # that blocks immediately and may outlive SIGKILL. Checked in the shared
+        # seam so every capture caller gets it, not just the ones that remember.
+        # Reported as the ordinary abort, which is what a cancel is.
+        if cancel_event is not None and cancel_event.is_set():
+            return None, b"", b""
+
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
         # (e.g. dolphin-tool verify reconstructing a full disc for DAT hashing)

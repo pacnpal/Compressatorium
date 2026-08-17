@@ -745,20 +745,30 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
             # never got to look at: an abandoned chdman child is a fact about the
             # storage, not the file, so marking it checked would suppress
             # extraction for good after the share recovers, until the mtime
-            # changes (issue #268). Leave the cache untouched in that case.
-            cache_the_outcome = True
+            # changes (issue #268). Raising past the cache write below is what
+            # keeps that case retryable.
             try:
                 disc_info = await disc_id_extract_from_chd(path, settings.chdman_path) or {}
             except DiscIdStorageAbandoned as e:
+                # Not cached (above), which on its own would make every refresh
+                # retry and strand another child while the client saw a perfectly
+                # ordinary response with no game ID. So say it: 503, matching
+                # /dat/match, rather than presenting an abandoned read as a
+                # successful partial lookup (issue #268).
                 logger.error("disc_id extraction abandoned for %s: %s", path, e)
-                cache_the_outcome = False
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Reading the disc ID left a process stuck on "
+                        f"unresponsive storage: {e}"
+                    ),
+                ) from None
             except Exception as e:
                 logger.debug("disc_id extraction failed for %s: %s", path, e)
-            if cache_the_outcome:
-                await chd_metadata_store.update_disc_id_info(
-                    path, disc_info.get("game_id"), disc_info.get("title")
-                )
-                await chd_metadata_store.mark_disc_id_checked(path)
+            await chd_metadata_store.update_disc_id_info(
+                path, disc_info.get("game_id"), disc_info.get("title")
+            )
+            await chd_metadata_store.mark_disc_id_checked(path)
 
         game_id = disc_info.get("game_id")
         # Only surface a distinct human-readable title; skip when it equals
@@ -786,6 +796,9 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
             title=title,
         )
 
+    except HTTPException:
+        # Already carries its own status (e.g. the 503 above); don't relabel it.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to read CHD info: {e!s}",

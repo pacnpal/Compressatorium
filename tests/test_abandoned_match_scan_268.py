@@ -617,7 +617,49 @@ async def test_abandoned_disc_id_read_stays_retryable(tmp_path, monkeypatch):
 
     chd = tmp_path / "game.chd"
     chd.write_bytes(b"x")
-    await info_routes.get_chd_info(path=str(chd))
+
+    # 503 rather than a cheerful CHDInfo with no game ID: leaving it uncached
+    # (so it stays retryable) means a client that is told nothing just refreshes,
+    # stranding another chdman child each time.
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as excinfo:
+        await info_routes.get_chd_info(path=str(chd))
+    assert excinfo.value.status_code == 503
 
     assert not marked, "an unexamined CHD must stay eligible for a retry"
     assert not updated, "and nothing may be persisted about its disc ID"
+
+
+@pytest.mark.asyncio
+async def test_run_capture_does_not_spawn_into_an_already_cancelled_operation():
+    """The child is created before the cancel_event becomes a waiter.
+
+    So a caller that resolved a size-scaled bound first -- itself a probe that
+    can take its full time on storage that stopped answering -- and only then
+    reached the spawn would start a verifier nobody wants, on exactly the storage
+    where it may outlive SIGKILL. Guarded in the shared seam so every capture
+    caller gets it rather than the ones that remember to ask.
+    """
+    runner = runner_mod.SubprocessRunner(owner="test")
+    cancel = asyncio.Event()
+    cancel.set()
+
+    spawned = []
+    real_exec = runner_mod.asyncio.create_subprocess_exec
+
+    async def watched_exec(*args, **kwargs):
+        spawned.append(args)
+        return await real_exec(*args, **kwargs)
+
+    runner_mod.asyncio.create_subprocess_exec = watched_exec
+    try:
+        rc, _out, _err = await runner.run_capture(
+            # Never runs -- the point is that nothing is spawned at all.
+            [sys.executable, "-c", "pass"], cancel_event=cancel,
+        )
+    finally:
+        runner_mod.asyncio.create_subprocess_exec = real_exec
+
+    assert rc is None, "reported as the ordinary abort, which is what a cancel is"
+    assert not spawned, "nothing may be spawned into an already-cancelled operation"
+    assert not runner.active_pids()
