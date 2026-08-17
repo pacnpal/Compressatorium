@@ -205,11 +205,12 @@
   wait: 1800
   javascript: *js_theme_dark
 
-# The Settings tab, where the integration is configured without touching a
-# compose file. Clicked after the theme flip, so the JS is inline rather than
-# using the shared anchors.
-- url: http://127.0.0.1:8099/?s=romm-settings-light#/romm
-  output: docs/screenshots/romm-settings-light.png
+# The Automation tab. NOT the Settings tab: with no RomM configured the view
+# opens on Settings by itself, so the base shot above already captures that
+# surface and a second one would be identical. Clicked after the theme flip, so
+# the JS is inline rather than using the shared anchors.
+- url: http://127.0.0.1:8099/?s=romm-automation-light#/romm
+  output: docs/screenshots/romm-automation-light.png
   width: 1280
   height: 900
   wait: 1800
@@ -218,12 +219,12 @@
       localStorage.setItem('theme-preference', 'light');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
       await new Promise(r => setTimeout(r, 400));
-      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Settings');
+      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Automation');
       if (tab) tab.click();
       await new Promise(r => setTimeout(r, 600));
     })()
-- url: http://127.0.0.1:8099/?s=romm-settings-dark#/romm
-  output: docs/screenshots/romm-settings-dark.png
+- url: http://127.0.0.1:8099/?s=romm-automation-dark#/romm
+  output: docs/screenshots/romm-automation-dark.png
   width: 1280
   height: 900
   wait: 1800
@@ -232,7 +233,7 @@
       localStorage.setItem('theme-preference', 'dark');
       window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
       await new Promise(r => setTimeout(r, 400));
-      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Settings');
+      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Automation');
       if (tab) tab.click();
       await new Promise(r => setTimeout(r, 600));
     })()

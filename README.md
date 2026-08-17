@@ -541,11 +541,17 @@ An at-a-glance view of the job queue, verification cache, mounted volumes, recen
 
 #### RomM library
 
-Browse a [RomM](https://romm.app) library by platform and convert it in place — real game names instead of filenames, and the platform tells Compressatorium what a bare `.iso` actually is. See [RomM integration](#romm-integration).
+Connect a [RomM](https://romm.app) instance and browse your library by platform — real game names instead of filenames, and the platform tells Compressatorium what a bare `.iso` actually is. Everything is configured in the app; this is the first-run setup. See [RomM integration](#romm-integration).
 
 | Light | Dark |
 |-------|------|
-| ![RomM library, light](docs/screenshots/romm-light.png) | ![RomM library, dark](docs/screenshots/romm-dark.png) |
+| ![RomM setup, light](docs/screenshots/romm-light.png) | ![RomM setup, dark](docs/screenshots/romm-dark.png) |
+
+Per-platform automation — target format, schedule, queueing limits and selection filters for each platform independently:
+
+| Light | Dark |
+|-------|------|
+| ![RomM automation, light](docs/screenshots/romm-automation-light.png) | ![RomM automation, dark](docs/screenshots/romm-automation-dark.png) |
 
 #### DAT Library
 
