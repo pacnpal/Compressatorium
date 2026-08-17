@@ -117,6 +117,12 @@ async def _bounded_probe(func: Callable, *args: object, **kwargs: object) -> obj
 # cannot disable the watchdog.
 _FIRST_SAMPLE_GRACE = 6.0
 
+# Minimum spacing between output-size samples. The read loop turns over once per
+# stdout chunk, so without this a chatty converter would set the probe rate --
+# hundreds of threads and metadata round-trips per second against the very mount
+# whose responsiveness is in question.
+_PROBE_INTERVAL = 2.0
+
 _EXIT_GRACE = 60.0
 _TERM_GRACE = 5.0
 _KILL_GRACE = 10.0
@@ -635,6 +641,7 @@ class SubprocessRunner:
             buffer = ""
             output_lines: list[str] = []
             stall_error: str | None = None
+            last_message = ""
             abandoned_error: str | None = None
             # Native stdout parsing is the preferred signal; the size-growth
             # fallback below only speaks while this stays False.
@@ -659,6 +666,7 @@ class SubprocessRunner:
                         output_lines.pop(0)
 
             probed_size: int | None = None
+            last_probe_at = 0.0
             # Whether any probe has ever finished. Distinguishes "no measurement
             # yet" from "measured, and there is no output file".
             probe_completed = False
@@ -695,12 +703,16 @@ class SubprocessRunner:
                 job rather than one per tick. The cost is that the size is one
                 tick (~2s) stale, which no consumer here cares about.
                 """
-                nonlocal size_probe, probed_size, probe_completed
-                if size_probe is None or size_probe.done():
-                    if size_probe is not None and not size_probe.cancelled():
+                nonlocal size_probe, probed_size, probe_completed, last_probe_at
+                if size_probe is not None and size_probe.done():
+                    if not size_probe.cancelled():
                         probe_completed = True
                         with contextlib.suppress(Exception):
                             probed_size = size_probe.result()
+                    size_probe = None
+                now = time.monotonic()
+                if size_probe is None and now - last_probe_at >= _PROBE_INTERVAL:
+                    last_probe_at = now
                     size_probe = _probe_in_daemon_thread(_measure_output_sync)
                 return probed_size
 
@@ -731,8 +743,6 @@ class SubprocessRunner:
                 # no wiring at all.
                 nonlocal last_output_size, last_activity_at, last_progress_value
                 nonlocal last_growth_at
-                if saw_native_progress:
-                    return None
                 size = _measure_output()
                 if size is None:
                     return None
@@ -743,6 +753,18 @@ class SubprocessRunner:
                 last_output_size = size
                 last_growth_at = now
                 last_activity_at = now
+                if saw_native_progress:
+                    # The tool speaks for itself, so don't replace its status
+                    # line -- but a file that is still growing is still
+                    # liveness, and a native tool can sit on one integer
+                    # percentage for many minutes on a large image. Republish
+                    # the current status carrying the flag so the job manager's
+                    # clock sees it (issue #263).
+                    return {
+                        "progress": last_progress_value,
+                        "message": last_message,
+                        "activity": True,
+                    }
                 progress = last_progress_value
                 if expected_size:
                     # Clamped to the floor: an estimate must never walk the bar
@@ -847,6 +869,7 @@ class SubprocessRunner:
                             advanced = True
                     # Clamp to the running floor (incl. initial_progress) so a
                     # parsed value below it can't move the bar backward.
+                    last_message = line
                     update = {"progress": last_progress_value, "message": line}
                     if advanced:
                         update["activity"] = True
@@ -870,6 +893,7 @@ class SubprocessRunner:
                         last_progress_value = progress
                         last_activity_at = now
                         advanced = True
+                last_message = line
                 update = {"progress": last_progress_value, "message": line}
                 if advanced:
                     update["activity"] = True
@@ -897,6 +921,14 @@ class SubprocessRunner:
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(
                     "%s pid=%s exit=%s", self._owner, process.pid, process.returncode,
+                )
+
+            if abandoned_error:
+                # Abandonment outranks the stall that triggered it: the child is
+                # still alive and still holding its output, which is the part an
+                # operator has to act on.
+                raise RuntimeError(
+                    f"{stall_error} {abandoned_error}" if stall_error else abandoned_error
                 )
 
             if stall_error:
