@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- **The Convert and Jobs panel no longer collapses into a narrow strip on
+  mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
+  monitor at 300% display scaling, a laptop at high zoom, or a half-snapped
+  window lands in — the workspace switches to a two-column layout where the
+  convert/jobs panel is meant to stack full-width below the file list. It was
+  never told to span the row, so the grid auto-placed it into the 220px
+  volumes-rail column: a squeezed sliver of a panel next to a huge empty cell,
+  with the page scrolling forever. The panel now spans the full row in that
+  range, and a laptop-width (1100px) screenshot was added to the automated set
+  so the in-between breakpoint stays covered.
 - **Every tool now reports real status, not just a spinning clock.** Dolphin
   conversions showed `Converting... (1134s)` against a progress bar pinned at
   0%, because dolphin-tool draws its progress bar only to a terminal and goes

@@ -437,6 +437,10 @@ The interface reflows cleanly across breakpoints:
 
 ![Desktop View](docs/screenshots/docs-desktop-view.png)
 
+**Laptop (1100px)**
+
+![Laptop View](docs/screenshots/docs-laptop-view.png)
+
 **Tablet (768px)**
 
 ![Tablet View](docs/screenshots/docs-tablet-view.png)

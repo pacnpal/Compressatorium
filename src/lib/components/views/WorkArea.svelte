@@ -106,6 +106,11 @@
   .grid > :global(.splitter) { display: none; }
   @media (min-width: 900px) {
     .grid { grid-template-columns: 220px minmax(0, 1fr); }
+    /* Two-column mode: volumes rail + file list share the first row, and
+       the convert/jobs panel stacks below. Without the explicit span,
+       auto-placement drops .right into the 220px rail column, leaving it
+       a narrow strip beside a huge empty cell. */
+    .right { grid-column: 1 / -1; }
   }
   @media (min-width: 1280px) {
     .grid {
@@ -114,6 +119,7 @@
       gap: var(--space-2);
     }
     .grid > :global(.splitter) { display: block; }
+    .right { grid-column: auto; }
   }
 
   .side, .main, .right {
