@@ -18,6 +18,7 @@ from services.dat_store import dat_store
 from services.file_hasher import compute_file_sha1
 from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
+from services.preferences_store import preferences_store
 from services.subprocess_runner import collect_abandonment
 from services.tools import registry
 from services.tools.base import EmbeddedHashUnavailable
@@ -99,6 +100,36 @@ class SyncRequest(BaseModel):
     force: bool = False
 
 
+class HasheousSettingsRequest(BaseModel):
+    """``None`` clears the override and falls back to the env var."""
+
+    enabled: bool | None = None
+
+
+# Preference key holding the Web UI's Hasheous override (see routes/preferences
+# for the sibling `layout` / `conversion` keys).
+HASHEOUS_PREF_KEY = "hasheous"
+
+
+async def load_hasheous_override() -> None:
+    """Restore the persisted Hasheous toggle. Called once at startup.
+
+    Best-effort: a preferences read failure must not stop the app booting, it
+    just means the environment default applies for this run.
+    """
+    try:
+        stored = await preferences_store.get(HASHEOUS_PREF_KEY)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not load the Hasheous preference: %s", exc)
+        return
+    if stored and "enabled" in stored:
+        hasheous.set_enabled_override(stored["enabled"])
+        logger.info(
+            "Hasheous fallback %s (saved in the Web UI)",
+            "enabled" if hasheous.enabled() else "disabled",
+        )
+
+
 @router.post("/dat/import")
 async def import_dat(file: UploadFile = File(...)):
     """Import a MAME Redump DAT file (Logiqx XML format)."""
@@ -166,11 +197,63 @@ async def get_dat_stats():
     endpoint.
     """
     stats = await run_in_threadpool(dat_store.get_stats)
+    state = _hasheous_state()
     return {
         **stats,
-        "hasheous_enabled": hasheous.enabled(),
-        "hasheous_url": settings.hasheous_base_url if hasheous.enabled() else None,
+        "hasheous_enabled": state["enabled"],
+        "hasheous_url": state["url"],
+        "hasheous_overridden": state["overridden"],
+        "hasheous_env_default": state["env_default"],
     }
+
+
+def _hasheous_state() -> dict:
+    """Everything the UI needs to render the Hasheous panel."""
+    return {
+        "enabled": hasheous.enabled(),
+        "url": hasheous.base_url(),
+        # True when the switch below is what's deciding, rather than the env
+        # var, so the UI can say the setting came from the environment.
+        "overridden": hasheous.override() is not None,
+        "env_default": hasheous.env_default(),
+    }
+
+
+@router.get("/dat/hasheous")
+async def get_hasheous_settings():
+    """Current Hasheous state (also carried on /dat/stats for convenience)."""
+    return _hasheous_state()
+
+
+@router.put("/dat/hasheous")
+async def put_hasheous_settings(request: HasheousSettingsRequest):
+    """Turn the Hasheous fallback on or off from the Web UI.
+
+    Persisted in the preferences table and applied immediately -- no container
+    restart, no editing docker-compose. ``enabled: null`` clears the override
+    and hands control back to ``COMPRESSATORIUM_HASHEOUS_ENABLED``.
+
+    Cached "no match" rows do not need clearing here: they carry the sources
+    they were produced with, and ``cached_result_usable`` re-checks them the
+    moment a stronger source becomes available.
+    """
+    hasheous.set_enabled_override(request.enabled)
+    await preferences_store.put(HASHEOUS_PREF_KEY, {"enabled": request.enabled})
+    logger.info(
+        "Hasheous fallback %s via Web UI",
+        "enabled" if hasheous.enabled() else "disabled",
+    )
+    return _hasheous_state()
+
+
+@router.post("/dat/hasheous/test")
+async def test_hasheous():
+    """Probe the configured server so the operator can confirm it works.
+
+    Always 200 with an ``ok`` flag: an unreachable server is a result to show,
+    not an API error.
+    """
+    return await hasheous.health()
 
 
 @router.post("/dat/match")
@@ -970,23 +1053,41 @@ async def _lookup_match(
     return None
 
 
-def cached_result_usable(payload: dict | None) -> bool:
-    """False when a cached row predates a lookup source that is now enabled.
+def remote_stamp() -> str | None:
+    """Identifies the remote source a verdict was reached with, or None.
 
-    A miss recorded before Hasheous was switched on came from a strictly weaker
-    matcher, so re-running it can now succeed. Without this an existing install
-    that enables Hasheous keeps serving its old "not in any DAT" rows and the
-    feature silently does nothing for precisely the uncovered library it exists
-    to identify.
+    The server *URL*, not a boolean: an operator who repoints
+    ``COMPRESSATORIUM_HASHEOUS_URL`` at a self-hosted instance has changed which
+    database answers, so misses recorded against the old one need re-checking
+    too -- not only misses recorded before the feature was switched on.
+    """
+    return hasheous.base_url() if hasheous.enabled() else None
+
+
+def cached_result_usable(payload: dict | None) -> bool:
+    """False when a cached row predates the lookup sources now configured.
+
+    A miss recorded before Hasheous was switched on -- or against a *different*
+    Hasheous server -- came from a different, or strictly weaker, matcher, so
+    re-running it can now succeed. Without this an existing install that enables
+    Hasheous keeps serving its old "not in any DAT" rows and the feature
+    silently does nothing for precisely the uncovered library it exists to
+    identify.
 
     Hits are always usable: local DATs are consulted first anyway, so a remote
     source could not have improved on one.
+
+    With Hasheous off, any miss is usable -- a local-only verdict is exactly
+    what a local-only configuration should produce.
     """
     if payload is None:
         return False
     if payload.get("matched"):
         return True
-    return bool(payload.get("checked_remote")) or not hasheous.enabled()
+    stamp = remote_stamp()
+    if stamp is None:
+        return True
+    return payload.get("checked_remote") == stamp
 
 
 async def _match_single_file(
@@ -1002,12 +1103,13 @@ async def _match_single_file(
     ``cancel_event`` is forwarded to the tool's (potentially expensive)
     embedded-hash hook so a background scan/match job can abort it promptly.
     """
-    # ``checked_remote`` records which sources this verdict was reached with, so
-    # a miss cached before Hasheous was enabled isn't served forever once it is
-    # (see cached_result_usable). Only misses need it: a hit is already the
-    # strongest answer available.
+    # ``checked_remote`` records WHICH remote source this verdict was reached
+    # with (the server URL, or None), so a miss cached before Hasheous was
+    # enabled -- or against a different server -- isn't served forever (see
+    # cached_result_usable). Only misses need it: a hit is already the strongest
+    # answer available.
     base_result = {
-        "path": file_path, "matched": False, "checked_remote": hasheous.enabled(),
+        "path": file_path, "matched": False, "checked_remote": remote_stamp(),
     }
 
     if not matching_available(await run_in_threadpool(dat_store.has_dats)):

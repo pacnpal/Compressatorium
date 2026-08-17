@@ -67,9 +67,82 @@ class HasheousUnavailable(Exception):
     """
 
 
+# Runtime override set from the Web UI toggle, persisted in the preferences
+# table and reloaded at startup. ``None`` means "no override, follow the env
+# var". Toggling has to take effect without a container restart, which is why
+# the flag is not read straight from Settings on every call.
+#
+# A plain module-level bool needs no lock: assignment is atomic, the container
+# pins uvicorn to --workers 1 (see the note in routes/dat.py), and a lookup
+# racing a toggle is harmless either way.
+_enabled_override: bool | None = None
+
+
 def enabled() -> bool:
-    """True when the operator has opted in to remote lookups."""
+    """True when remote lookups are switched on.
+
+    The UI toggle wins when set; otherwise the ``COMPRESSATORIUM_HASHEOUS_ENABLED``
+    environment default applies.
+    """
+    if _enabled_override is not None:
+        return _enabled_override
     return bool(getattr(settings, "hasheous_enabled", False))
+
+
+def env_default() -> bool:
+    """What the environment alone would say, ignoring any UI override."""
+    return bool(getattr(settings, "hasheous_enabled", False))
+
+
+def set_enabled_override(value: bool | None) -> None:
+    """Apply (or clear, with ``None``) the UI override."""
+    global _enabled_override  # noqa: PLW0603, intentional module-level state
+    _enabled_override = None if value is None else bool(value)
+    # A toggle is the operator saying "try again": drop any active cooldown so
+    # the next lookup actually goes out instead of reporting a stale outage.
+    _clear_cooldown()
+
+
+def override() -> bool | None:
+    """The current override, or ``None`` when following the environment."""
+    return _enabled_override
+
+
+def base_url() -> str:
+    return str(getattr(settings, "hasheous_base_url", "") or "").rstrip("/")
+
+
+async def health() -> dict:
+    """Probe the configured server so the UI can offer a 'Test connection'.
+
+    Never raises: a failure is the answer the caller wants to display.
+    """
+    url = f"{base_url()}/api/v1/Healthcheck"
+    started = time.monotonic()
+    try:
+        await run_in_threadpool(_probe, url)
+    except HasheousUnavailable as exc:
+        return {"ok": False, "url": url, "error": str(exc)}
+    except ValueError as exc:  # non-https base URL
+        return {"ok": False, "url": url, "error": str(exc)}
+    return {
+        "ok": True,
+        "url": url,
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+def _probe(url: str) -> None:
+    """GET *url*, raising HasheousUnavailable unless it answers 2xx."""
+    _require_https(url)
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    try:
+        with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
+            resp.read(1024)
+    except urllib.error.HTTPError as exc:
+        raise HasheousUnavailable(f"HTTP {exc.code}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise HasheousUnavailable(str(exc)) from exc
 
 
 def _require_https(url: str) -> None:
@@ -132,12 +205,12 @@ def _fetch_json(url: str) -> dict | None:
     The single seam tests patch (the same pattern as
     ``tests/test_dat_sync.py`` patching ``sync_service._fetch_json``).
     """
-    _require_https(url)
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
     )
     try:
+        _require_https(url)
         with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -145,6 +218,14 @@ def _fetch_json(url: str) -> dict | None:
             # The documented "no such hash" answer, not a failure.
             return None
         raise HasheousUnavailable(f"HTTP {exc.code}") from exc
+    except ValueError as exc:
+        # A non-https base URL, or a redirect trying to downgrade to http (the
+        # redirect handler raises from inside opener.open). Both are
+        # configuration/transport failures, so they have to arrive as
+        # HasheousUnavailable: a bare ValueError would escape the match path
+        # as a 500 and skip the cooldown, so a bulk match would re-raise it
+        # once per file.
+        raise HasheousUnavailable(str(exc)) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise HasheousUnavailable(str(exc)) from exc
 
@@ -245,4 +326,18 @@ async def lookup(sha1: str) -> dict | None:
     _clear_cooldown()
     if data is None:
         return None
-    return _normalize(data)
+
+    record = _normalize(data)
+    if not _is_identified(record):
+        # A 200 that carries no game identity is not a hit. Hasheous answers an
+        # unknown hash with 404, so this is something else answering for it --
+        # a proxy error envelope, a self-host returning `{}`. Recording it
+        # would cache an authoritative-looking match with no game attached, so
+        # treat it as a service failure (non-cacheable) rather than a result.
+        raise HasheousUnavailable("response carried no game identity")
+    return record
+
+
+def _is_identified(record: dict) -> bool:
+    """True when a normalized record actually names a game."""
+    return bool(record.get("game_name") or record.get("rom_name"))

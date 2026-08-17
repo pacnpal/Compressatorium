@@ -236,9 +236,14 @@ def test_oversized_body_raises_unavailable(hasheous_on):
 
 
 def test_plain_http_is_refused(monkeypatch):
-    """File hashes must not go out in the clear."""
+    """File hashes must not go out in the clear.
+
+    Surfaces as HasheousUnavailable, not a bare ValueError: the match path only
+    catches the former, so a ValueError would escape as a 500 and skip the
+    cooldown, making a bulk match re-raise it once per file.
+    """
     monkeypatch.setattr(settings, "hasheous_base_url", "http://hasheous.example")
-    with pytest.raises(ValueError, match="https"):
+    with pytest.raises(hasheous.HasheousUnavailable, match="https"):
         hasheous._fetch_json("http://hasheous.example/x")
 
 
@@ -525,11 +530,14 @@ def test_cached_miss_from_before_hasheous_is_not_reused(monkeypatch):
     forever and the feature silently does nothing for the very library it
     exists to identify.
     """
-    stale_miss = {"path": "/a.iso", "matched": False, "checked_remote": False}
-    fresh_miss = {"path": "/a.iso", "matched": False, "checked_remote": True}
+    stale_miss = {"path": "/a.iso", "matched": False, "checked_remote": None}
+    fresh_miss = {
+        "path": "/a.iso", "matched": False, "checked_remote": "https://hasheous.example",
+    }
     hit = {"path": "/a.iso", "matched": True, "source": "dat"}
 
     monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", "https://hasheous.example")
     assert dat_routes.cached_result_usable(stale_miss) is False
     assert dat_routes.cached_result_usable(fresh_miss) is True
     # A local hit is already the strongest answer; local is consulted first.
@@ -554,7 +562,9 @@ async def test_misses_record_which_sources_were_consulted(hasheous_on, monkeypat
     result = await dat_routes._match_single_file("/x.iso")
 
     assert result["matched"] is False
-    assert result["checked_remote"] is True
+    # The stamp is the server URL, not a flag, so repointing at a different
+    # Hasheous also invalidates the row.
+    assert result["checked_remote"] == "https://hasheous.example"
 
 
 @pytest.mark.asyncio
@@ -614,3 +624,219 @@ def test_redirect_to_https_is_allowed():
         req, None, 302, "Found", {}, "https://hasheous.example/b",
     )
     assert out is not None
+
+
+# ---------------------------------------------------------------------------
+# Web UI toggle + connection test
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_override():
+    """The override is module-level state; don't leak it between tests."""
+    hasheous.set_enabled_override(None)
+    yield
+    hasheous.set_enabled_override(None)
+
+
+def test_override_beats_the_env_var(monkeypatch):
+    """The toggle has to work without a container restart."""
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+    assert hasheous.enabled() is False
+
+    hasheous.set_enabled_override(True)
+    assert hasheous.enabled() is True
+    assert hasheous.env_default() is False  # the env var itself is unchanged
+
+    # ...and the reverse: the UI can switch it off even when the env says on.
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    hasheous.set_enabled_override(False)
+    assert hasheous.enabled() is False
+
+
+def test_clearing_the_override_falls_back_to_the_env_var(monkeypatch):
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    hasheous.set_enabled_override(False)
+    assert hasheous.enabled() is False
+
+    hasheous.set_enabled_override(None)
+    assert hasheous.enabled() is True
+    assert hasheous.override() is None
+
+
+def test_toggling_clears_an_active_cooldown(monkeypatch):
+    """Flipping the switch is the operator saying "try again"."""
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    hasheous._begin_cooldown()
+    assert hasheous._cooldown_remaining() > 0
+
+    hasheous.set_enabled_override(True)
+
+    assert hasheous._cooldown_remaining() == 0
+
+
+@pytest.mark.asyncio
+async def test_put_settings_persists_and_applies(monkeypatch):
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+    saved = {}
+
+    async def _put(key, value):
+        saved[key] = value
+        return value
+
+    monkeypatch.setattr(dat_routes.preferences_store, "put", _put)
+
+    state = await dat_routes.put_hasheous_settings(
+        dat_routes.HasheousSettingsRequest(enabled=True),
+    )
+
+    assert state["enabled"] is True
+    assert state["overridden"] is True
+    assert state["env_default"] is False
+    assert saved[dat_routes.HASHEOUS_PREF_KEY] == {"enabled": True}
+    # Applied immediately, not just persisted.
+    assert hasheous.enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_saved_toggle_is_restored_at_startup(monkeypatch):
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+
+    async def _get(_key):
+        return {"enabled": True}
+
+    monkeypatch.setattr(dat_routes.preferences_store, "get", _get)
+
+    await dat_routes.load_hasheous_override()
+
+    assert hasheous.enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_startup_survives_an_unreadable_preference(monkeypatch):
+    """A preferences failure must not stop the app booting."""
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+
+    async def _boom(_key):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(dat_routes.preferences_store, "get", _boom)
+
+    await dat_routes.load_hasheous_override()  # must not raise
+
+    assert hasheous.enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_health_probe_reports_success(hasheous_on):
+    with patch.object(hasheous._opener, "open", return_value=_Resp(b"OK")):
+        result = await hasheous.health()
+
+    assert result["ok"] is True
+    assert result["url"] == "https://hasheous.example/api/v1/Healthcheck"
+    assert "latency_ms" in result
+
+
+@pytest.mark.asyncio
+async def test_health_probe_reports_failure_without_raising(hasheous_on):
+    """An unreachable server is a result to display, not an API error."""
+    with patch.object(
+        hasheous._opener, "open", side_effect=urllib.error.URLError("no route"),
+    ):
+        result = await hasheous.health()
+
+    assert result["ok"] is False
+    assert "no route" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_health_probe_refuses_a_plain_http_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "hasheous_base_url", "http://hasheous.example")
+
+    result = await hasheous.health()
+
+    assert result["ok"] is False
+    assert "https" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Second review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_http_base_url_is_a_service_failure_not_a_crash(monkeypatch):
+    """Misconfiguration must degrade, not 500.
+
+    _require_https raises ValueError; nothing in the match path catches that,
+    so it would escape as a 500 and never open the cooldown.
+    """
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", "http://insecure.example")
+
+    with pytest.raises(hasheous.HasheousUnavailable):
+        await hasheous.lookup(SAMPLE_SHA1)
+
+    # ...and the cooldown opened, so a bulk match doesn't repeat it per file.
+    assert hasheous._cooldown_remaining() > 0
+
+
+@pytest.mark.asyncio
+async def test_match_reports_a_bad_url_as_non_cacheable(monkeypatch):
+    """End to end: the misconfiguration reaches the caller as an error result."""
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", "http://insecure.example")
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: False)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=SAMPLE_SHA1),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+
+    result = await dat_routes._match_single_file("/x.iso")
+
+    assert result["matched"] is False
+    assert result["error"] == "hasheous unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"error": "upstream failed"}, {"id": 7}])
+async def test_a_200_without_game_identity_is_not_a_hit(body, hasheous_on):
+    """A proxy error envelope must not be cached as an authoritative match.
+
+    Hasheous answers an unknown hash with 404, so a 200 carrying no game name
+    is something else answering for it.
+    """
+    with patch.object(hasheous, "_fetch_json", return_value=body):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            await hasheous.lookup(SAMPLE_SHA1)
+
+
+@pytest.mark.asyncio
+async def test_a_200_with_only_a_rom_name_still_counts(hasheous_on):
+    """Identity can come from either side; don't over-reject."""
+    body = {"id": 1, "signature": {"rom": {"name": "thing.bin"}}}
+    with patch.object(hasheous, "_fetch_json", return_value=body):
+        record = await hasheous.lookup(SAMPLE_SHA1)
+
+    assert record["rom_name"] == "thing.bin"
+
+
+def test_cached_miss_is_dropped_when_the_server_url_changes(monkeypatch):
+    """Repointing at a self-hosted instance changes which database answers."""
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", "https://hasheous.org")
+    miss = {"path": "/a.iso", "matched": False, "checked_remote": "https://hasheous.org"}
+
+    assert dat_routes.cached_result_usable(miss) is True
+
+    monkeypatch.setattr(settings, "hasheous_base_url", "https://my-hasheous.lan")
+    assert dat_routes.cached_result_usable(miss) is False
+
+
+def test_remote_stamp_is_the_url_not_a_flag(monkeypatch):
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", "https://my-hasheous.lan/")
+    assert dat_routes.remote_stamp() == "https://my-hasheous.lan"
+
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+    assert dat_routes.remote_stamp() is None

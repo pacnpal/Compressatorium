@@ -4,6 +4,11 @@
 import { SvelteMap } from 'svelte/reactivity';
 import { api } from '$lib/api/endpoints.js';
 
+// How long a match attempt suppresses a retry for the same path. Must exceed
+// the backend's Hasheous cooldown (60s) so the retry lands after the service
+// has had a chance to recover, not during the outage.
+const ATTEMPT_RETRY_MS = 90_000;
+
 class DATMatchingStore {
   matches = new SvelteMap();
   matchingAvailable = $state(false);
@@ -16,14 +21,21 @@ class DATMatchingStore {
   datsError = $state(null);
   stats = $state(null);
 
-  // Paths we've already kicked a match-job for in this session. The
-  // backend may complete a job without caching a result (e.g. file
-  // exceeds MATCH_MAX_FILE_SIZE), which would otherwise make hydrate()
-  // see the same path as uncached forever and re-spawn jobs on every
-  // hydration cycle. Plain object map (not Set) for the membership
-  // lookup so the svelte/prefer-svelte-reactivity rule doesn't flag
-  // it as a candidate for SvelteSet; this guard is purely internal
-  // and reloading the page resets it.
+  // Paths we've already kicked a match-job for, mapped to WHEN. The backend
+  // may complete a job without caching a result, which would otherwise make
+  // hydrate() see the same path as uncached forever and re-spawn jobs on every
+  // hydration cycle. Plain object map (not Set/Map) for the membership lookup
+  // so the svelte/prefer-svelte-reactivity rule doesn't flag it as a candidate
+  // for SvelteSet; this guard is purely internal and reloading the page resets
+  // it.
+  //
+  // The timestamps matter: an uncached result means either a permanent skip
+  // (over MATCH_MAX_FILE_SIZE) or a *transient* failure (a Hasheous timeout,
+  // which is deliberately non-cacheable). The client can't tell them apart, so
+  // a permanent guard would strand the transient ones until a page reload —
+  // exactly the files the retry is for. Entries expire instead, which retries
+  // the transient ones and costs a permanently-skipped file one cheap no-op
+  // job per interval (it re-checks the size cap without hashing).
   _attemptedPaths = Object.create(null);
 
   matchFor(path) {
@@ -48,6 +60,26 @@ class DATMatchingStore {
       this.matchingAvailable = false;
       return false;
     }
+  }
+
+  /**
+   * Flip the Hasheous fallback and re-read availability.
+   *
+   * Enabling it can turn previously-unmatched files into matches, so the
+   * cached badges and the session's "already attempted" set are both dropped
+   * — the backend re-checks those rows against the newly available source
+   * (see cached_result_usable), but only if the client asks again.
+   */
+  async setHasheousEnabled(enabled) {
+    const state = await api.setHasheousEnabled(enabled);
+    this.matches.clear();
+    this._resetAttempts();
+    await this.refreshMatchingAvailability();
+    return state;
+  }
+
+  async testHasheous() {
+    return api.testHasheous();
   }
 
   async loadDATs() {
@@ -95,14 +127,15 @@ class DATMatchingStore {
     if (!paths?.length) return;
     await this.hydrate(paths);
     if (!this.matchingAvailable) return;
-    // Drop paths the backend already attempted this session, if they
-    // came back uncached after a completed dat_match job, they were
-    // skipped (over MATCH_MAX_FILE_SIZE, unreadable, etc.) and
-    // re-spawning would loop forever. Backend de-dupes against the
-    // active queue too, but only while the prior job is still
-    // pending.
+    // Drop paths the backend attempted recently: if they came back uncached
+    // after a completed dat_match job they were skipped (over
+    // MATCH_MAX_FILE_SIZE, unreadable) or failed transiently, and re-spawning
+    // immediately would loop. The guard expires so a transient failure — a
+    // Hasheous outage is non-cacheable by design, and its cooldown is 60s —
+    // gets retried once the service recovers, without a page reload.
+    const now = Date.now();
     const uncached = paths.filter(
-      (p) => !this.matches.has(p) && !this._attemptedPaths[p],
+      (p) => !this.matches.has(p) && !this._recentlyAttempted(p, now),
     );
     if (uncached.length === 0) return;
     try {
@@ -111,7 +144,7 @@ class DATMatchingStore {
       // (another match job already active) would otherwise strand the
       // paths permanently, and any other failure should also leave
       // them eligible for the next hydration to retry.
-      for (const p of uncached) this._attemptedPaths[p] = true;
+      for (const p of uncached) this._attemptedPaths[p] = now;
     } catch (_e) {
       // non-fatal, the file list still renders without badges. The
       // next hydration cycle will try these paths again once any
@@ -127,6 +160,17 @@ class DATMatchingStore {
    */
   _resetAttempts() {
     this._attemptedPaths = Object.create(null);
+  }
+
+  /**
+   * True while `path`'s last match attempt is still recent enough to skip.
+   * Comfortably longer than the backend's 60s Hasheous cooldown, so a retry
+   * lands after the service has had a chance to recover rather than during
+   * the outage it is waiting out.
+   */
+  _recentlyAttempted(path, now = Date.now()) {
+    const at = this._attemptedPaths[path];
+    return at !== undefined && now - at < ATTEMPT_RETRY_MS;
   }
 
   async matchBatch(paths) {

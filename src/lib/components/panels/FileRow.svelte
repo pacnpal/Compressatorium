@@ -31,20 +31,28 @@
   // DAT. Both carry the same payload keys; `source` is what tells them apart.
   const remoteMatch = $derived(datMatch?.source === 'hasheous');
 
-  // Hasheous returns platform / year / region / originating DAT that a local
-  // match doesn't have. Build the tooltip from whichever of them are present so
-  // one expression covers both sources.
+  // Hasheous returns platform / publisher / year / region / originating DAT
+  // that a local match doesn't have. Build the tooltip from whichever of them
+  // are present so one expression covers both sources. Multi-line, because a
+  // remote match has enough to say that one run-on line stops being readable.
   const matchTooltip = $derived.by(() => {
     if (!datMatch?.matched) return null;
-    const parts = [
-      datMatch.game_name,
-      datMatch.platform,
-      datMatch.year,
-      datMatch.region,
-    ].filter(Boolean);
-    const detail = parts.join(' · ');
-    const origin = datMatch.dat_name ? `Matches ${datMatch.dat_name}` : 'Matches DAT entry';
-    return detail ? `${origin} — ${detail}` : origin;
+    const lines = [
+      datMatch.dat_name ? `Matches ${datMatch.dat_name}` : 'Matches DAT entry',
+    ];
+    if (datMatch.game_name) lines.push(datMatch.game_name);
+    const facts = [datMatch.platform, datMatch.year, datMatch.region, datMatch.publisher]
+      .filter(Boolean)
+      .join(' · ');
+    if (facts) lines.push(facts);
+    if (datMatch.rom_name && datMatch.rom_name !== datMatch.game_name) {
+      lines.push(datMatch.rom_name);
+    }
+    const links = Array.isArray(datMatch.metadata_links) ? datMatch.metadata_links : [];
+    if (links.length) {
+      lines.push(`Listed on ${links.map((l) => l.source).filter(Boolean).join(', ')}`);
+    }
+    return lines.join('\n');
   });
 
   const mediaType = $derived(chdMeta?.media_type ?? entry?.media_type ?? null);
