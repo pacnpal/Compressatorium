@@ -532,8 +532,11 @@ Three pieces, none of them per-tool:
 
 Three rules follow for any code that runs a verifier:
 
-- **Never offload a verify's blocking read to a shared pool.** Use
-  `run_detached`, and pass it the `cancel_event`: cancellation abandons the
+- **Never offload a verify's blocking read to a shared pool** — including the
+  event loop's *default* executor, which is what `aiofiles` uses unless handed a
+  private one (z3ds's payload feed passes a disposable single-worker executor
+  and shuts it down without joining). Use `run_detached`, and pass it the
+  `cancel_event`: cancellation abandons the
   thread either way, a pooled one is capacity the whole process shares, and
   without the event a Cancel pressed mid-read is not observed until the read
   finishes. Translate its `ReadCancelled` into the tool's own

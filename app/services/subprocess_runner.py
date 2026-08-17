@@ -323,7 +323,10 @@ async def run_detached(
 
 
 async def verify_preflight(
-    path: str, extensions: frozenset[str] | set[str],
+    path: str,
+    extensions: frozenset[str] | set[str],
+    *,
+    cancel_event: asyncio.Event | None = None,
 ) -> tuple[dict | None, int]:
     """The missing / empty / wrong-extension gate every ``verify_stream`` opens with.
 
@@ -337,9 +340,24 @@ async def verify_preflight(
     task in the process, including the ``asyncio.wait_for`` that is supposed to
     bound this very verify (the issue #263 failure mode, reached through the
     verify path). Off the loop, an unresponsive mount fails this one verify.
+
+    ``cancel_event`` is raced against the stat as well: on a volume that has
+    stopped answering, a cancel pressed during the probe must produce a
+    *cancelled* verdict, not the "stopped responding" failure the bound would
+    otherwise report ten seconds later.
     """
     try:
-        size = await _bounded_probe(os.path.getsize, path)
+        size = await asyncio.wait_for(
+            run_detached(os.path.getsize, path, cancel_event=cancel_event),
+            timeout=_STAT_TIMEOUT,
+        )
+    except ReadCancelled:
+        return {
+            "type": "error",
+            "valid": False,
+            "cancelled": True,
+            "message": "Verification cancelled",
+        }, 0
     except asyncio.TimeoutError:
         return {
             "type": "error",

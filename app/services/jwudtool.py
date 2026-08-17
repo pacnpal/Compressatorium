@@ -637,7 +637,7 @@ class JwudToolService:
         # verify, not freeze every task in the process (see verify_preflight).
         # It also hands back the size the truncation check below compares against.
         problem, file_size = await verify_preflight(
-            file_path, JWUD_DECOMPRESS_EXTENSIONS,
+            file_path, JWUD_DECOMPRESS_EXTENSIONS, cancel_event=cancel_event,
         )
         if problem is not None:
             yield problem

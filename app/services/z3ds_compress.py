@@ -5,6 +5,7 @@ from logging_setup import get_logger
 import os
 import shutil
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -353,7 +354,9 @@ class Z3DSCompressService:
         """
         # Bounded, off the event loop: an unresponsive volume must fail this
         # verify, not freeze every task in the process (see verify_preflight).
-        problem, _size = await verify_preflight(file_path, Z3DS_DECOMPRESS_EXTENSIONS)
+        problem, _size = await verify_preflight(
+            file_path, Z3DS_DECOMPRESS_EXTENSIONS, cancel_event=cancel_event,
+        )
         if problem is not None:
             yield problem
             return
@@ -399,6 +402,9 @@ class Z3DSCompressService:
             # it on a child that survived SIGKILL only burns another 15s of the
             # verify lane for no possible new outcome.
             reap_failed = False
+            payload_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="z3ds-verify-read",
+            )
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
 
@@ -415,7 +421,18 @@ class Z3DSCompressService:
                                 payload_offset,
                             )
 
-                        async with aiofiles.open(file_path, "rb") as f:
+                        # aiofiles runs its blocking reads in an executor; give
+                        # it a private single-worker one rather than the event
+                        # loop's shared default. A read wedged on a dead volume
+                        # can only be abandoned, and abandoning a *shared*
+                        # worker per cancelled verify would eventually starve
+                        # every other default-executor user in the process
+                        # (issue #266, same rule as run_detached). The executor
+                        # is shut down without joining below, so a wedged worker
+                        # costs one written-off thread and nothing more.
+                        async with aiofiles.open(
+                            file_path, "rb", executor=payload_executor,
+                        ) as f:
                             await f.seek(payload_offset)
 
                             while True:
@@ -525,6 +542,10 @@ class Z3DSCompressService:
                 if not reap_failed:
                     await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
+                # wait=False: never join. A worker still blocked on an
+                # unresponsive volume must not hold up this coroutine (or, at
+                # interpreter exit, the container restart).
+                payload_executor.shutdown(wait=False)
 
         except ReadCancelled:
             # Cancelled while reading the header: no verdict, so report the

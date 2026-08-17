@@ -832,3 +832,98 @@ async def _unkillable_verifier_reaped_once(tmp_path: Path, monkeypatch):
     assert result["valid"] is False
     assert "could not be killed" in result["message"]
     assert len(calls) == 1, f"the ladder ran {len(calls)}x on an abandoned child"
+
+
+@pytest.mark.asyncio
+async def test_a_chatty_verifier_still_hits_the_batch_bound(tmp_path, monkeypatch):
+    """A verifier that never stops talking must still expire.
+
+    Guarding the batch deadline on an empty queue — added so a verdict arriving
+    at the same instant would win — let a verifier printing progress faster than
+    the route drains it keep the queue non-empty and never expire at all.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(info_routes, "verification_store", Mock(mark_verified=AsyncMock()))
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    service = Mock()
+
+    async def _chatty(path, *, cancel_event=None):
+        while True:
+            # Slow enough that the 0.2s bound expires within a handful of
+            # events, fast enough that the queue is never empty when checked.
+            yield {"type": "progress", "progress": 1, "message": "still going"}
+            await asyncio.sleep(0.01)
+
+    service.verify_stream = _chatty
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.2
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    token = await info_routes.workload_limiter.try_acquire("verify")
+    response = info_routes._sse_batch_from_verify_stream(
+        info_routes.registry.get("jwud"),
+        info_routes._VERIFY_CONFIG["jwud"],
+        [str(target)],
+        token,
+    )
+    events = []
+    async for event in response.body_iterator:
+        if isinstance(event, dict):
+            events.append(event)
+        if len(events) > 200:  # a runaway loop would never reach the end
+            break
+
+    completions = [e for e in events if e["event"] == "verify_batch_file_complete"]
+    assert completions, "the batch never finished the file"
+    assert "timed out" in completions[-1]["data"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_preflight_reports_a_cancellation(tmp_path, monkeypatch):
+    """A cancel while the volume is not answering is a cancel, not a failure.
+
+    The preflight stat is bounded at 10s; without the event it reported "stopped
+    responding" — a verification *failure* — for a job the operator had already
+    cancelled.
+    """
+    import threading
+
+    from app.services import subprocess_runner as runner_mod
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 64)
+
+    probing = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_getsize = runner_mod.os.path.getsize
+
+    def _wedged_for_target(path):
+        if str(path) != str(target):
+            return real_getsize(path)
+        loop.call_soon_threadsafe(probing.set)
+        release.wait(30)
+        return 0
+
+    monkeypatch.setattr(runner_mod.os.path, "getsize", _wedged_for_target)
+
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(
+        runner_mod.verify_preflight(
+            str(target), {".wux"}, cancel_event=cancel_event,
+        ),
+    )
+    await asyncio.wait_for(probing.wait(), timeout=5)
+    cancel_event.set()
+
+    problem, _size = await asyncio.wait_for(task, timeout=5)
+    assert problem["cancelled"] is True
+    assert problem["valid"] is False
+    release.set()

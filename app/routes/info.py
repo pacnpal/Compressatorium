@@ -1396,18 +1396,21 @@ def _sse_batch_from_verify_stream(
 
                 verify_task = asyncio.create_task(run_verify())
                 try:
+                    # The bound is applied on both arms below rather than at the
+                    # top of the loop: gating it on an empty queue (so a verdict
+                    # arriving at the same instant still wins) would let a
+                    # verifier that prints progress faster than this drains it
+                    # keep the queue non-empty and never expire at all.
                     while not done.is_set() or not queue.empty():
-                        if _expired() and queue.empty():
-                            # Same bound the job pipeline applies, per file: one
-                            # wedged verify must not hold the batch (and the
-                            # verify lane) open indefinitely. Only when nothing
-                            # is already queued, so a verdict that landed in the
-                            # same instant is reported instead of discarded.
-                            final_result = _verify_timed_out(bound)
-                            break
                         try:
                             update = await asyncio.wait_for(queue.get(), timeout=2)
                             if update.get("type") == "progress":
+                                if _expired():
+                                    # Same bound the job pipeline applies, per
+                                    # file: one wedged verify must not hold the
+                                    # batch (and the verify lane) open forever.
+                                    final_result = _verify_timed_out(bound)
+                                    break
                                 yield {
                                     "event": "verify_batch_file_progress",
                                     "data": json.dumps(
@@ -1423,6 +1426,9 @@ def _sse_batch_from_verify_stream(
                             elif update.get("type") in ("complete", "error"):
                                 break
                         except asyncio.TimeoutError:
+                            if _expired():
+                                final_result = _verify_timed_out(bound)
+                                break
                             elapsed = int(time.monotonic() - start)
                             yield {
                                 "event": "verify_batch_file_progress",

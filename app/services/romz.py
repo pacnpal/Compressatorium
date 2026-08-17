@@ -553,7 +553,9 @@ class RomzService:
         """
         # Bounded, off the event loop: an unresponsive volume must fail this
         # verify, not freeze every task in the process (see verify_preflight).
-        problem, _size = await verify_preflight(file_path, ROMZ_ARCHIVE_EXTENSIONS)
+        problem, _size = await verify_preflight(
+            file_path, ROMZ_ARCHIVE_EXTENSIONS, cancel_event=cancel_event,
+        )
         if problem is not None:
             yield problem
             return
