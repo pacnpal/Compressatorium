@@ -625,6 +625,9 @@ class SubprocessRunner:
                         output_lines.pop(0)
 
             probed_size: int | None = None
+            # Whether any probe has ever finished. Distinguishes "no measurement
+            # yet" from "measured, and there is no output file".
+            probe_completed = False
 
             def _measure_output_sync() -> int | None:
                 # Summed size of the growth-probe target(s). Default is the
@@ -658,9 +661,10 @@ class SubprocessRunner:
                 job rather than one per tick. The cost is that the size is one
                 tick (~2s) stale, which no consumer here cares about.
                 """
-                nonlocal size_probe, probed_size
+                nonlocal size_probe, probed_size, probe_completed
                 if size_probe is None or size_probe.done():
                     if size_probe is not None and not size_probe.cancelled():
+                        probe_completed = True
                         with contextlib.suppress(Exception):
                             probed_size = size_probe.result()
                     size_probe = asyncio.ensure_future(
@@ -725,6 +729,14 @@ class SubprocessRunner:
                 if stall_timeout <= 0:
                     return False
                 _update_output_activity(now)
+                if not probe_completed:
+                    # No growth measurement has landed yet: the probe is off the
+                    # event loop and read one tick later, so the very first
+                    # checks have nothing to judge by. Never call a stall on the
+                    # absence of a measurement -- with a stall timeout shorter
+                    # than the ~2s probe cadence that would kill a converter
+                    # whose output is growing steadily.
+                    return False
                 if now - last_activity_at < stall_timeout:
                     return False
                 stall_error = (

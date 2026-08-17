@@ -721,3 +721,44 @@ def test_bounded_probe_returns_the_value_when_it_lands():
         return await runner_module._bounded_probe(len, "abcd")
 
     assert asyncio.run(_go()) == 4
+
+
+def test_growing_output_is_not_killed_by_a_short_stall_timeout(tmp_path, monkeypatch):
+    """A converter that is writing must never be stalled out by probe lag.
+
+    The growth probe runs off the event loop and is read a tick later, so the
+    first checks have no measurement to judge by. With a stall timeout shorter
+    than the probe cadence, treating "no sample yet" as "no growth" would kill a
+    child whose output is growing steadily.
+    """
+    monkeypatch.setattr(
+        runner_module, "compute_progress_stall_timeout", lambda **_: 1,
+    )
+    out = tmp_path / "out.bin"
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)
+    script = (
+        "import sys, time\n"
+        f"out = {str(out)!r}\n"
+        "with open(out, 'wb') as f:\n"
+        "    for _ in range(40):\n"          # ~4s of steady writing, silent stdout
+        "        f.write(b'x' * 4096); f.flush()\n"
+        "        time.sleep(0.1)\n"
+    )
+    runner = SubprocessRunner(owner="test")
+
+    updates = asyncio.run(
+        _drain(
+            runner.run(
+                _py_cmd(script),
+                input_path=str(src),
+                output_path=str(out),
+                parse_progress=lambda _line: None,
+                mode="cso_compress",
+                fail_label="testproc",
+            )
+        )
+    )
+
+    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert not runner.active_pids()
