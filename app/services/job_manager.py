@@ -2403,6 +2403,22 @@ class JobManager:
                         # verification would be wrong twice over: it is not a bad
                         # file, and the source must not be deleted on it.
                         raise ConversionCancelled("Conversion cancelled")
+                    if verify_result.get("abandoned"):
+                        # The verifier outlived SIGKILL and is still holding the
+                        # storage. Distinguished from an ordinary failure so the
+                        # log and the job's error name the real problem -- the
+                        # file was never judged, the mount stopped answering --
+                        # rather than reading as "this output is bad".
+                        logger.error(
+                            "Job %s: verification could not be stopped and is "
+                            "still holding %s; the volume is likely not "
+                            "responding",
+                            job_id, job.output_path,
+                        )
+                        raise RuntimeError(
+                            f"Verification could not be stopped: "
+                            f"{verify_result.get('message')}"
+                        )
                     if not verify_result.get("valid"):
                         raise RuntimeError(
                             f"Verification failed: {verify_result.get('message')}"

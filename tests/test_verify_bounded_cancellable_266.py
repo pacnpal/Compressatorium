@@ -2158,3 +2158,34 @@ async def _readback_under_cancel_is_cancelled(tmp_path: Path, monkeypatch):
 
     assert result["cancelled"] is True, result
     assert result["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_job_names_an_abandoned_verifier_rather_than_blaming_the_file(
+    tmp_path: Path, monkeypatch,
+):
+    """An unkillable verifier is not "this output is bad".
+
+    The job still fails — there is no verdict, so the source survives — but the
+    error says the verifier could not be stopped, which is what an operator has
+    to act on. Reported as an ordinary verification failure it reads as a bad
+    conversion and sends them looking in the wrong place.
+    """
+
+    async def fake_verify(path: str, *, cancel_event=None):
+        return {
+            "valid": False,
+            "abandoned": True,
+            "message": (
+                "Verification did not exit and could not be killed (pid 1); "
+                "it is likely blocked on unresponsive storage."
+            ),
+        }
+
+    _manager, job, source_path = await _run_delete_on_verify_job(
+        tmp_path, monkeypatch, fake_verify,
+    )
+
+    assert job.status == JobStatus.FAILED
+    assert "could not be stopped" in (job.error_message or "")
+    assert source_path.exists(), "a source was deleted on a verify with no verdict"
