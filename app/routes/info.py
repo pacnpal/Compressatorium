@@ -1419,6 +1419,14 @@ def _sse_batch_from_verify_stream(
     lane: dict[str, WorkloadToken | None] = {"token": verify_token}
 
     async def event_generator():
+        # The route's token gated admission (429 when the lane is full); hand it
+        # straight back rather than carrying it into the walk. Otherwise it
+        # spans the suspensions before the first file's verifier even starts,
+        # which is the same lost-lane shape on a peer that never reads.
+        if lane["token"] is not None:
+            lane["token"].release()
+            lane["token"] = None
+
         total = len(valid_paths)
         verified_count = 0
         failed_count = 0
@@ -1506,6 +1514,15 @@ def _sse_batch_from_verify_stream(
                         await _offer_verify_update(queue, final_result)
                     finally:
                         done.set()
+                        # Released here, not in the consumer's `finally`: this
+                        # file's verification is over, and the consumer may be
+                        # parked mid-file at a `yield` on a peer that stopped
+                        # reading -- which is exactly the case where holding
+                        # the one-slot lane refuses every later verification
+                        # for good. Same rule as the single-file route.
+                        if lane["token"] is not None:
+                            lane["token"].release()
+                            lane["token"] = None
 
                 if lane["token"] is None:
                     lane["token"] = await workload_limiter.acquire("verify")
@@ -1549,8 +1566,9 @@ def _sse_batch_from_verify_stream(
                     verify_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await verify_task
-                    # This file is done verifying; the slot goes back before
-                    # the generator suspends again to deliver the result.
+                    # Backstop: the producer above releases as soon as the
+                    # verification ends, but it never runs if the task was
+                    # cancelled before it started.
                     if lane["token"] is not None:
                         lane["token"].release()
                         lane["token"] = None

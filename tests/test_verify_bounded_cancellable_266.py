@@ -1889,3 +1889,66 @@ async def _reap_records_abandonment(monkeypatch):
     service.abandoned_pids = runner.abandoned_pids
     assert info_routes._abandonment(service) == {"abandoned": True}
     assert info_routes._abandonment(Mock(spec=[])) == {}
+
+
+def test_a_batch_frees_the_lane_when_the_reader_parks_mid_file(tmp_path, monkeypatch):
+    """Per-file ownership is not enough if the release is on the delivery side.
+
+    The batch released its slot in the *consumer's* per-file `finally`, which a
+    reader parked mid-file at a `yield` never reaches — so the fix that made the
+    lane per-file still lost it for good on exactly the peer it was meant to
+    survive. It is released where the single-file route releases it: beside the
+    producer's `done.set()`.
+    """
+    asyncio.run(_batch_frees_lane_mid_file(tmp_path, monkeypatch))
+
+
+async def _batch_frees_lane_mid_file(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    monkeypatch.setattr(
+        info_routes, "verification_store", Mock(mark_verified=AsyncMock()),
+    )
+
+    targets = []
+    for name in ("one.wux", "two.wux"):
+        target = tmp_path / name
+        target.write_bytes(b"WUX0" + b"\0" * 1024)
+        targets.append(str(target))
+
+    async def _endless(path, *, cancel_event=None):
+        while True:
+            yield {"type": "progress", "progress": 1, "message": "working"}
+            await asyncio.sleep(0.01)
+
+    service = Mock()
+    service.verify_stream = _endless
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.3
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    baseline = info_routes.workload_limiter.in_use("verify")
+    token = await info_routes.workload_limiter.try_acquire("verify")
+    response = info_routes._sse_batch_from_verify_stream(
+        info_routes.registry.get("jwud"),
+        info_routes._VERIFY_CONFIG["jwud"],
+        targets,
+        token,
+    )
+    iterator = response.body_iterator.__aiter__()
+    # batch_start, the file-start event, then a progress event from the file's
+    # running verifier — which is the point at which the lane is genuinely held.
+    await iterator.__anext__()
+    await iterator.__anext__()
+    await iterator.__anext__()
+    assert info_routes.workload_limiter.in_use("verify") == baseline + 1
+
+    await asyncio.sleep(1.5)
+
+    assert info_routes.workload_limiter.in_use("verify") == baseline, (
+        "the batch held the verify lane after the file's verifier stopped"
+    )
+    await response.body_iterator.aclose()

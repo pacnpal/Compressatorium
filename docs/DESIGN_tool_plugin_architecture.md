@@ -551,8 +551,11 @@ Three pieces, none of them per-tool:
    of the bound. Progress is dropped under backpressure — it is a level, not a
    log — while a terminal event always lands, making room by discarding progress
    the verdict has just made stale. The **workload token follows the same rule**:
-   it is released when the verifier stops, not when the generator unwinds, and
-   the batch route holds it per file rather than for the whole walk. A peer that
+   it is released **beside the producer's `done.set()`**, not from the consumer's
+   `finally`, which a parked reader never reaches; and the batch route takes a
+   slot per file rather than carrying one across the walk (the route's admission
+   token is handed back before the first file, since a token held across the
+   suspensions *before* a verifier starts is lost the same way). A peer that
    stays connected without reading parks the consumer indefinitely, and a
    one-slot lane released only on that path is a lane lost for the life of the
    process. A route-level timeout reports the
