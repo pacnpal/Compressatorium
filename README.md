@@ -377,7 +377,7 @@ and anything RomM hasn't scanned yet just waits for the next attempt.
 | Setting | Default | What it does |
 |---|---|---|
 | RomM URL | *(unset)* | Base URL of your instance. Unset hides the feature. |
-| API token | *(unset)* | Client API token. Stored server-side; never sent back to the browser. |
+| API token | *(unset)* | Client API token. Saved in `compressatorium.db` and never sent back to the browser — treat that file as holding a secret. |
 | Library path | *(unset)* | Where RomM's library is mounted **in this container**. |
 | Run automatically | off | Master switch for scheduled sweeps. |
 | Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. |

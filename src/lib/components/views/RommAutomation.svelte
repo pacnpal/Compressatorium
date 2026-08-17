@@ -50,8 +50,13 @@
     else expanded.add(platformId);
   }
 
+  // The zone the schedule window is evaluated in. Sent with every rule so a
+  // window entered as "22:00" means 22:00 where the operator is, not UTC.
+  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
   function update(platformId, patch) {
-    const rule = { ...romm.ruleFor(platformId), ...patch };
+    const current = romm.ruleFor(platformId);
+    const rule = { ...current, timezone: current.timezone || browserZone, ...patch };
     if (!rule.mode) romm.removeRule(platformId);
     else romm.setRule(platformId, rule);
     dirty = true;
@@ -253,7 +258,10 @@
                         })}
                       />
                     </div>
-                    <span class="hint">Leave blank to run at any hour.</span>
+                    <span class="hint">
+                      Leave blank to run at any hour. Times are
+                      {rule.timezone || browserZone}.
+                    </span>
                   </label>
 
                   <div class="field wide">

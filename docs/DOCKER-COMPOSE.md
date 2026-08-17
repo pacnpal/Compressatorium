@@ -212,7 +212,7 @@ Volume behavior:
 | `CHD_METADATA_STORE` | *(deprecated)* | Legacy JSON path; auto-migrated to SQLite on first startup (custom path honored if set) |
 | `CHD_VERIFICATION_STORE` | *(deprecated)* | Legacy JSON path; auto-migrated to SQLite on first startup (custom path honored if set) |
 | `ROMM_URL` | *(unset)* | Base URL of your RomM instance, e.g. `http://romm:8080`. Unset disables the RomM view entirely. |
-| `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. Read from the environment only — never stored in the database. |
+| `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. Seeds the first run only. A token entered in **RomM → Settings** is stored in the `preferences` table of `compressatorium.db` (never returned to the browser) and takes precedence over this variable — so back up and permission that file accordingly. |
 | `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
 | `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. Rules are configured in the app (**RomM → Automation**). |
 | `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Ceiling on jobs queued by one sweep, across all platforms. |

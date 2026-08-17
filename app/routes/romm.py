@@ -25,12 +25,10 @@ from logging_setup import get_logger
 from models import DirectoryListing, FileEntry
 from pydantic import BaseModel
 from routes.files import detect_file_outputs, verifiable_tools
-from services import db as _db
-from services import romm_auto, romm_settings
+from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
 from services.romm import (
     DAT_SAFE_OUTPUT_EXTS,
-    METADATA_ID_FIELDS,
     RommClient,
     RommError,
     RommNotConfigured,
@@ -153,9 +151,19 @@ async def romm_status() -> dict:
         # A dead NFS/SMB mount blocks in uninterruptible I/O, so this stat goes
         # through the shared bounded probe like every other path check.
         try:
-            result["library_root_mounted"] = bool(
-                await bounded_path_check(os.path.isdir, library_root),
-            )
+            is_dir = bool(await bounded_path_check(os.path.isdir, library_root))
+            # Existing on disk is not enough. Every ROM path is gated by
+            # `is_within_configured_volumes`, so a library root outside all of
+            # them yields a connection that looks healthy and a catalog where
+            # every single row is silently dropped. Report it here instead.
+            inside = is_dir and is_within_configured_volumes(library_root)
+            result["library_root_mounted"] = inside
+            if is_dir and not inside:
+                result["error"] = (
+                    "The library path exists but is outside the configured "
+                    "Compressatorium volumes, so none of its ROMs can be read. "
+                    "Mount it under one of them."
+                )
         except (asyncio.TimeoutError, OSError):
             # A dead mount is exactly what this probe exists to survive: report
             # it as status rather than failing the request. The reason goes to
@@ -176,7 +184,7 @@ async def romm_status() -> dict:
         except RommError as exc:
             logger.warning("romm: heartbeat failed: %s", exc)
             result["error"] = _safe_error(exc)
-    result["pending_repins"] = await run_in_threadpool(_count_pending)
+    result["pending_repins"] = await run_in_threadpool(romm_repin.count_pending)
     return result
 
 
@@ -314,13 +322,13 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
             status_code=400, detail=f"Unknown mode: {payload.mode}",
         ) from exc
 
-    if (spec.output_ext or "").lower() in DAT_SAFE_OUTPUT_EXTS:
+    if not romm_repin.mode_needs_repin(spec.output_ext):
         return {"recorded": 0, "skipped": len(payload.paths), "reason": "dat_safe"}
 
     # One catalog read for the whole batch, indexed by local path, instead of a
     # by-hash lookup per file.
     try:
-        platform_roms = await run_in_threadpool(_roms_by_local_path, payload.paths)
+        platform_roms = await run_in_threadpool(romm_repin.roms_by_local_path, payload.paths)
     except RommError as exc:
         raise _romm_call(exc, context="reading the catalog") from exc
 
@@ -334,13 +342,13 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if not rom:
             skipped += 1
             continue
-        ids = {f: rom.get(f) for f in METADATA_ID_FIELDS if rom.get(f)}
+        ids = romm_repin.metadata_ids(rom)
         if not ids:
             # Unidentified in RomM already — nothing to carry across.
             skipped += 1
             continue
         output_path = tool.output_path(payload.mode, path, payload.output_dir)
-        if await run_in_threadpool(_record_repin, rom, output_path, ids):
+        if await run_in_threadpool(romm_repin.record, rom, output_path, ids):
             recorded += 1
         else:
             skipped += 1
@@ -348,7 +356,7 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
 
 
 @router.post("/romm/repin")
-async def romm_repin() -> dict:
+async def settle_romm_repins() -> dict:
     """Re-attach metadata to converted ROMs RomM has since rescanned.
 
     Idempotent by construction: a settled row is never revisited, and a row
@@ -368,7 +376,7 @@ async def romm_repin() -> dict:
     cursor = 0
     settled = 0
     examined = 0
-    rows = await run_in_threadpool(_pending_rows, _SETTLE_PAGE, after_id=cursor)
+    rows = await run_in_threadpool(romm_repin.pending_rows, _SETTLE_PAGE, after_id=cursor)
 
     while rows and settled < _MAX_SETTLE_PER_CALL and examined < _MAX_EXAMINE_PER_CALL:
         row = rows.pop(0)
@@ -377,7 +385,7 @@ async def romm_repin() -> dict:
         cursor = row_id
         if not rows:
             rows = await run_in_threadpool(
-                _pending_rows, _SETTLE_PAGE, after_id=cursor,
+                romm_repin.pending_rows, _SETTLE_PAGE, after_id=cursor,
             )
         try:
             exists = await bounded_path_check(os.path.isfile, output_path)
@@ -388,7 +396,7 @@ async def romm_repin() -> dict:
         if not exists:
             if _is_stale(created_at):
                 await run_in_threadpool(
-                    _settle, rom_id, output_path, "abandoned",
+                    romm_repin.settle, rom_id, output_path, "abandoned",
                     "Output never appeared", None,
                 )
                 abandoned += 1
@@ -427,7 +435,7 @@ async def romm_repin() -> dict:
                 async with await workload_limiter.acquire("match"):
                     sha1 = await run_detached(compute_file_sha1_sync, output_path)
                 # Cache it: a row may be retried many times before RomM scans.
-                await run_in_threadpool(_store_sha1, output_path, sha1)
+                await run_in_threadpool(romm_repin.store_sha1, output_path, sha1)
 
             match = await run_in_threadpool(romm_client.rom_by_sha1, sha1)
             if not match:
@@ -437,7 +445,7 @@ async def romm_repin() -> dict:
                 romm_client.update_rom_metadata, match["id"], ids,
             )
             await run_in_threadpool(
-                _settle, rom_id, output_path, "done", None, match["id"],
+                romm_repin.settle, rom_id, output_path, "done", None, match["id"],
             )
             repinned += 1
             settled += 1
@@ -458,7 +466,7 @@ async def romm_repin() -> dict:
         "waiting": waiting,
         "abandoned": abandoned,
         "failed": failed,
-        "pending": await run_in_threadpool(_count_pending),
+        "pending": await run_in_threadpool(romm_repin.count_pending),
     }
 
 
@@ -475,133 +483,6 @@ def _is_stale(created_at: str) -> bool:
 # ----------------------------------------------------------------------
 # DB helpers (sync; always called through run_in_threadpool)
 # ----------------------------------------------------------------------
-
-
-def _session():
-    if _db.SessionLocal is None:
-        raise RuntimeError("db.SessionLocal not initialized")
-    return _db.SessionLocal()
-
-
-def _roms_by_local_path(paths: list[str]) -> dict[str, dict]:
-    """Index the platforms covering *paths* by resolved local path.
-
-    Reads the whole catalog for each platform involved rather than one lookup
-    per file: a batch is normally a single platform, making this one request.
-    """
-    wanted = {os.path.abspath(p) for p in paths}
-    index: dict[str, dict] = {}
-    for platform in romm_client.platforms():
-        pid = platform.get("id")
-        if pid is None:
-            continue
-        for rom in romm_client.roms(pid):
-            local = romm_client.local_path(rom)
-            if local and local in wanted:
-                index[local] = rom
-        if len(index) == len(wanted):
-            break
-    return index
-
-
-def _record_repin(rom: dict, output_path: str, ids: dict) -> bool:
-    """Insert a pending row unless one already covers this output.
-
-    The dedupe on ``output_path`` is what makes re-submitting the same batch
-    harmless — the second submit updates the existing row instead of stacking
-    another.
-    """
-    with _session() as session:
-        existing = (
-            session.query(_db.RommRepin)
-            .filter(_db.RommRepin.output_path == output_path)
-            .filter(_db.RommRepin.state == "pending")
-            .one_or_none()
-        )
-        if existing is not None:
-            existing.source_rom_id = rom.get("id")
-            existing.metadata_ids = ids
-            # The output is about to be rewritten, so any cached hash is stale.
-            existing.output_sha1 = None
-            # Restart the abandonment clock too. A conversion re-planned long
-            # after the original would otherwise be retired the moment it was
-            # re-recorded, and could never have its metadata restored.
-            existing.created_at = _utcnow_iso()
-            session.commit()
-            return True
-        session.add(
-            _db.RommRepin(
-                source_rom_id=rom.get("id"),
-                source_name=rom.get("name") or rom.get("fs_name"),
-                output_path=output_path,
-                metadata_ids=ids,
-                state="pending",
-                created_at=_utcnow_iso(),
-            ),
-        )
-        session.commit()
-        return True
-
-
-def _pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
-    """A page of pending rows, oldest first, starting after *after_id*.
-
-    The cursor matters: rows whose job was cancelled (or whose output RomM
-    never scans) stay pending until they age out, and always taking the oldest
-    N would let such a prefix occupy the whole page forever, so conversions
-    behind it would never be examined. The caller walks past them.
-    """
-    with _session() as session:
-        rows = (
-            session.query(_db.RommRepin)
-            .filter(_db.RommRepin.state == "pending")
-            .filter(_db.RommRepin.id > after_id)
-            .order_by(_db.RommRepin.id)
-            .limit(limit)
-            .all()
-        )
-        # Detach into plain tuples: the session closes before the caller awaits.
-        return [
-            (r.output_path, r.output_sha1, r.source_rom_id, dict(r.metadata_ids or {}),
-             r.created_at, r.id)
-            for r in rows
-        ]
-
-
-def _store_sha1(output_path: str, sha1: str) -> None:
-    with _session() as session:
-        session.query(_db.RommRepin).filter(
-            _db.RommRepin.output_path == output_path,
-            _db.RommRepin.state == "pending",
-        ).update({"output_sha1": sha1})
-        session.commit()
-
-
-def _settle(
-    rom_id: int, output_path: str, state: str, detail: str | None, new_id: int | None,
-) -> None:
-    with _session() as session:
-        values: dict = {"state": state, "settled_at": _utcnow_iso()}
-        if detail:
-            values["detail"] = detail
-        elif new_id is not None:
-            values["detail"] = f"Re-pinned to RomM rom {new_id}"
-        session.query(_db.RommRepin).filter(
-            _db.RommRepin.output_path == output_path,
-            _db.RommRepin.state == "pending",
-        ).update(values)
-        session.commit()
-
-
-def _count_pending() -> int:
-    if _db.SessionLocal is None:
-        return 0
-    with _session() as session:
-        return (
-            session.query(_db.RommRepin)
-            .filter(_db.RommRepin.state == "pending")
-            .count()
-        )
 
 
 # ----------------------------------------------------------------------
@@ -693,15 +574,23 @@ async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
         logger.warning("romm: connection test auth failed: %s", exc)
         result["error"] = _safe_error(exc)
 
+    outside_volumes = False
     if library_root:
         try:
-            result["library_root_mounted"] = bool(
-                await bounded_path_check(os.path.isdir, library_root),
+            is_dir = bool(await bounded_path_check(os.path.isdir, library_root))
+            result["library_root_mounted"] = (
+                is_dir and is_within_configured_volumes(library_root)
             )
+            outside_volumes = is_dir and not result["library_root_mounted"]
         except (asyncio.TimeoutError, OSError):
             result["library_root_mounted"] = False
     if result["authorized"] and not result["library_root_mounted"]:
+        # Two different fixes, so two different messages: mounting a folder and
+        # moving it inside a configured volume are not the same job.
         result["error"] = result["error"] or (
+            "Connected to RomM, but its library folder is outside the configured "
+            "Compressatorium volumes, so no ROM in it can be read."
+            if outside_volumes else
             "Connected to RomM, but its library folder is not mounted here. "
             "Check the library path and the volume mount."
         )

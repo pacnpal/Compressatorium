@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime, time as dt_time, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +40,13 @@ from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from models import ConversionMode
 from services import romm_settings
+from services import romm_repin
 from services.job_manager import QueueBackpressureError, job_manager
+from services.lock_manager import lock_manager
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
 from services.tools import registry
+from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes
 
 logger = get_logger("romm_auto")
@@ -94,6 +98,24 @@ def _parse_hhmm(value: Any) -> dt_time | None:
         return None
 
 
+def _valid_timezone(value: Any) -> str:
+    """An IANA zone name we can actually load, or ``"UTC"``.
+
+    Validated on the way in so a sweep can never fail on a zone the host has no
+    data for -- a rule written on a machine with a fuller tzdata than the
+    container's would otherwise break the schedule silently.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return "UTC"
+    name = value.strip()
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        logger.warning("romm_auto: unknown timezone %r, falling back to UTC", name)
+        return "UTC"
+    return name
+
+
 def _valid_pattern(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -123,6 +145,11 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         "window_start": None,
         "window_end": None,
         "days": list(ALL_DAYS),
+        # IANA zone the window and weekday mask are evaluated in. The editor
+        # sends the browser's zone; UTC is the fallback for a rule written
+        # before this existed. Stored as a name rather than a fixed offset so
+        # the window stays correct across DST.
+        "timezone": "UTC",
         # queueing
         "max_per_run": 25,
         "priority": 0,
@@ -185,6 +212,7 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
     out["interval_minutes"] = _clamp("interval_minutes", raw.get("interval_minutes"), 60)
     out["window_start"] = raw.get("window_start") or None
     out["window_end"] = raw.get("window_end") or None
+    out["timezone"] = _valid_timezone(raw.get("timezone"))
     days = raw.get("days")
     if isinstance(days, list):
         parsed = sorted({int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6})
@@ -256,9 +284,18 @@ async def _record_run(platform_id: str, summary: dict) -> None:
 def _in_window(rule: dict, now: datetime) -> bool:
     """Is *now* inside the rule's allowed days and time-of-day window?
 
-    A window whose end is before its start wraps midnight (22:00–04:00), which
-    is the shape an overnight conversion window actually takes.
+    Evaluated in the rule's own timezone. The editor collects plain wall-clock
+    values, so comparing them against UTC would run a 22:00-04:00 window at
+    22:00 UTC -- the middle of the working day for most of the world.
+
+    A window whose end is before its start wraps midnight (22:00-04:00), which
+    is the shape an overnight conversion window actually takes. The weekday is
+    read in the same zone, so "Saturday" means the operator's Saturday.
     """
+    try:
+        now = now.astimezone(ZoneInfo(rule.get("timezone") or "UTC"))
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        pass
     if now.weekday() not in rule["days"]:
         return False
     start = _parse_hhmm(rule["window_start"])
@@ -328,17 +365,27 @@ def _passes_filters(rom: dict, rule: dict) -> bool:
     return True
 
 
-def _output_exists(path: str, tool_id: str) -> bool:
-    """True when this tool's output already sits beside *path*.
+def _output_exists(path: str, mode: str, output_dir: str | None) -> bool:
+    """True when this rule's output already exists for *path*.
 
-    ``exists`` covers both a finished output and one a job is writing right
-    now: either way, queueing another conversion of the same source is wrong.
+    ``detect_output()`` only ever looks *beside the source* -- it takes no
+    output directory -- so a rule with ``output_dir`` set would never find its
+    own output, re-queue the ROM on every sweep, and fail each job on an output
+    collision. Derive the destination through ``tool.output_path()`` instead,
+    the same SSOT the manual conversion path uses.
+
+    ``check_file_status`` answers both halves in one call: a finished output and
+    one a job is writing right now are equally reasons not to queue another.
     """
-    tool = registry.get(tool_id)
+    tool = registry.for_mode(mode)
     if tool is None:
         return False
-    status = tool.detect_output(path)
-    return status is not None and status.exists
+    try:
+        destination = tool.output_path(mode, path, output_dir)
+    except (KeyError, ValueError, OSError):
+        return False
+    exists, locked = lock_manager.check_file_status(destination)
+    return exists or locked
 
 
 def _active_source_paths() -> set[str]:
@@ -378,6 +425,7 @@ async def sweep(
     result: dict = {
         "queued": 0,
         "considered": 0,
+        "repins_recorded": 0,
         "skipped_existing": 0,
         "skipped_active": 0,
         "skipped_filtered": 0,
@@ -411,8 +459,15 @@ async def sweep(
         rule = rules[platform_id]
         if wanted is not None and platform_id not in wanted:
             continue
-        if not rule["enabled"] and not ignore_schedule:
+        # `enabled` gates unconditionally: a paused platform must stay paused
+        # even when the operator presses Run now, which passes
+        # ignore_schedule=True. The one exception is naming platforms
+        # explicitly -- that is a deliberate per-platform action, and it keeps
+        # the "configure a rule, leave the scheduler off, run it by hand"
+        # workflow working.
+        if not rule["enabled"] and wanted is None:
             continue
+        # ignore_schedule bypasses only the clock (interval, window, weekday).
         if not ignore_schedule and not _is_due(rule, state.get(platform_id, {}), now):
             continue
 
@@ -432,7 +487,15 @@ async def sweep(
             continue
 
         per_platform_cap = min(rule["max_per_run"], cap - result["queued"])
+        # Asked once per platform, not per ROM: whether this target format keeps
+        # RomM's DAT match is a property of the mode. Honours the same
+        # `repin_enabled` switch the manual path reads.
+        repin_needed = (
+            bool(cfg.get("repin_enabled", True))
+            and romm_repin.mode_needs_repin(spec.output_ext)
+        )
         batch: list[str] = []
+        rom_by_path: dict[str, dict] = {}
         considered = 0
 
         for rom in sorted(roms, key=_rom_sort_key(rule)):
@@ -456,11 +519,12 @@ async def sweep(
                 result["skipped_active"] += 1
                 continue
             if rule["duplicate_action"] == "skip" and await run_in_threadpool(
-                _output_exists, path, spec.tool_id,
+                _output_exists, path, rule["mode"], rule["output_dir"],
             ):
                 result["skipped_existing"] += 1
                 continue
             batch.append(path)
+            rom_by_path[path] = rom
 
         result["considered"] += considered
         summary = {
@@ -472,13 +536,52 @@ async def sweep(
 
         if batch and not dry_run:
             try:
+                # Findings 2 and 3: the manual path does two things before it
+                # queues, and skipping them made automation quietly worse than
+                # converting by hand.
+                #
+                # (a) Snapshot the RomM metadata for formats RomM cannot
+                #     hash-match, or an automatic RVZ sweep destroys exactly the
+                #     metadata the re-pin feature exists to protect. The records
+                #     the sweep is already holding carry the provider ids, so
+                #     this costs no extra catalog fetch.
+                repin_count = 0
+                if repin_needed:
+                    for path in batch:
+                        rom = rom_by_path.get(path)
+                        ids = romm_repin.metadata_ids(rom) if rom else {}
+                        if not ids:
+                            continue
+                        destination = tool.output_path(
+                            rule["mode"], path, rule["output_dir"],
+                        )
+                        if await run_in_threadpool(
+                            romm_repin.record, rom, destination, ids,
+                        ):
+                            repin_count += 1
+
+                # (b) delete-on-verify needs its snapshot up front, or
+                #     `_process_job` refuses to delete ("Delete plan snapshot
+                #     missing") and fails every job after doing the full
+                #     conversion. Same helper the manual path uses.
+                snapshots = None
+                if rule["delete_on_verify"]:
+                    snapshots = {}
+                    for path in batch:
+                        snapshots[path] = await run_in_threadpool(
+                            build_delete_snapshot, path,
+                        )
+
                 jobs = await job_manager.create_batch_jobs(
                     batch,
                     ConversionMode(rule["mode"]),
                     output_dir=rule["output_dir"],
                     compression=rule["compression"],
                     delete_on_verify=rule["delete_on_verify"],
+                    delete_snapshots=snapshots,
                 )
+                summary["repins_recorded"] = repin_count
+                result["repins_recorded"] += repin_count
                 summary["queued"] = len(jobs)
                 result["queued"] += len(jobs)
                 # Claim them immediately so a later platform in the same sweep

@@ -20,6 +20,7 @@ import pytest
 from routes import romm as romm_routes
 from services import db as _db
 from services import romm as romm_service
+from services import romm_repin
 from services.romm import DAT_SAFE_OUTPUT_EXTS, RommClient, RommError
 
 # ----------------------------------------------------------------------
@@ -230,7 +231,7 @@ async def test_status_does_not_leak_romm_response_body() -> None:
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", ""), \
             patch.object(romm_routes.romm_client, "heartbeat", side_effect=exc), \
-            patch.object(romm_routes, "_count_pending", return_value=0):
+            patch.object(romm_repin, "count_pending", return_value=0):
         status = await romm_routes.romm_status()
 
     assert "hunter2" not in status["error"]
@@ -267,7 +268,7 @@ async def test_status_reports_unreachable_romm_as_data() -> None:
                 romm_routes.romm_client, "heartbeat",
                 side_effect=RommError("Connection refused"),
             ), \
-            patch.object(romm_routes, "_count_pending", return_value=0):
+            patch.object(romm_repin, "count_pending", return_value=0):
         status = await romm_routes.romm_status()
 
     assert status["configured"] is True
@@ -299,27 +300,27 @@ def _repin_db(tmp_path: Path):
 def test_record_repin_is_idempotent_per_output(repin_db) -> None:
     """Re-submitting the same batch must not stack duplicate rows."""
     rom = {"id": 7, "name": "Game", "fs_name": "Game.iso"}
-    romm_routes._record_repin(rom, "/vol/Game.rvz", {"igdb_id": 42})
-    romm_routes._record_repin(rom, "/vol/Game.rvz", {"igdb_id": 42})
-    assert romm_routes._count_pending() == 1
+    romm_repin.record(rom, "/vol/Game.rvz", {"igdb_id": 42})
+    romm_repin.record(rom, "/vol/Game.rvz", {"igdb_id": 42})
+    assert romm_repin.count_pending() == 1
 
 
 def test_record_repin_clears_stale_hash_on_resubmit(repin_db) -> None:
     """A re-run rewrites the output, so a cached hash of the old one is wrong."""
     rom = {"id": 7, "name": "Game"}
-    romm_routes._record_repin(rom, "/vol/Game.rvz", {"igdb_id": 42})
-    romm_routes._store_sha1("/vol/Game.rvz", "deadbeef")
-    assert romm_routes._pending_rows(10)[0][1] == "deadbeef"
+    romm_repin.record(rom, "/vol/Game.rvz", {"igdb_id": 42})
+    romm_repin.store_sha1("/vol/Game.rvz", "deadbeef")
+    assert romm_repin.pending_rows(10)[0][1] == "deadbeef"
 
-    romm_routes._record_repin(rom, "/vol/Game.rvz", {"igdb_id": 42})
-    assert romm_routes._pending_rows(10)[0][1] is None
+    romm_repin.record(rom, "/vol/Game.rvz", {"igdb_id": 42})
+    assert romm_repin.pending_rows(10)[0][1] is None
 
 
 def test_settled_rows_are_not_revisited(repin_db) -> None:
-    romm_routes._record_repin({"id": 7}, "/vol/Game.rvz", {"igdb_id": 42})
-    romm_routes._settle(7, "/vol/Game.rvz", "done", None, 99)
-    assert romm_routes._count_pending() == 0
-    assert romm_routes._pending_rows(10) == []
+    romm_repin.record({"id": 7}, "/vol/Game.rvz", {"igdb_id": 42})
+    romm_repin.settle(7, "/vol/Game.rvz", "done", None, 99)
+    assert romm_repin.count_pending() == 0
+    assert romm_repin.pending_rows(10) == []
 
 
 @pytest.mark.asyncio
@@ -327,7 +328,7 @@ async def test_repin_leaves_unscanned_rows_pending(repin_db, tmp_path: Path) -> 
     """RomM not having scanned yet is the normal case, not a failure."""
     output = tmp_path / "Game.rvz"
     output.write_bytes(b"x" * 8)
-    romm_routes._record_repin({"id": 7}, str(output), {"igdb_id": 42})
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
@@ -338,14 +339,14 @@ async def test_repin_leaves_unscanned_rows_pending(repin_db, tmp_path: Path) -> 
             patch.object(
                 romm_routes.romm_client, "update_rom_metadata",
             ) as update:
-        result = await romm_routes.romm_repin()
+        result = await romm_routes.settle_romm_repins()
 
     assert result["waiting"] == 1
     assert result["repinned"] == 0
     assert result["pending"] == 1
     update.assert_not_called()
     # The hash is cached so the next pass does not re-read a multi-GB file.
-    assert romm_routes._pending_rows(10)[0][1] == "abc123"
+    assert romm_repin.pending_rows(10)[0][1] == "abc123"
 
 
 @pytest.mark.asyncio
@@ -354,7 +355,7 @@ async def test_repin_applies_metadata_once_romm_has_scanned(
 ) -> None:
     output = tmp_path / "Game.rvz"
     output.write_bytes(b"x" * 8)
-    romm_routes._record_repin({"id": 7}, str(output), {"igdb_id": 42, "ra_id": 5})
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42, "ra_id": 5})
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
@@ -365,7 +366,7 @@ async def test_repin_applies_metadata_once_romm_has_scanned(
                 romm_routes.romm_client, "rom_by_sha1", return_value={"id": 108},
             ), \
             patch.object(romm_routes.romm_client, "update_rom_metadata") as update:
-        result = await romm_routes.romm_repin()
+        result = await romm_routes.settle_romm_repins()
 
     assert result["repinned"] == 1
     assert result["pending"] == 0
@@ -375,7 +376,7 @@ async def test_repin_applies_metadata_once_romm_has_scanned(
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
             patch.object(romm_routes.romm_client, "update_rom_metadata") as update2:
-        again = await romm_routes.romm_repin()
+        again = await romm_routes.settle_romm_repins()
     assert again["repinned"] == 0
     update2.assert_not_called()
 
@@ -390,7 +391,7 @@ async def test_repin_plan_skips_dat_safe_modes(repin_db) -> None:
         )
     assert result["recorded"] == 0
     assert result["reason"] == "dat_safe"
-    assert romm_routes._count_pending() == 0
+    assert romm_repin.count_pending() == 0
 
 
 def test_update_rom_metadata_sends_only_set_provider_ids(client: RommClient) -> None:
@@ -841,3 +842,252 @@ async def test_sweep_skips_sources_already_being_converted(
 
     assert result["queued"] == 0
     assert result["skipped_active"] == 1
+
+
+# ----------------------------------------------------------------------
+# review findings: each test fails on the bug, not merely on a crash
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_with_output_dir_is_idempotent(settings_db, tmp_path: Path) -> None:
+    """A rule writing elsewhere must still see its own output.
+
+    `detect_output()` only looks beside the source, so an `output_dir` rule used
+    to re-queue the same ROM on every sweep and fail each job on a collision.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    out = tmp_path / "library" / "converted"
+    out.mkdir()
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {
+        "mode": "dolphin_rvz", "enabled": True, "output_dir": str(out),
+    }})
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        first = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+        assert first["queued"] == 1, first
+
+        # The conversion lands in the configured output directory, not beside
+        # the source -- which is exactly what the old check could not see.
+        (out / "Game.rvz").write_bytes(b"\0" * 16)
+        second = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert second["queued"] == 0, second
+    assert second["skipped_existing"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_records_repin_rows_for_unsafe_formats(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Automatic RVZ conversion must preserve metadata like the manual path."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc", "igdb_id": 1122,
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["repins_recorded"] == 1, result
+    assert romm_repin.count_pending() == 1
+    # Recorded against the *output*, which is what RomM will scan.
+    assert romm_repin.pending_rows(10)[0][0].endswith("Game.rvz")
+
+
+@pytest.mark.asyncio
+async def test_sweep_records_nothing_for_dat_safe_formats(
+    settings_db, tmp_path: Path,
+) -> None:
+    """CHD keeps its own DAT identity, so a row would be pure noise."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "ps2"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"9": {"mode": "createdvd", "enabled": True}})
+
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/ps2/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ps2", "igdb_id": 42,
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["queued"] == 1
+    assert result["repins_recorded"] == 0
+    assert romm_repin.count_pending() == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_supplies_delete_snapshots(settings_db, tmp_path: Path) -> None:
+    """delete_on_verify without a snapshot fails every job after converting."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "ps2"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"9": {
+        "mode": "createdvd", "enabled": True, "delete_on_verify": True,
+    }})
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/ps2/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ps2",
+    }]
+    captured: dict = {}
+
+    async def _fake_batch(paths, mode, **kwargs):
+        captured.update(kwargs)
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.sweep(ignore_schedule=True)
+
+    assert captured["delete_on_verify"] is True
+    assert captured["delete_snapshots"], "job_manager refuses to delete without one"
+    assert str(lib / "Game.iso") in captured["delete_snapshots"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_rule_is_paused_even_for_run_now(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Run now must not convert a platform the operator explicitly paused."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": False}})
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        # The global button: paused stays paused.
+        globally = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+        # Naming the platform is a deliberate per-platform action, so it runs.
+        targeted = await romm_auto.sweep(
+            platform_ids=[7], ignore_schedule=True, dry_run=True,
+        )
+
+    assert globally["queued"] == 0, globally
+    assert targeted["queued"] == 1, targeted
+
+
+@pytest.mark.asyncio
+async def test_library_root_outside_volumes_is_not_usable(tmp_path: Path) -> None:
+    """An existing folder outside every volume must not look healthy.
+
+    Every ROM path is gated by `is_within_configured_volumes`, so reporting the
+    root as mounted yields a connection that looks fine and a catalog in which
+    every row is silently dropped.
+    """
+    outside = tmp_path / "not-a-volume"
+    outside.mkdir()
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(outside)), \
+            patch.object(
+                romm_routes.romm_client, "heartbeat", return_value={"VERSION": "4.9.0"},
+            ), \
+            patch.object(romm_repin, "count_pending", return_value=0), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=False,
+            ):
+        status = await romm_routes.romm_status()
+
+    assert status["library_root_mounted"] is False
+    assert "outside the configured" in status["error"]
+
+
+def test_schedule_window_uses_the_rules_timezone() -> None:
+    """A 22:00-04:00 window means the operator's evening, not UTC's."""
+    from datetime import datetime, timezone as dt_timezone
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["window_start"], rule["window_end"] = "22:00", "04:00"
+    rule["timezone"] = "America/New_York"
+
+    # 03:00 UTC Tuesday is 23:00 Monday in New York -> inside the window.
+    assert romm_auto._in_window(
+        rule, datetime(2026, 8, 18, 3, 0, tzinfo=dt_timezone.utc),
+    )
+    # 22:00 UTC is 18:00 in New York -> outside it, though it would have
+    # matched when the window was compared against UTC.
+    assert not romm_auto._in_window(
+        rule, datetime(2026, 8, 17, 22, 0, tzinfo=dt_timezone.utc),
+    )
+
+
+def test_unknown_timezone_falls_back_to_utc() -> None:
+    """A zone the container has no data for must not break the schedule."""
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "timezone": "Mars/Olympus_Mons",
+    })
+    assert rule["timezone"] == "UTC"
