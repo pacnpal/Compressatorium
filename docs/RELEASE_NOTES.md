@@ -23,6 +23,12 @@
   on the first one and says why: the metadata, disc-ID and DAT-match phases of a
   scan, the background match job, and `/dat/match-batch`. A single-file match
   reports it rather than answering with a silent "no match".
+- **A conversion whose volume dies during tagging now fails instead of
+  hanging.** Writing the disc-ID tag is best-effort and a failure there has never
+  failed the job — but if the drive stopped answering, everything the job did
+  next (measuring the output, and verifying it when *Delete sources after
+  verification* is on) read that same drive, so the job could hang rather than
+  finish untagged. It now fails with the reason.
 - **A stuck read can no longer be mistaken for "this disc has no ID".** If
   reading a CHD's GAME tag had to be abandoned, the answer came back identical to
   a disc that genuinely has no tag — so the tagger wrote a new tag to a file the

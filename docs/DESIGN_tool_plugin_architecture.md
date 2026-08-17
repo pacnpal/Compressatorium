@@ -676,6 +676,14 @@ Three rules follow for any code that runs a verifier:
   after resolving the bound, before spawning"* extended to abandonment, and the
   reward for ignoring it is larger: a child that blocks immediately and may
   outlive SIGKILL.
+- **`post_convert` is best-effort about tagging, not about storage.** Its
+  contract is that a tagging failure never fails the job, because a missing
+  disc-ID tag is cosmetic. An abandoned chdman child is not that: it says the
+  output's storage stopped answering, and every step after the hook reads that
+  storage -- `_compute_output_size` is an unbounded `run_in_threadpool`, and
+  delete-on-verify spawns a verifier. Swallowing it trades a skipped tag for a
+  hung job, which is #263's original failure, so `DiscIdStorageAbandoned` alone
+  propagates and `JobManager` lets it reach the handler that fails the job.
 - **One volume's failure stops the whole pass, deliberately.** A scan or batch is
   one user-initiated walk, and the loops do not resolve which configured volume
   each path belongs to, so the first abandonment ends all of it — including

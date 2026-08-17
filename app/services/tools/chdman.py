@@ -186,7 +186,12 @@ class ChdmanTool(BaseTool):
         ``ChainTool``'s final step, so both paths tag identically.
 
         Only ``createcd`` / ``createdvd`` carry a disc serial, so every other
-        chdman mode is a no-op. Best-effort: a failure here never fails the job.
+        chdman mode is a no-op. Best-effort, with one exception: a *tagging*
+        failure never fails the job, but a chdman child that outlived SIGKILL
+        does (``DiscIdStorageAbandoned``). That is not a fact about the tag, it
+        is the output's storage no longer answering -- and every step after this
+        hook reads that storage, so continuing buys a hung job instead of an
+        untagged one (issue #268).
         Idempotent: if the CHD already carries a GAME tag equal to the source's
         serial the embed is skipped, so re-invoking the hook never appends a
         duplicate tag.
@@ -227,11 +232,14 @@ class ChdmanTool(BaseTool):
                     game_id, Path(output_path).name,
                 )
         except DiscIdStorageAbandoned as exc:
-            # Still best-effort -- tagging never fails the job -- but this is not
-            # an ordinary "couldn't tag it": a chdman child is still running
-            # against this CHD, which is why the embed was skipped rather than
-            # attempted (issue #268). At debug it would leave no trace at all.
-            logger.error("Disc ID embed skipped for %s: %s", output_path, exc)
+            # The one failure that is *not* best-effort. A chdman child is still
+            # running against this output, and everything the caller does next
+            # touches the same storage -- `_compute_output_size` is an unbounded
+            # `run_in_threadpool`, and delete-on-verify starts a verifier -- so
+            # swallowing this trades a skipped tag for a hung job, which is
+            # #263's original failure. Propagate and let the job fail (#268).
+            logger.error("Disc ID embed abandoned for %s: %s", output_path, exc)
+            raise
         except Exception as exc:  # best effort; tagging never fails the job
             logger.debug("Disc ID embed skipped for %s: %s", output_path, exc)
 

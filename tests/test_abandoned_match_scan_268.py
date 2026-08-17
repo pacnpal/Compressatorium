@@ -525,11 +525,14 @@ async def test_reading_a_tag_that_was_abandoned_is_not_reported_as_untagged(
 
 
 @pytest.mark.asyncio
-async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
-    """Best-effort still holds -- the job must not fail -- but not silently.
+async def test_post_convert_skips_the_write_and_fails_the_job(tmp_path, monkeypatch):
+    """Tagging is best-effort; a dead output volume is not.
 
-    The harm was `addmeta` landing on a CHD an abandoned reader still holds; the
-    secondary harm was reporting that at debug, where nobody would find it.
+    The first harm was `addmeta` landing on a CHD an abandoned reader still holds.
+    The second was swallowing it: everything `_process_job` does after this hook
+    reads the same storage -- the output-size probe is an unbounded
+    `run_in_threadpool`, and delete-on-verify spawns a verifier -- so a skipped
+    tag would be traded for a hung job, which is #263's original failure.
     """
     from services.chdman import chdman_service
     from services.tools import registry
@@ -563,8 +566,12 @@ async def test_post_convert_skips_the_write_and_says_so(tmp_path, monkeypatch):
         lambda msg, *args, **kw: errors.append(str(msg) % args if args else str(msg)),
     )
 
-    # Never raises: tagging is best-effort and must not fail the job.
-    await chdman.post_convert(str(chd), str(chd), "createcd")
+    from services.disc_id import DiscIdStorageAbandoned
+
+    # Propagates, so the job manager's handler fails the job before any more
+    # output I/O -- rather than being logged away as an ordinary skipped tag.
+    with pytest.raises(DiscIdStorageAbandoned):
+        await chdman.post_convert(str(chd), str(chd), "createcd")
 
     assert not wrote, "must not write to a CHD an abandoned reader still holds"
     assert errors and "still running" in errors[0], (
