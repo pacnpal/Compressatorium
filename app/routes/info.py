@@ -41,6 +41,7 @@ from services.jwudtool import (
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
+from services.subprocess_runner import bounded_path_check
 from services.workload_limiter import WorkloadToken, workload_limiter
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.maxcso import (
@@ -1192,15 +1193,32 @@ _VERIFY_CONFIG: dict[str, _VerifyRouteConfig] = {
 async def _guard_verify_path(
     path: str, tool: ToolPlugin, cfg: _VerifyRouteConfig,
 ) -> None:
-    """403 (outside volumes) -> 404 (missing) -> 400 (unsupported extension)."""
-    if not await run_in_threadpool(
-        is_within_configured_volumes, path, treat_archives=False,
-    ):
-        raise HTTPException(
-            status_code=403, detail="Access denied: path outside configured volumes",
+    """403 (outside volumes) -> 404 (missing) -> 400 (unsupported extension).
+
+    Both filesystem checks run through the shared **bounded** seam rather than
+    the app's thread pool. They land ahead of every bound the verify itself
+    carries, so on a volume that stopped answering they would hang the request
+    before any of that applied — and, in a shared pool, take one worker per
+    attempt with them (issue #266). A volume that does not answer is a 503:
+    unlike 403/404 it says nothing about the path, only that the storage is
+    unreachable right now.
+    """
+    try:
+        within_volumes = await bounded_path_check(
+            is_within_configured_volumes, path, treat_archives=False,
         )
-    if not await run_in_threadpool(os.path.isfile, path):
-        raise HTTPException(status_code=404, detail="File not found")
+        if not within_volumes:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: path outside configured volumes",
+            )
+        if not await bounded_path_check(os.path.isfile, path):
+            raise HTTPException(status_code=404, detail="File not found")
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Storage did not respond; the volume may be offline",
+        ) from None
     if os.path.splitext(path)[1].lower() not in tool.verify_extensions:
         raise HTTPException(status_code=400, detail=cfg.bad_ext_detail)
 
@@ -1558,11 +1576,21 @@ def register_verify_routes(router_: APIRouter, tool: ToolPlugin) -> tuple:
 
         valid_paths = []
         for path in request.paths:
-            if not await run_in_threadpool(
-                is_within_configured_volumes, path, treat_archives=False,
-            ):
-                continue
-            if not await run_in_threadpool(os.path.isfile, path):
+            # Bounded, like the single-file guard: one unreachable path in a
+            # batch must not hang the whole request before any verify starts.
+            # It is dropped from the batch (the same outcome as any other path
+            # that fails validation here) and named in the log.
+            try:
+                if not await bounded_path_check(
+                    is_within_configured_volumes, path, treat_archives=False,
+                ):
+                    continue
+                if not await bounded_path_check(os.path.isfile, path):
+                    continue
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Batch verify: skipping %s, storage did not respond", path,
+                )
                 continue
             if os.path.splitext(path)[1].lower() not in tool.verify_extensions:
                 continue

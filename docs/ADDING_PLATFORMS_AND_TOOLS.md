@@ -782,7 +782,13 @@ class NszipTool(BaseTool):
   `run_in_threadpool` / `asyncio.to_thread`: a cancelled read abandons its
   thread either way, a pooled one is capacity the whole process shares, and the
   event is what frees the awaiter mid-read (catch `ReadCancelled` and yield your
-  `{"cancelled": True}` terminal event).
+  `{"cancelled": True}` terminal event). Don't wrap the handle in a context
+  manager either — its exit awaits a close that a stuck read blocks, which is
+  just the unbounded wait again in the cleanup path.
+- **Spawn with `nice`/`ionice` command wrappers, not `preexec_fn`.** This
+  process is multithreaded, and forking a Python callable from it can deadlock
+  the child before `exec` — inside `create_subprocess_exec`, before the PID is
+  tracked and before any bound is installed.
 - Track PIDs so the debug heartbeat can report them.
 
 ### 5.4 Register the plugin: `app/services/tools/__init__.py`

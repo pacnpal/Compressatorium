@@ -5,11 +5,9 @@ from logging_setup import get_logger
 import os
 import shutil
 import struct
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-import aiofiles
 from config import settings
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
@@ -402,9 +400,6 @@ class Z3DSCompressService:
             # it on a child that survived SIGKILL only burns another 15s of the
             # verify lane for no possible new outcome.
             reap_failed = False
-            payload_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="z3ds-verify-read",
-            )
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
 
@@ -412,7 +407,7 @@ class Z3DSCompressService:
                 # in one coroutine so an overall verify timeout can bound the
                 # whole feed-and-test cycle, not just the final wait.
                 async def _stream_and_wait():
-                    chunk_size = 1024 * 1024  # 1MB chunks
+                    chunk_size = 4 * 1024 * 1024  # 4MB per detached read
                     try:
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
@@ -421,27 +416,38 @@ class Z3DSCompressService:
                                 payload_offset,
                             )
 
-                        # aiofiles runs its blocking reads in an executor; give
-                        # it a private single-worker one rather than the event
-                        # loop's shared default. A read wedged on a dead volume
-                        # can only be abandoned, and abandoning a *shared*
-                        # worker per cancelled verify would eventually starve
-                        # every other default-executor user in the process
-                        # (issue #266, same rule as run_detached). The executor
-                        # is shut down without joining below, so a wedged worker
-                        # costs one written-off thread and nothing more.
-                        async with aiofiles.open(
-                            file_path, "rb", executor=payload_executor,
-                        ) as f:
-                            await f.seek(payload_offset)
+                        # Plain file object read through the shared detached
+                        # seam, deliberately *not* an async file context (this
+                        # replaced the aiofiles one, the app's last user of it):
+                        # on an unresponsive volume the read can only be
+                        # abandoned, and a context manager's exit would then
+                        # await a close that waits on the very lock the stuck
+                        # read holds -- turning the cleanup below into another
+                        # unbounded wait. So the handle is closed only on the
+                        # paths that got that far, and simply abandoned (with
+                        # its thread) otherwise.
+                        def _open_payload():
+                            handle = open(file_path, "rb")  # noqa: SIM115
+                            handle.seek(payload_offset)
+                            return handle
 
+                        f = await run_detached(_open_payload, cancel_event=cancel_event)
+                        abandoned = False
+                        try:
                             while True:
                                 if cancel_event is not None and cancel_event.is_set():
                                     # Stop feeding immediately; the waiter below
                                     # reports the cancel and the finally reaps
                                     # zstd. One chunk of latency at most.
+                                    abandoned = True
                                     break
-                                chunk = await f.read(chunk_size)
+                                try:
+                                    chunk = await run_detached(
+                                        f.read, chunk_size, cancel_event=cancel_event,
+                                    )
+                                except ReadCancelled:
+                                    abandoned = True
+                                    break
                                 if not chunk:
                                     break
                                 try:
@@ -452,6 +458,10 @@ class Z3DSCompressService:
                                 except BrokenPipeError:
                                     # zstd closed stdin early due to integrity failure.
                                     break
+                        finally:
+                            if not abandoned:
+                                with contextlib.suppress(Exception):
+                                    await run_detached(f.close)
 
                         if process.stdin is not None:
                             process.stdin.close()
@@ -542,10 +552,6 @@ class Z3DSCompressService:
                 if not reap_failed:
                     await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
-                # wait=False: never join. A worker still blocked on an
-                # unresponsive volume must not hold up this coroutine (or, at
-                # interpreter exit, the container restart).
-                payload_executor.shutdown(wait=False)
 
         except ReadCancelled:
             # Cancelled while reading the header: no verdict, so report the

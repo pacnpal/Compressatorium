@@ -927,3 +927,60 @@ async def test_cancel_during_preflight_reports_a_cancellation(tmp_path, monkeypa
     assert problem["cancelled"] is True
     assert problem["valid"] is False
     release.set()
+
+
+@pytest.mark.asyncio
+async def test_route_guard_is_bounded_and_off_the_shared_pool(tmp_path, monkeypatch):
+    """The path checks that precede a verify are bounded too.
+
+    They land ahead of every bound the verify itself carries, so on a volume
+    that stopped answering the request hung before any of that applied — and in
+    the app's shared pool, one worker went with each attempt.
+    """
+    import threading
+
+    # The module the route's helper actually came from (see _runner_module).
+    runner_mod = sys.modules[info_routes.bounded_path_check.__module__]
+
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 64)
+
+    release = threading.Event()
+
+    def _wedged(*_args, **_kwargs):
+        release.wait(30)
+        return True
+
+    monkeypatch.setattr(runner_mod, "_STAT_TIMEOUT", 0.2)
+    monkeypatch.setattr(info_routes, "is_within_configured_volumes", _wedged)
+
+    with pytest.raises(info_routes.HTTPException) as excinfo:
+        await asyncio.wait_for(
+            info_routes.verify_jwud(path=str(target)), timeout=10,
+        )
+
+    # 503, not 403/404: the path was never judged, the storage just went quiet.
+    assert excinfo.value.status_code == 503
+    release.set()
+
+
+def test_streaming_verify_spawns_without_a_preexec_fork_hook():
+    """No `preexec_fn` on the verify spawn.
+
+    Forking a Python callable from this multithreaded process can deadlock the
+    child before it reaches exec — inside `create_subprocess_exec`, before the
+    PID is tracked and before any bound is installed, which is the one failure
+    none of this could rescue. nice/ionice are applied as exec-only wrappers
+    instead, the same way maxcso and nsz already do it.
+    """
+    import inspect as _inspect
+
+    from app.services.subprocess_runner import SubprocessRunner
+
+    source = _inspect.getsource(SubprocessRunner.run_verify)
+    # The argument, not the word: the comment above the spawn explains why it
+    # is absent, and should keep explaining it.
+    assert "preexec_fn=" not in source
+    assert "nice_prefix(self._owner)" in source

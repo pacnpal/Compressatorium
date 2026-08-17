@@ -533,10 +533,12 @@ Three pieces, none of them per-tool:
 Three rules follow for any code that runs a verifier:
 
 - **Never offload a verify's blocking read to a shared pool** — including the
-  event loop's *default* executor, which is what `aiofiles` uses unless handed a
-  private one (z3ds's payload feed passes a disposable single-worker executor
-  and shuts it down without joining). Use `run_detached`, and pass it the
-  `cancel_event`: cancellation abandons the
+  event loop's *default* executor (what `aiofiles` uses), and including the
+  route guards that run *before* the verify, which have their own bounded seam
+  in `bounded_path_check`. Nor wrap such a read in a context manager whose exit
+  awaits a close: on a stuck read that close waits on the same lock, turning
+  cleanup into a second unbounded wait, so an abandoned handle is left
+  unclosed with its thread. Use `run_detached`, and pass it the `cancel_event`: cancellation abandons the
   thread either way, a pooled one is capacity the whole process shares, and
   without the event a Cancel pressed mid-read is not observed until the read
   finishes. Translate its `ReadCancelled` into the tool's own

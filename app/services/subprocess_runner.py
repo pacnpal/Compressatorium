@@ -271,6 +271,20 @@ class ReadCancelled(Exception):
     """
 
 
+async def bounded_path_check(func: Callable, *args: object, **kwargs: object) -> object:
+    """A one-shot path predicate (``isfile``, within-volumes) under a hard bound.
+
+    The verify *routes* validate a path before they start anything, and those
+    checks are ordinary blocking stats: on an unresponsive volume they block in
+    uninterruptible I/O, ahead of every bound the verify itself carries, and in
+    a shared pool they take a worker with them. Running them here bounds the
+    wait and keeps the abandoned thread off any pool that matters.
+
+    Raises :class:`asyncio.TimeoutError` when the volume does not answer.
+    """
+    return await _bounded_probe(func, *args, **kwargs)
+
+
 async def run_detached(
     func: Callable,
     *args: object,
@@ -764,10 +778,16 @@ class SubprocessRunner:
         shared :func:`_split_stream_lines`, so a percentage redraw split across
         read chunks still parses.
         """
-        cmd = ioprio_prefix(self._owner) + cmd
-
-        def _preexec():
-            apply_nice(self._owner)
+        # nice/ionice as *command wrappers*, never a preexec_fn: this process is
+        # multithreaded (threadpools, the SSE routes), and forking a Python
+        # callable from a multithreaded parent can deadlock the child before it
+        # reaches exec. That would hang inside create_subprocess_exec, before
+        # the PID is tracked and before any of the bounds below are installed --
+        # the one failure mode nothing here could rescue. maxcso and nsz already
+        # avoid preexec for the same reason; `nice`/`ionice` only exec. When
+        # either binary is absent its prefix is empty and the verify simply runs
+        # unniced, which is what it did before this policy applied to it at all.
+        cmd = nice_prefix(self._owner) + ioprio_prefix(self._owner) + cmd
 
         # Resolve the bounds *before* spawning. They stat the file, and an await
         # between the spawn and the try/finally below is a window where a
@@ -781,7 +801,6 @@ class SubprocessRunner:
             cmd[0], *cmd[1:],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            preexec_fn=_preexec if os.name == "posix" else None,
         )
         self.track_pid(process.pid)
         if self._logger.isEnabledFor(logging.DEBUG):
