@@ -388,7 +388,13 @@ class RomzService:
             # needs no separate stat on the event loop) — but here the result is
             # load-bearing: if the stale archive is still there, appending to it
             # would produce a silently wrong output, so refuse to start.
-            if not await remove_partial_output(output_path, label="stale romz archive"):
+            #
+            # propagate_cancel because this is the one sweep that does NOT run
+            # while unwinding a failure: a job cancelled during it must report
+            # cancelled, not fail with the message below.
+            if not await remove_partial_output(
+                output_path, label="stale romz archive", propagate_cancel=True,
+            ):
                 raise RuntimeError(
                     f"Could not clear the existing archive at {output_path}; "
                     "7z would append to it. Remove it and retry.",

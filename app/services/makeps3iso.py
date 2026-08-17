@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import re
@@ -205,8 +206,14 @@ class MakePs3IsoService:
             # is what the previous synchronous unlinks bought. Re-raise so
             # cancellation semantics are preserved. (run() does not clean the
             # output itself.)
+            #
+            # `discover=` rather than enumerating here: output_artifacts probes
+            # the disk for the numbered parts, and those stats hit the same
+            # volume as the unlinks. Run on the event loop they would be the one
+            # unbounded step left in this block, so they go inside the worker.
             await remove_partial_output(
-                *self.output_artifacts(output_path), label="makeps3iso output",
+                discover=functools.partial(self.output_artifacts, output_path),
+                label=f"makeps3iso output {output_path} (with any split parts)",
             )
             raise
 

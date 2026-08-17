@@ -400,11 +400,13 @@ class SubprocessRunner:
 # Module-level, not methods: cleanup runs after run() has already given up, and
 # chains (which own no runner) need the same bound. See "Cleaning up partial
 # output is bounded too" below.
-async def remove_partial_output(*paths: str, label="partial output",
-                                timeout=None) -> bool:
+async def remove_partial_output(*paths: str, discover=None,
+                                label="partial output", timeout=None,
+                                propagate_cancel=False) -> bool:
     """Bounded unlink of every file a failed run may have left behind.
     True if the sweep finished, False if it timed out / failed / was
-    interrupted. Never raises.
+    interrupted. Never raises. `discover()` enumerates further paths from
+    inside the bounded worker, for a set only knowable by probing the disk.
     """
 
 async def remove_partial_tree(path: str, *, label="work directory",
@@ -492,24 +494,43 @@ The contract, which is what makes them safe to use everywhere:
   must not replace that error. Failure is a logged warning and a `False`
   return, so the job finishes as failed with a leftover partial file — a much
   smaller problem than a frozen queue.
-- **The removal is dispatched unconditionally; only the wait is bounded.** So
-  cleanup still happens in full even when the coroutine is torn down mid-wait.
-  That is the property the old blocks bought by unlinking *synchronously* on
-  the event loop (awaiting during a cancellation could be re-cancelled and skip
-  the cleanup) — kept, without the unbounded block.
+- **The removal is dispatched before the wait**, so a cancellation arriving
+  afterwards cannot take back work the sweep already did — the useful half of
+  what the old blocks bought by unlinking *synchronously* on the event loop
+  (awaiting during a cancellation could be re-cancelled and skip the cleanup),
+  without the unbounded block.
+- **Giving up stops the rest of the sweep.** Once the helper returns, the job
+  finalises and stops owning those paths, so an abandoned thread must not keep
+  deleting: the mount can recover minutes later, by which point a retry may own
+  the names, and the thread would delete the *new* job's good output. The
+  worker checks an `abandoned` flag before each unlink. The one unlink already
+  in flight when the bound expired can't be recalled — an in-flight syscall is
+  not cancellable — so that single path stays at risk and every path after it
+  does not. On responsive storage the sweep finishes long before any of this,
+  so the normal case pays nothing.
 - **An absent path is success**, so no caller needs a separate `os.path.exists`
   round trip on the mount in question.
 - **One bad path does not stop the sweep**: the rest are still removed, and
   everything that failed is named in one warning.
 
-Two rules for a new tool: catch the abnormal exits *after* the spawn only (a
-setup or pre-spawn failure wrote nothing, so deleting a pre-existing output
-there would destroy a good file), and pass **every** path the run could have
-written — a split makeps3iso build leaves numbered parts alongside the base, so
-it feeds the sweep from `output_artifacts()`, the same enumeration that backs
-`overwrite_targets`. Where the result is load-bearing rather than best-effort,
-check it: romz clears a stale archive *before* running `7z a` (which appends),
-and refuses to start if that sweep reports failure.
+Rules for a new tool:
+
+- Catch the abnormal exits *after* the spawn only. A setup or pre-spawn failure
+  wrote nothing, so deleting a pre-existing output there would destroy a good
+  file.
+- Pass **every** path the run could have written. When the set is only knowable
+  by probing the disk, pass `discover=` instead of enumerating first — it runs
+  *inside* the bounded worker. makeps3iso's split parts are the case: those
+  `isfile` probes hit the same volume the sweep is about to unlink from, so
+  enumerating on the event loop would reintroduce the exact unbounded block
+  this seam removes. It passes `output_artifacts()` as the discovery callable,
+  keeping the one enumeration that also backs `overwrite_targets`.
+- Where the result is load-bearing rather than best-effort, check it. romz
+  clears a stale archive *before* running `7z a` (which appends) and refuses to
+  start if that sweep reports failure. That one call also passes
+  `propagate_cancel=True`: it is the only sweep that does **not** run while
+  unwinding a failure, so swallowing a `CancelledError` there would report a
+  cancelled job as a failed one.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
