@@ -470,6 +470,14 @@ class SubprocessRunner:
         ``mode`` to additionally get a percentage from :data:`SIZE_RATIOS`; a
         mode absent from that table still gets the message, so a new tool needs
         no wiring to be observable and a ratio only sharpens the bar.
+        Updates carry ``"activity": True`` when this tick represented real
+        forward movement -- a parsed percentage that advanced, or the output
+        file growing -- and omit it for keep-alives. It is the same signal the
+        stall watchdog runs on, published so callers judging liveness do not
+        have to re-derive it from a proxy: percentage alone stops moving at the
+        fallback's 95% cap and never moves for a mode with no size ratio, and
+        update arrivals alone count heartbeats as progress (issue #263).
+
         ``initial_progress`` seeds the floor with the caller's preamble (e.g. a
         service's "Starting..." yield at 1/5%) so an early non-parseable line
         cannot drop the bar below it.
@@ -728,6 +736,7 @@ class SubprocessRunner:
                 return {
                     "progress": progress,
                     "message": output_size_message(size, delta_bytes, delta_seconds),
+                    "activity": True,
                 }
 
             async def _check_stall(now: float) -> bool:
@@ -813,14 +822,19 @@ class SubprocessRunner:
                     _record_line(line)
                     now = time.monotonic()
                     progress = parse_progress(line)
+                    advanced = False
                     if progress is not None:
                         saw_native_progress = True
                         if progress > last_progress_value:
                             last_progress_value = progress
                             last_activity_at = now
+                            advanced = True
                     # Clamp to the running floor (incl. initial_progress) so a
                     # parsed value below it can't move the bar backward.
-                    yield {"progress": last_progress_value, "message": line}
+                    update = {"progress": last_progress_value, "message": line}
+                    if advanced:
+                        update["activity"] = True
+                    yield update
                 now = time.monotonic()
                 update = _size_update(now)
                 if update is not None:
@@ -833,12 +847,17 @@ class SubprocessRunner:
                 _record_line(line)
                 now = time.monotonic()
                 progress = parse_progress(line)
+                advanced = False
                 if progress is not None:
                     saw_native_progress = True
                     if progress > last_progress_value:
                         last_progress_value = progress
                         last_activity_at = now
-                yield {"progress": last_progress_value, "message": line}
+                        advanced = True
+                update = {"progress": last_progress_value, "message": line}
+                if advanced:
+                    update["activity"] = True
+                yield update
                 update = _size_update(time.monotonic())
                 if update is not None:
                     yield update
@@ -904,7 +923,7 @@ class SubprocessRunner:
                     )
                 raise RuntimeError(f"{fail_label} produced no output file")
 
-            yield {"progress": 100, "message": complete_message}
+            yield {"progress": 100, "message": complete_message, "activity": True}
         finally:
             self.untrack_pid(process.pid)
             if size_probe is not None and not size_probe.done():

@@ -56,7 +56,8 @@ def test_happy_path_streams_progress_then_final_100(tmp_path):
 
     progresses = [u["progress"] for u in updates]
     assert progresses[:3] == [10, 50, 90]
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert not runner.active_pids()
 
 
@@ -146,7 +147,8 @@ def test_require_output_present_completes(tmp_path):
         )
     )
 
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert out.exists()
     assert not runner.active_pids()
 
@@ -349,7 +351,8 @@ def test_cancel_racing_clean_exit_reports_success(tmp_path, monkeypatch):
         )
     )
 
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert not runner.active_pids()
 
 
@@ -428,7 +431,8 @@ def test_size_progress_emits_from_output_growth(tmp_path):
     assert max(u["progress"] for u in size_updates) >= 14
     progresses = [u["progress"] for u in updates]
     assert progresses == sorted(progresses)
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert not runner.active_pids()
 
 
@@ -494,7 +498,8 @@ def test_nice_via_wrapper_omits_preexec_fn(tmp_path, monkeypatch):
 
     assert captured.get("preexec_fn") is None
     assert 50 in [u["progress"] for u in updates]
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert not runner.active_pids()
 
 
@@ -767,5 +772,51 @@ def test_growing_output_is_not_killed_by_a_short_stall_timeout(tmp_path, monkeyp
         )
     )
 
-    assert updates[-1] == {"progress": 100, "message": "Conversion complete"}
+    assert updates[-1]["progress"] == 100
+    assert updates[-1]["message"] == "Conversion complete"
     assert not runner.active_pids()
+
+
+def test_activity_flag_marks_real_movement_only(tmp_path):
+    """Keep-alives are not activity; output growth is.
+
+    The job manager judges liveness off this flag, so a heartbeat must not
+    refresh its clock (that made a hung job look alive) and growth must, even
+    once the size estimate pins at its 95% cap (that made a healthy job look
+    stalled).
+    """
+    out = tmp_path / "out.bin"
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)
+    # Writes once immediately, then goes silent. The first tick has no sample
+    # yet so a heartbeat fires; the growth sample lands a tick later; the rest
+    # of the silence produces heartbeats against an unchanging file.
+    script = (
+        "import time\n"
+        f"out = {str(out)!r}\n"
+        "with open(out, 'wb') as f:\n"
+        "    f.write(b'x' * 4096); f.flush()\n"
+        "time.sleep(4.5)\n"
+    )
+    runner = SubprocessRunner(owner="test")
+
+    updates = asyncio.run(
+        _drain(
+            runner.run(
+                _py_cmd(script),
+                input_path=str(src),
+                output_path=str(out),
+                parse_progress=lambda _line: None,
+                mode="cso_compress",
+                heartbeat=True,
+                fail_label="testproc",
+            )
+        )
+    )
+
+    heartbeats = [u for u in updates if u["message"].startswith("Converting...")]
+    growth = [u for u in updates if "MB written" in u["message"]]
+
+    assert heartbeats, "expected the keep-alive to fire during the silent stretch"
+    assert not any(u.get("activity") for u in heartbeats)
+    assert growth and all(u.get("activity") for u in growth)

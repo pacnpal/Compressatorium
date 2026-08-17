@@ -2261,16 +2261,14 @@ class JobManager:
                 if cancel_event.is_set():
                     continue
                 now = time.monotonic()
-                # Only *advancing* progress counts as activity. Several tools
-                # emit a keep-alive every couple of seconds whose message
-                # changes while the percentage does not (dolphin's
-                # "Converting... (Ns)"), and treating each arrival as activity
-                # made this clock unable to distinguish a working job from a
-                # hung one -- which is precisely what the stalled-job warning
-                # reads (issue #263). Output growth advances the percentage via
-                # the runner's size fallback, so a job that is writing still
-                # refreshes this even when its tool prints nothing.
-                if update["progress"] > job.progress:
+                # The runner tells us which updates were real forward movement
+                # (a percentage that advanced, or the output file growing) and
+                # which were keep-alives. Don't re-derive it: counting every
+                # arrival makes a heartbeating-but-hung job look alive, and
+                # counting only percentage changes makes a healthy job look
+                # stalled once the size fallback pins at 95% or when its mode
+                # has no size ratio at all (issue #263).
+                if update.get("activity"):
                     self._last_progress_at[job_id] = now
                 job.progress = update["progress"]
                 job.message = update["message"]
