@@ -387,13 +387,12 @@ class RomzService:
             # as the failure path (an already-absent file counts as cleared, and
             # needs no separate stat on the event loop) — but here the result is
             # load-bearing: if the stale archive is still there, appending to it
-            # would produce a silently wrong output, so refuse to start.
-            #
-            # propagate_cancel because this is the one sweep that does NOT run
-            # while unwinding a failure: a job cancelled during it must report
-            # cancelled, not fail with the message below.
+            # would produce a silently wrong output, so refuse to start. (A job
+            # cancelled mid-sweep raises CancelledError out of the helper rather
+            # than reaching the RuntimeError below, so it still reports as
+            # cancelled and not as this failure.)
             if not await remove_partial_output(
-                output_path, label="stale romz archive", propagate_cancel=True,
+                output_path, label="stale romz archive",
             ):
                 raise RuntimeError(
                     f"Could not clear the existing archive at {output_path}; "

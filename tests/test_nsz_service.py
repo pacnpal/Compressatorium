@@ -13,8 +13,13 @@ from pathlib import Path
 import pytest
 
 from app.services import nsz as nsz_module
-from app.services import subprocess_runner as runner_module
 from app.services.chdman import ConversionCancelled
+
+# ``services.subprocess_runner``, not ``app.services.subprocess_runner``: the
+# two are separate module objects (the app is imported with ``app`` on the path
+# and uses the former), so patching the latter would leave the code under test
+# untouched and quietly prove nothing.
+from services import subprocess_runner as runner_module
 
 NSZ_OUTPUT_FORMATS = nsz_module.NSZ_OUTPUT_FORMATS
 
@@ -264,6 +269,7 @@ async def test_convert_failure_finishes_even_if_the_work_dir_wont_delete(
         return _FakeProcess(pid=5, chunks=[b"bad input\n"], returncode=1)
 
     release = threading.Event()
+    wedged = threading.Event()
     real_rmtree = runner_module.shutil.rmtree
 
     def _wedged(path, *args, **kwargs):
@@ -271,6 +277,7 @@ async def test_convert_failure_finishes_even_if_the_work_dir_wont_delete(
         # service also rmtrees) must still be cleaned up normally.
         if ".nsz-home-" in str(path):
             return real_rmtree(path, *args, **kwargs)
+        wedged.set()
         return release.wait(30)  # an rmtree stuck in uninterruptible I/O
 
     monkeypatch.setattr(nsz_module.asyncio, "create_subprocess_exec", fake_exec)
@@ -287,6 +294,7 @@ async def test_convert_failure_finishes_even_if_the_work_dir_wont_delete(
                 ),
                 timeout=10,
             )
+        assert wedged.is_set(), "the wedged rmtree must actually have been run"
     finally:
         release.set()
 

@@ -927,8 +927,13 @@ def test_remove_partial_output_gives_up_instead_of_freezing_the_queue(monkeypatc
     finalises instead.
     """
     release = threading.Event()
+    entered = threading.Event()
 
-    def _wedged(_paths):
+    # Signature must match `_unlink_all` exactly: a stub that raises TypeError
+    # would be caught as an ordinary cleanup failure and return False without
+    # the timeout ever running, passing this test for the wrong reason.
+    def _wedged(_paths, _discover, _abandoned):
+        entered.set()
         release.wait(30)  # stands in for an unlink in uninterruptible I/O
 
     monkeypatch.setattr(runner_module, "_unlink_all", _wedged)
@@ -940,18 +945,21 @@ def test_remove_partial_output_gives_up_instead_of_freezing_the_queue(monkeypatc
 
     try:
         assert asyncio.run(_go()) is False
+        assert entered.is_set(), "the wedged sweep must actually have been run"
     finally:
         release.set()
 
 
-def test_a_cancelled_wait_does_not_undo_a_removal_already_underway(tmp_path):
-    """Cancelling abandons the wait, not work the sweep already did.
+def test_cancellation_propagates_without_undoing_the_removal(tmp_path):
+    """A cancel is re-raised, but doesn't take back work the sweep already did.
 
-    The old synchronous unlinks couldn't be skipped by a second cancellation.
-    The bounded await keeps the useful half of that: the removal is dispatched
-    before the wait, so a cancel arriving afterwards can't take it back. (What
-    a cancel *does* stop is paths the sweep hasn't started — see
-    ``test_abandoned_sweep_stops_before_touching_later_paths``.)
+    Swallowing CancelledError here would defeat cancellation outright for the
+    callers that clean up in a ``finally`` which also runs after a *successful*
+    conversion (nsz, JWUDTool, romz extract, chains): with no pending exception
+    to re-raise, the job would go on to be marked complete. The other half still
+    holds — the removal is dispatched before the wait, so a cancel arriving
+    afterwards can't undo it. (What a cancel *does* stop is paths the sweep
+    hasn't started — see ``test_abandoned_sweep_stops_before_touching_later_paths``.)
     """
     partial = tmp_path / "game.cso"
     partial.write_bytes(b"partial")
@@ -975,12 +983,30 @@ def test_a_cancelled_wait_does_not_undo_a_removal_already_underway(tmp_path):
     try:
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(runner_module, "_unlink_all", _slow)
-            # The cancellation is swallowed: the caller re-raises the failure it
-            # was already unwinding, so the job's reported outcome is unchanged.
-            assert asyncio.run(_go()) is False
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(_go())
     finally:
         release.set()
     assert not partial.exists()
+
+
+def test_cleanup_reports_failure_when_no_thread_can_be_started(monkeypatch):
+    """Out of threads is a cleanup failure, not the job's reported outcome.
+
+    Plausible precisely here: a run of dead-mount sweeps deliberately writes
+    threads off. Letting the RuntimeError escape would stand in for the
+    converter's real error on a failure path, and would fail an already-
+    published conversion from the success-path `finally` callers.
+    """
+    def _no_threads(_func):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(runner_module, "_probe_in_daemon_thread", _no_threads)
+
+    async def _go():
+        return await runner_module.remove_partial_output("/vol/game.cso")
+
+    assert asyncio.run(_go()) is False
 
 
 def test_remove_partial_tree_clears_the_work_dir(tmp_path):
@@ -997,8 +1023,13 @@ def test_remove_partial_tree_clears_the_work_dir(tmp_path):
 
 def test_remove_partial_tree_gives_up_on_an_unresponsive_volume(monkeypatch):
     release = threading.Event()
+    entered = threading.Event()
 
-    def _wedged(_path, _ignore_errors):
+    # *args/**kwargs, so how rmtree is called (ignore_errors positional or
+    # keyword) can't turn this into a TypeError that returns False before the
+    # timeout is ever exercised.
+    def _wedged(*_args, **_kwargs):
+        entered.set()
         release.wait(30)
 
     monkeypatch.setattr(runner_module.shutil, "rmtree", _wedged)
@@ -1010,6 +1041,7 @@ def test_remove_partial_tree_gives_up_on_an_unresponsive_volume(monkeypatch):
 
     try:
         assert asyncio.run(_go()) is False
+        assert entered.is_set(), "the wedged rmtree must actually have been run"
     finally:
         release.set()
 
@@ -1100,28 +1132,31 @@ def test_abandoned_sweep_stops_before_touching_later_paths(tmp_path):
     assert later.read_bytes() == b"a retry's valid output"
 
 
-def test_remove_partial_output_can_preserve_cancellation(tmp_path):
-    """A caller that isn't unwinding a failure needs the cancel to survive.
+def test_a_cancel_abandons_a_sweep_that_had_not_started_unlinking(tmp_path):
+    """A cancel stops a wedged sweep the same way a timeout does.
 
-    romz's pre-run sweep runs before anything has failed, so swallowing the
-    CancelledError there would turn a cancelled job into a failed one.
+    The counterpart of the timeout case: once the caller is gone the job stops
+    owning these paths, so a sweep still stuck when the cancel lands must not
+    unlink them when the storage eventually answers.
     """
     partial = tmp_path / "game.7z"
     partial.write_bytes(b"stale")
     start = threading.Event()
     release = threading.Event()
+    done = threading.Event()
     real_unlink_all = runner_module._unlink_all
 
     def _slow(paths, discover, abandoned):
         start.set()
-        release.wait(30)
-        real_unlink_all(paths, discover, abandoned)
+        release.wait(30)  # still wedged when the cancel arrives
+        try:
+            real_unlink_all(paths, discover, abandoned)
+        finally:
+            done.set()
 
     async def _go():
         task = asyncio.ensure_future(
-            runner_module.remove_partial_output(
-                str(partial), propagate_cancel=True,
-            ),
+            runner_module.remove_partial_output(str(partial)),
         )
         await asyncio.get_running_loop().run_in_executor(None, start.wait, 5)
         task.cancel()
@@ -1134,3 +1169,6 @@ def test_remove_partial_output_can_preserve_cancellation(tmp_path):
                 asyncio.run(_go())
     finally:
         release.set()
+
+    assert done.wait(5)
+    assert partial.exists()  # abandoned before it reached the unlink

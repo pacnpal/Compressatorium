@@ -192,16 +192,22 @@ async def _bounded_cleanup(
     work: Callable[[threading.Event], None],
     what: str,
     timeout: float,
-    *,
-    propagate_cancel: bool = False,
 ) -> bool:
-    """Run a blocking cleanup call with a hard bound, never raising.
+    """Run a blocking cleanup call with a hard bound, raising only to cancel.
 
     Returns ``True`` when the removal finished, ``False`` when it did not --
-    timed out, failed, or the wait was interrupted. Callers are already
-    unwinding a failure and re-raise it immediately after, so a cleanup problem
-    is logged rather than raised: it must not replace the error that actually
-    explains the job's outcome, and it must never hold up finalising the job.
+    timed out, or failed. A cleanup problem is logged rather than raised: on an
+    error path it must not replace the exception that actually explains the
+    job's outcome, and in a ``finally`` after a *successful* conversion it must
+    not fail a job whose output is already published. It must also never hold up
+    finalising the job.
+
+    ``CancelledError`` is the one exception that does propagate, like from any
+    other ``await``. Swallowing it would defeat cancellation outright for the
+    callers that have no pending exception to re-raise -- nsz, JWUDTool, romz's
+    extract and chains all clean up in a ``finally`` that runs on the success
+    path too, where consuming the cancel lets the job go on to be marked
+    complete.
 
     The blocking call is *dispatched* before the wait, so a cancellation
     arriving afterwards cannot take back work the sweep already did -- the
@@ -211,11 +217,6 @@ async def _bounded_cleanup(
     is the rest of the sweep: once this returns, the job finalises and stops
     owning those paths, so ``abandoned`` tells the thread not to unlink anything
     it has not already started. See :func:`_unlink_all`.
-
-    ``propagate_cancel`` re-raises ``CancelledError`` instead of swallowing it,
-    for the one caller that is *not* already unwinding a failure: romz's
-    pre-run sweep. Swallowing there would turn a cancelled job into a failed
-    one. The removal still proceeds on its thread either way.
     """
     abandoned = threading.Event()
 
@@ -228,7 +229,17 @@ async def _bounded_cleanup(
                     "Cleanup of %s finished after it was abandoned", what,
                 )
 
-    future = _probe_in_daemon_thread(_run_work)
+    try:
+        future = _probe_in_daemon_thread(_run_work)
+    except RuntimeError as exc:
+        # Out of threads -- plausible precisely here, since a run of dead-mount
+        # sweeps deliberately writes threads off. Nothing was dispatched, so
+        # report it like any other cleanup failure rather than letting it
+        # escape and stand in for the conversion's own outcome.
+        _cleanup_logger.warning(
+            "Could not start a cleanup thread for %s: %s", what, exc,
+        )
+        return False
     try:
         await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
@@ -241,15 +252,11 @@ async def _bounded_cleanup(
         )
         return False
     except asyncio.CancelledError:
-        # The removal is already running on its own thread and still completes;
-        # only the wait for confirmation is abandoned. Swallowed by default
-        # because every such caller re-raises the failure it was already
-        # unwinding, so the outcome the job reports is unchanged.
+        # Stop the sweep before re-raising: the job is going away, so anything
+        # it has not already started to unlink is no longer its to delete.
         abandoned.set()
         _cleanup_logger.warning("Interrupted while removing %s", what)
-        if propagate_cancel:
-            raise
-        return False
+        raise
     except Exception as exc:  # noqa: BLE001 - cleanup never raises at its caller
         _cleanup_logger.warning("Could not remove %s: %s", what, exc)
         return False
@@ -261,7 +268,6 @@ async def remove_partial_output(
     discover: Callable[[], Sequence[str]] | None = None,
     label: str = "partial output",
     timeout: float | None = None,
-    propagate_cancel: bool = False,
 ) -> bool:
     """Bounded unlink of the file(s) a failed run may have left behind.
 
@@ -272,7 +278,8 @@ async def remove_partial_output(
     ``label`` names the sweep in the log, and should carry the path when
     ``discover`` means there is nothing static to print.
 
-    Returns ``True`` if the sweep finished. ``timeout`` defaults to
+    Returns ``True`` if the sweep finished, ``False`` if it did not; only
+    ``CancelledError`` propagates. ``timeout`` defaults to
     :data:`_CLEANUP_TIMEOUT`, read at call time so the bound stays one knob
     rather than a value frozen into each signature.
     """
@@ -283,7 +290,6 @@ async def remove_partial_output(
         functools.partial(_unlink_all, paths, discover),
         what,
         _CLEANUP_TIMEOUT if timeout is None else timeout,
-        propagate_cancel=propagate_cancel,
     )
 
 

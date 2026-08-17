@@ -401,12 +401,11 @@ class SubprocessRunner:
 # chains (which own no runner) need the same bound. See "Cleaning up partial
 # output is bounded too" below.
 async def remove_partial_output(*paths: str, discover=None,
-                                label="partial output", timeout=None,
-                                propagate_cancel=False) -> bool:
+                                label="partial output", timeout=None) -> bool:
     """Bounded unlink of every file a failed run may have left behind.
-    True if the sweep finished, False if it timed out / failed / was
-    interrupted. Never raises. `discover()` enumerates further paths from
-    inside the bounded worker, for a set only knowable by probing the disk.
+    True if the sweep finished, False if it timed out or failed. Raises only
+    CancelledError. `discover()` enumerates further paths from inside the
+    bounded worker, for a set only knowable by probing the disk.
     """
 
 async def remove_partial_tree(path: str, *, label="work directory",
@@ -489,11 +488,17 @@ froze anyway. These helpers run the blocking call on a throwaway daemon thread
 
 The contract, which is what makes them safe to use everywhere:
 
-- **They never raise.** The caller is already unwinding the failure that
-  explains the job's outcome and re-raises it immediately; a cleanup problem
-  must not replace that error. Failure is a logged warning and a `False`
-  return, so the job finishes as failed with a leftover partial file — a much
-  smaller problem than a frozen queue.
+- **They never raise, except to cancel.** A cleanup problem must not replace the
+  exception that explains the job's outcome on an error path, and must not fail
+  an already-published conversion from the `finally` blocks that also run on
+  success. It is a logged warning and a `False` return — the job finishes with a
+  leftover partial file, a much smaller problem than a frozen queue. That
+  includes being unable to start the cleanup thread at all, which is plausible
+  precisely here since a run of dead-mount sweeps deliberately writes threads
+  off. `CancelledError` is the one exception that propagates, like from any
+  other `await`: swallowing it would defeat cancellation outright for the
+  `finally` callers, which have no pending exception to re-raise and would go on
+  to be marked complete.
 - **The removal is dispatched before the wait**, so a cancellation arriving
   afterwards cannot take back work the sweep already did — the useful half of
   what the old blocks bought by unlinking *synchronously* on the event loop
@@ -527,10 +532,10 @@ Rules for a new tool:
   keeping the one enumeration that also backs `overwrite_targets`.
 - Where the result is load-bearing rather than best-effort, check it. romz
   clears a stale archive *before* running `7z a` (which appends) and refuses to
-  start if that sweep reports failure. That one call also passes
-  `propagate_cancel=True`: it is the only sweep that does **not** run while
-  unwinding a failure, so swallowing a `CancelledError` there would report a
-  cancelled job as a failed one.
+  start if that sweep reports failure. Note what the propagating `CancelledError`
+  buys that call: a job cancelled mid-sweep raises out of the helper instead of
+  reaching the "could not clear the existing archive" error, so it still reports
+  as cancelled rather than as that failure.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 

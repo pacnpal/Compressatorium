@@ -17,8 +17,9 @@ from app.models import ConversionJob, ConversionMode, InputKind, JobStatus
 from app.routes import convert as convert_routes
 from app.routes import files as files_routes
 from app.services.makeps3iso import ConversionCancelled, makeps3iso_service
-from app.services.subprocess_runner import remove_partial_output
 from app.services.tools import registry
+# The module the services themselves import (see the note in test_cso_service).
+from services.subprocess_runner import remove_partial_output
 
 from .ps3_helpers import make_ps3_folder as _make_ps3_folder
 

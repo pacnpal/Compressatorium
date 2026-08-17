@@ -12,8 +12,13 @@ from pathlib import Path
 import pytest
 
 from app.services import maxcso as maxcso_module
-from app.services import subprocess_runner as runner_module
 from app.services.chdman import ConversionCancelled
+
+# ``services.subprocess_runner``, not ``app.services.subprocess_runner``: the
+# two are separate module objects (the app is imported with ``app`` on the path
+# and uses the former), so patching the latter would leave the code under test
+# untouched and quietly prove nothing.
+from services import subprocess_runner as runner_module
 
 service = maxcso_module.maxcso_service
 
@@ -131,8 +136,13 @@ async def test_convert_failure_finishes_even_if_cleanup_wedges(tmp_path, monkeyp
         return _FakeProcess(pid=5, chunks=[b"bad input\n"], returncode=1)
 
     release = threading.Event()
+    entered = threading.Event()
 
-    def _wedged(_paths):
+    # Signature must match `_unlink_all`: a stub that raises TypeError would be
+    # caught as an ordinary cleanup failure, and this would pass without the
+    # wedge or the timeout ever being exercised.
+    def _wedged(_paths, _discover, _abandoned):
+        entered.set()
         release.wait(30)  # an unlink stuck in uninterruptible I/O
 
     monkeypatch.setattr(maxcso_module.asyncio, "create_subprocess_exec", fake_exec)
@@ -145,6 +155,7 @@ async def test_convert_failure_finishes_even_if_cleanup_wedges(tmp_path, monkeyp
                 _drain(service.convert(str(src_path), str(out_path), "cso_compress")),
                 timeout=10,
             )
+        assert entered.is_set(), "the wedged sweep must actually have been run"
     finally:
         release.set()
 
