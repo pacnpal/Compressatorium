@@ -6,7 +6,7 @@ import { api } from '$lib/api/endpoints.js';
 
 class DATMatchingStore {
   matches = new SvelteMap();
-  hasDats = $state(false);
+  matchingAvailable = $state(false);
   panelOpen = $state(false);
   importingDat = $state(false);
   syncing = $state(false);
@@ -30,16 +30,22 @@ class DATMatchingStore {
     return this.matches.get(path) ?? null;
   }
 
-  async refreshHasDats() {
+  async refreshMatchingAvailability() {
     try {
       const stats = await api.getDATStats();
       this.stats = stats;
       // /api/dat/stats returns total_dats (legacy UI checked this exact field);
       // `total` / `imported_count` are not part of the response.
-      this.hasDats = (stats?.total_dats ?? 0) > 0;
-      return this.hasDats;
+      //
+      // This gate is "can anything answer a hash lookup?", NOT "are there
+      // DATs" -- with Hasheous enabled a library with zero imported DATs still
+      // matches, and gating on total_dats alone would mean ordinary browsing
+      // never kicks a match job in exactly that case.
+      this.matchingAvailable =
+        (stats?.total_dats ?? 0) > 0 || Boolean(stats?.hasheous_enabled);
+      return this.matchingAvailable;
     } catch (_e) {
-      this.hasDats = false;
+      this.matchingAvailable = false;
       return false;
     }
   }
@@ -53,7 +59,7 @@ class DATMatchingStore {
       // record: { id, name, description, version, imported_at, file_count }.
       const data = await api.listDATs();
       this.dats = Array.isArray(data) ? data : (Array.isArray(data?.dats) ? data.dats : []);
-      await this.refreshHasDats();
+      await this.refreshMatchingAvailability();
     } catch (e) {
       this.datsError = e?.message ?? 'Failed to load DATs';
     } finally {
@@ -88,7 +94,7 @@ class DATMatchingStore {
   async hydrateAndMatch(paths) {
     if (!paths?.length) return;
     await this.hydrate(paths);
-    if (!this.hasDats) return;
+    if (!this.matchingAvailable) return;
     // Drop paths the backend already attempted this session, if they
     // came back uncached after a completed dat_match job, they were
     // skipped (over MATCH_MAX_FILE_SIZE, unreadable, etc.) and
@@ -211,18 +217,18 @@ class DATMatchingStore {
       if (!stillSyncing && wasSyncing) {
         // Sync just finished (syncing → done transition). The backend
         // has persisted the new DAT set and may have dropped the old
-        // one, so reload the full list, not just hasDats, and clear
+        // one, so reload the full list, not just availability, and clear
         // the stale match cache (new hashes can flip prior matches).
         // Reset attempts so previously-uncached paths get tried
-        // against the new DAT set. loadDATs() refreshes hasDats
+        // against the new DAT set. loadDATs() refreshes availability
         // internally.
         this.matches.clear();
         this._resetAttempts();
         await this.loadDATs();
       } else if (!stillSyncing) {
         // Cold poll (e.g. on mount) with no sync running: cheap
-        // hasDats refresh is enough; no need to reload the whole list.
-        await this.refreshHasDats();
+        // An availability refresh is enough; no need to reload the whole list.
+        await this.refreshMatchingAvailability();
       }
       return this.syncStatus;
     } catch (_e) {

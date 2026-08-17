@@ -201,7 +201,7 @@
     //      every page change, polluting the unmatched count and
     //      wasting I/O.
     chdMetadata.hydrate(allPaths).catch(() => {});
-    if (datMatching.hasDats) {
+    if (datMatching.matchingAvailable) {
       const matchableExts = registry.allFilterableExts();
       const matchExtSet = new Set(matchableExts.map((e) => e.toLowerCase()));
       const filePaths = entries

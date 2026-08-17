@@ -1197,7 +1197,42 @@ identity fields the source carries — so `_lookup_sha1_match` builds the
 result dict once and splats the record into it. Adding a field to a remote match
 means adding a key to that record, not touching the builder.
 
-Three properties are load-bearing:
+#### Candidate ordering: all local, then all remote
+
+`_lookup_match(file_path, candidates)` takes the **whole** candidate list rather
+than being called once per hash. A tool can report several content hashes for one
+file — `ChdmanTool.embedded_hashes` returns the header SHA1 *and* the data SHA1 —
+and the two loops inside it are not interchangeable with one fused loop:
+
+```python
+for sha1, mt in candidates:          # every candidate, local only
+    ...
+if hasheous.enabled():
+    for sha1, mt in candidates:      # then, and only then, remote
+        ...
+```
+
+Interleaving (remote-checking candidate 1 before local-checking candidate 2) has
+two failure modes. It discloses a hash the local DATs could have identified on
+their own, and a remote timeout on the first candidate raises before the second —
+the one that *would* have matched locally — is ever tried. Keeping the passes
+separate is what makes "local always wins" true at the candidate-set level and
+not just per hash.
+
+#### Cache entries are scoped to the sources that produced them
+
+Every cacheable miss carries `checked_remote`, and `cached_result_usable(payload)`
+is the single gate every cache read goes through (`/dat/match-batch`,
+`/dat/matches/lookup`, `/dat/match-batch/job`, and the scan's Phase 3 skip).
+
+A miss recorded before Hasheous was enabled came from a strictly weaker matcher,
+so it must not be served once the stronger one is available — otherwise an
+existing install switches the feature on and nothing happens, because every path
+in the library already has a cached "not in any DAT" row. Hits are always usable:
+local DATs are consulted first, so a remote source could not have improved on one.
+This is a payload field, not a schema change.
+
+#### Other load-bearing properties
 
 - **A failure is not a miss.** `hasheous.lookup` raises `HasheousUnavailable` for
   timeouts, 5xx and unparseable bodies, and returns `None` **only** for the
@@ -1205,18 +1240,35 @@ Three properties are load-bearing:
   `{**base_result, "error": ...}`, which the existing rule (see
   `_abandoned_match_result`) refuses to cache. Without this, one network blip
   would permanently record every in-flight file as being in no DAT.
+- **An outage is learned once, not once per file.** A failure opens a 60-second
+  module-level cooldown during which `lookup` raises immediately without a
+  request. Files still come back non-cacheable — just without paying
+  `hasheous_timeout` each. A 1,000-file scan against a dead endpoint would
+  otherwise burn over four hours rediscovering the same fact.
 - **`dat_id` is always `None` on a remote hit.** It is a FK into the local `dats`
   table and a remote match has no row there. `dat_store` already nulls unknown
   values before writing, so this keeps the cached row byte-identical across
   re-runs rather than depending on that guard.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
-  ever reached for an operator who imported no DATs at all.
+  ever reached for an operator who imported no DATs at all. The frontend has the
+  same gate — `datMatching.matchingAvailable`, derived from `total_dats > 0 ||
+  hasheous_enabled` — and it is deliberately *not* named `hasDats`, because
+  reading it as "are there DATs" is exactly what would silently stop the browse
+  path from ever scheduling a match job.
+- **A broken store still skips Phase 3.** `_scan_phase_dat_match` tracks store
+  health separately from `has_dats`: the phase exists to prime the match cache
+  and every write goes through that store, so proceeding on a dead DB would fail
+  the whole scan instead of degrading quietly.
 
 The client is stdlib-only (`urllib.request`), mirroring `services/dat_sync.py`:
 `_require_https`, an explicit `User-Agent`, a hard timeout, a response size cap,
-and `_fetch_json` as the single seam tests patch. Extra fields ride in the
-existing `dat_matches.payload` JSON column, so no migration is involved.
+and `_fetch_json` as the single seam tests patch. Redirects go through
+`_HTTPSOnlyRedirectHandler`, which re-runs the scheme check on every hop —
+`urlopen` follows redirects itself, so validating only the initial URL would let
+a misconfigured or hostile server bounce a lookup to `http://` and put the file's
+SHA1 on the wire in the clear. Extra fields ride in the existing
+`dat_matches.payload` JSON column, so no migration is involved.
 
 ### 3.3.6 Re-run fast path (`JobManager._output_already_verified`)
 

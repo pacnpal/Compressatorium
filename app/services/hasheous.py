@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +46,15 @@ _USER_AGENT = "compressatorium-hasheous/1.0"
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _SHA1_RE = re.compile(r"[0-9a-f]{40}")
+
+# How long to stop calling out after a failure. Without this, an outage during
+# a 1,000-file scan costs 1,000 x hasheous_timeout -- over four hours at the
+# default -- to learn the same fact once per file. Files still come back
+# non-cacheable during the cooldown, just immediately.
+_COOLDOWN_SECONDS = 60
+
+_cooldown_lock = threading.Lock()
+_unavailable_until = 0.0  # monotonic deadline; 0 == service presumed up
 
 
 class HasheousUnavailable(Exception):
@@ -72,6 +83,40 @@ def _require_https(url: str) -> None:
         raise ValueError(f"Only https URLs are permitted; got scheme '{parsed.scheme}'")
 
 
+class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that would downgrade the transport.
+
+    ``urlopen`` follows redirects on its own, and ``_require_https`` only sees
+    the URL we start with -- so a misconfigured or hostile server could bounce
+    a lookup to ``http://`` and put the file's SHA1 on the wire in the clear.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_HTTPSOnlyRedirectHandler)
+
+
+def _cooldown_remaining() -> float:
+    """Seconds left before remote lookups are attempted again (0 when up)."""
+    with _cooldown_lock:
+        return max(0.0, _unavailable_until - time.monotonic())
+
+
+def _begin_cooldown() -> None:
+    global _unavailable_until  # noqa: PLW0603, intentional module-level state
+    with _cooldown_lock:
+        _unavailable_until = time.monotonic() + _COOLDOWN_SECONDS
+
+
+def _clear_cooldown() -> None:
+    global _unavailable_until  # noqa: PLW0603, intentional module-level state
+    with _cooldown_lock:
+        _unavailable_until = 0.0
+
+
 def _lookup_url(sha1: str) -> str:
     base = str(getattr(settings, "hasheous_base_url", "") or "").rstrip("/")
     return f"{base}/api/v1/Lookup/ByHash/sha1/{sha1}"
@@ -93,7 +138,7 @@ def _fetch_json(url: str) -> dict | None:
         headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
     )
     try:
-        with urllib.request.urlopen(req, timeout=_timeout()) as resp:  # nosec B310
+        with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -183,7 +228,21 @@ async def lookup(sha1: str) -> dict | None:
         # Not a SHA1 we can put in a URL path; treat as "nothing to ask".
         return None
 
-    data = await run_in_threadpool(_fetch_json, _lookup_url(normalized))
+    remaining = _cooldown_remaining()
+    if remaining > 0:
+        # Still unavailable, and still non-cacheable -- just without paying
+        # another full timeout to rediscover it.
+        raise HasheousUnavailable(
+            f"skipped: unavailable, retrying in {remaining:.0f}s"
+        )
+
+    try:
+        data = await run_in_threadpool(_fetch_json, _lookup_url(normalized))
+    except HasheousUnavailable:
+        _begin_cooldown()
+        raise
+
+    _clear_cooldown()
     if data is None:
         return None
     return _normalize(data)

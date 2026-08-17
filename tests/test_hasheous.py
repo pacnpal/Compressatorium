@@ -6,6 +6,7 @@ No HTTP mocking library is used (the suite has none): the seam is
 """
 
 import urllib.error
+import urllib.request
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -72,6 +73,19 @@ def test_patches_the_module_the_routes_actually_use():
     while hitting the real network.
     """
     assert hasheous is dat_routes.hasheous
+
+
+@pytest.fixture(autouse=True)
+def _reset_cooldown():
+    """Clear the circuit breaker around every test.
+
+    It is module-level state, so one failing-transport test would otherwise
+    make every later test skip its lookup and see "unavailable" instead of
+    whatever it was actually asserting.
+    """
+    hasheous._clear_cooldown()
+    yield
+    hasheous._clear_cooldown()
 
 
 @pytest.fixture
@@ -164,25 +178,25 @@ async def test_404_is_a_clean_miss(hasheous_on):
 
 @pytest.mark.parametrize("code", [500, 502, 503, 429])
 def test_non_404_http_errors_raise_unavailable(code, hasheous_on):
-    with patch("urllib.request.urlopen", side_effect=_http_error(code)):
+    with patch.object(hasheous._opener, "open", side_effect=_http_error(code)):
         with pytest.raises(hasheous.HasheousUnavailable):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
 def test_fetch_json_maps_404_to_none(hasheous_on):
-    with patch("urllib.request.urlopen", side_effect=_http_error(404)):
+    with patch.object(hasheous._opener, "open", side_effect=_http_error(404)):
         assert hasheous._fetch_json("https://hasheous.example/x") is None
 
 
 def test_timeout_raises_unavailable(hasheous_on):
-    with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+    with patch.object(hasheous._opener, "open", side_effect=TimeoutError("timed out")):
         with pytest.raises(hasheous.HasheousUnavailable):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
 def test_url_error_raises_unavailable(hasheous_on):
-    with patch(
-        "urllib.request.urlopen", side_effect=urllib.error.URLError("no route"),
+    with patch.object(
+        hasheous._opener, "open", side_effect=urllib.error.URLError("no route"),
     ), pytest.raises(hasheous.HasheousUnavailable):
         hasheous._fetch_json("https://hasheous.example/x")
 
@@ -202,21 +216,21 @@ class _Resp:
 
 
 def test_unparseable_body_raises_unavailable(hasheous_on):
-    with patch("urllib.request.urlopen", return_value=_Resp(b"<html>nope</html>")):
+    with patch.object(hasheous._opener, "open", return_value=_Resp(b"<html>nope</html>")):
         with pytest.raises(hasheous.HasheousUnavailable):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
 def test_non_object_body_raises_unavailable(hasheous_on):
     """A bare list is not the documented shape; refuse rather than guess."""
-    with patch("urllib.request.urlopen", return_value=_Resp(b"[1, 2, 3]")):
+    with patch.object(hasheous._opener, "open", return_value=_Resp(b"[1, 2, 3]")):
         with pytest.raises(hasheous.HasheousUnavailable):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
 def test_oversized_body_raises_unavailable(hasheous_on):
     huge = b"x" * (hasheous._MAX_RESPONSE_BYTES + 1)
-    with patch("urllib.request.urlopen", return_value=_Resp(huge)):
+    with patch.object(hasheous._opener, "open", return_value=_Resp(huge)):
         with pytest.raises(hasheous.HasheousUnavailable):
             hasheous._fetch_json("https://hasheous.example/x")
 
@@ -258,7 +272,7 @@ async def test_disabled_by_default_makes_no_call(monkeypatch):
         dat_routes, "_local_dat_record", AsyncMock(return_value=None),
     )
     with patch.object(hasheous, "lookup", new=AsyncMock()) as remote:
-        result = await dat_routes._lookup_sha1_match("/x.iso", SAMPLE_SHA1, "file_sha1")
+        result = await dat_routes._lookup_match("/x.iso", [(SAMPLE_SHA1, "file_sha1")])
 
     assert result is None
     remote.assert_not_awaited()
@@ -273,8 +287,8 @@ async def test_local_hit_short_circuits_the_remote_lookup(hasheous_on):
     }
     with patch.object(dat_routes, "_local_dat_record", AsyncMock(return_value=local)):
         with patch.object(hasheous, "lookup", new=AsyncMock()) as remote:
-            result = await dat_routes._lookup_sha1_match(
-                "/x.iso", SAMPLE_SHA1, "file_sha1",
+            result = await dat_routes._lookup_match(
+                "/x.iso", [(SAMPLE_SHA1, "file_sha1")],
             )
 
     assert result["source"] == "dat"
@@ -286,8 +300,8 @@ async def test_local_hit_short_circuits_the_remote_lookup(hasheous_on):
 async def test_remote_fallback_on_local_miss(hasheous_on):
     with patch.object(dat_routes, "_local_dat_record", AsyncMock(return_value=None)):
         with patch.object(hasheous, "_fetch_json", return_value=SAMPLE_RESPONSE):
-            result = await dat_routes._lookup_sha1_match(
-                "/x.iso", SAMPLE_SHA1, "file_sha1",
+            result = await dat_routes._lookup_match(
+                "/x.iso", [(SAMPLE_SHA1, "file_sha1")],
             )
 
     assert result["matched"] is True
@@ -424,3 +438,179 @@ def test_matching_available_gate(monkeypatch):
 
     monkeypatch.setattr(settings, "hasheous_enabled", True)
     assert dat_routes.matching_available(False) is True
+
+
+# ---------------------------------------------------------------------------
+# Review findings (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_all_candidates_checked_locally_before_any_remote_call(hasheous_on):
+    """A CHD reports header SHA1 then data SHA1.
+
+    If only the *second* is in a local DAT, the first must never be sent
+    remotely: interleaving would disclose a hash the local DATs could identify
+    on their own, and a remote timeout on it would mask the local hit.
+    """
+    header, data = "a" * 40, "b" * 40
+    local = {
+        "dat_id": "d1", "dat_name": "Local DAT", "game_name": "G",
+        "rom_name": "g.chd", "source": "dat",
+    }
+
+    async def _local(sha1):
+        return local if sha1 == data else None
+
+    with patch.object(dat_routes, "_local_dat_record", _local):
+        with patch.object(hasheous, "lookup", new=AsyncMock()) as remote:
+            result = await dat_routes._lookup_match(
+                "/g.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+            )
+
+    assert result["source"] == "dat"
+    assert result["match_type"] == "chd_data_sha1"
+    assert result["file_hash"] == data
+    remote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_outage_cannot_mask_a_later_local_candidate(hasheous_on):
+    """The failure mode the two-pass ordering exists to prevent."""
+    header, data = "a" * 40, "b" * 40
+    local = {
+        "dat_id": "d1", "dat_name": "Local DAT", "game_name": "G",
+        "rom_name": "g.chd", "source": "dat",
+    }
+
+    async def _local(sha1):
+        return local if sha1 == data else None
+
+    async def _boom(_sha1):
+        raise hasheous.HasheousUnavailable("timed out")
+
+    with patch.object(dat_routes, "_local_dat_record", _local):
+        with patch.object(hasheous, "lookup", _boom):
+            result = await dat_routes._lookup_match(
+                "/g.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+            )
+
+    assert result["matched"] is True
+    assert result["source"] == "dat"
+
+
+@pytest.mark.asyncio
+async def test_remote_tried_for_every_candidate_once_all_miss_locally(hasheous_on):
+    header, data = "a" * 40, "b" * 40
+    seen = []
+
+    async def _remote(sha1):
+        seen.append(sha1)
+        return None
+
+    with patch.object(dat_routes, "_local_dat_record", AsyncMock(return_value=None)):
+        with patch.object(hasheous, "lookup", _remote):
+            result = await dat_routes._lookup_match(
+                "/g.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+            )
+
+    assert result is None
+    assert seen == [header, data]
+
+
+def test_cached_miss_from_before_hasheous_is_not_reused(monkeypatch):
+    """An existing install that switches Hasheous on must re-check old misses.
+
+    Otherwise the rows cached by the weaker local-only matcher are served
+    forever and the feature silently does nothing for the very library it
+    exists to identify.
+    """
+    stale_miss = {"path": "/a.iso", "matched": False, "checked_remote": False}
+    fresh_miss = {"path": "/a.iso", "matched": False, "checked_remote": True}
+    hit = {"path": "/a.iso", "matched": True, "source": "dat"}
+
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    assert dat_routes.cached_result_usable(stale_miss) is False
+    assert dat_routes.cached_result_usable(fresh_miss) is True
+    # A local hit is already the strongest answer; local is consulted first.
+    assert dat_routes.cached_result_usable(hit) is True
+    assert dat_routes.cached_result_usable(None) is False
+
+    # With the feature off, a local-only miss is still the correct verdict.
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+    assert dat_routes.cached_result_usable(stale_miss) is True
+
+
+@pytest.mark.asyncio
+async def test_misses_record_which_sources_were_consulted(hasheous_on, monkeypatch):
+    """The stamp cached_result_usable reads has to actually be written."""
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: False)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=SAMPLE_SHA1),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(hasheous, "lookup", AsyncMock(return_value=None))
+
+    result = await dat_routes._match_single_file("/x.iso")
+
+    assert result["matched"] is False
+    assert result["checked_remote"] is True
+
+
+@pytest.mark.asyncio
+async def test_outage_short_circuits_instead_of_timing_out_per_file(hasheous_on):
+    """A 1,000-file scan must not pay hasheous_timeout a thousand times."""
+    calls = []
+
+    def _boom(_url):
+        calls.append(_url)
+        raise hasheous.HasheousUnavailable("timed out")
+
+    with patch.object(hasheous, "_fetch_json", _boom):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            await hasheous.lookup(SAMPLE_SHA1)
+        # Every subsequent file still fails (non-cacheable), but without
+        # another network round trip.
+        for _ in range(5):
+            with pytest.raises(hasheous.HasheousUnavailable):
+                await hasheous.lookup(SAMPLE_SHA1)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cooldown_clears_after_a_success(hasheous_on):
+    with patch.object(
+        hasheous, "_fetch_json", side_effect=hasheous.HasheousUnavailable("down"),
+    ):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            await hasheous.lookup(SAMPLE_SHA1)
+
+    assert hasheous._cooldown_remaining() > 0
+    hasheous._clear_cooldown()
+
+    with patch.object(hasheous, "_fetch_json", return_value=SAMPLE_RESPONSE):
+        assert await hasheous.lookup(SAMPLE_SHA1) is not None
+    assert hasheous._cooldown_remaining() == 0
+
+
+def test_redirect_to_http_is_refused():
+    """urlopen follows redirects itself, so the guard must run on each hop.
+
+    Without it a misconfigured or hostile server could bounce the lookup to
+    http:// and put the file's SHA1 on the wire in the clear.
+    """
+    handler = hasheous._HTTPSOnlyRedirectHandler()
+    with pytest.raises(ValueError, match="https"):
+        handler.redirect_request(
+            None, None, 302, "Found", {}, "http://evil.example/leak",
+        )
+
+
+def test_redirect_to_https_is_allowed():
+    handler = hasheous._HTTPSOnlyRedirectHandler()
+    req = urllib.request.Request("https://hasheous.example/a")
+    out = handler.redirect_request(
+        req, None, 302, "Found", {}, "https://hasheous.example/b",
+    )
+    assert out is not None

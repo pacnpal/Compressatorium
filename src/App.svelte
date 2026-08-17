@@ -123,7 +123,7 @@
     // Rehydrate the verified set + DAT-library state so OK / DAT badges
     // survive reloads. Fire and forget, failure leaves the cache empty.
     verification.loadVerified();
-    datMatching.refreshHasDats();
+    datMatching.refreshMatchingAvailability();
     jobs.connect();
     const stopRouter = startRouter();
     return () => {

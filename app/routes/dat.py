@@ -282,7 +282,7 @@ async def match_batch(request: MatchBatchRequest):
                 results[original_path] = result
             continue
         cached_result = cached.get(normalized_path)
-        if cached_result is not None:
+        if cached_result_usable(cached_result):
             for original_path in original_paths:
                 results[original_path] = cached_result
         else:
@@ -371,7 +371,10 @@ async def match_cache_lookup(request: MatchCacheLookupRequest):
                 }
             continue
         cached_entry = cached.get(normalized_path)
-        if cached_entry is None:
+        if not cached_result_usable(cached_entry):
+            # Withhold a row that predates a now-enabled lookup source, so the
+            # client sees the path as uncached and schedules a match job rather
+            # than rendering a stale "no match" forever.
             continue
         for original_path in original_paths:
             results[original_path] = cached_entry
@@ -434,7 +437,7 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
                 }
             continue
         cached_entry = cached.get(normalized_path)
-        if cached_entry is not None:
+        if cached_result_usable(cached_entry):
             for original_path in original_paths:
                 results[original_path] = cached_entry
             continue
@@ -919,29 +922,8 @@ async def _local_dat_record(sha1: str) -> dict | None:
     }
 
 
-async def _lookup_sha1_match(file_path: str, sha1: str, match_type: str) -> dict | None:
-    """Resolve ``sha1`` to a match-result dict, locally first then remotely.
-
-    Shared by every match path (per-tool embedded hashes and the file-level
-    SHA1 fallback) so the lookup order and the result-dict shape live in one
-    place. Returns ``None`` when neither the imported DATs nor Hasheous know
-    the hash.
-
-    Order is fixed and local-first: an operator whose DATs already cover their
-    library never makes a network call, and a given hash always resolves the
-    same way regardless of network weather.
-
-    Propagates :class:`HasheousUnavailable` -- a transient remote failure is
-    *not* a miss, and the caller turns it into a non-cacheable error.
-    """
-    record = await _local_dat_record(sha1)
-    if record is None and hasheous.enabled():
-        # ponytail: unbounded concurrency. Each call is bounded by
-        # hasheous_timeout and the bulk match job is already single-flight; add
-        # a workload_limiter lane if a large scan ever gets rate-limited.
-        record = await hasheous.lookup(sha1)
-    if record is None:
-        return None
+def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> dict:
+    """Build the match-result dict from a lookup record. The one place it lives."""
     return {
         "path": file_path,
         "matched": True,
@@ -949,6 +931,62 @@ async def _lookup_sha1_match(file_path: str, sha1: str, match_type: str) -> dict
         "file_hash": sha1,
         **record,
     }
+
+
+async def _lookup_match(
+    file_path: str, candidates: list[tuple[str, str]],
+) -> dict | None:
+    """Resolve the first of ``candidates`` that any source knows.
+
+    ``candidates`` is a list of ``(sha1, match_type)``. A tool can report
+    several content hashes for one file -- a CHD carries both a header SHA1 and
+    a data SHA1 -- and the file-level fallback supplies exactly one.
+
+    **Every** candidate is tried against the imported DATs before *any* of them
+    is sent to Hasheous. Interleaving the two (remote-checking candidate 1
+    before local-checking candidate 2) would both disclose a hash the local DATs
+    could have identified on their own, and let a remote timeout mask an
+    available local hit.
+
+    Returns ``None`` when nothing knows any candidate. Propagates
+    :class:`HasheousUnavailable` -- a transient remote failure is *not* a miss,
+    and the caller turns it into a non-cacheable error.
+    """
+    for sha1, match_type in candidates:
+        record = await _local_dat_record(sha1)
+        if record is not None:
+            return _match_result(file_path, sha1, match_type, record)
+
+    if hasheous.enabled():
+        for sha1, match_type in candidates:
+            # ponytail: unbounded concurrency. Each call is bounded by
+            # hasheous_timeout, the bulk match job is already single-flight, and
+            # the client short-circuits while the service is down; add a
+            # workload_limiter lane if a large scan ever gets rate-limited.
+            record = await hasheous.lookup(sha1)
+            if record is not None:
+                return _match_result(file_path, sha1, match_type, record)
+
+    return None
+
+
+def cached_result_usable(payload: dict | None) -> bool:
+    """False when a cached row predates a lookup source that is now enabled.
+
+    A miss recorded before Hasheous was switched on came from a strictly weaker
+    matcher, so re-running it can now succeed. Without this an existing install
+    that enables Hasheous keeps serving its old "not in any DAT" rows and the
+    feature silently does nothing for precisely the uncovered library it exists
+    to identify.
+
+    Hits are always usable: local DATs are consulted first anyway, so a remote
+    source could not have improved on one.
+    """
+    if payload is None:
+        return False
+    if payload.get("matched"):
+        return True
+    return bool(payload.get("checked_remote")) or not hasheous.enabled()
 
 
 async def _match_single_file(
@@ -964,7 +1002,13 @@ async def _match_single_file(
     ``cancel_event`` is forwarded to the tool's (potentially expensive)
     embedded-hash hook so a background scan/match job can abort it promptly.
     """
-    base_result = {"path": file_path, "matched": False}
+    # ``checked_remote`` records which sources this verdict was reached with, so
+    # a miss cached before Hasheous was enabled isn't served forever once it is
+    # (see cached_result_usable). Only misses need it: a hit is already the
+    # strongest answer available.
+    base_result = {
+        "path": file_path, "matched": False, "checked_remote": hasheous.enabled(),
+    }
 
     if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return base_result
@@ -1029,7 +1073,7 @@ async def _match_single_file(
         return {**base_result, "error": "Unable to process file"}
 
     try:
-        match = await _lookup_sha1_match(file_path, file_sha1, "file_sha1")
+        match = await _lookup_match(file_path, [(file_sha1, "file_sha1")])
     except HasheousUnavailable as e:
         logger.warning("Hasheous unavailable for %s: %s", file_path, e)
         return {**base_result, "error": "hasheous unavailable"}
@@ -1066,14 +1110,14 @@ async def _try_embedded_hash_match(
             raise EmbeddedHashUnavailable("embedded hash derivation failed") from exc
         return None, False
 
-    had_candidates = False
-    for raw_hash, match_type in candidates:
-        sha1 = (raw_hash or "").strip().lower()
-        if not sha1:
-            continue
-        had_candidates = True
-        match = await _lookup_sha1_match(file_path, sha1, match_type)
-        if match:
-            return match, True
+    usable = [
+        ((raw_hash or "").strip().lower(), match_type)
+        for raw_hash, match_type in candidates
+        if (raw_hash or "").strip()
+    ]
+    if not usable:
+        return None, False
 
-    return None, had_candidates
+    # One call with the whole candidate set, so all of them are checked
+    # locally before any is sent remotely.
+    return await _lookup_match(file_path, usable), True

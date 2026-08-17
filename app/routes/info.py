@@ -169,7 +169,7 @@ async def _scan_phase_dat_match(
     Progress band: 65 % → 97 %. Returns the number of matched files.
     """
     # Lazy import keeps the routes modules import-order independent.
-    from routes.dat import _match_single_file, matching_available
+    from routes.dat import _match_single_file, cached_result_usable, matching_available
     from services.dat_store import dat_store
 
     if not all_paths:
@@ -218,7 +218,7 @@ async def _scan_phase_dat_match(
     for idx, path in enumerate(all_paths, start=1):
         if job_manager.is_cancelled(scan_job_id):
             raise ExternalJobCancelled()
-        if not force and cached.get(path) is not None:
+        if not force and cached_result_usable(cached.get(path)):
             if cached[path].get("matched"):
                 matched += 1
         else:
