@@ -638,7 +638,9 @@ async def test_abandoned_disc_id_read_stays_retryable(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_capture_does_not_spawn_into_an_already_cancelled_operation():
+async def test_run_capture_does_not_spawn_into_an_already_cancelled_operation(
+    monkeypatch,
+):
     """The child is created before the cancel_event becomes a waiter.
 
     So a caller that resolved a size-scaled bound first -- itself a probe that
@@ -652,20 +654,20 @@ async def test_run_capture_does_not_spawn_into_an_already_cancelled_operation():
     cancel.set()
 
     spawned = []
-    real_exec = runner_mod.asyncio.create_subprocess_exec
 
     async def watched_exec(*args, **kwargs):
+        # Recorded, never delegated: reaching here at all is the failure.
         spawned.append(args)
-        return await real_exec(*args, **kwargs)
+        raise AssertionError("nothing may be spawned into a cancelled operation")
 
-    runner_mod.asyncio.create_subprocess_exec = watched_exec
-    try:
-        rc, _out, _err = await runner.run_capture(
-            # Never runs -- the point is that nothing is spawned at all.
-            [sys.executable, "-c", "pass"], cancel_event=cancel,
-        )
-    finally:
-        runner_mod.asyncio.create_subprocess_exec = real_exec
+    # Via monkeypatch, not manual assignment: this reaches into the shared
+    # asyncio module, so a future edit that raises between the swap and the
+    # restore would leak watched_exec into every later test.
+    monkeypatch.setattr(runner_mod.asyncio, "create_subprocess_exec", watched_exec)
+    rc, _out, _err = await runner.run_capture(
+        # Never runs -- the point is that nothing is spawned at all.
+        [sys.executable, "-c", "pass"], cancel_event=cancel,
+    )
 
     assert rc is None, "reported as the ordinary abort, which is what a cancel is"
     assert not spawned, "nothing may be spawned into an already-cancelled operation"

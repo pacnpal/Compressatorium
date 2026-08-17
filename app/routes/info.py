@@ -42,7 +42,11 @@ from services.jwudtool import (
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
-from services.subprocess_runner import bounded_path_check, collect_abandonment
+from services.subprocess_runner import (
+    StorageAbandoned,
+    bounded_path_check,
+    collect_abandonment,
+)
 from services.workload_limiter import WorkloadToken, workload_limiter
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.maxcso import (
@@ -797,8 +801,13 @@ async def get_chd_info(path: str = Query(..., description="Path to CHD file")):
         )
 
     except HTTPException:
-        # Already carries its own status (e.g. the 503 above); don't relabel it.
+        # Already carries its own status (e.g. the 503s above); don't relabel it.
         raise
+    except StorageAbandoned as e:
+        # A metadata read that left a child running is transient, not a broken
+        # CHD: 500 would invite a refresh that strands another one (issue #268).
+        logger.error("CHD info abandoned for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to read CHD info: {e!s}",
@@ -946,6 +955,11 @@ async def get_dolphin_info(
             file_size=info.get("file_size"),
             raw_data=info.get("raw_data", ""),
         )
+    except StorageAbandoned as e:
+        # Transient, not a broken disc image: a 500 invites a refresh that
+        # strands another child (issue #268). Ordered before the broad handler.
+        logger.error("Dolphin header abandoned for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(
             status_code=500,

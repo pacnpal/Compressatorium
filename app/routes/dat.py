@@ -195,6 +195,23 @@ async def match_file(request: MatchRequest):
     return result
 
 
+def _abandoned_match_result(path: str, abandoned: list) -> dict:
+    """The result a path gets when matching left a process stuck on its storage.
+
+    Carries ``error``, so it is non-cacheable by the same rule that keeps
+    transient failures out of ``dat_matches`` -- a retry re-hashes it once the
+    storage answers again (issue #268).
+    """
+    return {
+        "path": path,
+        "matched": False,
+        "error": (
+            "aborted: matching left a process stuck on this storage "
+            f"({', '.join(abandoned)})"
+        ),
+    }
+
+
 def _resolve_and_group_paths(
     paths: list[str],
 ) -> tuple[dict[str, list[str]], set[str]]:
@@ -262,6 +279,7 @@ async def match_batch(request: MatchBatchRequest):
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
     stopped_at = len(to_compute)
+    abandoned_detail: list[str] = []
     for index, normalized_path in enumerate(to_compute):
         exists = await run_in_threadpool(os.path.isfile, normalized_path)
         if not exists:
@@ -271,6 +289,19 @@ async def match_batch(request: MatchBatchRequest):
         else:
             with collect_abandonment() as abandoned:
                 result = await _match_single_file(normalized_path)
+            # Checked *before* the cache write below, not after. An abandoned
+            # helper comes back as an ordinary unmatched result -- no `reason`,
+            # no `error` -- so it passes the cacheability test, and a stale
+            # negative would reach `dat_matches` and survive until the file's
+            # mtime changed: matching stays broken for that path long after the
+            # storage recovers. `stopped_at = index` puts the offending file at
+            # the head of the untouched tail, so one code path marks it and
+            # everything after it (issue #268).
+            if abandoned:
+                logger.error("DAT match batch stopped, abandoned %s", abandoned)
+                stopped_at = index
+                abandoned_detail = list(abandoned)
+                break
             # Don't cache size-cap skips: the result is configuration-dependent.
             # If MATCH_MAX_FILE_SIZE is later raised or disabled the file must
             # be re-hashed rather than being served a stale "too large" entry.
@@ -278,28 +309,15 @@ async def match_batch(request: MatchBatchRequest):
             # persisted as a permanent negative entry.
             if not result.get("reason") and not result.get("error"):
                 new_matches[normalized_path] = result
-            if abandoned:
-                # Not a fact about this file: the helper is still running
-                # against the storage every remaining path also lives on, so
-                # walking on costs one stuck process per file (issue #268).
-                logger.error("DAT match batch stopped, abandoned %s", abandoned)
-                stopped_at = index + 1
-                for original_path in normalized_to_originals[normalized_path]:
-                    results[original_path] = result
-                break
         for original_path in normalized_to_originals[normalized_path]:
             results[original_path] = result
 
-    # Paths the abort never reached. Non-cacheable by construction (they carry
-    # "error"), so nothing stale is left behind and a retry re-hashes them.
-    for skipped in to_compute[stopped_at:]:
-        result = {
-            "path": skipped,
-            "matched": False,
-            "error": "aborted: matching left a process stuck on this storage",
-        }
-        for original_path in normalized_to_originals[skipped]:
-            results[original_path] = result
+    # Paths the abort never reached, marked the same way.
+    if abandoned_detail:
+        for skipped in to_compute[stopped_at:]:
+            result = _abandoned_match_result(skipped, abandoned_detail)
+            for original_path in normalized_to_originals[skipped]:
+                results[original_path] = result
 
     # Cache new results using normalized path keys
     if new_matches:
@@ -650,6 +668,19 @@ async def _run_match_job(
                 result, cacheable = await _hash_one_for_job(
                     normalized_path, cancel_event=cancel_event,
                 )
+            # Before `set_match` and the counters, for the same reason as the
+            # batch route: an abandoned helper's result is an ordinary unmatched
+            # one, so persisting it writes a stale negative that outlives the
+            # outage. Also before the cancellation re-check below -- a cancel is
+            # usually what triggered the teardown that then failed to kill the
+            # child, so both are true at once and a clean CANCELLED would be the
+            # more misleading report. `run()` makes the same call (issue #268).
+            if abandoned:
+                raise RuntimeError(
+                    f"matching {display_name} left a process stuck on "
+                    f"unresponsive storage ({', '.join(abandoned)}); "
+                    "it is still running, so the remaining files were skipped"
+                )
             if cacheable:
                 hashed += 1
                 # Per-file writes are intentional: persist each completed
@@ -675,22 +706,6 @@ async def _run_match_job(
             processed += 1
             if result.get("matched"):
                 matched += 1
-
-            # Abandonment is checked *before* cancellation, because a cancel
-            # is what usually triggers the teardown that then fails to kill the
-            # child -- so both are true at once, and reporting a clean CANCELLED
-            # would be the more misleading of the two: the process is still
-            # running. `run()` makes the same call for the same reason.
-            if abandoned:
-                # The only per-file outcome that is not about the file: a hash
-                # helper outlived SIGKILL and is still reading the storage every
-                # remaining path shares. Fail the job here rather than spend the
-                # rest of the list stranding one process per file (issue #268).
-                raise RuntimeError(
-                    f"matching {display_name} left a process stuck on "
-                    f"unresponsive storage ({', '.join(abandoned)}); "
-                    "it is still running, so the remaining files were skipped"
-                )
 
             # A cancellable embedded-hash hook (e.g. dolphin run_capture) may
             # have been aborted mid-file, returning a non-cacheable error

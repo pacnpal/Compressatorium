@@ -8,6 +8,8 @@ from pathlib import Path
 
 from config import settings
 from services.subprocess_runner import (
+    StorageAbandoned,
+    abandonment_checkpoint,
     ConversionCancelled,
     SubprocessRunner,
     collect_verify,
@@ -138,18 +140,28 @@ class ChdmanService:
         # `ionice` only exec. The hand-rolled spawn this replaces used no
         # preexec_fn, so this keeps that property.
         owner = self._runner.owner
-        returncode, stdout, stderr = await self._runner.run_capture(
-            nice_prefix(owner) + ioprio_prefix(owner)
-            + [self.chdman_path, "info", "-i", chd_path],
-            timeout=timeout or None,
-            nice_via_wrapper=True,
-        )
+        with abandonment_checkpoint() as abandoned:
+            returncode, stdout, stderr = await self._runner.run_capture(
+                nice_prefix(owner) + ioprio_prefix(owner)
+                + [self.chdman_path, "info", "-i", chd_path],
+                timeout=timeout or None,
+                nice_via_wrapper=True,
+            )
+        # An ordinary timeout leaves the child dead; this one does not, and the
+        # caller's answer differs (retry vs. tell the client the storage is not
+        # answering). Folding both into one RuntimeError makes it a generic 500
+        # and invites a refresh that strands another child (issue #268).
+        if abandoned:
+            raise StorageAbandoned(
+                f"chdman info on the file left {', '.join(abandoned)} stuck on "
+                "unresponsive storage; it is still running"
+            )
         if returncode is None:
             raise RuntimeError(f"chdman info timed out after {timeout}s")
 
         if returncode != 0:
             raise RuntimeError(
-                stderr.decode() or f"chdman info failed with code {returncode}",
+                stderr.decode(errors="replace").strip() or f"chdman info failed with code {returncode}",
             )
 
         return self._parse_info(stdout.decode())
@@ -188,20 +200,6 @@ class ChdmanService:
             cancel_event=cancel_event,
         )
 
-    @staticmethod
-    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-        try:
-            if process.returncode is not None:
-                return
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            # The process has already exited or no longer exists; nothing left to terminate.
-            pass
 
     def _parse_progress(self, line: str) -> int | None:
         """Parse chdman output for progress percentage, None if the line has none.

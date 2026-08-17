@@ -1,12 +1,12 @@
 import asyncio
-from logging_setup import get_logger
 import re
 import shutil
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from config import settings
+from logging_setup import get_logger
 from services.subprocess_runner import (
+    StorageAbandoned,
     SubprocessRunner,
     abandonment_checkpoint,
     collect_verify,
@@ -15,6 +15,8 @@ from services.subprocess_runner import (
     nice_prefix,
     resolve_verify_timeout,
 )
+
+from config import settings
 
 DOLPHIN_CONVERTIBLE_EXTENSIONS = {".iso", ".gcz", ".wia", ".rvz", ".wbfs"}
 
@@ -138,12 +140,22 @@ class DolphinToolService:
         # parent can deadlock the child before exec, and then
         # create_subprocess_exec never returns to apply the bound at all.
         owner = self._runner.owner
-        returncode, stdout, stderr = await self._runner.run_capture(
-            nice_prefix(owner) + ioprio_prefix(owner)
-            + [self.dolphin_tool_path, "header", "-i", path],
-            timeout=timeout or None,
-            nice_via_wrapper=True,
-        )
+        with abandonment_checkpoint() as abandoned:
+            returncode, stdout, stderr = await self._runner.run_capture(
+                nice_prefix(owner) + ioprio_prefix(owner)
+                + [self.dolphin_tool_path, "header", "-i", path],
+                timeout=timeout or None,
+                nice_via_wrapper=True,
+            )
+        # An ordinary timeout leaves the child dead; this one does not, and the
+        # caller's answer differs (retry vs. tell the client the storage is not
+        # answering). Folding both into one RuntimeError makes it a generic 500
+        # and invites a refresh that strands another child (issue #268).
+        if abandoned:
+            raise StorageAbandoned(
+                f"dolphin-tool header on the file left {', '.join(abandoned)} stuck on "
+                "unresponsive storage; it is still running"
+            )
         if returncode is None:
             raise RuntimeError(f"dolphin-tool header timed out after {timeout}s")
 
@@ -243,22 +255,6 @@ class DolphinToolService:
             cancel_event=cancel_event,
         )
 
-    @staticmethod
-    async def _terminate_process(
-        process: asyncio.subprocess.Process,
-    ) -> None:
-        try:
-            if process.returncode is not None:
-                return
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            # Process is already gone; nothing left to terminate.
-            logger.debug("Process already exited before termination completed.")
 
     def _parse_progress(self, line: str) -> int | None:
         """Parse dolphin-tool output for progress percentage."""

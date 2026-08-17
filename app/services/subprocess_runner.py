@@ -102,6 +102,19 @@ def collect_abandonment():
         _abandon_sink.reset(token)
 
 
+class StorageAbandoned(RuntimeError):
+    """A child for this file outlived SIGKILL and is still running.
+
+    Raised by a *caller* at the point it would otherwise act on a value that
+    cannot distinguish "the storage stopped answering" from an ordinary result --
+    a metadata read that came back empty, a tag that appears absent. The runner
+    itself never raises it: an exception thrown from the ``finally`` an outer
+    deadline unwinds through would mask whatever is already propagating, which is
+    the case ``collect_abandonment()`` exists for. Deciding helpers raise it after
+    an ``abandonment_checkpoint()`` tells them what just happened (issue #268).
+    """
+
+
 @contextlib.contextmanager
 def abandonment_checkpoint():
     """Observe what *this step* abandoned, without hiding it from the caller.
@@ -797,9 +810,10 @@ def abandoned_verify_error(pid: int) -> dict:
     comes from. The ``abandoned`` flag is the part that matters: it outranks
     "cancelled" and "timed out", because the child is still running and still
     holding the storage, and a caller working through a list has to stop rather
-    than open the next file against it. Issue #268 argues abandonment should
-    *raise* rather than be a flag on an event; when that lands, this is what the
-    exception replaces.
+    than open the next file against it. Issue #268 considered replacing this
+    flag with an exception and rejected it: the sink is the mechanism, and a
+    deciding helper raises ``StorageAbandoned`` only where the value it would
+    otherwise return cannot express the difference.
     """
     return {
         "type": "error",
@@ -1077,8 +1091,12 @@ class SubprocessRunner:
         was reading. Without it that fact is invisible here: an abandoned child
         and a clean cancellation both come back as a ``None`` returncode, and a
         caller working through a list would open the next file against the same
-        storage. Issue #268 replaces this hook with an exception from
-        ``run_capture`` itself.
+        storage. Retained for a caller that must name the pid in its own
+        terminal event (``capture_verify``); every other caller reads the same
+        fact from an open ``collect_abandonment()`` sink, which ``reap`` always
+        fills. Raising from ``run_capture`` itself was tried for issue #268 and
+        rejected: it cannot be raised from the ``finally`` an outer deadline
+        unwinds through without masking what already propagates.
         """
         # Don't spawn into an already-cancelled operation. The race is real
         # rather than theoretical: the child is created *before* the

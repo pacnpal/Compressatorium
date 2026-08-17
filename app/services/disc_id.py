@@ -49,7 +49,12 @@ import zlib as _zlib
 from pathlib import Path
 from typing import Optional
 
-from services.subprocess_runner import abandonment_checkpoint
+from services.subprocess_runner import (
+    StorageAbandoned,
+    abandonment_checkpoint,
+    ioprio_prefix,
+    nice_prefix,
+)
 
 logger = get_logger("disc_id")
 
@@ -65,7 +70,7 @@ _MAX_CHD_HUNK_BYTES = 8 * 1024 * 1024
 _MAX_CHD_COMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_CHD_LZMA_DICT_BYTES = 16 * 1024 * 1024
 _MAX_DUMPMETA_BYTES = 1 * 1024 * 1024
-class DiscIdStorageAbandoned(RuntimeError):
+class DiscIdStorageAbandoned(StorageAbandoned):
     """A chdman child for this CHD outlived SIGKILL and is still running.
 
     Distinct from "no tag found" because the two demand opposite behaviour: the
@@ -124,7 +129,6 @@ def _chdman_cmd(chdman_path: str, *args: str) -> list[str]:
     get would never be applied. ``nice``/``ionice`` only exec. The hand-rolled
     spawns this replaces used no ``preexec_fn`` either.
     """
-    from services.subprocess_runner import ioprio_prefix, nice_prefix
     owner = _chdman_runner().owner
     return nice_prefix(owner) + ioprio_prefix(owner) + [chdman_path, *args]
 
