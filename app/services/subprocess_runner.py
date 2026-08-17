@@ -38,7 +38,6 @@ import shutil
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 
 from config import settings
 from services.timeout_policy import compute_progress_stall_timeout
@@ -51,6 +50,39 @@ class ConversionCancelled(Exception):
 # Hard bound on a filesystem probe taken on the spawn path, where there is no
 # stall loop yet to rescue a wait that never returns.
 _STAT_TIMEOUT = 10.0
+
+
+def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
+    """Run a blocking filesystem call on a throwaway daemon thread.
+
+    Deliberately not a ``ThreadPoolExecutor``. Its workers are joined during
+    interpreter shutdown, so a probe wedged on a dead mount would stop the
+    container from restarting cleanly -- and a pooled worker that never returns
+    starves every probe queued behind it. A daemon thread does neither: it holds
+    up nothing at exit and occupies no shared capacity. A call that never
+    returns simply costs one written-off thread that dies with the process,
+    which is the unavoidable price of a syscall Python cannot cancel.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    def _settle(setter: Callable, value: object) -> None:
+        if not future.done():
+            setter(value)
+
+    def _worker() -> None:
+        try:
+            result = func()
+        except BaseException as exc:  # noqa: BLE001 - relayed to the awaiter
+            setter, value = future.set_exception, exc
+        else:
+            setter, value = future.set_result, result
+        with contextlib.suppress(RuntimeError):
+            # RuntimeError: the loop closed while this thread was blocked.
+            loop.call_soon_threadsafe(_settle, setter, value)
+
+    threading.Thread(target=_worker, daemon=True, name="fs-probe").start()
+    return future
 
 
 async def _bounded_probe(func: Callable, *args: object, **kwargs: object) -> object:
@@ -71,16 +103,10 @@ async def _bounded_probe(func: Callable, *args: object, **kwargs: object) -> obj
     whose output is writing perfectly well with no status and no watchdog
     activity until the stall timeout killed it.
     """
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fs-probe")
-    try:
-        return await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(
-                pool, functools.partial(func, *args, **kwargs),
-            ),
-            timeout=_STAT_TIMEOUT,
-        )
-    finally:
-        pool.shutdown(wait=False)
+    return await asyncio.wait_for(
+        _probe_in_daemon_thread(functools.partial(func, *args, **kwargs)),
+        timeout=_STAT_TIMEOUT,
+    )
 
 
 # Bounds on reaping a subprocess: how long to let it exit on its own once its
@@ -495,12 +521,6 @@ class SubprocessRunner:
         rather than a bare "no output" message. Used by nsz, whose ``output_path``
         is the temp file the runner already watches.
         """
-        # A worker dedicated to this run's output-growth probe, and to nothing
-        # else. Per-run so one dead mount cannot starve later jobs of the growth
-        # signal; exclusive to growth probing so a hung input-side stat cannot
-        # either. A wedged probe costs this one thread, abandoned at teardown.
-        growth_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="growth-probe")
-
         output_dir = os.path.dirname(output_path)
         if output_dir:
             # Bounded like every other filesystem call here: an unresponsive
@@ -681,11 +701,7 @@ class SubprocessRunner:
                         probe_completed = True
                         with contextlib.suppress(Exception):
                             probed_size = size_probe.result()
-                    size_probe = asyncio.ensure_future(
-                        asyncio.get_running_loop().run_in_executor(
-                            growth_pool, _measure_output_sync,
-                        )
-                    )
+                    size_probe = _probe_in_daemon_thread(_measure_output_sync)
                 return probed_size
 
             def _update_output_activity(now: float):
@@ -892,6 +908,12 @@ class SubprocessRunner:
             # before cancellation took effect is reported complete — its output
             # is valid and must not be deleted as a false cancellation.
             if cancelled_by_request:
+                if abandoned_error:
+                    # Reporting a clean CANCELLED would be a lie: the child is
+                    # still running and still holding its output.
+                    raise RuntimeError(
+                        f"Cancellation did not stop {fail_label}. {abandoned_error}"
+                    )
                 raise ConversionCancelled("Conversion cancelled")
 
             # Nothing below can be trusted for an abandoned child: it has no
@@ -928,9 +950,6 @@ class SubprocessRunner:
             self.untrack_pid(process.pid)
             if size_probe is not None and not size_probe.done():
                 size_probe.cancel()
-            # wait=False: never join. A wedged probe thread is abandoned with the
-            # executor rather than holding the job open behind it.
-            growth_pool.shutdown(wait=False)
             if cancel_task:
                 cancel_task.cancel()
                 try:
