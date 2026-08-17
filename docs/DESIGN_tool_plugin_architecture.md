@@ -623,8 +623,43 @@ Three rules follow for any code that runs a verifier:
   job's) is the one case that cannot carry the flag on an event at all — it
   cancels the generator rather than letting it reach one — so `reap` records the
   pid it gave up on (`SubprocessRunner.abandoned_pids`) and the routes fold that
-  into the timeout verdict. Issue #268 argues abandonment should be an exception
-  rather than a flag; when that lands, it replaces exactly these.
+  into the timeout verdict. Issue #268 proposed replacing this with an exception;
+  it was tried and rejected, because an exception cannot be raised from the
+  `finally` an outer deadline unwinds through without masking what is already
+  propagating — the very case the sink exists for. **The sink is the mechanism;
+  there is no second one.**
+- **Every loop that walks a list opens a sink (#268).** The verify routes were
+  the first, but they are not special: the DAT-match paths and all three library
+  scan phases walk a caller-supplied list of files on one storage in exactly the
+  same way, and none of their return values can carry the fact — `disc_hashes`
+  returns `list[str]`, `embedded_hashes` returns `list[tuple]`, and a match
+  result has no field for it, so an unkillable `dolphin-tool verify` was
+  indistinguishable from "this disc has no embedded hash". Because `reap()`
+  reports into whatever sink is open and `run_capture` always reaps, the loop
+  needs only the `with` block — no hook argument, and no change to the four
+  layers between it and the child:
+
+  ```python
+  with collect_abandonment() as abandoned:
+      result = await _match_single_file(path)
+  if abandoned:
+      ...  # stop walking; the next file is on the same mount
+  ```
+
+  Where the loop has a per-file `except` that swallows failures, the sink goes
+  **outside** the handler, not inside: a corrupt file stays isolated to itself,
+  while an unkillable child escapes. Scan Phase 2 is the sharpest case — its
+  handler only logs at `debug`, so a stranded child there previously left no
+  trace at all. A single-file endpoint has no walk to stop, so it reports instead
+  (`/dat/match` answers 503).
+- **One-shot chdman/dolphin captures go through `run_capture`.** `chdman info`,
+  `dolphin-tool header`, and the `chdman addmeta` / `delmeta` / `dumpmeta`
+  helpers in `services.disc_id` used to spawn directly, untracked, and finish
+  with an unbounded wait after `kill()` — `dumpmeta` could hang the scan's Phase
+  2 outright. They now share the capture path, so they are PID-tracked, bounded,
+  subject to the tool priority policy, and able to report abandonment.
+  `services.disc_id` uses `chdman_service.runner` rather than a runner of its
+  own, so `active_pids()` still describes every chdman child.
 - **Stop a list at the first unresponsive path, don't survey them all.** The
   batch route's path validation bounds each check, but bounding is not enough on
   its own: a batch is a list of paths on *one* storage, so carrying on after a

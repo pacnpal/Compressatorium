@@ -14,6 +14,21 @@
   with the page scrolling forever. The panel now spans the full row in that
   range, and a laptop-width (1100px) screenshot was added to the automated set
   so the in-between breakpoint stays covered.
+- **A library scan or DAT match no longer strands one stuck process per file.**
+  When a hash helper had to be abandoned — it survived `SIGKILL` and kept
+  running — matching reported it exactly like a disc with no embedded hash, so a
+  scan recorded a miss and opened the next file on the same unresponsive share.
+  Each step left another live process behind, invisible to the app because it had
+  already stopped tracking them. Every pass that walks your library now **stops**
+  on the first one and says why: the metadata, disc-ID and DAT-match phases of a
+  scan, the background match job, and `/dat/match-batch`. A single-file match
+  reports it rather than answering with a silent "no match".
+- **Reading CHD metadata can no longer hang a scan.** `chdman info` and the
+  GAME/NAME tag helpers spawned their own processes and, after giving up on a
+  stuck one, waited for it with no time limit — so a scan could stop partway
+  through with no error and no way to tell it from a slow one. Those calls now go
+  through the same bounded machinery as everything else.
+
 - **Every tool now reports real status, not just a spinning clock.** Dolphin
   conversions showed `Converting... (1134s)` against a progress bar pinned at
   0%, because dolphin-tool draws its progress bar only to a terminal and goes

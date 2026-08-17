@@ -106,31 +106,38 @@ class ChdmanService:
         ):
             yield update
 
-    async def info(self, chd_path: str) -> dict:
-        """Get information about a CHD file."""
-        process = await asyncio.create_subprocess_exec(
-            self.chdman_path,
-            "info",
-            "-i",
-            chd_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            await self._terminate_process(process)
-            raise RuntimeError(f"chdman info timed out after {timeout}s") from exc
+    @property
+    def runner(self) -> SubprocessRunner:
+        """This tool's runner, shared with helpers that spawn chdman children.
 
-        if process.returncode != 0:
+        ``services.disc_id`` shells out to chdman for the GAME/NAME tag work, so
+        it goes through this same instance rather than one of its own: one PID
+        set that ``active_pids()`` fully describes, and one place that records a
+        child the teardown ladder had to give up on.
+        """
+        return self._runner
+
+    async def info(self, chd_path: str) -> dict:
+        """Get information about a CHD file.
+
+        Goes through the shared capture rather than a hand-rolled spawn: that
+        tracks the PID, bounds the teardown (the old path ended in an unbounded
+        ``wait()`` after ``kill()``), applies the tool priority policy, and
+        reports an unkillable child into any open ``collect_abandonment()`` sink
+        so a scan walking a library can stop rather than strand one per file
+        (issue #268).
+        """
+        timeout = info_timeout(self._runner.owner)
+        returncode, stdout, stderr = await self._runner.run_capture(
+            [self.chdman_path, "info", "-i", chd_path],
+            timeout=timeout or None,
+        )
+        if returncode is None:
+            raise RuntimeError(f"chdman info timed out after {timeout}s")
+
+        if returncode != 0:
             raise RuntimeError(
-                stderr.decode() or f"chdman info failed with code {process.returncode}",
+                stderr.decode() or f"chdman info failed with code {returncode}",
             )
 
         return self._parse_info(stdout.decode())

@@ -16,6 +16,7 @@ from models import ConversionMode
 from services.dat_store import dat_store
 from services.file_hasher import compute_file_sha1
 from services.job_manager import ExternalJobCancelled, job_manager
+from services.subprocess_runner import collect_abandonment
 from services.tools import registry
 from services.tools.base import EmbeddedHashUnavailable
 from services.workload_limiter import workload_limiter
@@ -175,7 +176,22 @@ async def match_file(request: MatchRequest):
     if not await run_in_threadpool(os.path.isfile, normalized_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    result = await _match_single_file(normalized_path)
+    # A hash helper that outlived SIGKILL is still reading this file, and the
+    # match result cannot say so -- an embedded-hash miss and an abandoned
+    # verify both come back as "unmatched" (issue #268). 503 rather than a
+    # cheerful 200: it is a transient resource condition, and a caller that
+    # retries immediately just spawns a second one against the same storage.
+    with collect_abandonment() as abandoned:
+        result = await _match_single_file(normalized_path)
+    if abandoned:
+        logger.error("DAT match abandoned %s for %s", abandoned, normalized_path)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Matching left a process stuck on unresponsive storage "
+                f"({', '.join(abandoned)}); it is still running."
+            ),
+        )
     return result
 
 
@@ -245,14 +261,16 @@ async def match_batch(request: MatchBatchRequest):
 
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
-    for normalized_path in to_compute:
+    stopped_at = len(to_compute)
+    for index, normalized_path in enumerate(to_compute):
         exists = await run_in_threadpool(os.path.isfile, normalized_path)
         if not exists:
             result = {"path": normalized_path, "matched": False}
             # Don't cache missing-file results: the file may appear later and
             # a stale negative entry would not be cleared by prune_missing.
         else:
-            result = await _match_single_file(normalized_path)
+            with collect_abandonment() as abandoned:
+                result = await _match_single_file(normalized_path)
             # Don't cache size-cap skips: the result is configuration-dependent.
             # If MATCH_MAX_FILE_SIZE is later raised or disabled the file must
             # be re-hashed rather than being served a stale "too large" entry.
@@ -260,7 +278,27 @@ async def match_batch(request: MatchBatchRequest):
             # persisted as a permanent negative entry.
             if not result.get("reason") and not result.get("error"):
                 new_matches[normalized_path] = result
+            if abandoned:
+                # Not a fact about this file: the helper is still running
+                # against the storage every remaining path also lives on, so
+                # walking on costs one stuck process per file (issue #268).
+                logger.error("DAT match batch stopped, abandoned %s", abandoned)
+                stopped_at = index + 1
+                for original_path in normalized_to_originals[normalized_path]:
+                    results[original_path] = result
+                break
         for original_path in normalized_to_originals[normalized_path]:
+            results[original_path] = result
+
+    # Paths the abort never reached. Non-cacheable by construction (they carry
+    # "error"), so nothing stale is left behind and a retry re-hashes them.
+    for skipped in to_compute[stopped_at:]:
+        result = {
+            "path": skipped,
+            "matched": False,
+            "error": "aborted: matching left a process stuck on this storage",
+        }
+        for original_path in normalized_to_originals[skipped]:
             results[original_path] = result
 
     # Cache new results using normalized path keys
@@ -608,9 +646,10 @@ async def _run_match_job(
                 message=f"[{idx}/{total}] {display_name}",
             )
 
-            result, cacheable = await _hash_one_for_job(
-                normalized_path, cancel_event=cancel_event,
-            )
+            with collect_abandonment() as abandoned:
+                result, cacheable = await _hash_one_for_job(
+                    normalized_path, cancel_event=cancel_event,
+                )
             if cacheable:
                 hashed += 1
                 # Per-file writes are intentional: persist each completed
@@ -645,6 +684,17 @@ async def _run_match_job(
             # path finalizes the job as cancelled instead of failed/complete.
             if job_manager.is_cancelled(job_id):
                 raise ExternalJobCancelled()
+
+            if abandoned:
+                # The only per-file outcome that is not about the file: a hash
+                # helper outlived SIGKILL and is still reading the storage every
+                # remaining path shares. Fail the job here rather than spend the
+                # rest of the list stranding one process per file (issue #268).
+                raise RuntimeError(
+                    f"matching {display_name} left a process stuck on "
+                    f"unresponsive storage ({', '.join(abandoned)}); "
+                    "it is still running, so the remaining files were skipped"
+                )
 
         # If every single file errored, something structural is wrong
         # (volume unmounted, DB down, etc.).  Flip the job to failure so

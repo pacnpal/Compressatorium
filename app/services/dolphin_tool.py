@@ -122,32 +122,26 @@ class DolphinToolService:
             yield update
 
     async def header(self, path: str) -> dict:
-        """Get header information about a disc image."""
-        process = await asyncio.create_subprocess_exec(
-            self.dolphin_tool_path,
-            "header",
-            "-i", path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        timeout = info_timeout(self._runner.owner)
-        try:
-            if timeout:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout,
-                )
-            else:
-                stdout, stderr = await process.communicate()
-        except asyncio.TimeoutError as exc:
-            await self._terminate_process(process)
-            raise RuntimeError(
-                f"dolphin-tool header timed out after {timeout}s",
-            ) from exc
+        """Get header information about a disc image.
 
-        if process.returncode != 0:
+        Goes through the shared capture rather than a hand-rolled spawn, for the
+        same reasons as ``chdman.info``: PID tracking, a bounded teardown in
+        place of an unbounded ``wait()`` after ``kill()``, the tool priority
+        policy, and an unkillable child reported into any open
+        ``collect_abandonment()`` sink (issue #268).
+        """
+        timeout = info_timeout(self._runner.owner)
+        returncode, stdout, stderr = await self._runner.run_capture(
+            [self.dolphin_tool_path, "header", "-i", path],
+            timeout=timeout or None,
+        )
+        if returncode is None:
+            raise RuntimeError(f"dolphin-tool header timed out after {timeout}s")
+
+        if returncode != 0:
             raise RuntimeError(
                 stderr.decode()
-                or f"dolphin-tool header failed with code {process.returncode}",
+                or f"dolphin-tool header failed with code {returncode}",
             )
 
         return self._parse_header(stdout.decode())

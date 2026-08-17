@@ -65,6 +65,23 @@ _MAX_CHD_LZMA_DICT_BYTES = 16 * 1024 * 1024
 _MAX_DUMPMETA_BYTES = 1 * 1024 * 1024
 _DUMPMETA_TIMEOUT_SECONDS = 15
 
+
+def _chdman_runner():
+    """The chdman service's ``SubprocessRunner``, imported lazily.
+
+    These helpers shell out to chdman, so they belong on that tool's runner:
+    one PID set ``active_pids()`` fully describes, one nice/ionice policy, and
+    one bounded teardown instead of three hand-rolled spawns whose waits after
+    ``kill()`` were unbounded -- ``dumpmeta`` in particular could hang the
+    library scan's Phase 2 outright on unresponsive storage. Going through
+    ``run_capture`` also reports an unkillable child into any open
+    ``collect_abandonment()`` sink, which is what lets the scan stop instead of
+    stranding one per file (issue #268). The import is deferred to keep this
+    module free of a load-order dependency on the service singletons.
+    """
+    from services.chdman import chdman_service
+    return chdman_service.runner
+
 # ---------------------------------------------------------------------------
 # ISO 9660 constants
 # ---------------------------------------------------------------------------
@@ -1329,21 +1346,17 @@ async def _addmeta_text(
             value,
             chd_path,
         )
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "addmeta",
-            "-i", chd_path,
-            "-t", tag,
-            "-vt", value,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Bounded like dumpmeta below; addmeta writes one small tag, so the
+        # same 15s ceiling is generous. It previously had no bound at all.
+        returncode, _, stderr = await _chdman_runner().run_capture(
+            [chdman_path, "addmeta", "-i", chd_path, "-t", tag, "-vt", value],
+            timeout=_DUMPMETA_TIMEOUT_SECONDS,
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        if returncode != 0:
             logger.warning(
                 "disc_id: addmeta tag=%s failed (rc=%s): %s",
                 tag,
-                proc.returncode,
+                returncode,
                 stderr.decode(errors="replace").strip(),
             )
             return False
@@ -1362,21 +1375,16 @@ async def _delmeta(chd_path: str, tag: str, chdman_path: str) -> bool:
     guarantee the tag is absent before a fresh addmeta writes the current value.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "delmeta",
-            "-i", chd_path,
-            "-t", tag,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, _, stderr = await _chdman_runner().run_capture(
+            [chdman_path, "delmeta", "-i", chd_path, "-t", tag],
+            timeout=_DUMPMETA_TIMEOUT_SECONDS,
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "disc_id: delmeta tag=%s not present or failed (rc=%s) in %s: %s",
                     tag,
-                    proc.returncode,
+                    returncode,
                     chd_path,
                     stderr.decode(errors="replace").strip(),
                 )
@@ -1413,22 +1421,14 @@ async def _dumpmeta_raw(
     tmp_path = tmp.name
     tmp.close()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            chdman_path,
-            "dumpmeta",
-            "-i", chd_path,
-            "-t", tag,
-            "-o", tmp_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, _, stderr = await _chdman_runner().run_capture(
+            [chdman_path, "dumpmeta", "-i", chd_path, "-t", tag, "-o", tmp_path],
+            timeout=_DUMPMETA_TIMEOUT_SECONDS,
         )
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_DUMPMETA_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
+        if returncode is None:
+            # The shared teardown already bounded the kill; the old path killed
+            # the child and then waited for it with no limit, which is what
+            # could hang a scan on a dead mount.
             logger.debug(
                 "disc_id: dumpmeta tag=%s timed out after %ss in %s",
                 tag,
@@ -1436,13 +1436,13 @@ async def _dumpmeta_raw(
                 chd_path,
             )
             return None
-        if proc.returncode != 0:
+        if returncode != 0:
             if logger.isEnabledFor(logging.DEBUG):
                 stderr_text = stderr.decode(errors="replace").strip()
                 logger.debug(
                     "disc_id: dumpmeta tag=%s not found or failed (rc=%d) in %s: %s",
                     tag,
-                    proc.returncode,
+                    returncode,
                     chd_path,
                     stderr_text,
                 )
