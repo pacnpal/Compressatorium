@@ -2,6 +2,30 @@
 
 ## 4.4.2 (unreleased)
 
+### Added
+
+- **Hasheous fallback: match files that aren't in your DATs.** Set
+  `COMPRESSATORIUM_HASHEOUS_ENABLED=true` and any hash the imported DATs don't
+  recognise is looked up at [hasheous.org](https://hasheous.org), which indexes
+  Redump, No-Intro, TOSEC, MAMEArcade/Mess, MAMERedump, WHDLoad,
+  RetroAchievements and FBNeo. Remote matches carry more than a local one does —
+  platform, publisher, year, region, and which preservation DAT the hash
+  actually came from — all shown in the badge tooltip, and they get a **HASH**
+  badge to distinguish them from a local **DAT** hit. This also means a fresh
+  install matches your library immediately, without syncing hundreds of MB of
+  DATs first.
+
+  It is **off by default and stays off until you turn it on**: a lookup sends
+  the SHA1 of your file to a third-party service, which should be your call, not
+  a default. Local DATs are always consulted first, so a library your DATs
+  already cover never makes a network call. Point
+  `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you self-host Hasheous,
+  and `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default 15s) bounds each lookup.
+
+  A lookup that fails — timeout, server error, unreachable — is reported as an
+  error rather than recorded as "not in any DAT", so one bad minute of network
+  can't permanently mark your library unmatched.
+
 ### Fixed
 
 - **The Convert and Jobs panel no longer collapses into a narrow strip on

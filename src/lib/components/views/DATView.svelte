@@ -13,6 +13,7 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import XIcon from '@lucide/svelte/icons/x';
+  import Globe from '@lucide/svelte/icons/globe';
 
   const dats = $derived(datMatching.dats);
   const loading = $derived(datMatching.datsLoading);
@@ -146,6 +147,28 @@
     </div>
   </header>
 
+  <!-- Hasheous state rides on /api/dat/stats (app/routes/dat.py:get_dat_stats)
+       rather than a second endpoint, since this view already fetches it. -->
+  <article class="panel hasheous" class:is-on={stats?.hasheous_enabled}>
+    <Globe size={15} aria-hidden="true" />
+    {#if stats?.hasheous_enabled}
+      <span>
+        <strong>Hasheous fallback on.</strong>
+        Hashes your imported DATs don't recognise are looked up at
+        <code>{stats.hasheous_url}</code>, covering Redump, No-Intro, TOSEC,
+        MAME and RetroAchievements. Those matches show a
+        <strong>HASH</strong> badge instead of DAT.
+      </span>
+    {:else}
+      <span>
+        <strong>Hasheous fallback off.</strong>
+        Set <code>COMPRESSATORIUM_HASHEOUS_ENABLED=true</code> to match files
+        that aren't in your imported DATs against hasheous.org. Lookups send
+        each file's SHA1 to that service.
+      </span>
+    {/if}
+  </article>
+
   <!-- Stats response shape (app/services/dat_store.py:get_stats):
        total_dats, total_sha1_hashes, total_md5_hashes,
        total_matches, total_unmatched. -->
@@ -244,6 +267,10 @@
   .panel-title { margin: 0; font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--text-1); text-transform: uppercase; letter-spacing: 0.05em; }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--space-3); }
+  .hasheous { display: flex; align-items: flex-start; gap: var(--space-3); font-size: var(--text-sm); color: var(--text-2); line-height: 1.5; }
+  .hasheous :global(svg) { flex: none; margin-top: 0.15em; color: var(--text-3); }
+  .hasheous.is-on :global(svg) { color: var(--accent); }
+  .hasheous code { font-family: var(--font-mono); font-size: 0.92em; padding: 0.05em 0.35em; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-1); }
   .stat { display: flex; flex-direction: column; gap: 2px; }
   .stat-label { color: var(--text-3); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.05em; }
   .stat-value { color: var(--text-1); font-size: var(--text-xl); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; }

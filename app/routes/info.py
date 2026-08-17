@@ -169,18 +169,24 @@ async def _scan_phase_dat_match(
     Progress band: 65 % → 97 %. Returns the number of matched files.
     """
     # Lazy import keeps the routes modules import-order independent.
-    from routes.dat import _match_single_file
+    from routes.dat import _match_single_file, matching_available
     from services.dat_store import dat_store
 
     if not all_paths:
         return 0
+    store_ok = True
     try:
         has_dats = await run_in_threadpool(dat_store.has_dats)
     except Exception as e:
         # No DAT store available (e.g. DB not initialised); nothing to prime.
         logger.debug("Phase 3: DAT store unavailable, skipping match priming: %s", e)
         has_dats = False
-    if not has_dats:
+        store_ok = False
+    # A broken store skips the phase even when Hasheous could answer lookups:
+    # this phase exists to *prime the match cache*, and every write below goes
+    # through the same store. Proceeding would just fail the whole scan on the
+    # next dat_store call instead of degrading quietly the way it used to.
+    if not store_ok or not matching_available(has_dats):
         # Advance through the Phase 3 band so the job doesn't appear stuck at
         # the Phase 2 progress (and then jump straight to the flush) for
         # libraries with no DATs imported / no CHDs.

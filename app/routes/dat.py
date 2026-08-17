@@ -13,8 +13,10 @@ from pydantic import BaseModel
 
 from config import settings
 from models import ConversionMode
+from services import hasheous
 from services.dat_store import dat_store
 from services.file_hasher import compute_file_sha1
+from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.subprocess_runner import collect_abandonment
 from services.tools import registry
@@ -157,8 +159,18 @@ async def delete_dat(dat_id: str):
 
 @router.get("/dat/stats")
 async def get_dat_stats():
-    """Get DAT store statistics."""
-    return await run_in_threadpool(dat_store.get_stats)
+    """Get DAT store statistics.
+
+    Carries the Hasheous flags too, so the DAT view learns whether remote
+    lookup is on from the request it already makes rather than a second
+    endpoint.
+    """
+    stats = await run_in_threadpool(dat_store.get_stats)
+    return {
+        **stats,
+        "hasheous_enabled": hasheous.enabled(),
+        "hasheous_url": settings.hasheous_base_url if hasheous.enabled() else None,
+    }
 
 
 @router.post("/dat/match")
@@ -247,7 +259,7 @@ def _resolve_and_group_paths(
 @router.post("/dat/match-batch")
 async def match_batch(request: MatchBatchRequest):
     """Match multiple files against imported DATs."""
-    if not await run_in_threadpool(dat_store.has_dats):
+    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return {"results": {p: {"path": p, "matched": False} for p in request.paths}}
 
     # Resolve all paths and check volume membership in a single thread-pool
@@ -396,7 +408,7 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
     if not request.paths:
         return {"status": "idle", "results": {}}
 
-    if not await run_in_threadpool(dat_store.has_dats):
+    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return {
             "status": "idle",
             "results": {p: {"path": p, "matched": False} for p in request.paths},
@@ -881,26 +893,61 @@ async def sync_cancel():
     raise HTTPException(status_code=409, detail="No sync in progress")
 
 
-async def _lookup_sha1_match(file_path: str, sha1: str, match_type: str) -> dict | None:
-    """Look ``sha1`` up in the imported DATs and build a match-result dict.
+def matching_available(has_dats: bool) -> bool:
+    """True when *something* can answer a hash lookup.
 
-    Shared by every match path (per-tool embedded hashes and the file-level
-    SHA1 fallback) so the DAT lookup + result-dict shape lives in one place.
-    Returns ``None`` when the hash isn't in any DAT.
+    Local DATs alone used to be the answer, so every match entry point gated on
+    ``dat_store.has_dats``. With Hasheous enabled an operator who has imported
+    no DATs at all can still match, and those gates would otherwise short-
+    circuit before the remote lookup is ever reached.
     """
+    return bool(has_dats) or hasheous.enabled()
+
+
+async def _local_dat_record(sha1: str) -> dict | None:
+    """Look ``sha1`` up in the imported DATs; ``None`` when absent."""
     record = await run_in_threadpool(dat_store.lookup_sha1, sha1)
     if not record:
         return None
     dat_name = await run_in_threadpool(dat_store.get_dat_name, record.get("dat_id", ""))
     return {
-        "path": file_path,
-        "matched": True,
         "dat_id": record.get("dat_id"),
         "dat_name": dat_name,
         "game_name": record.get("game_name"),
         "rom_name": record.get("rom_name"),
+        "source": "dat",
+    }
+
+
+async def _lookup_sha1_match(file_path: str, sha1: str, match_type: str) -> dict | None:
+    """Resolve ``sha1`` to a match-result dict, locally first then remotely.
+
+    Shared by every match path (per-tool embedded hashes and the file-level
+    SHA1 fallback) so the lookup order and the result-dict shape live in one
+    place. Returns ``None`` when neither the imported DATs nor Hasheous know
+    the hash.
+
+    Order is fixed and local-first: an operator whose DATs already cover their
+    library never makes a network call, and a given hash always resolves the
+    same way regardless of network weather.
+
+    Propagates :class:`HasheousUnavailable` -- a transient remote failure is
+    *not* a miss, and the caller turns it into a non-cacheable error.
+    """
+    record = await _local_dat_record(sha1)
+    if record is None and hasheous.enabled():
+        # ponytail: unbounded concurrency. Each call is bounded by
+        # hasheous_timeout and the bulk match job is already single-flight; add
+        # a workload_limiter lane if a large scan ever gets rate-limited.
+        record = await hasheous.lookup(sha1)
+    if record is None:
+        return None
+    return {
+        "path": file_path,
+        "matched": True,
         "match_type": match_type,
         "file_hash": sha1,
+        **record,
     }
 
 
@@ -919,7 +966,7 @@ async def _match_single_file(
     """
     base_result = {"path": file_path, "matched": False}
 
-    if not await run_in_threadpool(dat_store.has_dats):
+    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return base_result
 
     # Per-tool embedded-hash fast path (already cached / cheap where the tool
@@ -930,6 +977,13 @@ async def _match_single_file(
             match, had_candidates = await _try_embedded_hash_match(
                 file_path, tool, cancel_event=cancel_event,
             )
+        except HasheousUnavailable as e:
+            # Remote lookup failed mid-flight. Same rule as the abandoned-hash
+            # case: a transient failure must NOT be cached as "unmatched", or a
+            # single network blip permanently marks every in-flight file as not
+            # in any DAT.
+            logger.warning("Hasheous unavailable for %s: %s", file_path, e)
+            return {**base_result, "error": "hasheous unavailable"}
         except EmbeddedHashUnavailable as e:
             # The tool couldn't derive its content hash (e.g. dolphin-tool
             # verify failed). For these formats the file-level SHA1 of the
@@ -974,7 +1028,12 @@ async def _match_single_file(
         logger.warning("Failed to hash %s", file_path, exc_info=True)
         return {**base_result, "error": "Unable to process file"}
 
-    return await _lookup_sha1_match(file_path, file_sha1, "file_sha1") or base_result
+    try:
+        match = await _lookup_sha1_match(file_path, file_sha1, "file_sha1")
+    except HasheousUnavailable as e:
+        logger.warning("Hasheous unavailable for %s: %s", file_path, e)
+        return {**base_result, "error": "hasheous unavailable"}
+    return match or base_result
 
 
 async def _try_embedded_hash_match(

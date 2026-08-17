@@ -1179,6 +1179,45 @@ gone, or changed) it returns `None`, and the caller falls back to a file-level S
 is valid for any DAT that indexes the container bytes. New cache/tool code that needs
 freshness-gated metadata must call this rather than reintroducing the two-read pattern.
 
+### 3.3.5.1 Remote hash fallback (`services/hasheous.py`)
+
+Hash matching has two sources, and exactly one place decides between them:
+`routes.dat._lookup_sha1_match`. Every match path already funnels through it —
+`POST /dat/match`, `/dat/match-batch`, the background match job, and
+`info._scan_phase_dat_match` — so the fallback was added there rather than by
+introducing a provider registry. Two sources do not need an interface; a third
+would.
+
+The order is **fixed and local-first**: `_local_dat_record` (the imported DATs)
+and only on a miss, and only when the operator opted in, `hasheous.lookup`. That
+keeps a covered library fully offline and makes a given hash resolve the same way
+regardless of network weather. Both helpers return the **same record shape** —
+`dat_id` / `dat_name` / `game_name` / `rom_name` / `source`, plus whatever extra
+identity fields the source carries — so `_lookup_sha1_match` builds the
+result dict once and splats the record into it. Adding a field to a remote match
+means adding a key to that record, not touching the builder.
+
+Three properties are load-bearing:
+
+- **A failure is not a miss.** `hasheous.lookup` raises `HasheousUnavailable` for
+  timeouts, 5xx and unparseable bodies, and returns `None` **only** for the
+  documented 404. `_match_single_file` converts the exception into
+  `{**base_result, "error": ...}`, which the existing rule (see
+  `_abandoned_match_result`) refuses to cache. Without this, one network blip
+  would permanently record every in-flight file as being in no DAT.
+- **`dat_id` is always `None` on a remote hit.** It is a FK into the local `dats`
+  table and a remote match has no row there. `dat_store` already nulls unknown
+  values before writing, so this keeps the cached row byte-identical across
+  re-runs rather than depending on that guard.
+- **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
+  gates predate the remote source and would otherwise short-circuit before it is
+  ever reached for an operator who imported no DATs at all.
+
+The client is stdlib-only (`urllib.request`), mirroring `services/dat_sync.py`:
+`_require_https`, an explicit `User-Agent`, a hard timeout, a response size cap,
+and `_fetch_json` as the single seam tests patch. Extra fields ride in the
+existing `dat_matches.payload` JSON column, so no migration is involved.
+
 ### 3.3.6 Re-run fast path (`JobManager._output_already_verified`)
 
 `_process_job` recognizes a prior success before it re-spawns the converter: a

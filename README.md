@@ -81,6 +81,21 @@ Compressatorium can sync [MAME Redump](https://github.com/MetalSlug/MAMERedump) 
 - **DAT management**: Import, list, and delete DATs via the web UI "DAT Files" button
 - **Match badges**: Files matching a DAT entry show a blue "DAT" badge in the file list
 
+#### Hasheous fallback (optional)
+
+[Hasheous](https://hasheous.org) is a hosted hash-lookup service indexing Redump, No-Intro, TOSEC, MAMEArcade/Mess, **MAMERedump**, WHDLoad, RetroAchievements and FBNeo — a superset of the DATs above. Enable it and any hash your imported DATs don't recognise is looked up remotely, so a fresh install matches your library without syncing DATs first.
+
+```bash
+COMPRESSATORIUM_HASHEOUS_ENABLED=true
+```
+
+- **Off by default.** A lookup sends the SHA1 of your file to a third-party service, so turning it on is a deliberate choice. Nothing is sent while it is off.
+- **Local DATs win.** Hasheous is consulted only when the local index misses, so a library your DATs already cover never makes a network call.
+- **Richer matches**: remote hits carry platform, publisher, year, region, and which preservation DAT the hash came from, all shown in the badge tooltip. They get a **HASH** badge to distinguish them from a local **DAT** hit.
+- **Self-hosting**: Hasheous is open source. Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance to keep lookups on your network.
+- **Bounded**: `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default `15` seconds) caps each lookup. A failed lookup is reported as an error rather than cached as "not in any DAT", so a network blip can't permanently mark files unmatched.
+- **One request per file**: Hasheous has no bulk endpoint, so a first scan of a large library makes one request per uncached file. Results are cached locally afterwards.
+
 ---
 
 ## Installation
@@ -1331,6 +1346,9 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `MAX_METADATA_SCAN_CONCURRENCY` | `1` | Maximum concurrent metadata scan tasks |
 | `MAX_MATCH_CONCURRENCY` | `1` | Maximum concurrent DAT hash-matching operations. Raise only if your storage can handle parallel full-file reads (matching a raw Wii ISO is a full-file SHA1). |
 | `MATCH_MAX_FILE_SIZE` | `0` | Skip DAT hash-matching for files larger than this many bytes (0 disables the cap). Set e.g. `2147483648` on slow storage to keep 8 GB ISOs from blocking the browse-triggered matcher. |
+| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Look hashes up at [Hasheous](https://hasheous.org) when the imported DATs don't recognise them. **Off by default**: enabling it sends the SHA1 of your files to a third-party service. Local DATs are always tried first, so a covered library makes no network calls. Legacy alias: `HASHEOUS_ENABLED`. |
+| `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Base URL of the Hasheous server. Hasheous is open source and self-hostable — point this at your own instance to keep lookups on your network. Must be `https`. Legacy alias: `HASHEOUS_URL`. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Per-request timeout in seconds for Hasheous lookups. This call sits in the file-browse path, so keep it short. Legacy alias: `HASHEOUS_TIMEOUT`. |
 | `MAX_JOB_HISTORY` | `500` | Maximum finished jobs (completed + failed + cancelled) to retain in history. Past the cap the oldest are dropped, but the Jobs tab badges still report the true total — the panel says how many of them are still listed. |
 | `COMPRESSATORIUM_TOOL_NICE` | `10` | Nice level for every conversion tool (0-19, higher = lower priority). Legacy alias: `CHD_CHDMAN_NICE`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` | `2` | I/O priority class for every tool (`1` realtime, `2` best-effort, `3` idle). Legacy alias: `CHD_CHDMAN_IOPRIO_CLASS`. |

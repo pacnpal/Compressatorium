@@ -27,6 +27,26 @@
   const datMatch = $derived(datMatching.matchFor(path));
   const chdMeta = $derived(chdMetadata.metadataFor(path));
 
+  // A match resolved remotely (Hasheous) instead of from a locally imported
+  // DAT. Both carry the same payload keys; `source` is what tells them apart.
+  const remoteMatch = $derived(datMatch?.source === 'hasheous');
+
+  // Hasheous returns platform / year / region / originating DAT that a local
+  // match doesn't have. Build the tooltip from whichever of them are present so
+  // one expression covers both sources.
+  const matchTooltip = $derived.by(() => {
+    if (!datMatch?.matched) return null;
+    const parts = [
+      datMatch.game_name,
+      datMatch.platform,
+      datMatch.year,
+      datMatch.region,
+    ].filter(Boolean);
+    const detail = parts.join(' · ');
+    const origin = datMatch.dat_name ? `Matches ${datMatch.dat_name}` : 'Matches DAT entry';
+    return detail ? `${origin} — ${detail}` : origin;
+  });
+
   const mediaType = $derived(chdMeta?.media_type ?? entry?.media_type ?? null);
 
   const convertibleBy = $derived(
@@ -129,8 +149,8 @@
       </Badge>
     {/if}
     {#if datMatch && datMatch.matched}
-      <Badge tone="dat-match" title={datMatch.title ?? 'Matches DAT entry'}>
-        <BadgeCheck size={11} aria-hidden="true" /> DAT
+      <Badge tone={remoteMatch ? 'info' : 'dat-match'} title={matchTooltip}>
+        <BadgeCheck size={11} aria-hidden="true" /> {remoteMatch ? 'HASH' : 'DAT'}
       </Badge>
     {/if}
     {#each outputs as out (out.tool_id)}

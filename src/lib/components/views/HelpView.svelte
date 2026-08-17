@@ -325,6 +325,15 @@
       matches feed tools like Hasheous and RomM, so a verified set carries over.
     </p>
     <p>
+      Hasheous also works the other way round. Set
+      <code>COMPRESSATORIUM_HASHEOUS_ENABLED=true</code> and anything your DATs don't
+      recognise gets looked up at hasheous.org, which covers Redump, No-Intro, TOSEC, MAME
+      and RetroAchievements. Those hits show a <strong>HASH</strong> badge instead of DAT,
+      and their tooltip carries the platform, year and region a local match doesn't have.
+      It's off until you turn it on, because a lookup sends your file's SHA1 to that
+      service — and your own DATs are always checked first.
+    </p>
+    <p>
       CHDs match on the header SHA1, which is codec-independent. Dolphin RVZ/WIA/GCZ match on
       the game image's content SHA1, reconstructed on the fly by
       <code>dolphin-tool verify --algorithm sha1</code> — the same hash Redump records — so any
