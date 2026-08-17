@@ -46,6 +46,9 @@ class _FakeProcess:
             self.returncode = -9 if self.killed else 0
         return b"", b""
 
+    def terminate(self) -> None:
+        self.returncode = -15
+
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
@@ -170,14 +173,20 @@ async def test_verify_times_out_when_process_hangs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
     monkeypatch.setattr(z3ds_module.asyncio, "create_subprocess_exec", _fake_exec)
     # Bound the verify subprocess at a tiny timeout so the hang trips it fast.
-    monkeypatch.setattr(z3ds_module, "verify_timeout", lambda _owner=None: 0.05)
+    async def _tiny_bound(_path, _owner=None, *, cancel_event=None):
+        return 0.05
+
+    monkeypatch.setattr(z3ds_module, "resolve_verify_timeout", _tiny_bound)
 
     service = z3ds_module.z3ds_compress_service
     result = await service.verify(str(rom_path))
 
     assert result["valid"] is False
     assert "timed out" in result["message"].lower()
-    assert process.killed is True
+    # Reaped via the shared TERM -> KILL ladder: a child that answers SIGTERM
+    # never needs SIGKILL, so assert it was signalled and is gone, not that it
+    # was killed outright.
+    assert process.returncode is not None
     assert process.pid not in set(service.active_pids())
 
 

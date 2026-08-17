@@ -50,16 +50,39 @@ def test_stalled_job_warns_with_debug_logging_disabled(caplog):
     assert any("Stalled job" in r.message for r in caplog.records)
 
 
-def test_verifying_job_is_not_reported_as_stalled(caplog):
-    """Verification emits no progress and legitimately runs for many minutes."""
+def test_verifying_job_is_reported_as_verifying_not_stalled(caplog):
+    """A job in verify is reported in its own words, not as stalled.
+
+    Verification emits no progress and legitimately runs for many minutes, so
+    calling it stalled would be wrong -- but staying silent hid a job genuinely
+    wedged *in* verify, which is what issue #266 is about. It gets its own line,
+    timed from when the verify phase began.
+    """
     mgr = JobManager(max_concurrent=1, max_job_history=10)
     _processing_job(mgr)
-    mgr._verifying.add("job-1")
+    mgr._verifying["job-1"] = time.monotonic() - 100_000
 
     with caplog.at_level(logging.WARNING):
         mgr._log_stalled_jobs()
 
     assert not [r for r in caplog.records if "Stalled job" in r.message]
+    assert any("Verifying job job-1" in r.message for r in caplog.records)
+
+
+def test_verify_phase_is_timed_from_when_verification_started(caplog):
+    """A verify that just began is not reported at all.
+
+    The progress clock stopped at the end of the conversion, so timing the
+    verify by it would report a verify as long-running the instant it starts.
+    """
+    mgr = JobManager(max_concurrent=1, max_job_history=10)
+    _processing_job(mgr)
+    mgr._verifying["job-1"] = time.monotonic()
+
+    with caplog.at_level(logging.WARNING):
+        mgr._log_stalled_jobs()
+
+    assert not caplog.records
 
 
 def test_chdman_parse_progress_returns_none_for_non_progress_lines():

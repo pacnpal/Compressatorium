@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from models import OutputStatus
+from services.subprocess_runner import resolve_verify_timeout
 from utils.path_utils import match_extension
 
 from .spec import ModeSpec
@@ -180,11 +181,44 @@ class ToolPlugin(Protocol):
         exactly as they do ``compression`` they don't use.
         """
 
-    async def verify(self, path: str) -> dict:
-        """Verify an output file; returns ``{"valid", "message"}``."""
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        """Verify an output file; returns ``{"valid", "message"}``.
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        """Verify with streaming progress updates."""
+        ``cancel_event`` is the same event ``convert()`` takes, and it must be
+        honored the same way: a job cancelled during the delete-on-verify verify
+        stage has to stop the verifier, not wait it out. A run that ended
+        because the event fired returns ``"cancelled": True`` alongside
+        ``valid=False`` — it proved nothing, so no caller may record it as a
+        verification failure (issue #266).
+
+        Every implementation is also **bounded**: it ends within
+        ``ToolPlugin.verify_timeout(path)`` whether or not it is cancelled.
+        """
+
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Verify with streaming progress updates.
+
+        Yields ``{"type": "progress"|"complete"|"error", ...}``; the terminal
+        event carries ``valid`` and, on cancellation, ``cancelled``.
+        """
+
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        """Wall-clock bound for verifying ``path``, in seconds (0 = unbounded).
+
+        The tool's own verify already enforces this; it is exposed so the job
+        pipeline can apply the *same* number as an outer backstop without
+        knowing which knob a given tool reads. That matters because a tool whose
+        verify never spawns a subprocess (jwud's container walk, makeps3iso's
+        PARAM.SFO readback) has nothing for a subprocess timeout to bound, and
+        because the bound is per-tool tunable — resolving it centrally with a
+        shared default would silently override a per-tool override.
+        """
 
     async def info(self, path: str) -> dict:
         """Return raw tool info for a file."""
@@ -284,6 +318,14 @@ class BaseTool:
     modes: Sequence[ModeSpec] = ()
     output_extensions: frozenset[str] = frozenset()
     verify_extensions: frozenset[str] = frozenset()
+    # The ``SubprocessRunner`` owner name this tool's service runs under, which
+    # is what the shared nice/ioprio/timeout policy keys its per-tool overrides
+    # on (``COMPRESSATORIUM_<OWNER>_*``). It is *not* always ``id``: the plugin
+    # id is the routing/UI name ("dolphin", "cso") while the owner is the
+    # historical service name ("dolphin_tool", "maxcso"). Declared here so
+    # policy lookups stay registry-driven instead of re-deriving the mapping at
+    # each call site. None means "shared defaults only".
+    policy_owner: str | None = None
     # Default False: a tool whose container file SHA1 might be DAT-indexed
     # still falls back to a file-level hash after an embedded-hash miss.
     embedded_hash_is_exhaustive: bool = False
@@ -349,6 +391,18 @@ class BaseTool:
         # is enough to justify removing the source. Only a tool whose verify
         # is weaker than its conversion-time check (jwud) overrides this.
         return True
+
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        # Default: the shared size-scaled verify bound, resolved for this tool's
+        # policy owner so a per-tool COMPRESSATORIUM_<OWNER>_VERIFY_TIMEOUT
+        # override applies here exactly as it does inside the tool's own verify.
+        # Sizing the file is itself a stat, so the cancel event is raced against
+        # it: this runs before the verify that would otherwise observe it.
+        return await resolve_verify_timeout(
+            path, self.policy_owner, cancel_event=cancel_event,
+        )
 
     def verifies_path(self, path: str) -> bool:
         # Default: a declared-extension match (suffix-based, so a compound

@@ -385,11 +385,24 @@ class ChainTool(BaseTool):
         step = spec.steps[spec.verify_step]
         return self._registry.get(step.tool_id)
 
-    async def verify(self, path: str) -> dict:
-        return await self._final_tool(path).verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._final_tool(path).verify(path, cancel_event=cancel_event)
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._final_tool(path).verify_stream(path)
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        return self._final_tool(path).verify_stream(path, cancel_event=cancel_event)
+
+    async def verify_timeout(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        # The final step's tool runs the verify, so its policy owner (and any
+        # per-tool override) sets the bound -- not the synthetic "chain" owner.
+        return await self._final_tool(path).verify_timeout(
+            path, cancel_event=cancel_event,
+        )
 
     async def info(self, path: str) -> dict:
         return await self._final_tool(path).info(path)

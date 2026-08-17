@@ -33,6 +33,66 @@
   exactly the case above — was the one state it could not see, and the only
   record of it was logged at debug level where nobody would find it. It is now a
   warning at the default log level.
+- **Verification can no longer run forever, and Cancel now stops it.** The
+  previous round bounded every wait in the *conversion* path; verification had
+  the same two gaps. There was no verify timeout at all out of the box, so a
+  verify that never returned never ended — and since jobs run serially by
+  default, it froze every job behind it, reachable through the commonly used
+  **Delete sources after verification**. Cancel didn't help: the verify stage
+  never received the cancellation, so the UI sat on *Cancelling...* while the
+  verifier kept reading. Verification is now bounded by default and genuinely
+  cancellable, for every tool:
+  - The bound scales with the file, because verify reads all of it: 30 minutes
+    plus 10 minutes per GiB, capped at 24 hours
+    (`COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` / `…_PER_GIB` / `…_CAP`). That is
+    deliberately loose — the per-GiB allowance alone works out to about
+    1.7 MB/s, on top of the half-hour baseline and under the 24-hour cap — so a
+    slow verify on tired storage still finishes; the point is that a wedged one
+    ends. Tools that
+    stream progress (chdman, Dolphin) also get a 10-minute no-output stall bound
+    (`COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT`), which catches a hang much
+    sooner. The two are independent knobs: setting the first to `0` switches off
+    the overall bound but leaves the stall bound running, so zero both for the
+    old fully unbounded behaviour.
+  - Cancel now reaches the verify stage, and the job stops waiting on it at
+    once instead of sitting on *Cancelling...*. A verifier that runs as a
+    subprocess is terminated and reaped; a pure-Python one (the Wii U container
+    walk, the PS3 title readback) stops at its next checkpoint, and a blocking
+    read already in flight is abandoned rather than killed — the operating
+    system offers no way to interrupt one. That holds at every point the verify
+    can be waiting: while the bound is still being sized from the file, and
+    while a verifier that has stopped printing is being given a moment to exit
+    on its own. Either way the job is reported as a
+    **cancelled job, not a failed verification**: it reached no verdict, so the
+    source is never deleted on the strength of it.
+  - A **Verify all** run now stops if one file's verifier cannot be stopped —
+    for any tool, whether the stop was a cancel or a timeout, and whether the
+    verifier was a subprocess or a plain read that is still blocked. Every
+    remaining file is on the same storage, so continuing used to leave one
+    unkillable verifier (or one blocked thread) behind per file. The stop
+    carries across tool groups too: a mixed selection no longer starts the next
+    tool against storage that just proved it can wedge one.
+  - Selecting a folder full of files on a mount that has gone away now fails
+    fast, with one message, instead of spending ten seconds per file finding out
+    the same thing — which used to delay the whole run by minutes and could
+    leave enough stuck threads behind to make verification fail on healthy
+    volumes too. (This one needs no wedged verifier — an unreachable mount is
+    enough.)
+  - Closing the browser tab mid-verify, or leaving it on a stalled connection,
+    no longer costs the verification slot. It used to be handed back only when
+    the page came back for the next event, so a client that went quiet at the
+    wrong moment left every later verification refused as at-capacity until a
+    restart. The slot now follows the verifier: it is returned when the check
+    stops, and a **Verify all** run holds it for the file being checked rather
+    than for the whole list.
+  - The bound applies to verification started from the Verify buttons too, not
+    just to delete-on-verify jobs. Those run through the same verifiers and hold
+    the same verification lane, so a wedged one used to keep that lane occupied
+    for good.
+- **A job wedged in verify is now visible in the log.** The stalled-job warning
+  used to skip the verify phase outright, to avoid calling a legitimately long
+  checksum stalled — which meant a job genuinely stuck *in* verify logged
+  nothing. It now gets its own line, timed from when verification started.
 
 The counting half of the fix 4.4.1 started. 4.4.1 stopped a deep queue from
 *deleting* your job history; this one stops the retention cap from *lying* about

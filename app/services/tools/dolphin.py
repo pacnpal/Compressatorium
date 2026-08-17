@@ -58,6 +58,7 @@ def _build_modes() -> list[ModeSpec]:
 
 class DolphinTool(BaseTool):
     id = "dolphin"
+    policy_owner = "dolphin_tool"
     display_name = "Dolphin"
     modes = _build_modes()
     output_extensions = frozenset({".rvz", ".wia", ".gcz", ".iso"})
@@ -134,11 +135,15 @@ class DolphinTool(BaseTool):
             compression=compression, cancel_event=cancel_event,
         )
 
-    async def verify(self, path: str) -> dict:
-        return await self._service.verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._service.verify(path, cancel_event=cancel_event)
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._service.verify_stream(path)
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        return self._service.verify_stream(path, cancel_event=cancel_event)
 
     async def info(self, path: str) -> dict:
         return await self._service.header(path)

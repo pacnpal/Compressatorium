@@ -41,8 +41,10 @@ from logging_setup import get_logger
 from services import ps3
 from services.subprocess_runner import (
     ConversionCancelled,
+    ReadCancelled,
     SubprocessRunner,
     ioprio_prefix,
+    run_detached,
 )
 
 # SubprocessRunner "owner" for the shared priority/timeout policy. An optional
@@ -127,6 +129,10 @@ class MakePs3IsoService:
 
     def active_pids(self) -> list[int]:
         return self._runner.active_pids()
+
+    def abandoned_pids(self) -> list[int]:
+        """Children that outlived SIGKILL; see ``SubprocessRunner``."""
+        return self._runner.abandoned_pids()
 
     # ----- output paths -----------------------------------------------------
 
@@ -304,16 +310,51 @@ class MakePs3IsoService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, iso_path: str) -> dict:
+    async def verify(
+        self, iso_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Confirm a built ``.iso`` carries a readable PS3 PARAM.SFO TITLE_ID.
 
         makeps3iso has no native verify; this is the light readback. It is not
         wired to delete-on-verify (deleting a curated source folder is
         destructive), so it only runs when explicitly requested.
+
+        ``cancel_event`` is both checked before the readback and raced against
+        it: the read is a single PARAM.SFO lookup on a throwaway daemon thread
+        (never a shared pool worker), seconds at worst on a healthy volume, but
+        on a dead one it is exactly the wait a cancel has to escape.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("makeps3iso verify (TITLE_ID readback) for %s", iso_path)
-        title_id = await asyncio.to_thread(ps3.ps3_iso_title_id, iso_path)
+        # Detached, not pooled: an ISO on a dead mount can only be abandoned,
+        # and a shared worker abandoned per cancelled verify would starve the
+        # pool every other offload in the process depends on.
+        try:
+            title_id = await run_detached(
+                ps3.ps3_iso_title_id, iso_path, cancel_event=cancel_event,
+            )
+        except ReadCancelled:
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
+        if cancel_event is not None and cancel_event.is_set():
+            # The read and the cancel can land together, and `run_detached`
+            # resolves whichever it sees first. A verdict reached under a cancel
+            # is still a verdict nobody asked for: report the cancellation, so
+            # no caller records a verification (or deletes a source) on it.
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         if title_id:
             return {"valid": True, "message": f"PS3 ISO TITLE_ID {title_id}"}
         return {

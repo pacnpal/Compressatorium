@@ -127,6 +127,14 @@
         verifiedTotal += result?.verified ?? 0;
         failedTotal += result?.failed ?? 0;
         runResults = { verified: verifiedTotal, failed: failedTotal };
+        if (result?.aborted) {
+          // The backend stopped that group because a verifier could not be
+          // killed and is still holding the storage. The remaining groups are
+          // the same files on the same storage, so starting the next one just
+          // strands another verifier per file.
+          toast.error(result.message ?? 'Verification stopped: storage is not responding');
+          return;
+        }
       }
       toast.success(
         `Verified ${verifiedTotal} of ${totalPaths} file${totalPaths === 1 ? '' : 's'}`,

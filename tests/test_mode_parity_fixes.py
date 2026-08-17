@@ -734,7 +734,7 @@ async def test_z3ds_delete_on_verify_marks_output_verified(tmp_path: Path, monke
         yield {"progress": 75, "message": "Compressing..."}
         yield {"progress": 100, "message": "Done"}
 
-    async def fake_verify(path: str):
+    async def fake_verify(path: str, *, cancel_event=None):
         return {"valid": True, "message": "File verified successfully"}
 
     mark_verified = AsyncMock()
@@ -812,7 +812,7 @@ async def test_delete_on_verify_clears_verification_store_for_non_chd_source(
         Path(destination_path).write_bytes(b"converted")
         yield {"progress": 100, "message": "Done"}
 
-    async def fake_verify(path: str):
+    async def fake_verify(path: str, *, cancel_event=None):
         return {"valid": True, "message": "File verified successfully"}
 
     mark_verified = AsyncMock()
@@ -889,7 +889,7 @@ async def test_delete_on_verify_rejects_inode_device_fingerprint_mismatch(
         Path(destination_path).write_bytes(b"converted")
         yield {"progress": 100, "message": "Done"}
 
-    async def fake_verify(path: str):
+    async def fake_verify(path: str, *, cancel_event=None):
         return {"valid": True, "message": "File verified successfully"}
 
     _z3ds_service = job_manager_module.registry.for_mode("z3ds_compress")._service

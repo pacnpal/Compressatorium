@@ -27,6 +27,7 @@ from .spec import ModeKind, ModeSpec
 
 class NszTool(BaseTool):
     id = "nsz"
+    policy_owner = "nsz"
     display_name = "Switch"
     modes = (
         ModeSpec(
@@ -116,11 +117,15 @@ class NszTool(BaseTool):
             compression=compression, cancel_event=cancel_event,
         )
 
-    async def verify(self, path: str) -> dict:
-        return await self._service.verify(path)
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await self._service.verify(path, cancel_event=cancel_event)
 
-    def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        return self._service.verify_stream(path)
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        return self._service.verify_stream(path, cancel_event=cancel_event)
 
     async def info(self, path: str) -> dict:
         return await run_in_threadpool(self._service.info, path)

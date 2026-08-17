@@ -124,15 +124,21 @@ class VerificationStore {
         },
       });
       if (this.batchRun) {
+        // A batch the backend stopped early did not process every file, so it
+        // must not be shown as 100% of the list done — the counts it did reach
+        // stand, the progress it never made does not.
+        const aborted = result?.aborted === true;
         this.batchRun = {
           ...this.batchRun,
-          done: this.batchRun.total,
+          done: aborted ? this.batchRun.done : this.batchRun.total,
           verified: result?.verified ?? this.batchRun.verified,
           failed: result?.failed ?? this.batchRun.failed,
           currentPath: null,
           currentFilename: null,
-          currentPercent: 100,
-          message: 'Batch complete',
+          currentPercent: aborted ? this.batchRun.currentPercent : 100,
+          // A batch the backend stopped early is not a completed batch: say so
+          // rather than reporting 'Batch complete' over an unfinished list.
+          message: aborted ? (result.message ?? 'Batch stopped') : 'Batch complete',
         };
       }
       return result;

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import logging
 import os
@@ -40,7 +41,10 @@ import time
 from collections.abc import AsyncGenerator, Callable, Mapping
 
 from config import settings
-from services.timeout_policy import compute_progress_stall_timeout
+from services.timeout_policy import (
+    compute_progress_stall_timeout,
+    compute_size_scaled_timeout,
+)
 
 
 class ConversionCancelled(Exception):
@@ -50,6 +54,75 @@ class ConversionCancelled(Exception):
 # Hard bound on a filesystem probe taken on the spawn path, where there is no
 # stall loop yet to rescue a wait that never returns.
 _STAT_TIMEOUT = 10.0
+
+# Ceiling on how many abandoned probes may be outstanding at once. Writing off a
+# thread per wedged syscall is the deliberate trade below, but it has to have a
+# floor under it: a request-driven probe (a verify route's path guard) can be
+# retried indefinitely against a dead volume, and one leaked thread per attempt
+# eventually exhausts memory or the process thread limit -- turning a broken
+# mount into a dead application, which is the outcome all of this exists to
+# prevent. In healthy operation these probes finish in microseconds and the
+# count sits at zero, so reaching the ceiling is itself the diagnosis.
+_MAX_DETACHED_PROBES = 64
+_probe_slots = threading.Semaphore(_MAX_DETACHED_PROBES)
+
+# Whatever the current operation has had to abandon: a child that outlived
+# SIGKILL, or a detached read whose awaiter gave up while it was still blocked
+# (one written-off thread each, holding a probe slot until the kernel unblocks
+# it). Neither is an error on its own -- both are the deliberate trade for never
+# hanging -- but a caller working through a list has to know, because the next
+# file is on the same storage and will cost another one.
+#
+# A context variable rather than a global tally, because "did *this* verify
+# abandon something" is the actual question. Globals cannot answer it once
+# MAX_VERIFY_CONCURRENCY > 1: one request's wedged mount would mark another
+# request's ordinary timeout as abandoned and stop its batch, possibly on
+# perfectly healthy storage. ``asyncio.create_task`` copies the current context,
+# so a producer task started inside ``collect_abandonment()`` reports into that
+# sink and no other.
+_abandon_sink: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "verify_abandon_sink", default=None,
+)
+
+
+@contextlib.contextmanager
+def collect_abandonment():
+    """Collect what the work started inside this block had to abandon.
+
+    Yields the list it collects into; truthy afterwards means this operation
+    left something stuck behind. Nests and interleaves safely: each caller gets
+    its own sink, and work outside any block simply reports nowhere.
+    """
+    sink: list[str] = []
+    token = _abandon_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _abandon_sink.reset(token)
+
+
+def _note_abandoned(detail: str) -> None:
+    sink = _abandon_sink.get()
+    if sink is not None:
+        sink.append(detail)
+
+
+class ProbeCapacityExceeded(asyncio.TimeoutError):
+    """Too many filesystem probes are already stuck to start another.
+
+    Deliberately an ``asyncio.TimeoutError``: to every caller this means exactly
+    what a timeout means -- "the filesystem did not answer" -- so each existing
+    bounded-probe handler treats it correctly with no new branch. Only the
+    message differs, because the cause an operator has to act on is different:
+    the volume has been unresponsive for a while and probes have been piling up
+    against it.
+
+    ``asyncio.TimeoutError`` and not the builtin, because they are only the same
+    class from 3.11 on; on 3.10 (which ``pyproject.toml`` still targets) the
+    builtin is an ``OSError`` subclass that ``except asyncio.TimeoutError`` does
+    not catch -- and every handler here catches the asyncio one. Inheriting both
+    is not an option either: their C layouts conflict.
+    """
 
 
 def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
@@ -62,7 +135,17 @@ def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
     up nothing at exit and occupies no shared capacity. A call that never
     returns simply costs one written-off thread that dies with the process,
     which is the unavoidable price of a syscall Python cannot cancel.
+
+    Bounded by :data:`_MAX_DETACHED_PROBES` outstanding at a time: the price is
+    per-probe, so an unbounded number of attempts against a dead volume would
+    otherwise be an unbounded number of threads. Raises
+    :class:`ProbeCapacityExceeded` instead of starting the next one.
     """
+    if not _probe_slots.acquire(blocking=False):
+        raise ProbeCapacityExceeded(
+            f"{_MAX_DETACHED_PROBES} filesystem probes are already blocked; "
+            "the volume is not responding",
+        )
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
 
@@ -72,14 +155,19 @@ def _probe_in_daemon_thread(func: Callable[[], object]) -> asyncio.Future:
 
     def _worker() -> None:
         try:
-            result = func()
-        except BaseException as exc:  # noqa: BLE001 - relayed to the awaiter
-            setter, value = future.set_exception, exc
-        else:
-            setter, value = future.set_result, result
-        with contextlib.suppress(RuntimeError):
-            # RuntimeError: the loop closed while this thread was blocked.
-            loop.call_soon_threadsafe(_settle, setter, value)
+            try:
+                result = func()
+            except BaseException as exc:  # noqa: BLE001 - relayed to the awaiter
+                setter, value = future.set_exception, exc
+            else:
+                setter, value = future.set_result, result
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError: the loop closed while this thread was blocked.
+                loop.call_soon_threadsafe(_settle, setter, value)
+        finally:
+            # Released only when the call actually returns, so the count
+            # reflects probes that are *stuck*, not probes that were started.
+            _probe_slots.release()
 
     threading.Thread(target=_worker, daemon=True, name="fs-probe").start()
     return future
@@ -132,6 +220,10 @@ _PROBE_INTERVAL = 2.0
 _MIN_STALL_TIMEOUT = 3 * _PROBE_INTERVAL
 
 _EXIT_GRACE = 60.0
+# How finely the post-EOF exit grace is sliced. Each slice re-checks the cancel
+# event and both verify deadlines, so this is the worst-case lag between a
+# Cancel and the streaming verifier acting on it once its output has stopped.
+_EXIT_POLL = 1.0
 _TERM_GRACE = 5.0
 _KILL_GRACE = 10.0
 
@@ -215,8 +307,277 @@ def info_timeout(owner: str | None = None) -> int:
 
 
 def verify_timeout(owner: str | None = None) -> int:
-    """Effective ``verify`` subprocess timeout in seconds (0 disables)."""
+    """Baseline ``verify`` timeout in seconds (0 disables).
+
+    The *baseline* only. Callers that know which file is being verified should
+    use :func:`resolve_verify_timeout`, which adds the per-GiB allowance that
+    makes one bound workable across a 400 MB CIA and a 90 GB PS3 ISO.
+    """
     return max(0, int(_resolve_policy("verify_timeout", owner) or 0))
+
+
+def verify_stall_timeout(owner: str | None = None) -> int:
+    """Effective no-output stall bound for a streaming verify (0 disables)."""
+    return max(0, int(_resolve_policy("verify_progress_timeout", owner) or 0))
+
+
+def _verify_timeout_sync(path: str, owner: str | None = None) -> int:
+    return compute_size_scaled_timeout(
+        path=path,
+        base_timeout=verify_timeout(owner),
+        timeout_per_gib=_resolve_policy("verify_timeout_per_gib", owner),
+        timeout_cap=_resolve_policy("verify_timeout_cap", owner),
+    )
+
+
+async def resolve_verify_timeout(
+    path: str,
+    owner: str | None = None,
+    *,
+    cancel_event: asyncio.Event | None = None,
+) -> int:
+    """Effective wall-clock bound for verifying ``path`` (0 disables).
+
+    The single source of truth for "how long may a verify run": the configured
+    baseline plus a per-GiB allowance for the file actually being read, capped
+    (see :func:`services.timeout_policy.compute_size_scaled_timeout`). Every
+    tool's verify resolves its own bound through this, and ``job_manager``
+    resolves the same value to bound the whole ``verify()`` call as a backstop
+    for tools whose verify never spawns a subprocess.
+
+    Sizing ``path`` stats it, which on a dead mount blocks in uninterruptible
+    I/O -- exactly the failure this bound exists to survive -- so the stat is
+    taken through the bounded detached seam and a probe that does not answer
+    falls back to the flat baseline. A bound that cannot be sized still applies.
+
+    ``cancel_event`` is raced against the stat for the same reason
+    :func:`verify_preflight` races it: this runs *before* the verify that would
+    observe the cancel, so without it a Cancel pressed while sizing an output on
+    a dead mount left the job -- and the single-slot dispatcher behind it -- on
+    "Cancelling..." for the full probe bound. A cancelled sizing falls back to
+    the flat baseline too: the caller is about to be told the run was cancelled,
+    so the number only has to exist.
+    """
+    try:
+        return await asyncio.wait_for(
+            run_detached(_verify_timeout_sync, path, owner, cancel_event=cancel_event),
+            timeout=_STAT_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, ReadCancelled):
+        return verify_timeout(owner)
+
+
+class ReadCancelled(Exception):
+    """A detached read was abandoned because its ``cancel_event`` fired.
+
+    Distinct from :class:`ConversionCancelled` (which belongs to the conversion
+    pipeline) so a verify can translate it into its own terminal
+    ``{"cancelled": True}`` event rather than letting it read as a failure.
+    """
+
+
+async def bounded_path_check(func: Callable, *args: object, **kwargs: object) -> object:
+    """A one-shot path predicate (``isfile``, within-volumes) under a hard bound.
+
+    The verify *routes* validate a path before they start anything, and those
+    checks are ordinary blocking stats: on an unresponsive volume they block in
+    uninterruptible I/O, ahead of every bound the verify itself carries, and in
+    a shared pool they take a worker with them. Running them here bounds the
+    wait and keeps the abandoned thread off any pool that matters.
+
+    Raises :class:`asyncio.TimeoutError` when the volume does not answer.
+    """
+    return await _bounded_probe(func, *args, **kwargs)
+
+
+async def run_detached(
+    func: Callable,
+    *args: object,
+    cancel_event: asyncio.Event | None = None,
+    **kwargs: object,
+) -> object:
+    """Run a blocking call off the event loop **without** a shared pool worker.
+
+    The un-pooled counterpart of ``run_in_threadpool`` / ``asyncio.to_thread``
+    for work that may never return: a verify's whole-file reads (the WUX index
+    scan, an archive listing, a header probe, a PARAM.SFO readback). Cancelling
+    a thread is impossible — Python can abandon the future, never the OS thread
+    — so the only question is *whose* thread is abandoned. In a shared pool it
+    is one of a small fixed set: now that verify is genuinely cancellable and
+    bounded, a client disconnecting repeatedly against an unresponsive mount
+    would strand one pooled worker per attempt and eventually starve every
+    unrelated offload in the process. Here it is a throwaway daemon thread,
+    which holds up nothing at interpreter exit and occupies no shared capacity.
+
+    Unbounded by design: the caller supplies the bound (a route deadline, the
+    job's ``verify_timeout``), because the right limit depends on the file.
+
+    ``cancel_event`` is raced against the read and raises :class:`ReadCancelled`
+    the moment it fires. The read itself cannot be stopped — it is abandoned, on
+    its own disposable thread — but the *awaiter* returns immediately, which is
+    the part that matters: without it, pressing Cancel during a long index scan
+    or archive listing left the job (and the single-slot dispatcher behind it)
+    on "Cancelling..." until the outer bound expired, possibly hours later.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        # Before taking a probe slot, not after: starting the call would write
+        # off a thread (and one of the process-wide slots) on a dead mount for a
+        # result nobody wants, and enough cancelled attempts that way would
+        # exhaust the ceiling and start failing path checks on healthy volumes.
+        raise ReadCancelled("Read cancelled")
+    future = _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
+    waiter = (
+        asyncio.ensure_future(cancel_event.wait())
+        if cancel_event is not None
+        else None
+    )
+    try:
+        if waiter is None:
+            # No event to race, but still inside the try: an *outer* deadline
+            # cancelling this await abandons the thread just the same, and that
+            # has to be noticed and counted like any other abandonment.
+            return await future
+        done, _pending = await asyncio.wait(
+            [future, waiter], return_when=asyncio.FIRST_COMPLETED,
+        )
+        if future in done:
+            return future.result()
+        raise ReadCancelled("Read cancelled")
+    finally:
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+        if not future.done():
+            # Abandons the thread, not the syscall: nothing can stop the latter,
+            # and the thread dies with the process. Counted, because for a
+            # verify that spawns no child this is the only trace left when an
+            # outer deadline cancels it.
+            future.cancel()
+            _note_abandoned("detached read")
+        elif future.cancelled():
+            # Cancelling the awaiting task propagates straight into the future
+            # it is awaiting, so it is already "done" here -- cancelled, not
+            # answered. The thread is every bit as stuck; count it the same.
+            _note_abandoned("detached read")
+
+
+async def verify_preflight(
+    path: str,
+    extensions: frozenset[str] | set[str],
+    *,
+    cancel_event: asyncio.Event | None = None,
+) -> tuple[dict | None, int]:
+    """The missing / empty / wrong-extension gate every ``verify_stream`` opens with.
+
+    Returns ``(error_event_or_None, size_in_bytes)``: an event to yield and
+    return on, or ``None`` plus the size when the file is worth verifying.
+
+    Five services opened with the identical three checks, so they are written
+    once here — and, more to the point, the stat is **bounded**. These checks run
+    on the event loop before the verify's first real await, and ``getsize`` on an
+    unresponsive mount blocks in uninterruptible I/O: inline, that freezes every
+    task in the process, including the ``asyncio.wait_for`` that is supposed to
+    bound this very verify (the issue #263 failure mode, reached through the
+    verify path). Off the loop, an unresponsive mount fails this one verify.
+
+    ``cancel_event`` is raced against the stat as well: on a volume that has
+    stopped answering, a cancel pressed during the probe must produce a
+    *cancelled* verdict, not the "stopped responding" failure the bound would
+    otherwise report ten seconds later.
+    """
+    try:
+        size = await asyncio.wait_for(
+            run_detached(os.path.getsize, path, cancel_event=cancel_event),
+            timeout=_STAT_TIMEOUT,
+        )
+    except ReadCancelled:
+        return {
+            "type": "error",
+            "valid": False,
+            "cancelled": True,
+            "message": "Verification cancelled",
+        }, 0
+    except asyncio.TimeoutError:
+        return {
+            "type": "error",
+            "valid": False,
+            # The stat is still running on its own thread -- giving up on it is
+            # abandonment, and a caller walking a list has to stop rather than
+            # spend one more thread per remaining path on the same storage.
+            "abandoned": True,
+            "message": (
+                f"File stopped responding (no answer in {_STAT_TIMEOUT:.0f}s); "
+                "the volume may be offline"
+            ),
+        }, 0
+    except FileNotFoundError:
+        return {"type": "error", "valid": False, "message": "File not found"}, 0
+    except OSError as e:
+        return {
+            "type": "error", "valid": False, "message": f"Error reading file: {e}",
+        }, 0
+    if size == 0:
+        return {"type": "error", "valid": False, "message": "File is empty"}, 0
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in extensions:
+        return {
+            "type": "error", "valid": False, "message": f"Invalid extension: {ext}",
+        }, size
+    return None, size
+
+
+def abandoned_verify_error(pid: int) -> dict:
+    """The one terminal event for a verifier that outlived ``SIGKILL``.
+
+    Written once because every verify path can reach it -- the streaming loop's
+    cancel/timeout/stall ladder, its post-EOF grace, the captured one-shot
+    verifiers through ``run_capture``'s ``on_abandoned`` hook, and z3ds's
+    hand-rolled zstd loop -- and because it has to read the same wherever it
+    comes from. The ``abandoned`` flag is the part that matters: it outranks
+    "cancelled" and "timed out", because the child is still running and still
+    holding the storage, and a caller working through a list has to stop rather
+    than open the next file against it. Issue #268 argues abandonment should
+    *raise* rather than be a flag on an event; when that lands, this is what the
+    exception replaces.
+    """
+    return {
+        "type": "error",
+        "valid": False,
+        "abandoned": True,
+        "message": (
+            f"Verification did not exit and could not be killed (pid {pid}); "
+            "it is likely blocked on unresponsive storage."
+        ),
+    }
+
+
+async def collect_verify(
+    stream: AsyncGenerator[dict, None], *, fallback_message: str,
+) -> dict:
+    """Reduce a ``verify_stream`` to the one-shot ``verify()`` result.
+
+    Every tool's ``verify()`` is this same drain-and-keep-the-terminal-event
+    wrapper, so it is written once here rather than eight times. The result is
+    ``{"valid", "message"}`` plus ``"cancelled": True`` when the stream ended
+    because the operator cancelled -- a distinction callers must keep, since a
+    cancelled verify proved nothing and must not be recorded as a failure --
+    and ``"abandoned": True`` when it ended with a child that outlived SIGKILL,
+    which tells a caller working through a list to stop.
+    """
+    final: dict = {"valid": False, "message": fallback_message}
+    async for update in stream:
+        if update.get("type") in ("complete", "error"):
+            final = update
+    result = {
+        "valid": bool(final.get("valid", False)),
+        "message": final.get("message") or fallback_message,
+    }
+    if final.get("cancelled"):
+        result["cancelled"] = True
+    if final.get("abandoned"):
+        result["abandoned"] = True
+    return result
 
 
 def _split_stream_lines(buffer: str) -> tuple[list[str], str]:
@@ -313,6 +674,7 @@ class SubprocessRunner:
     def __init__(self, owner: str) -> None:
         self._owner = owner
         self._active_pids: set[int] = set()
+        self._abandoned_pids: set[int] = set()
         self._pid_lock = threading.Lock()
         self._logger = logging.getLogger(f"chd.{owner}")
 
@@ -332,6 +694,37 @@ class SubprocessRunner:
     def active_pids(self) -> list[int]:
         with self._pid_lock:
             return list(self._active_pids)
+
+    def abandoned_pids(self) -> list[int]:
+        """Children of this runner that outlived ``SIGKILL`` and are still alive.
+
+        Recorded in :meth:`reap`, the one place that discovers the fact, so it
+        survives paths that cannot report it in their own return value -- above
+        all a verify generator cancelled by an *outer* deadline, which unwinds
+        through its ``finally`` with no event left to carry the flag. A caller
+        working through a list (the batch verify route) asks here before opening
+        the next file, since a wedged mount would otherwise cost it one
+        unkillable process per file.
+
+        Entries are dropped once the pid is gone: the kernel does eventually
+        unblock most of these, and a permanent entry would stop every later
+        batch. A pid the OS has since reused reads as still-abandoned, which
+        errs toward stopping early -- the safe direction here.
+        """
+        with self._pid_lock:
+            candidates = list(self._abandoned_pids)
+        gone = []
+        for pid in candidates:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                gone.append(pid)
+            except PermissionError:  # pragma: no cover - not ours any more
+                gone.append(pid)
+        if gone:
+            with self._pid_lock:
+                self._abandoned_pids.difference_update(gone)
+        return [pid for pid in candidates if pid not in gone]
 
     async def reap(self, process, *, exit_timeout: float = _EXIT_GRACE) -> bool:
         """Wait for ``process`` to exit, bounded at every step. True if reaped.
@@ -382,6 +775,9 @@ class SubprocessRunner:
             "abandoning it so the job fails instead of stalling the queue",
             self._owner, process.pid,
         )
+        with self._pid_lock:
+            self._abandoned_pids.add(process.pid)
+        _note_abandoned(f"pid {process.pid}")
         return False
 
     async def run_capture(
@@ -391,6 +787,9 @@ class SubprocessRunner:
         timeout: float | None = None,
         cancel_event: asyncio.Event | None = None,
         stderr_to_stdout: bool = False,
+        nice_via_wrapper: bool = False,
+        env: Mapping[str, str] | None = None,
+        on_abandoned: Callable[[int], None] | None = None,
     ) -> tuple[int | None, bytes, bytes]:
         """Run ``cmd`` to completion and capture ``(returncode, stdout, stderr)``.
 
@@ -405,16 +804,35 @@ class SubprocessRunner:
         returncode is reported as ``None`` to signal the abort. ``stderr`` is
         folded into ``stdout`` when ``stderr_to_stdout`` is set (and the
         returned ``stderr`` is then empty).
+
+        ``nice_via_wrapper`` and ``env`` mirror :meth:`run`: the first skips the
+        ``preexec_fn`` renice for a caller that has already prefixed ``cmd`` with
+        ``nice``/``ionice`` wrappers (maxcso/nsz avoid ``preexec_fn`` -- forking a
+        Python callable in this multithreaded process can deadlock the child
+        before ``exec``), the second forwards a private environment (nsz runs
+        with its own keys home).
+
+        ``on_abandoned`` is called with the pid when the TERM/KILL ladder gives
+        up -- the child outlived ``SIGKILL`` and is still holding whatever it
+        was reading. Without it that fact is invisible here: an abandoned child
+        and a clean cancellation both come back as a ``None`` returncode, and a
+        caller working through a list would open the next file against the same
+        storage. Issue #268 replaces this hook with an exception from
+        ``run_capture`` itself.
         """
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
         # (e.g. dolphin-tool verify reconstructing a full disc for DAT hashing)
         # is just as heavy as a conversion, so it must respect TOOL_NICE /
-        # TOOL_IOPRIO_* instead of running at normal priority.
-        cmd = ioprio_prefix(self._owner) + cmd
+        # TOOL_IOPRIO_* instead of running at normal priority. A caller using
+        # command wrappers has already applied both.
+        if not nice_via_wrapper:
+            cmd = ioprio_prefix(self._owner) + cmd
 
         def _preexec():
             apply_nice(self._owner)
+
+        use_preexec = os.name == "posix" and not nice_via_wrapper
 
         process = await asyncio.create_subprocess_exec(  # nosemgrep
             cmd[0], *cmd[1:],
@@ -424,7 +842,8 @@ class SubprocessRunner:
                 if stderr_to_stdout
                 else asyncio.subprocess.PIPE
             ),
-            preexec_fn=_preexec if os.name == "posix" else None,
+            preexec_fn=_preexec if use_preexec else None,
+            env=env,
         )
         self.track_pid(process.pid)
         comm = asyncio.ensure_future(process.communicate())
@@ -453,7 +872,8 @@ class SubprocessRunner:
                     await cancel_wait
             # exit_timeout=0: nothing is reading the child's output any more, so
             # go straight to signalling instead of waiting out a voluntary exit.
-            await self.reap(process, exit_timeout=0)
+            if not await self.reap(process, exit_timeout=0) and on_abandoned:
+                on_abandoned(process.pid)
             if not comm.done():
                 comm.cancel()
             # CancelledError is a BaseException, so it is NOT covered by
@@ -462,6 +882,292 @@ class SubprocessRunner:
             # cancellation out of run_capture.
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm
+            self.untrack_pid(process.pid)
+
+    # --- verify ----------------------------------------------------------
+    #
+    # Two shared shapes cover every tool's verify subprocess, so the bound and
+    # the cancel handling are written once instead of per tool (issue #266):
+    # :meth:`run_verify` for a verifier that streams progress (chdman,
+    # dolphin-tool) and :meth:`capture_verify` for one that says nothing until
+    # it exits (maxcso ``--crc``, nsz ``-V``, ``7z t``). Both emit the same
+    # ``{"type": "progress"|"complete"|"error"}`` events the verify SSE routes
+    # and ``ToolPlugin.verify()`` already consume, and both honour the same
+    # ``cancel_event`` so pressing Cancel actually stops the verifier.
+
+    @staticmethod
+    def _verify_error(
+        message: str, *, cancelled: bool = False, abandoned: bool = False,
+    ) -> dict:
+        event = {"type": "error", "valid": False, "message": message}
+        if cancelled:
+            # Distinguishes "the operator stopped this" from "this file is
+            # bad": job_manager turns the flag into a CANCELLED job rather than
+            # a failed one, and no caller may record a verification result from
+            # a run that never finished.
+            event["cancelled"] = True
+        if abandoned:
+            # Distinguishes "this file failed" from "cleanup itself failed":
+            # a verifier that outlived SIGKILL is still holding the storage,
+            # so a caller working through a list must stop rather than open the
+            # next file against it.
+            event["abandoned"] = True
+        return event
+
+
+    async def capture_verify(
+        self,
+        cmd: list[str],
+        *,
+        path: str,
+        success_message: str,
+        cancel_event: asyncio.Event | None = None,
+        nice_via_wrapper: bool = False,
+        env: Mapping[str, str] | None = None,
+        start_message: str = "Verifying integrity...",
+    ) -> AsyncGenerator[dict, None]:
+        """Run a one-shot verifier, yielding this tool's verify events.
+
+        For a verifier that prints nothing useful until it exits: the whole run
+        is one :meth:`run_capture` bounded by :func:`resolve_verify_timeout` for
+        ``path`` and racing ``cancel_event`` -- which the bound resolution takes
+        too, since sizing the file is another stat of the same storage.
+        The whole is wrapped in the 0%/100% progress
+        events the SSE routes expect. ``run_capture`` reports both an abort and
+        a timeout as a ``None`` return code, so the two are told apart here by
+        asking the cancel event which one happened.
+        """
+        yield {"type": "progress", "progress": 0, "message": start_message}
+        timeout = await resolve_verify_timeout(
+            path, self._owner, cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            # Same re-check as run_verify: resolving the bound above can take
+            # the full probe bound on unresponsive storage.
+            yield self._verify_error("Verification cancelled", cancelled=True)
+            return
+        abandoned_pid: list[int] = []
+        returncode, stdout, _ = await self.run_capture(
+            cmd,
+            timeout=timeout or None,
+            cancel_event=cancel_event,
+            stderr_to_stdout=True,
+            nice_via_wrapper=nice_via_wrapper,
+            env=env,
+            on_abandoned=abandoned_pid.append,
+        )
+        if abandoned_pid:
+            # Outranks both branches below: the child outlived SIGKILL, so it is
+            # still holding the storage whether the operator cancelled or the
+            # bound expired, and a caller walking a list has to stop.
+            yield abandoned_verify_error(abandoned_pid[0])
+            return
+        if returncode == 0:
+            yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
+            yield {"type": "complete", "valid": True, "message": success_message}
+            return
+        if returncode is None:
+            if cancel_event is not None and cancel_event.is_set():
+                yield self._verify_error("Verification cancelled", cancelled=True)
+            else:
+                yield self._verify_error(f"Verification timed out after {timeout}s")
+            return
+        output = (stdout or b"").decode("utf-8", errors="replace").strip()
+        tail = "\n".join(output.splitlines()[-5:]) if output else "verification failed"
+        yield self._verify_error(f"Integrity check failed: {tail}")
+
+    async def run_verify(
+        self,
+        cmd: list[str],
+        *,
+        path: str,
+        parse_progress: Callable[[str], int | None],
+        success_message: str,
+        failure_message: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream a verifier's output, yielding this tool's verify events.
+
+        The streaming counterpart to :meth:`capture_verify`, and the shared
+        replacement for the two near-identical read loops chdman and
+        dolphin-tool each carried. Every bound the conversion path already has
+        applies here too (issue #266):
+
+        * an **overall** bound from :func:`resolve_verify_timeout` for ``path``
+          (baseline + per-GiB allowance), so a verify that never returns ends;
+        * a **stall** bound (``COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT``)
+          on a verifier that streams but goes silent, which catches a wedge long
+          before the overall bound would;
+        * ``cancel_event``, so Cancel terminates the verifier instead of leaving
+          the UI on *Cancelling...* until the read loop happens to end;
+        * the bounded :meth:`reap` ladder rather than a bare ``process.wait()``,
+          which on a child stuck in uninterruptible I/O never returns and
+          freezes the queue behind it (the issue #263 failure, on this path).
+
+        ``parse_progress`` is the only per-tool knob; line segmentation is the
+        shared :func:`_split_stream_lines`, so a percentage redraw split across
+        read chunks still parses.
+        """
+        # nice/ionice as *command wrappers*, never a preexec_fn: this process is
+        # multithreaded (threadpools, the SSE routes), and forking a Python
+        # callable from a multithreaded parent can deadlock the child before it
+        # reaches exec. That would hang inside create_subprocess_exec, before
+        # the PID is tracked and before any of the bounds below are installed --
+        # the one failure mode nothing here could rescue. maxcso and nsz already
+        # avoid preexec for the same reason; `nice`/`ionice` only exec. When
+        # either binary is absent its prefix is empty and the verify simply runs
+        # unniced, which is what it did before this policy applied to it at all.
+        cmd = nice_prefix(self._owner) + ioprio_prefix(self._owner) + cmd
+
+        # Resolve the bounds *before* spawning. They stat the file, and an await
+        # between the spawn and the try/finally below is a window where a
+        # cancellation (the verify SSE route cancels its task when the client
+        # disconnects) unwinds this coroutine with the child already running and
+        # tracked, but with nothing to reap or untrack it.
+        overall_timeout = await resolve_verify_timeout(
+            path, self._owner, cancel_event=cancel_event,
+        )
+        stall_timeout = verify_stall_timeout(self._owner)
+        if cancel_event is not None and cancel_event.is_set():
+            # Re-checked after the bound is resolved, because resolving it can
+            # take the full probe bound on storage that has stopped answering
+            # -- and spawning into that would mean a child that immediately
+            # blocks and may outlive SIGKILL, turning a prompt cancellation
+            # into an abandoned process for no work gained.
+            yield self._verify_error("Verification cancelled", cancelled=True)
+            return
+
+        process = await asyncio.create_subprocess_exec(  # nosemgrep
+            cmd[0], *cmd[1:],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        self.track_pid(process.pid)
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "Starting %s verify pid=%s path=%s", self._owner, process.pid, path,
+            )
+
+        output_lines: list[str] = []
+        buffer = ""
+        start = time.monotonic()
+        last_output_at = start
+        terminal: dict | None = None
+        # Set once the ladder has run and given up, so teardown does not repeat
+        # TERM/KILL on a child known to be unkillable -- that second pass is
+        # another 15s holding the verify lane (and, at MAX_CONCURRENT_JOBS=1,
+        # the queue) for no possible gain. Same guard run() carries.
+        reap_failed = False
+
+        async def _stop() -> None:
+            # TERM -> KILL with grace, then give up rather than waiting forever:
+            # the point of every bound here is that this coroutine ends.
+            nonlocal reap_failed
+            if not await self.reap(process, exit_timeout=0):
+                reap_failed = True
+
+        async def _check_limits(now: float) -> bool:
+            nonlocal terminal
+            if cancel_event is not None and cancel_event.is_set():
+                terminal = self._verify_error("Verification cancelled", cancelled=True)
+            elif overall_timeout > 0 and now - start >= overall_timeout:
+                terminal = self._verify_error(
+                    f"Verification timed out after {overall_timeout}s",
+                )
+            elif stall_timeout > 0 and now - last_output_at >= stall_timeout:
+                terminal = self._verify_error(
+                    f"Verification stalled: no output for {stall_timeout}s",
+                )
+            else:
+                return False
+            await _stop()
+            if reap_failed:
+                # Abandonment outranks whatever prompted the stop. The child is
+                # still running and still holding the storage, which is a
+                # bigger fact than "the operator cancelled" -- and the caller
+                # walking a list has to know to stop. Same precedence run()
+                # gives it.
+                terminal = abandoned_verify_error(process.pid)
+            return True
+
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(process.stdout.read(100), timeout=2)
+                except asyncio.TimeoutError:
+                    if await _check_limits(time.monotonic()):
+                        break
+                    continue
+                if not chunk:
+                    break
+
+                buffer += chunk.decode("utf-8", errors="replace")
+                last_output_at = time.monotonic()
+                lines, buffer = _split_stream_lines(buffer)
+                for line in lines:
+                    output_lines.append(line)
+                    yield {
+                        "type": "progress",
+                        "progress": parse_progress(line),
+                        "message": line,
+                    }
+                if await _check_limits(time.monotonic()):
+                    break
+
+            if terminal is None:
+                if buffer.strip():
+                    line = buffer.strip()
+                    output_lines.append(line)
+                    yield {
+                        "type": "progress",
+                        "progress": parse_progress(line),
+                        "message": line,
+                    }
+                # The voluntary-exit grace runs under the same live checks the
+                # read loop ran, rather than as one blocking wait: a verifier
+                # that closed stdout without exiting is still subject to the
+                # cancel and to both deadlines. Deciding the grace once, up
+                # front, would cover neither a cancel pressed a second later
+                # nor a stall-only configuration -- so it is sliced, and each
+                # slice re-asks the same question the read loop asked.
+                grace_until = time.monotonic() + _EXIT_GRACE
+                stopped = False
+                while process.returncode is None:
+                    now = time.monotonic()
+                    if await _check_limits(now):
+                        stopped = True
+                        break
+                    if now >= grace_until:
+                        break
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=min(_EXIT_POLL, grace_until - now),
+                        )
+                if not stopped and not await self.reap(process, exit_timeout=0):
+                    reap_failed = True
+                    terminal = abandoned_verify_error(process.pid)
+
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "%s verify pid=%s exit=%s",
+                    self._owner, process.pid, process.returncode,
+                )
+
+            if terminal is not None:
+                yield terminal
+                return
+
+            if process.returncode == 0:
+                yield {"type": "complete", "valid": True, "message": success_message}
+            else:
+                output = "\n".join(output_lines[-20:]).strip()
+                yield self._verify_error(output or failure_message)
+        finally:
+            # Skipped when the ladder already exhausted itself: repeating it on a
+            # child that survived SIGKILL only burns another 15s.
+            if not reap_failed:
+                await self.reap(process, exit_timeout=0)
             self.untrack_pid(process.pid)
 
     async def run(
@@ -729,7 +1435,14 @@ class SubprocessRunner:
                 now = time.monotonic()
                 if size_probe is None and now - last_probe_at >= _PROBE_INTERVAL:
                     last_probe_at = now
-                    size_probe = _probe_in_daemon_thread(_measure_output_sync)
+                    try:
+                        size_probe = _probe_in_daemon_thread(_measure_output_sync)
+                    except ProbeCapacityExceeded:
+                        # No sample this tick. The growth signal degrades to
+                        # "nothing observed", which the stall watchdog already
+                        # handles -- and which is the correct reading anyway
+                        # when that many probes are stuck on this storage.
+                        size_probe = None
                 return probed_size
 
             def _update_output_activity(now: float):
