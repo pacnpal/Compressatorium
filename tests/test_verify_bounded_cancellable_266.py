@@ -16,15 +16,18 @@ a cancellation rather than a verification failure.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from app.models import ConversionMode, JobStatus
+from app.routes import info as info_routes
+from app.services import z3ds_compress as z3ds_module
 from app.services import job_manager as job_manager_module
 from app.services.chdman import ChdmanService
 from app.services.concurrency_manager import ConcurrencyManager
@@ -339,3 +342,129 @@ async def test_a_verify_that_never_returns_is_bounded_by_the_job(
     assert job.status == JobStatus.FAILED
     assert "timed out" in (job.error_message or "").lower()
     assert source_path.exists()
+
+
+# --- review follow-ups ---------------------------------------------------
+#
+# Three gaps found reviewing the change: two spawn-then-await windows where a
+# cancellation (the verify SSE route cancels its task on client disconnect)
+# would strand a running child, and the verify *routes* — a second entry point
+# into the same verifiers, holding the same workload lane — never applying the
+# bound at all.
+
+
+def test_cancelling_during_bound_resolution_strands_no_verifier(tmp_path, monkeypatch):
+    """No await may sit between spawning the verifier and its cleanup block.
+
+    The bound is resolved from a filesystem probe. Resolving it after the spawn
+    left a window where cancellation unwound the coroutine with the child
+    running and tracked but nothing to reap or untrack it, so a client that
+    disconnected repeatedly could pile up full-disc verifiers.
+    """
+    asyncio.run(_cancel_during_bound_resolution(tmp_path, monkeypatch))
+
+
+async def _cancel_during_bound_resolution(tmp_path: Path, monkeypatch):
+    service = ChdmanService()
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "fake_chdman.py", "time.sleep(60)\n",
+    )
+    runner_mod = _runner_module(service)
+    resolving = asyncio.Event()
+
+    async def _slow_bound(_path, _owner=None):
+        resolving.set()
+        await asyncio.sleep(30)
+        return 0
+
+    monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _slow_bound)
+
+    task = asyncio.create_task(service.verify(str(tmp_path / "sample.chd")))
+    await asyncio.wait_for(resolving.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert service.active_pids() == []
+
+
+def test_z3ds_cancelling_during_bound_resolution_strands_no_zstd(tmp_path, monkeypatch):
+    """Same window, same rule, for the tool that feeds zstd on stdin."""
+    asyncio.run(_z3ds_cancel_during_bound_resolution(tmp_path, monkeypatch))
+
+
+async def _z3ds_cancel_during_bound_resolution(tmp_path: Path, monkeypatch):
+    rom = tmp_path / "game.z3ds"
+    rom.write_bytes(b"Z3DS" + b"\0" * 4096)
+    resolving = asyncio.Event()
+
+    async def _slow_bound(_path, _owner=None):
+        resolving.set()
+        await asyncio.sleep(30)
+        return 0
+
+    monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
+    monkeypatch.setattr(z3ds_module, "resolve_verify_timeout", _slow_bound)
+    async def _offset(_path):
+        return 0
+
+    monkeypatch.setattr(z3ds_module.z3ds_compress_service, "_get_verify_payload_offset", _offset)
+
+    service = z3ds_module.z3ds_compress_service
+    before = set(service.active_pids())
+
+    async def _drain():
+        async for _update in service.verify_stream(str(rom)):
+            pass
+
+    task = asyncio.create_task(_drain())
+    await asyncio.wait_for(resolving.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert set(service.active_pids()) == before
+
+
+@pytest.mark.asyncio
+async def test_verify_route_applies_the_bound(tmp_path, monkeypatch):
+    """The routes bound the verify too, not just delete-on-verify jobs.
+
+    ``/jwud-verify`` and friends call the service directly, so without this a
+    wedged pure-Python verifier (nothing for a subprocess timeout to stop) holds
+    the verify workload lane forever and the configured bound does nothing.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    store = Mock()
+    store.mark_verified = AsyncMock()
+    monkeypatch.setattr(info_routes, "verification_store", store)
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    service = Mock()
+
+    async def _hanging_verify(path, *, cancel_event=None):
+        await asyncio.sleep(60)
+        return {"valid": True, "message": "never"}
+
+    service.verify = _hanging_verify
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.2
+
+    # The route module resolves its own registry copy (intra-project imports are
+    # written `from services.x import y`, the tests use `app.services.x`), so
+    # patch the plugin object the route actually holds.
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    result = await asyncio.wait_for(
+        info_routes.verify_jwud(path=str(target)), timeout=20,
+    )
+
+    assert result["valid"] is False
+    assert "timed out" in result["message"].lower()
+    # A verify that never finished proves nothing, so nothing is recorded.
+    store.mark_verified.assert_not_called()

@@ -382,6 +382,15 @@ class Z3DSCompressService:
 
             payload_offset = await self._get_verify_payload_offset(file_path)
 
+            # Size-scaled bound, resolved from the file actually being read, so
+            # this verify ends even if zstd never does (issue #266). Resolved
+            # *before* the spawn: it stats the file, and an await between the
+            # spawn and the try/finally below is a window where a cancellation
+            # (the verify SSE route cancels its task on client disconnect)
+            # unwinds this generator with zstd already running and tracked, but
+            # with nothing to reap or untrack it.
+            overall_timeout = await resolve_verify_timeout(file_path, "z3ds")
+
             # Start zstd -t process reading from stdin
             process = await asyncio.create_subprocess_exec(
                 zstd_path,
@@ -391,9 +400,6 @@ class Z3DSCompressService:
                 stderr=asyncio.subprocess.PIPE,
             )
             self._runner.track_pid(process.pid)
-            # Size-scaled bound, resolved from the file actually being read, so
-            # this verify ends even if zstd never does (issue #266).
-            overall_timeout = await resolve_verify_timeout(file_path, "z3ds")
 
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}

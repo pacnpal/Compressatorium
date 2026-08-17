@@ -1205,6 +1205,22 @@ async def _guard_verify_path(
         raise HTTPException(status_code=400, detail=cfg.bad_ext_detail)
 
 
+def _verify_timed_out(bound: int) -> dict:
+    """The terminal event/result for a route-level verify that outran its bound.
+
+    The verify routes are a second entry point into the same verifiers the job
+    pipeline drives, and they hold the "verify" workload lane while they run —
+    so the bound has to apply here too, not only to delete-on-verify jobs
+    (issue #266). Tools that spawn a subprocess enforce it themselves; this
+    outer bound is what covers a verify with no child process to time out (the
+    Wii U container walk, the PS3 PARAM.SFO readback) and any tool added later.
+    Shaped like a tool's own timeout report, so callers need no new branch: the
+    ``{"valid", "message"}`` the sync route returns, which the SSE paths widen
+    with ``"type": "error"`` exactly as a tool's own terminal event carries it.
+    """
+    return {"valid": False, "message": f"Verification timed out after {bound}s"}
+
+
 def _sse_from_verify_stream(
     tool: ToolPlugin, cfg: _VerifyRouteConfig, path: str,
 ) -> EventSourceResponse:
@@ -1228,6 +1244,10 @@ def _sse_from_verify_stream(
         queue: asyncio.Queue = asyncio.Queue()
         done = asyncio.Event()
         start = time.monotonic()
+        bound = await tool.verify_timeout(path)
+
+        def _expired() -> bool:
+            return bound > 0 and time.monotonic() - start >= bound
 
         async def run_verify():
             try:
@@ -1253,8 +1273,27 @@ def _sse_from_verify_stream(
                     }
                     if done.is_set() and queue.empty():
                         break
+                    if _expired():
+                        yield {
+                            "event": "verify_error",
+                            "data": json.dumps(
+                                {"type": "error", **_verify_timed_out(bound)},
+                            ),
+                        }
+                        break
                     continue
 
+                if _expired():
+                    # Checked on the update path too: a verifier that keeps
+                    # printing progress forever never reaches the heartbeat
+                    # branch above, and is exactly the run this bounds.
+                    yield {
+                        "event": "verify_error",
+                        "data": json.dumps(
+                            {"type": "error", **_verify_timed_out(bound)},
+                        ),
+                    }
+                    break
                 if update.get("type") == "progress":
                     yield {"event": "verify_progress", "data": json.dumps(update)}
                 elif update.get("type") == "complete":
@@ -1339,9 +1378,20 @@ def _sse_batch_from_verify_stream(
                     finally:
                         done.set()
 
+                bound = await tool.verify_timeout(path)
+
+                def _expired(start=start, bound=bound) -> bool:
+                    return bound > 0 and time.monotonic() - start >= bound
+
                 verify_task = asyncio.create_task(run_verify())
                 try:
                     while not done.is_set() or not queue.empty():
+                        if _expired():
+                            # Same bound the job pipeline applies, per file: one
+                            # wedged verify must not hold the batch (and the
+                            # verify lane) open indefinitely.
+                            final_result = _verify_timed_out(bound)
+                            break
                         try:
                             update = await asyncio.wait_for(queue.get(), timeout=2)
                             if update.get("type") == "progress":
@@ -1452,11 +1502,19 @@ def register_verify_routes(router_: APIRouter, tool: ToolPlugin) -> tuple:
     async def _verify(path: str = Query(..., description="Path to file to verify")) -> dict:
         await _guard_verify_path(path, tool, cfg)
         verify_token = await _acquire_verify_lane_or_429()
+        bound = await tool.verify_timeout(path)
         try:
-            result = await cfg.service().verify(path)
+            result = await asyncio.wait_for(
+                cfg.service().verify(path), timeout=bound or None,
+            )
             if result.get("valid"):
                 await verification_store.mark_verified(path)
             return result
+        except asyncio.TimeoutError:
+            # A verdict-shaped answer, not a 500: the file is not known bad, the
+            # check simply did not finish inside its bound. Must precede the
+            # generic handler -- asyncio.TimeoutError is an Exception.
+            return _verify_timed_out(bound)
         except Exception as e:
             raise HTTPException(
                 status_code=500, detail=f"{cfg.verify_error_prefix}: {e!s}",

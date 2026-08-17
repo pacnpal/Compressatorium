@@ -54,6 +54,10 @@
   - Cancel terminates the verifier, and a cancelled verify is reported as a
     **cancelled job, not a failed verification** — it reached no verdict, so the
     source is never deleted on the strength of it.
+  - The bound applies to verification started from the Verify buttons too, not
+    just to delete-on-verify jobs. Those run through the same verifiers and hold
+    the same verification lane, so a wedged one used to keep that lane occupied
+    for good.
 - **A job wedged in verify is now visible in the log.** The stalled-job warning
   used to skip the verify phase outright, to avoid calling a legitimately long
   checksum stalled — which meant a job genuinely stuck *in* verify logged

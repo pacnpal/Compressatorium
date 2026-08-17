@@ -648,6 +648,14 @@ class SubprocessRunner:
         def _preexec():
             apply_nice(self._owner)
 
+        # Resolve the bounds *before* spawning. They stat the file, and an await
+        # between the spawn and the try/finally below is a window where a
+        # cancellation (the verify SSE route cancels its task when the client
+        # disconnects) unwinds this coroutine with the child already running and
+        # tracked, but with nothing to reap or untrack it.
+        overall_timeout = await resolve_verify_timeout(path, self._owner)
+        stall_timeout = verify_stall_timeout(self._owner)
+
         process = await asyncio.create_subprocess_exec(  # nosemgrep
             cmd[0], *cmd[1:],
             stdout=asyncio.subprocess.PIPE,
@@ -659,9 +667,6 @@ class SubprocessRunner:
             self._logger.debug(
                 "Starting %s verify pid=%s path=%s", self._owner, process.pid, path,
             )
-
-        overall_timeout = await resolve_verify_timeout(path, self._owner)
-        stall_timeout = verify_stall_timeout(self._owner)
 
         output_lines: list[str] = []
         buffer = ""

@@ -511,9 +511,22 @@ Three pieces, none of them per-tool:
    PARAM.SFO readback) check it between steps. A cancelled run returns
    `cancelled: True`, which `job_manager` turns into a CANCELLED job — never a
    verification failure, and never a reason to delete a source.
-3. **A backstop at the call site.** `job_manager` wraps the whole `verify()` in
-   `asyncio.wait_for(tool.verify_timeout(path))`, so the guarantee holds even
-   for a tool whose verify spawns nothing for a subprocess timeout to bound.
+3. **A backstop at every call site.** `job_manager` wraps the whole `verify()`
+   in `asyncio.wait_for(tool.verify_timeout(path))`, so the guarantee holds even
+   for a tool whose verify spawns nothing for a subprocess timeout to bound. The
+   generated verify routes (`register_verify_routes`: sync, SSE, batch SSE) are
+   the *other* entry point into the same verifiers, and they hold the `verify`
+   workload lane while they run — so they apply the same per-path bound, once,
+   in the shared factory rather than per tool. A route-level timeout reports the
+   tool's own timeout shape (`{"valid": False, "message": "Verification timed
+   out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
+   the file is not known bad, the check just did not finish.
+
+Two rules follow for any code that spawns a verifier: **resolve the bound
+before the spawn** (it stats the file, and an `await` between the spawn and the
+`try/finally` is a window where a cancelled SSE request unwinds the coroutine
+with the child running, tracked, and nothing left to reap it), and never record
+a verification result from a run that did not reach a verdict.
 
 With verify genuinely bounded, the stalled-job warning no longer *skips* jobs in
 the verify phase (it did, to avoid calling a long checksum stalled — at the cost

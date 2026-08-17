@@ -769,7 +769,11 @@ class NszipTool(BaseTool):
   `cancel_event` and checks it between steps, and still ends within its bound —
   `job_manager` applies `tool.verify_timeout(path)` around the whole call. A run
   cut short by the event yields `{"cancelled": True, "valid": False}` so the job
-  is cancelled rather than recorded as a failed verification.
+  is cancelled rather than recorded as a failed verification. Resolve any bound
+  **before** spawning the child: an `await` between the spawn and the
+  `try/finally` is a window where a cancelled SSE request (the verify routes
+  cancel their task on client disconnect) unwinds your coroutine with the child
+  running and tracked, and nothing left to reap it.
 - Track PIDs so the debug heartbeat can report them.
 
 ### 5.4 Register the plugin: `app/services/tools/__init__.py`
