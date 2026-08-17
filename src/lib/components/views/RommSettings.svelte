@@ -51,7 +51,7 @@
       repin_enabled: repinEnabled,
       repin_on_load: repinOnLoad,
     };
-    if (clearToken) out.token = '__clear__';
+    if (clearToken) out.clear_token = true;
     else if (token.trim()) out.token = token.trim();
     return out;
   }

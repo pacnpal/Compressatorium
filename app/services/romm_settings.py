@@ -39,11 +39,6 @@ logger = get_logger("romm_settings")
 
 SETTINGS_KEY = "romm.settings"
 
-# Sentinel a client sends to clear the stored token. An empty string means
-# "unchanged" instead, so a form that never displays the secret (it can't --
-# the API does not return it) cannot blank it out just by being submitted.
-CLEAR_TOKEN = "__clear__"
-
 # field -> (env var, default, kind). One table, so a new setting is one row and
 # every layer (env fallback, coercion, serialization) picks it up for free.
 _FIELDS: dict[str, tuple[str, Any, str]] = {
@@ -159,13 +154,15 @@ async def save(patch: dict[str, Any]) -> dict[str, Any]:
         if field in patch and patch[field] is not None:
             stored[field] = _coerce(kind, patch[field], default, field)
 
-    if "token" in patch:
-        raw = patch["token"]
-        if raw == CLEAR_TOKEN:
-            stored.pop("token", None)
-        elif isinstance(raw, str) and raw.strip():
-            stored["token"] = raw.strip()
-        # An empty/omitted token means "leave it alone".
+    # Clearing is an explicit flag rather than a reserved token value: a magic
+    # string in a credential field is both worse to use and indistinguishable
+    # from someone's actual token.
+    if patch.get("clear_token"):
+        stored.pop("token", None)
+    elif isinstance(patch.get("token"), str) and patch["token"].strip():
+        stored["token"] = patch["token"].strip()
+    # An empty or omitted token means "leave the stored one alone", so a form
+    # that cannot display the secret does not blank it just by being submitted.
 
     await preferences_store.put(SETTINGS_KEY, stored)
     merged = _merge(stored)

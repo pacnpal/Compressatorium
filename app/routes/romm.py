@@ -618,6 +618,8 @@ class RommSettingsPatch(BaseModel):
 
     url: str | None = None
     token: str | None = None
+    # Explicitly drop the stored token. A blank `token` means "unchanged".
+    clear_token: bool | None = None
     library_root: str | None = None
     auto_convert: bool | None = None
     auto_convert_interval_minutes: int | None = None
@@ -655,7 +657,7 @@ async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
     override = patch.model_dump(exclude_unset=True) if patch else {}
     url = (override.get("url") or romm_settings.effective().get("url") or "").rstrip("/")
     token = override.get("token")
-    if not token or token == romm_settings.CLEAR_TOKEN:
+    if not token:
         token = romm_settings.token()
     library_root = override.get("library_root") or romm_settings.effective().get(
         "library_root",

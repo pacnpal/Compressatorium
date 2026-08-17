@@ -530,7 +530,7 @@ async def test_empty_token_leaves_the_stored_one_alone(settings_db) -> None:
     await settings_db.save({"url": "http://romm:8080", "token": ""})
     assert settings_db.token() == "rmm_" + "c" * 64
 
-    await settings_db.save({"token": settings_db.CLEAR_TOKEN})
+    await settings_db.save({"clear_token": True})
     assert settings_db.token() is None
 
 

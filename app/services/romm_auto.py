@@ -534,8 +534,8 @@ async def run_forever() -> None:
                     "romm_auto: queued %s job(s) across %s platform(s)",
                     summary["queued"], len(summary["platforms"]),
                 )
-        except asyncio.CancelledError:
-            raise
         except Exception:
-            # A sweep failure must never kill the scheduler; the next tick retries.
+            # A sweep failure must never kill the scheduler; the next tick
+            # retries. Shutdown still stops it: CancelledError derives from
+            # BaseException, so it passes straight through this handler.
             logger.warning("romm_auto: sweep failed", exc_info=True)
