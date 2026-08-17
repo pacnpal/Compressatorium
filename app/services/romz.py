@@ -36,8 +36,8 @@ from services.archive_members import read_archive_members
 from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
-    verify_timeout,
 )
 from utils.junk import is_junk_path
 
@@ -530,21 +530,23 @@ class RomzService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Verify an archive by running ``7z t`` (tests every member's CRC).
 
         A clean (exit 0) run proves the archive decompresses intact, the analog
-        of maxcso ``--crc`` / nsz ``-V`` / z3ds ``zstd -t``.
+        of maxcso ``--crc`` / nsz ``-V`` / z3ds ``zstd -t``. The run is the
+        shared :meth:`SubprocessRunner.capture_verify`, which applies the shared
+        nice/ionice policy, the size-scaled verify bound, and ``cancel_event``.
         """
         if not os.path.exists(file_path):
             yield {"type": "error", "valid": False, "message": "File not found"}
@@ -577,33 +579,14 @@ class RomzService:
             yield {"type": "error", "valid": False, "message": f"Cannot read archive: {exc}"}
             return
 
-        yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
-        # run_capture applies the shared nice/ionice policy and honors the
-        # verify timeout (0 disables); a heavy `7z t` is throttled like a convert.
         # `--` keeps an archive name beginning with `-` a positional filename.
-        timeout = verify_timeout(_OWNER)
-        returncode, stdout, _ = await self._runner.run_capture(
+        async for update in self._runner.capture_verify(
             [self.sevenzip_path, "t", "--", file_path],
-            timeout=timeout or None,
-            stderr_to_stdout=True,
-        )
-        output = (stdout or b"").decode("utf-8", errors="replace").strip()
-        if returncode == 0:
-            yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
-            yield {"type": "complete", "valid": True, "message": "File verified successfully"}
-        elif returncode is None:
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Verification timed out after {timeout}s",
-            }
-        else:
-            tail = "\n".join(output.splitlines()[-5:]) if output else "verification failed"
-            yield {
-                "type": "error",
-                "valid": False,
-                "message": f"Integrity check failed: {tail}",
-            }
+            path=file_path,
+            success_message="File verified successfully",
+            cancel_event=cancel_event,
+        ):
+            yield update
 
 
 # Global service instance

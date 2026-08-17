@@ -51,7 +51,12 @@ from pathlib import Path
 from config import settings
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
-from services.subprocess_runner import SubprocessRunner, ioprio_prefix, nice_prefix
+from services.subprocess_runner import (
+    SubprocessRunner,
+    collect_verify,
+    ioprio_prefix,
+    nice_prefix,
+)
 
 # Compress takes the raw dump, decompress takes the compressed container.
 JWUD_COMPRESS_EXTENSIONS = {".wud"}
@@ -589,17 +594,17 @@ class JwudToolService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Validate a .wux container structurally.
 
         Checks the magic and header fields, then walks every sector-index entry
@@ -607,7 +612,21 @@ class JwudToolService:
         That is what catches the two failure modes a 25 GB image really hits — a
         truncated copy and a corrupt index table — and it is the deepest check
         the format allows: WUX carries no content checksums.
+
+        The two heavy steps run in the threadpool and cannot be interrupted
+        mid-read, so ``cancel_event`` is honoured *between* them: a cancel is
+        observed within one index scan rather than at the end of the job.
         """
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        cancelled_event = {
+            "type": "error",
+            "valid": False,
+            "cancelled": True,
+            "message": "Verification cancelled",
+        }
+
         if not os.path.exists(file_path):
             yield {"type": "error", "valid": False, "message": "File not found"}
             return
@@ -625,6 +644,9 @@ class JwudToolService:
             return
 
         try:
+            if _cancelled():
+                yield cancelled_event
+                return
             yield {"type": "progress", "progress": 0, "message": "Reading WUX header..."}
             try:
                 header = await run_in_threadpool(read_wux_header, file_path)
@@ -636,6 +658,9 @@ class JwudToolService:
                 }
                 return
 
+            if _cancelled():
+                yield cancelled_event
+                return
             yield {
                 "type": "progress",
                 "progress": 25,
@@ -645,6 +670,10 @@ class JwudToolService:
                 highest = await run_in_threadpool(_scan_index_table, file_path, header)
             except ValueError as e:
                 yield {"type": "error", "valid": False, "message": f"Corrupt WUX: {e}"}
+                return
+
+            if _cancelled():
+                yield cancelled_event
                 return
 
             required = header["sector_array_offset"] + (highest + 1) * header["sector_size"]

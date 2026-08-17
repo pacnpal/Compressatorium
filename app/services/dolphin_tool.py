@@ -1,18 +1,17 @@
 import asyncio
-import logging
 from logging_setup import get_logger
 import re
 import shutil
-import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from config import settings
 from services.subprocess_runner import (
     SubprocessRunner,
+    collect_verify,
     info_timeout,
     ioprio_prefix,
-    verify_timeout,
+    resolve_verify_timeout,
 )
 
 DOLPHIN_CONVERTIBLE_EXTENSIONS = {".iso", ".gcz", ".wia", ".rvz", ".wbfs"}
@@ -171,7 +170,9 @@ class DolphinToolService:
         cmd = [
             self.dolphin_tool_path, "verify", "-i", path, "--algorithm", "sha1",
         ]
-        timeout = verify_timeout(self._runner.owner)
+        # Same size-scaled bound as verify(): this *is* a verify run, just one
+        # whose output we read for a hash instead of a verdict.
+        timeout = await resolve_verify_timeout(path, self._runner.owner)
         returncode, stdout, _ = await self._runner.run_capture(
             cmd, timeout=timeout or None, cancel_event=cancel_event,
         )
@@ -187,154 +188,33 @@ class DolphinToolService:
         text = stdout.decode("utf-8", "replace")
         return [m.lower() for m in re.findall(r"\b[0-9a-fA-F]{40}\b", text)]
 
-    async def verify(self, path: str) -> dict:
+    async def verify(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Verify the integrity of a disc image."""
-        final = {"valid": False, "message": "Disc verification failed"}
-        async for update in self.verify_stream(path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Disc verification failed",
-        }
-
-    async def verify_stream(self, path: str) -> AsyncGenerator[dict, None]:
-        """Stream disc image verification progress."""
-        cmd = self._wrap_with_stdbuf(
-            [
-                self.dolphin_tool_path,
-                "verify",
-                "-i",
-                path,
-            ]
+        return await collect_verify(
+            self.verify_stream(path, cancel_event=cancel_event),
+            fallback_message="Disc verification failed",
         )
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+
+    def verify_stream(
+        self, path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream disc image verification progress.
+
+        The loop is the shared :meth:`SubprocessRunner.run_verify`, so this
+        verify is bounded and cancellable on the same terms as every other
+        tool's; dolphin contributes the stdbuf wrap (its progress bar is
+        block-buffered on a pipe) and its progress parser.
+        """
+        return self._runner.run_verify(
+            self._wrap_with_stdbuf([self.dolphin_tool_path, "verify", "-i", path]),
+            path=path,
+            parse_progress=self._parse_progress,
+            success_message="Disc image verified successfully",
+            failure_message="Disc verification failed",
+            cancel_event=cancel_event,
         )
-        self._runner.track_pid(process.pid)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Starting dolphin-tool verify pid=%s path=%s",
-                process.pid, path,
-            )
-
-        output_lines = []
-        buffer = ""
-        last_output_at = time.monotonic()
-        start = last_output_at
-        stall_timeout = max(
-            0, int(getattr(settings, "verify_progress_timeout", 0) or 0),
-        )
-        overall_timeout = verify_timeout(self._runner.owner)
-        timeout_error = None
-
-        async def _check_timeouts(now: float) -> bool:
-            nonlocal timeout_error
-            if overall_timeout > 0 and now - start >= overall_timeout:
-                timeout_error = (
-                    f"Verification timed out after {overall_timeout}s"
-                )
-                await self._terminate_process(process)
-                return True
-            if stall_timeout > 0 and now - last_output_at >= stall_timeout:
-                timeout_error = (
-                    f"Verification stalled: no output for {stall_timeout}s"
-                )
-                await self._terminate_process(process)
-                return True
-            return False
-
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        process.stdout.read(100), timeout=2,
-                    )
-                except asyncio.TimeoutError:
-                    if await _check_timeouts(time.monotonic()):
-                        break
-                    continue
-                if not chunk:
-                    break
-
-                buffer += chunk.decode("utf-8", errors="replace")
-                last_output_at = time.monotonic()
-
-                while "\r" in buffer or "\n" in buffer:
-                    if "\r" in buffer:
-                        parts = buffer.split("\r")
-                        for part in parts[:-1]:
-                            line = part.strip()
-                            if line:
-                                output_lines.append(line)
-                                progress = self._parse_progress(line)
-                                yield {
-                                    "type": "progress",
-                                    "progress": progress,
-                                    "message": line,
-                                }
-                        buffer = parts[-1]
-                    elif "\n" in buffer:
-                        parts = buffer.split("\n")
-                        for part in parts[:-1]:
-                            line = part.strip()
-                            if line:
-                                output_lines.append(line)
-                                progress = self._parse_progress(line)
-                                yield {
-                                    "type": "progress",
-                                    "progress": progress,
-                                    "message": line,
-                                }
-                        buffer = parts[-1]
-                if await _check_timeouts(time.monotonic()):
-                    break
-
-            if buffer.strip():
-                line = buffer.strip()
-                output_lines.append(line)
-                progress = self._parse_progress(line)
-                yield {
-                    "type": "progress",
-                    "progress": progress,
-                    "message": line,
-                }
-
-            await process.wait()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "dolphin-tool verify pid=%s exit=%s",
-                    process.pid, process.returncode,
-                )
-
-            if timeout_error:
-                yield {
-                    "type": "error",
-                    "valid": False,
-                    "message": timeout_error,
-                }
-                return
-
-            output_lines = output_lines[-20:]
-            output = "\n".join(output_lines).strip()
-            if process.returncode == 0:
-                yield {
-                    "type": "complete",
-                    "valid": True,
-                    "message": "Disc image verified successfully",
-                }
-            else:
-                yield {
-                    "type": "error",
-                    "valid": False,
-                    "message": output or "Disc verification failed",
-                }
-        finally:
-            if process.returncode is None:
-                await self._terminate_process(process)
-            self._runner.untrack_pid(process.pid)
 
     @staticmethod
     async def _terminate_process(

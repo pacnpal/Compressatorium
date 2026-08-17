@@ -162,13 +162,15 @@ Volume behavior:
 | `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` | `2` | I/O priority class for all tools (`1` realtime, `2` best-effort, `3` idle). Legacy alias: `CHD_CHDMAN_IOPRIO_CLASS`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_LEVEL` | `6` | I/O priority level for all tools (`0` highest, `7` lowest). Legacy alias: `CHD_CHDMAN_IOPRIO_LEVEL`. |
 | `COMPRESSATORIUM_TOOL_INFO_TIMEOUT` | `60` | Timeout in seconds for `info`/`header` subprocesses (chdman and Dolphin; nsz/3DS read info from the filesystem). 0 disables. Legacy alias: `CHD_INFO_TIMEOUT`. |
-| `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `0` | Timeout in seconds for verify runs across all tools (0 disables). Legacy alias: `CHD_VERIFY_TIMEOUT`. |
-| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | *(shared default)* | Optional per-tool overrides (`<TOOL>` = `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ`, `MAKEPS3ISO`, `NKIT2ISO`, `JWUD`) that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `MAKEPS3ISO`, `NKIT2ISO` and `JWUD` have no `_VERIFY_TIMEOUT`: neither makeps3iso nor nkit2iso has a verify step, and the Wii U verify is a pure-Python container walk with no subprocess. |
+| `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` | `1800` | Baseline timeout in seconds for verify runs across all tools. The effective bound is this plus `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_PER_GIB` per GiB of the file being verified, capped by `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_CAP` — verify reads the whole file, so its runtime scales with size. Set to `0` to disable the bound entirely. Legacy alias: `CHD_VERIFY_TIMEOUT`. |
+| `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_PER_GIB` | `600` | Extra verify allowance in seconds per GiB of the verified file (0 makes the bound flat). |
+| `COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_CAP` | `86400` | Upper bound in seconds on the size-scaled verify timeout (0 uncapped). |
+| `COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT` | `600` | Timeout in seconds without any verify output, for the verifiers that stream progress (chdman, dolphin-tool); catches a wedged verify long before the overall bound. 0 disables. Legacy alias: `CHD_VERIFY_PROGRESS_TIMEOUT`. |
+| `COMPRESSATORIUM_<TOOL>_NICE` / `_IOPRIO_CLASS` / `_IOPRIO_LEVEL` / `_VERIFY_TIMEOUT` | *(shared default)* | Optional per-tool overrides (`<TOOL>` = `CHDMAN`, `DOLPHIN_TOOL`, `NSZ`, `Z3DS`, `MAXCSO`, `ROMZ`, `MAKEPS3ISO`, `NKIT2ISO`, `JWUD`) that fall back to the shared `COMPRESSATORIUM_TOOL_*` values. `NKIT2ISO` has no `_VERIFY_TIMEOUT` (no verify step); `MAKEPS3ISO` and `JWUD` verify without a subprocess, so theirs bounds the verify call itself. |
 | `COMPRESSATORIUM_<TOOL>_INFO_TIMEOUT` | *(shared default)* | Optional per-tool info-timeout override, only for `<TOOL>` = `CHDMAN` or `DOLPHIN_TOOL` (the only tools whose `info` runs a subprocess). |
 | `CHD_ARCHIVE_MAX_ENTRIES` | `5000` | Max archive members to list (0 disables limit) |
 | `CHD_ARCHIVE_MAX_MEMBER_SIZE` | `0` | Max size in bytes per archive member (0 disables limit) |
 | `CHD_ARCHIVE_MAX_TOTAL_SIZE` | `0` | Max total size in bytes for archive listings/extractions (0 disables) |
-| `CHD_VERIFY_PROGRESS_TIMEOUT` | `0` | Timeout in seconds without verify output (0 disables) |
 | `LOGLEVEL` | `INFO` | Log verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `LOG_PATH` | (none) | Path to log file (stdout only if unset) |
 | `CHD_DEBUG_HEARTBEAT` | `30` | Maintenance loop interval (seconds) |

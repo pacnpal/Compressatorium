@@ -3,7 +3,6 @@ import asyncio
 import logging
 from logging_setup import get_logger
 import re
-import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -11,9 +10,9 @@ from config import settings
 from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
+    collect_verify,
     info_timeout,
     ioprio_prefix,
-    verify_timeout,
 )
 
 # Re-exported for backwards compatibility: ``ConversionCancelled`` historically
@@ -132,138 +131,39 @@ class ChdmanService:
 
         return self._parse_info(stdout.decode())
 
-    async def verify(self, chd_path: str) -> dict:
+    async def verify(
+        self, chd_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Verify the integrity of a CHD file.
 
         Returns:
-            dict: {"valid": bool, "message": str}
+            dict: {"valid": bool, "message": str}, plus "cancelled": True when
+            ``cancel_event`` stopped the run before it reached a verdict.
 
         """
-        final = {"valid": False, "message": "CHD verification failed"}
-        async for update in self.verify_stream(chd_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "CHD verification failed",
-        }
-
-    async def verify_stream(self, chd_path: str) -> AsyncGenerator[dict, None]:
-        process = await asyncio.create_subprocess_exec(
-            self.chdman_path,
-            "verify",
-            "-i",
-            chd_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        return await collect_verify(
+            self.verify_stream(chd_path, cancel_event=cancel_event),
+            fallback_message="CHD verification failed",
         )
-        self._runner.track_pid(process.pid)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Starting chdman verify pid=%s path=%s", process.pid, chd_path)
 
-        output_lines = []
-        buffer = ""
-        last_output_at = time.monotonic()
-        start = last_output_at
-        stall_timeout = max(
-            0, int(getattr(settings, "verify_progress_timeout", 0) or 0),
+    def verify_stream(
+        self, chd_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream ``chdman verify`` progress.
+
+        The loop itself is the shared :meth:`SubprocessRunner.run_verify` --
+        bounds, cancellation, line segmentation and the reap ladder are the same
+        for every streaming verifier, so chdman contributes only its command and
+        its progress parser.
+        """
+        return self._runner.run_verify(
+            [self.chdman_path, "verify", "-i", chd_path],
+            path=chd_path,
+            parse_progress=self._parse_progress,
+            success_message="CHD file verified successfully",
+            failure_message="CHD verification failed",
+            cancel_event=cancel_event,
         )
-        overall_timeout = verify_timeout(self._runner.owner)
-        timeout_error = None
-
-        async def _check_timeouts(now: float) -> bool:
-            nonlocal timeout_error
-            if overall_timeout > 0 and now - start >= overall_timeout:
-                timeout_error = f"Verification timed out after {overall_timeout}s"
-                await self._terminate_process(process)
-                return True
-            if stall_timeout > 0 and now - last_output_at >= stall_timeout:
-                timeout_error = (
-                    "Verification stalled: no output for "
-                    f"{stall_timeout}s"
-                )
-                await self._terminate_process(process)
-                return True
-            return False
-
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(process.stdout.read(100), timeout=2)
-                except asyncio.TimeoutError:
-                    if await _check_timeouts(time.monotonic()):
-                        break
-                    continue
-                if not chunk:
-                    break
-
-                buffer += chunk.decode("utf-8", errors="replace")
-                last_output_at = time.monotonic()
-
-                while "\r" in buffer or "\n" in buffer:
-                    if "\r" in buffer:
-                        parts = buffer.split("\r")
-                        for part in parts[:-1]:
-                            line = part.strip()
-                            if line:
-                                output_lines.append(line)
-                                progress = self._parse_progress(line) or 0
-                                yield {
-                                    "type": "progress",
-                                    "progress": progress,
-                                    "message": line,
-                                }
-                        buffer = parts[-1]
-                    elif "\n" in buffer:
-                        parts = buffer.split("\n")
-                        for part in parts[:-1]:
-                            line = part.strip()
-                            if line:
-                                output_lines.append(line)
-                                progress = self._parse_progress(line) or 0
-                                yield {
-                                    "type": "progress",
-                                    "progress": progress,
-                                    "message": line,
-                                }
-                        buffer = parts[-1]
-                if await _check_timeouts(time.monotonic()):
-                    break
-
-            if buffer.strip():
-                line = buffer.strip()
-                output_lines.append(line)
-                progress = self._parse_progress(line) or 0
-                yield {"type": "progress", "progress": progress, "message": line}
-
-            await process.wait()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "chdman verify pid=%s exit=%s", process.pid, process.returncode,
-                )
-
-            if timeout_error:
-                yield {"type": "error", "valid": False, "message": timeout_error}
-                return
-
-            output_lines = output_lines[-20:]
-            output = "\n".join(output_lines).strip()
-            if process.returncode == 0:
-                yield {
-                    "type": "complete",
-                    "valid": True,
-                    "message": "CHD file verified successfully",
-                }
-            else:
-                yield {
-                    "type": "error",
-                    "valid": False,
-                    "message": output or "CHD verification failed",
-                }
-        finally:
-            if process.returncode is None:
-                await self._terminate_process(process)
-            self._runner.untrack_pid(process.pid)
 
     @staticmethod
     async def _terminate_process(process: asyncio.subprocess.Process) -> None:

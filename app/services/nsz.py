@@ -31,9 +31,9 @@ from pathlib import Path
 from config import settings
 from services.subprocess_runner import (
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
     nice_prefix,
-    verify_timeout,
 )
 from utils.junk import is_junk_entry
 
@@ -416,22 +416,26 @@ class NszService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Verify a compressed Switch file by running ``nsz -V`` on it.
 
         NSZ is an NCZ block container, not a raw zstd stream, so a generic zstd
         test can't validate it. nsz's own verify re-derives and checks the
-        content hashes, which is why this also needs keys.
+        content hashes, which is why this also needs keys. The run is the shared
+        :meth:`SubprocessRunner.capture_verify` (size-scaled bound +
+        ``cancel_event``), given nsz's private keys HOME and its command-wrapper
+        nice/ionice -- forking a Python callable via ``preexec_fn`` in this
+        multithreaded process can deadlock the child before ``exec``.
         """
         if not os.path.exists(file_path):
             yield {"type": "error", "valid": False, "message": "File not found"}
@@ -462,61 +466,25 @@ class NszService:
 
         try:
             with self._keys_home() as env:
-                process = await asyncio.create_subprocess_exec(  # nosemgrep
-                    self.nsz_path, "-V", file_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=env,
+                verify_cmd = (
+                    nice_prefix("nsz")
+                    + ioprio_prefix("nsz")
+                    + [self.nsz_path, "-V", file_path]
                 )
-                self._runner.track_pid(process.pid)
-                overall_timeout = verify_timeout("nsz")
-                try:
-                    yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
-                    try:
-                        if overall_timeout > 0:
-                            stdout, _ = await asyncio.wait_for(
-                                process.communicate(), timeout=overall_timeout,
-                            )
-                        else:
-                            stdout, _ = await process.communicate()
-                    except asyncio.TimeoutError:
-                        # Process is killed in the finally block below.
-                        yield {
-                            "type": "error",
-                            "valid": False,
-                            "message": f"Verification timed out after {overall_timeout}s",
-                        }
-                        return
-                    output = (stdout or b"").decode("utf-8", errors="replace").strip()
-                    if process.returncode == 0:
-                        yield {
-                            "type": "progress",
-                            "progress": 100,
-                            "message": "Integrity check passed",
-                        }
-                        yield {
-                            "type": "complete",
-                            "valid": True,
-                            "message": "File verified successfully",
-                        }
-                    else:
-                        tail = (
-                            "\n".join(output.splitlines()[-5:])
-                            if output else "verification failed"
-                        )
-                        yield {
-                            "type": "error",
-                            "valid": False,
-                            "message": f"Integrity check failed: {tail}",
-                        }
-                finally:
-                    if process.returncode is None:
-                        with contextlib.suppress(ProcessLookupError):
-                            process.kill()
-                        with contextlib.suppress(Exception):
-                            await process.wait()
-                    self._runner.untrack_pid(process.pid)
+                async for update in self._runner.capture_verify(
+                    verify_cmd,
+                    path=file_path,
+                    success_message="File verified successfully",
+                    cancel_event=cancel_event,
+                    nice_via_wrapper=True,
+                    env=env,
+                ):
+                    yield update
         except Exception as e:
+            # NOTE (#268): this catch-all turns any runner-raised failure into a
+            # per-file "verification error". Once abandonment is its own signal,
+            # re-raise that one — a child that outlived SIGKILL is still reading
+            # this storage, so a batch has to stop rather than open the next file.
             logger.exception("Error during Switch verification: %s", e)
             yield {"type": "error", "valid": False, "message": f"Verification error: {e}"}
 

@@ -40,7 +40,10 @@ import time
 from collections.abc import AsyncGenerator, Callable, Mapping
 
 from config import settings
-from services.timeout_policy import compute_progress_stall_timeout
+from services.timeout_policy import (
+    compute_progress_stall_timeout,
+    compute_size_scaled_timeout,
+)
 
 
 class ConversionCancelled(Exception):
@@ -215,8 +218,72 @@ def info_timeout(owner: str | None = None) -> int:
 
 
 def verify_timeout(owner: str | None = None) -> int:
-    """Effective ``verify`` subprocess timeout in seconds (0 disables)."""
+    """Baseline ``verify`` timeout in seconds (0 disables).
+
+    The *baseline* only. Callers that know which file is being verified should
+    use :func:`resolve_verify_timeout`, which adds the per-GiB allowance that
+    makes one bound workable across a 400 MB CIA and a 90 GB PS3 ISO.
+    """
     return max(0, int(_resolve_policy("verify_timeout", owner) or 0))
+
+
+def verify_stall_timeout(owner: str | None = None) -> int:
+    """Effective no-output stall bound for a streaming verify (0 disables)."""
+    return max(0, int(_resolve_policy("verify_progress_timeout", owner) or 0))
+
+
+def _verify_timeout_sync(path: str, owner: str | None = None) -> int:
+    return compute_size_scaled_timeout(
+        path=path,
+        base_timeout=verify_timeout(owner),
+        timeout_per_gib=_resolve_policy("verify_timeout_per_gib", owner),
+        timeout_cap=_resolve_policy("verify_timeout_cap", owner),
+    )
+
+
+async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
+    """Effective wall-clock bound for verifying ``path`` (0 disables).
+
+    The single source of truth for "how long may a verify run": the configured
+    baseline plus a per-GiB allowance for the file actually being read, capped
+    (see :func:`services.timeout_policy.compute_size_scaled_timeout`). Every
+    tool's verify resolves its own bound through this, and ``job_manager``
+    resolves the same value to bound the whole ``verify()`` call as a backstop
+    for tools whose verify never spawns a subprocess.
+
+    Sizing ``path`` stats it, which on a dead mount blocks in uninterruptible
+    I/O -- exactly the failure this bound exists to survive -- so the stat is
+    taken through :func:`_bounded_probe` and a probe that does not answer falls
+    back to the flat baseline. A bound that cannot be sized still applies.
+    """
+    try:
+        return await _bounded_probe(_verify_timeout_sync, path, owner)
+    except asyncio.TimeoutError:
+        return verify_timeout(owner)
+
+
+async def collect_verify(
+    stream: AsyncGenerator[dict, None], *, fallback_message: str,
+) -> dict:
+    """Reduce a ``verify_stream`` to the one-shot ``verify()`` result.
+
+    Every tool's ``verify()`` is this same drain-and-keep-the-terminal-event
+    wrapper, so it is written once here rather than eight times. The result is
+    ``{"valid", "message"}`` plus ``"cancelled": True`` when the stream ended
+    because the operator cancelled -- a distinction callers must keep, since a
+    cancelled verify proved nothing and must not be recorded as a failure.
+    """
+    final: dict = {"valid": False, "message": fallback_message}
+    async for update in stream:
+        if update.get("type") in ("complete", "error"):
+            final = update
+    result = {
+        "valid": bool(final.get("valid", False)),
+        "message": final.get("message") or fallback_message,
+    }
+    if final.get("cancelled"):
+        result["cancelled"] = True
+    return result
 
 
 def _split_stream_lines(buffer: str) -> tuple[list[str], str]:
@@ -391,6 +458,8 @@ class SubprocessRunner:
         timeout: float | None = None,
         cancel_event: asyncio.Event | None = None,
         stderr_to_stdout: bool = False,
+        nice_via_wrapper: bool = False,
+        env: Mapping[str, str] | None = None,
     ) -> tuple[int | None, bytes, bytes]:
         """Run ``cmd`` to completion and capture ``(returncode, stdout, stderr)``.
 
@@ -405,16 +474,27 @@ class SubprocessRunner:
         returncode is reported as ``None`` to signal the abort. ``stderr`` is
         folded into ``stdout`` when ``stderr_to_stdout`` is set (and the
         returned ``stderr`` is then empty).
+
+        ``nice_via_wrapper`` and ``env`` mirror :meth:`run`: the first skips the
+        ``preexec_fn`` renice for a caller that has already prefixed ``cmd`` with
+        ``nice``/``ionice`` wrappers (maxcso/nsz avoid ``preexec_fn`` -- forking a
+        Python callable in this multithreaded process can deadlock the child
+        before ``exec``), the second forwards a private environment (nsz runs
+        with its own keys home).
         """
         # Honour the shared process-priority policy, same as the streaming
         # run(): renice via preexec and wrap with ionice. A captured command
         # (e.g. dolphin-tool verify reconstructing a full disc for DAT hashing)
         # is just as heavy as a conversion, so it must respect TOOL_NICE /
-        # TOOL_IOPRIO_* instead of running at normal priority.
-        cmd = ioprio_prefix(self._owner) + cmd
+        # TOOL_IOPRIO_* instead of running at normal priority. A caller using
+        # command wrappers has already applied both.
+        if not nice_via_wrapper:
+            cmd = ioprio_prefix(self._owner) + cmd
 
         def _preexec():
             apply_nice(self._owner)
+
+        use_preexec = os.name == "posix" and not nice_via_wrapper
 
         process = await asyncio.create_subprocess_exec(  # nosemgrep
             cmd[0], *cmd[1:],
@@ -424,7 +504,8 @@ class SubprocessRunner:
                 if stderr_to_stdout
                 else asyncio.subprocess.PIPE
             ),
-            preexec_fn=_preexec if os.name == "posix" else None,
+            preexec_fn=_preexec if use_preexec else None,
+            env=env,
         )
         self.track_pid(process.pid)
         comm = asyncio.ensure_future(process.communicate())
@@ -462,6 +543,217 @@ class SubprocessRunner:
             # cancellation out of run_capture.
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm
+            self.untrack_pid(process.pid)
+
+    # --- verify ----------------------------------------------------------
+    #
+    # Two shared shapes cover every tool's verify subprocess, so the bound and
+    # the cancel handling are written once instead of per tool (issue #266):
+    # :meth:`run_verify` for a verifier that streams progress (chdman,
+    # dolphin-tool) and :meth:`capture_verify` for one that says nothing until
+    # it exits (maxcso ``--crc``, nsz ``-V``, ``7z t``). Both emit the same
+    # ``{"type": "progress"|"complete"|"error"}`` events the verify SSE routes
+    # and ``ToolPlugin.verify()`` already consume, and both honour the same
+    # ``cancel_event`` so pressing Cancel actually stops the verifier.
+
+    @staticmethod
+    def _verify_error(message: str, *, cancelled: bool = False) -> dict:
+        event = {"type": "error", "valid": False, "message": message}
+        if cancelled:
+            # Distinguishes "the operator stopped this" from "this file is
+            # bad": job_manager turns the flag into a CANCELLED job rather than
+            # a failed one, and no caller may record a verification result from
+            # a run that never finished.
+            event["cancelled"] = True
+        return event
+
+    async def capture_verify(
+        self,
+        cmd: list[str],
+        *,
+        path: str,
+        success_message: str,
+        cancel_event: asyncio.Event | None = None,
+        nice_via_wrapper: bool = False,
+        env: Mapping[str, str] | None = None,
+        start_message: str = "Verifying integrity...",
+    ) -> AsyncGenerator[dict, None]:
+        """Run a one-shot verifier, yielding this tool's verify events.
+
+        For a verifier that prints nothing useful until it exits: the whole run
+        is one :meth:`run_capture` bounded by :func:`resolve_verify_timeout` for
+        ``path`` and racing ``cancel_event``, wrapped in the 0%/100% progress
+        events the SSE routes expect. ``run_capture`` reports both an abort and
+        a timeout as a ``None`` return code, so the two are told apart here by
+        asking the cancel event which one happened.
+        """
+        yield {"type": "progress", "progress": 0, "message": start_message}
+        timeout = await resolve_verify_timeout(path, self._owner)
+        returncode, stdout, _ = await self.run_capture(
+            cmd,
+            timeout=timeout or None,
+            cancel_event=cancel_event,
+            stderr_to_stdout=True,
+            nice_via_wrapper=nice_via_wrapper,
+            env=env,
+        )
+        if returncode == 0:
+            yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
+            yield {"type": "complete", "valid": True, "message": success_message}
+            return
+        if returncode is None:
+            if cancel_event is not None and cancel_event.is_set():
+                yield self._verify_error("Verification cancelled", cancelled=True)
+            else:
+                yield self._verify_error(f"Verification timed out after {timeout}s")
+            return
+        output = (stdout or b"").decode("utf-8", errors="replace").strip()
+        tail = "\n".join(output.splitlines()[-5:]) if output else "verification failed"
+        yield self._verify_error(f"Integrity check failed: {tail}")
+
+    async def run_verify(
+        self,
+        cmd: list[str],
+        *,
+        path: str,
+        parse_progress: Callable[[str], int | None],
+        success_message: str,
+        failure_message: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Stream a verifier's output, yielding this tool's verify events.
+
+        The streaming counterpart to :meth:`capture_verify`, and the shared
+        replacement for the two near-identical read loops chdman and
+        dolphin-tool each carried. Every bound the conversion path already has
+        applies here too (issue #266):
+
+        * an **overall** bound from :func:`resolve_verify_timeout` for ``path``
+          (baseline + per-GiB allowance), so a verify that never returns ends;
+        * a **stall** bound (``COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT``)
+          on a verifier that streams but goes silent, which catches a wedge long
+          before the overall bound would;
+        * ``cancel_event``, so Cancel terminates the verifier instead of leaving
+          the UI on *Cancelling...* until the read loop happens to end;
+        * the bounded :meth:`reap` ladder rather than a bare ``process.wait()``,
+          which on a child stuck in uninterruptible I/O never returns and
+          freezes the queue behind it (the issue #263 failure, on this path).
+
+        ``parse_progress`` is the only per-tool knob; line segmentation is the
+        shared :func:`_split_stream_lines`, so a percentage redraw split across
+        read chunks still parses.
+        """
+        cmd = ioprio_prefix(self._owner) + cmd
+
+        def _preexec():
+            apply_nice(self._owner)
+
+        process = await asyncio.create_subprocess_exec(  # nosemgrep
+            cmd[0], *cmd[1:],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            preexec_fn=_preexec if os.name == "posix" else None,
+        )
+        self.track_pid(process.pid)
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "Starting %s verify pid=%s path=%s", self._owner, process.pid, path,
+            )
+
+        overall_timeout = await resolve_verify_timeout(path, self._owner)
+        stall_timeout = verify_stall_timeout(self._owner)
+
+        output_lines: list[str] = []
+        buffer = ""
+        start = time.monotonic()
+        last_output_at = start
+        terminal: dict | None = None
+
+        async def _stop() -> None:
+            # TERM -> KILL with grace, then give up rather than waiting forever:
+            # the point of every bound here is that this coroutine ends.
+            await self.reap(process, exit_timeout=0)
+
+        async def _check_limits(now: float) -> bool:
+            nonlocal terminal
+            if cancel_event is not None and cancel_event.is_set():
+                terminal = self._verify_error("Verification cancelled", cancelled=True)
+            elif overall_timeout > 0 and now - start >= overall_timeout:
+                terminal = self._verify_error(
+                    f"Verification timed out after {overall_timeout}s",
+                )
+            elif stall_timeout > 0 and now - last_output_at >= stall_timeout:
+                terminal = self._verify_error(
+                    f"Verification stalled: no output for {stall_timeout}s",
+                )
+            else:
+                return False
+            await _stop()
+            return True
+
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(process.stdout.read(100), timeout=2)
+                except asyncio.TimeoutError:
+                    if await _check_limits(time.monotonic()):
+                        break
+                    continue
+                if not chunk:
+                    break
+
+                buffer += chunk.decode("utf-8", errors="replace")
+                last_output_at = time.monotonic()
+                lines, buffer = _split_stream_lines(buffer)
+                for line in lines:
+                    output_lines.append(line)
+                    yield {
+                        "type": "progress",
+                        "progress": parse_progress(line),
+                        "message": line,
+                    }
+                if await _check_limits(time.monotonic()):
+                    break
+
+            if terminal is None:
+                if buffer.strip():
+                    line = buffer.strip()
+                    output_lines.append(line)
+                    yield {
+                        "type": "progress",
+                        "progress": parse_progress(line),
+                        "message": line,
+                    }
+                if not await self.reap(process):
+                    # An abandoned child is reported as a terminal error event
+                    # here, matching run()'s message. Issue #268 argues an
+                    # abandonment should *raise* instead, so a batch stops
+                    # walking rather than opening the next file against the same
+                    # storage; when that lands this is the single line to swap
+                    # for the raising variant of reap.
+                    terminal = self._verify_error(
+                        f"Verification did not exit and could not be killed "
+                        f"(pid {process.pid}); it is likely blocked on "
+                        "unresponsive storage.",
+                    )
+
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "%s verify pid=%s exit=%s",
+                    self._owner, process.pid, process.returncode,
+                )
+
+            if terminal is not None:
+                yield terminal
+                return
+
+            if process.returncode == 0:
+                yield {"type": "complete", "valid": True, "message": success_message}
+            else:
+                output = "\n".join(output_lines[-20:]).strip()
+                yield self._verify_error(output or failure_message)
+        finally:
+            await self.reap(process, exit_timeout=0)
             self.untrack_pid(process.pid)
 
     async def run(

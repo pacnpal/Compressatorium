@@ -33,6 +33,31 @@
   exactly the case above — was the one state it could not see, and the only
   record of it was logged at debug level where nobody would find it. It is now a
   warning at the default log level.
+- **Verification can no longer run forever, and Cancel now stops it.** The
+  previous round bounded every wait in the *conversion* path; verification had
+  the same two gaps. There was no verify timeout at all out of the box, so a
+  verify that never returned never ended — and since jobs run serially by
+  default, it froze every job behind it, reachable through the commonly used
+  **Delete sources after verification**. Cancel didn't help: the verify stage
+  never received the cancellation, so the UI sat on *Cancelling...* while the
+  verifier kept reading. Verification is now bounded by default and genuinely
+  cancellable, for every tool:
+  - The bound scales with the file, because verify reads all of it: 30 minutes
+    plus 10 minutes per GiB, capped at 24 hours
+    (`COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT` / `…_PER_GIB` / `…_CAP`; set the
+    first to `0` for the old unbounded behaviour). That is deliberately loose —
+    roughly a 1.7 MB/s floor — so a slow verify on tired storage still finishes;
+    the point is that a wedged one ends. Tools that stream progress (chdman,
+    Dolphin) also get a 10-minute no-output stall bound
+    (`COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT`), which catches a hang much
+    sooner.
+  - Cancel terminates the verifier, and a cancelled verify is reported as a
+    **cancelled job, not a failed verification** — it reached no verdict, so the
+    source is never deleted on the strength of it.
+- **A job wedged in verify is now visible in the log.** The stalled-job warning
+  used to skip the verify phase outright, to avoid calling a legitimately long
+  checksum stalled — which meant a job genuinely stuck *in* verify logged
+  nothing. It now gets its own line, timed from when verification started.
 
 The counting half of the fix 4.4.1 started. 4.4.1 stopped a deep queue from
 *deleting* your job history; this one stops the retention cap from *lying* about

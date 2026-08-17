@@ -113,10 +113,13 @@ class JobManager:
         # it runs (a cancel notification or history prune silently dropped).
         self._background_tasks: Set[asyncio.Task] = set()
         self._delete_plans: Dict[str, Dict[str, object]] = {}
-        # Jobs currently inside the verify phase. Verification emits no progress
-        # and can legitimately run for many minutes, so the stalled-job warning
-        # skips them rather than reporting healthy work as wedged.
-        self._verifying: set[str] = set()
+        # Jobs currently inside the verify phase, mapped to the monotonic clock
+        # reading when that phase began. Verification emits no progress and can
+        # legitimately run for many minutes, so the stalled-job warning reports
+        # it against its own elapsed time and in its own words rather than
+        # calling healthy work stalled (or, as before issue #266, saying nothing
+        # at all about a job genuinely wedged in verify).
+        self._verifying: dict[str, float] = {}
         self._last_progress_at: Dict[str, float] = {}
         self._last_progress_log_at: Dict[str, float] = {}
         self._last_stall_log_at: Dict[str, float] = {}
@@ -1504,9 +1507,15 @@ class JobManager:
         this the sole trace of a frozen queue was a debug line nobody would find
         (issue #263).
 
-        Jobs in the verify phase are exempt. Verification emits no progress and
-        legitimately runs for many minutes on a large image, so warning on it
-        would report healthy work as stalled.
+        Jobs in the verify phase are reported *as verifying*, not as stalled.
+        They used to be skipped outright, because verification emits no progress
+        and legitimately runs for many minutes on a large image -- but that also
+        meant a job genuinely wedged **in** verify logged nothing at all, which
+        is exactly the state issue #266 is about. Verify is now bounded and
+        cancellable, so the honest report is what phase the job is in and how
+        long it has been there; an operator reading the log can tell a long
+        checksum from a hang by whether the line keeps repeating past what the
+        file's size can justify.
 
         Deliberately touches no filesystem. Running at the default log level
         means running for every processing job on every heartbeat, and the mount
@@ -1520,10 +1529,16 @@ class JobManager:
             return
         now = time.monotonic()
         for job in list(self.jobs.values()):
-            if job.status != JobStatus.PROCESSING or job.id in self._verifying:
+            if job.status != JobStatus.PROCESSING:
                 continue
-            last_progress = self._last_progress_at.get(job.id, now)
-            idle_for = now - last_progress
+            verifying_since = self._verifying.get(job.id)
+            # In verify, the phase's own clock is the meaningful one: the
+            # progress clock stopped at the end of the conversion, so it would
+            # report the verify as having been idle since before it started.
+            idle_for = now - (
+                verifying_since if verifying_since is not None
+                else self._last_progress_at.get(job.id, now)
+            )
             if idle_for < settings.debug_progress_timeout:
                 continue
             # None, not 0, for "never logged": monotonic() counts from boot, so
@@ -1533,6 +1548,17 @@ class JobManager:
             if last_stall is not None and now - last_stall < settings.debug_progress_timeout:
                 continue
             self._last_stall_log_at[job.id] = now
+            if verifying_since is not None:
+                logger.warning(
+                    "Verifying job %s has been in the verify phase for %.1fs "
+                    "(bounded; cancellable) input=%s output=%s started_at=%s",
+                    job.id,
+                    idle_for,
+                    job.file_path,
+                    job.output_path,
+                    job.started_at,
+                )
+                continue
             logger.warning(
                 "Stalled job %s idle=%.1fs progress=%s message=%s input=%s output=%s "
                 "started_at=%s",
@@ -2344,13 +2370,33 @@ class JobManager:
                         },
                     )
 
-                    self._verifying.add(job_id)
+                    tool = registry.for_mode(job.mode.value)
+                    # Bound the whole verify, not just whatever subprocess it
+                    # happens to spawn: a tool whose verify is pure Python (the
+                    # Wii U container walk, the PS3 PARAM.SFO readback) has no
+                    # subprocess timeout to hide behind, and with
+                    # MAX_CONCURRENT_JOBS=1 a verify that never returns freezes
+                    # every job queued behind it (issue #266). The tool resolves
+                    # the number so its own per-tool override applies.
+                    verify_bound = await tool.verify_timeout(job.output_path)
+                    self._verifying[job_id] = time.monotonic()
                     try:
-                        verify_result = await registry.for_mode(job.mode.value).verify(
-                            job.output_path
+                        verify_result = await asyncio.wait_for(
+                            tool.verify(job.output_path, cancel_event=cancel_event),
+                            timeout=verify_bound or None,
                         )
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"Verification timed out after {verify_bound}s"
+                        ) from None
                     finally:
-                        self._verifying.discard(job_id)
+                        self._verifying.pop(job_id, None)
+                    if verify_result.get("cancelled"):
+                        # The verifier stopped because Cancel was pressed, so it
+                        # reached no verdict. Reporting that as a failed
+                        # verification would be wrong twice over: it is not a bad
+                        # file, and the source must not be deleted on it.
+                        raise ConversionCancelled("Conversion cancelled")
                     if not verify_result.get("valid"):
                         raise RuntimeError(
                             f"Verification failed: {verify_result.get('message')}"

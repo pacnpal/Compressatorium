@@ -33,9 +33,9 @@ from logging_setup import get_logger
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
     nice_prefix,
-    verify_timeout,
 )
 
 # SubprocessRunner "owner" for the shared priority/timeout policy. An optional
@@ -286,22 +286,24 @@ class MaxcsoService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, file_path: str) -> dict:
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Verify a compressed CSO/ZSO/DAX by running ``maxcso --crc`` on it.
 
         ``--crc`` reads and decompresses the whole container, logging its CRC32
         and ignoring output, so a clean (exit 0) run proves the file decompresses
-        intact end to end.
+        intact end to end. The run itself is the shared
+        :meth:`SubprocessRunner.capture_verify`, which applies the size-scaled
+        verify bound and honours ``cancel_event``.
         """
         if not os.path.exists(file_path):
             yield {"type": "error", "valid": False, "message": "File not found"}
@@ -322,72 +324,27 @@ class MaxcsoService:
         # Throttle verify the same way conversions are: `maxcso --crc` fully
         # decompresses the container and is just as disk/CPU-heavy as a convert,
         # so it must honor the same nice/ionice policy (incl. the optional
-        # COMPRESSATORIUM_MAXCSO_* overrides) via command wrappers.
+        # COMPRESSATORIUM_MAXCSO_* overrides) via command wrappers -- maxcso
+        # avoids preexec_fn, hence nice_via_wrapper below.
         verify_cmd = (
             nice_prefix(_OWNER)
             + ioprio_prefix(_OWNER)
             + [self.maxcso_path, "--crc", file_path]
         )
         try:
-            process = await asyncio.create_subprocess_exec(  # nosemgrep
-                *verify_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            self._runner.track_pid(process.pid)
-            try:
-                yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
-                # Bound a hung/very-slow --crc by the shared verify timeout
-                # (COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT, or the MAXCSO override).
-                overall_timeout = verify_timeout(_OWNER)
-                try:
-                    if overall_timeout > 0:
-                        stdout, _ = await asyncio.wait_for(
-                            process.communicate(), timeout=overall_timeout,
-                        )
-                    else:
-                        stdout, _ = await process.communicate()
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
-                    yield {
-                        "type": "error",
-                        "valid": False,
-                        "message": f"Verification timed out after {overall_timeout}s",
-                    }
-                    return
-                output = (stdout or b"").decode("utf-8", errors="replace").strip()
-                if process.returncode == 0:
-                    yield {
-                        "type": "progress",
-                        "progress": 100,
-                        "message": "Integrity check passed",
-                    }
-                    yield {
-                        "type": "complete",
-                        "valid": True,
-                        "message": "File verified successfully",
-                    }
-                else:
-                    tail = (
-                        "\n".join(output.splitlines()[-5:])
-                        if output else "verification failed"
-                    )
-                    yield {
-                        "type": "error",
-                        "valid": False,
-                        "message": f"Integrity check failed: {tail}",
-                    }
-            finally:
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
-                self._runner.untrack_pid(process.pid)
+            async for update in self._runner.capture_verify(
+                verify_cmd,
+                path=file_path,
+                success_message="File verified successfully",
+                cancel_event=cancel_event,
+                nice_via_wrapper=True,
+            ):
+                yield update
         except Exception as e:
+            # NOTE (#268): this catch-all turns any runner-raised failure into a
+            # per-file "verification error". Once abandonment is its own signal,
+            # re-raise that one — a child that outlived SIGKILL is still reading
+            # this storage, so a batch has to stop rather than open the next file.
             logger.exception("Error during CSO verification: %s", e)
             yield {"type": "error", "valid": False, "message": f"Verification error: {e}"}
 

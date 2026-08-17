@@ -304,13 +304,25 @@ class MakePs3IsoService:
 
     # ----- verify -----------------------------------------------------------
 
-    async def verify(self, iso_path: str) -> dict:
+    async def verify(
+        self, iso_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Confirm a built ``.iso`` carries a readable PS3 PARAM.SFO TITLE_ID.
 
         makeps3iso has no native verify; this is the light readback. It is not
         wired to delete-on-verify (deleting a curated source folder is
         destructive), so it only runs when explicitly requested.
+
+        ``cancel_event`` is checked before the readback rather than during it:
+        the read is a single PARAM.SFO lookup in a threadpool, seconds at worst,
+        with nothing to interrupt in between.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("makeps3iso verify (TITLE_ID readback) for %s", iso_path)
         title_id = await asyncio.to_thread(ps3.ps3_iso_title_id, iso_path)

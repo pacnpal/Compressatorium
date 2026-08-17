@@ -14,8 +14,9 @@ from fastapi.concurrency import run_in_threadpool
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
+    collect_verify,
     ioprio_prefix,
-    verify_timeout,
+    resolve_verify_timeout,
 )
 
 # Compress inputs (raw 3DS ROMs). The upstream fork
@@ -315,7 +316,9 @@ class Z3DSCompressService:
         return str(input_p.parent / filename)
 
 
-    async def verify(self, file_path: str) -> dict:
+    async def verify(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         """Verify the integrity of a compressed 3DS file.
 
         Performs deep verification by streaming the compressed Z3DS/ZCCI/ZCIA file
@@ -324,16 +327,14 @@ class Z3DSCompressService:
         Returns:
             dict: {"valid": bool, "message": str}
         """
-        final = {"valid": False, "message": "Verification failed"}
-        async for update in self.verify_stream(file_path):
-            if update.get("type") in ("complete", "error"):
-                final = update
-        return {
-            "valid": bool(final.get("valid", False)),
-            "message": final.get("message") or "Verification failed",
-        }
+        return await collect_verify(
+            self.verify_stream(file_path, cancel_event=cancel_event),
+            fallback_message="Verification failed",
+        )
 
-    async def verify_stream(self, file_path: str) -> AsyncGenerator[dict, None]:
+    async def verify_stream(
+        self, file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Stream verification progress for a compressed 3DS file.
 
         Performs deep integrity verification by piping the file through `zstd -t`
@@ -390,7 +391,9 @@ class Z3DSCompressService:
                 stderr=asyncio.subprocess.PIPE,
             )
             self._runner.track_pid(process.pid)
-            overall_timeout = verify_timeout("z3ds")
+            # Size-scaled bound, resolved from the file actually being read, so
+            # this verify ends even if zstd never does (issue #266).
+            overall_timeout = await resolve_verify_timeout(file_path, "z3ds")
 
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
@@ -412,6 +415,11 @@ class Z3DSCompressService:
                             await f.seek(payload_offset)
 
                             while True:
+                                if cancel_event is not None and cancel_event.is_set():
+                                    # Stop feeding immediately; the waiter below
+                                    # reports the cancel and the finally reaps
+                                    # zstd. One chunk of latency at most.
+                                    break
                                 chunk = await f.read(chunk_size)
                                 if not chunk:
                                     break
@@ -435,21 +443,49 @@ class Z3DSCompressService:
                     # Wait for process to finish
                     return await process.communicate()
 
+                # This tool feeds the child on stdin, so it cannot use the shared
+                # capture_verify; it races the same three outcomes by hand.
+                feed = asyncio.ensure_future(_stream_and_wait())
+                cancel_wait = (
+                    asyncio.ensure_future(cancel_event.wait())
+                    if cancel_event is not None
+                    else None
+                )
                 try:
-                    if overall_timeout > 0:
-                        _stdout, stderr = await asyncio.wait_for(
-                            _stream_and_wait(), timeout=overall_timeout,
-                        )
+                    done, _pending = await asyncio.wait(
+                        [feed] + ([cancel_wait] if cancel_wait is not None else []),
+                        timeout=overall_timeout or None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if cancel_wait is not None and not cancel_wait.done():
+                        cancel_wait.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await cancel_wait
+
+                if feed not in done:
+                    # Cancelled or timed out: stop zstd, drain the feeder, and
+                    # report which one it was. The finally below reaps.
+                    await self._runner.reap(process, exit_timeout=0)
+                    feed.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await feed
+                    if cancel_event is not None and cancel_event.is_set():
+                        yield {
+                            "type": "error",
+                            "valid": False,
+                            "cancelled": True,
+                            "message": "Verification cancelled",
+                        }
                     else:
-                        _stdout, stderr = await _stream_and_wait()
-                except asyncio.TimeoutError:
-                    # Process is killed in the finally block below.
-                    yield {
-                        "type": "error",
-                        "valid": False,
-                        "message": f"Verification timed out after {overall_timeout}s",
-                    }
+                        yield {
+                            "type": "error",
+                            "valid": False,
+                            "message": f"Verification timed out after {overall_timeout}s",
+                        }
                     return
+
+                _stdout, stderr = feed.result()
 
                 if process.returncode == 0:
                     yield {"type": "progress", "progress": 100, "message": "Integrity check passed"}
@@ -466,11 +502,10 @@ class Z3DSCompressService:
                         "message": f"Integrity check failed: {stderr_text}"
                     }
             finally:
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
+                # Bounded TERM -> KILL ladder rather than kill()+wait(): a child
+                # blocked in uninterruptible I/O never answers either, and an
+                # unbounded wait here would hold the queue's only slot forever.
+                await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
 
         except Exception as e:

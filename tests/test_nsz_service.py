@@ -7,6 +7,7 @@ disk is enough for the ``_keys_home`` symlink path to work.
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -303,6 +304,9 @@ class _HangingProcess:
         await asyncio.sleep(10)
         return b"", b""
 
+    def terminate(self) -> None:
+        self.returncode = -15
+
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
@@ -324,14 +328,21 @@ async def test_verify_times_out_when_process_hangs(tmp_path, monkeypatch, keys_p
         return proc
 
     monkeypatch.setattr(nsz_module.asyncio, "create_subprocess_exec", fake_exec)
-    # Bound the verify subprocess at a tiny timeout so the hang trips it fast.
-    monkeypatch.setattr(nsz_module, "verify_timeout", lambda _owner=None: 0.05)
+
+    # The verify bound is now resolved inside the shared runner, so patch it
+    # there (the runner module the service's SubprocessRunner came from).
+    async def _tiny_bound(_path, _owner=None):
+        return 0.05
+
+    runner_module = sys.modules[type(nsz_module.nsz_service._runner).__module__]
+    monkeypatch.setattr(runner_module, "resolve_verify_timeout", _tiny_bound)
 
     result = await nsz_module.nsz_service.verify(str(nsz_path))
     assert result["valid"] is False
     assert "timed out" in result["message"].lower()
-    # The runner must reap the hung child rather than leak it.
-    assert proc.killed is True
+    # The runner must reap the hung child rather than leak it. It answers
+    # SIGTERM, so the ladder stops there rather than escalating to SIGKILL.
+    assert proc.returncode is not None
     assert proc.pid not in set(nsz_module.nsz_service.active_pids())
 
 

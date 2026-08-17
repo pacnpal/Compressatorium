@@ -249,11 +249,43 @@ class Settings(BaseSettings):
             "COMPRESSATORIUM_TOOL_INFO_TIMEOUT", "CHD_INFO_TIMEOUT",
         ),
     )
+    # Verify is bounded the same adaptive way a conversion is: a *baseline* plus
+    # an allowance per GiB of the file being read, capped. A flat bound cannot
+    # serve both a 400 MB CIA and a 90 GB PS3 ISO -- one is generous, the other
+    # kills healthy work -- because verify reads the whole file, so its runtime
+    # scales with size. Defaults are deliberately loose (30 min + 10 min/GiB,
+    # i.e. a ~1.7 MB/s floor, capped at 24h): the point is that a verify wedged
+    # on dead storage *ends*, not that a slow one is policed. Set
+    # COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_PER_GIB=0 for a flat bound, or
+    # COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT=0 to disable the bound entirely
+    # (issue #266 -- it used to default to 0, so a verify that never returned
+    # never ended, freezing the whole queue behind it).
     tool_verify_timeout: int = Field(
-        default=0,
+        default=1800,
         alias="COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT",
         validation_alias=AliasChoices(
             "COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT", "CHD_VERIFY_TIMEOUT",
+        ),
+    )
+    tool_verify_timeout_per_gib: int = Field(
+        default=600,
+        alias="COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_PER_GIB",
+    )
+    tool_verify_timeout_cap: int = Field(
+        default=86400,
+        alias="COMPRESSATORIUM_TOOL_VERIFY_TIMEOUT_CAP",
+    )
+    # Stall bound for verifiers that stream progress (chdman, dolphin-tool):
+    # no output at all for this long means wedged, and it catches a hang far
+    # sooner than the size-scaled overall bound above. Mirrors the conversion
+    # path's CHD_PROGRESS_TIMEOUT default. Named `tool_*` so per-tool overrides
+    # resolve through the same policy as every other knob here.
+    tool_verify_progress_timeout: int = Field(
+        default=600,
+        alias="COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT",
+        validation_alias=AliasChoices(
+            "COMPRESSATORIUM_TOOL_VERIFY_PROGRESS_TIMEOUT",
+            "CHD_VERIFY_PROGRESS_TIMEOUT",
         ),
     )
 
@@ -334,8 +366,10 @@ class Settings(BaseSettings):
         default=None, alias="COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT",
     )
     # makeps3iso (PS3 folder -> ISO): one packing subprocess. Its verify is a
-    # pure-Python PARAM.SFO readback (no child process), so only the shared
-    # nice/ioprio policy applies; expose the per-tool overrides for parity.
+    # pure-Python PARAM.SFO readback with no child process, so the verify
+    # timeout bounds the *call* (the job pipeline applies it) rather than a
+    # subprocess -- which is exactly why it is exposed: a readback that never
+    # returns has nothing else to stop it.
     makeps3iso_nice: int | None = Field(
         default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_NICE",
     )
@@ -344,6 +378,9 @@ class Settings(BaseSettings):
     )
     makeps3iso_ioprio_level: int | None = Field(
         default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_IOPRIO_LEVEL",
+    )
+    makeps3iso_verify_timeout: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_VERIFY_TIMEOUT",
     )
     # romz (7z ROM packer): like nsz/z3ds/maxcso, info() is a filesystem read so
     # only a verify-timeout override is exposed, no info-timeout.
@@ -361,7 +398,7 @@ class Settings(BaseSettings):
     )
     # jwud (JWUDTool, Wii U .wud <-> .wux): one conversion subprocess. Like
     # makeps3iso its verify is pure Python (a WUX header/index-table walk, no
-    # child process), so only the shared nice/ioprio policy applies.
+    # child process), so its verify timeout likewise bounds the call itself.
     jwud_nice: int | None = Field(
         default=None, alias="COMPRESSATORIUM_JWUD_NICE",
     )
@@ -370,6 +407,9 @@ class Settings(BaseSettings):
     )
     jwud_ioprio_level: int | None = Field(
         default=None, alias="COMPRESSATORIUM_JWUD_IOPRIO_LEVEL",
+    )
+    jwud_verify_timeout: int | None = Field(
+        default=None, alias="COMPRESSATORIUM_JWUD_VERIFY_TIMEOUT",
     )
     # nkit2iso (NKit -> ISO): one restore subprocess, and no info/verify child
     # process of its own (integrity is the header CRC32 checked inline during the
@@ -382,10 +422,6 @@ class Settings(BaseSettings):
     )
     nkit2iso_ioprio_level: int | None = Field(
         default=None, alias="COMPRESSATORIUM_NKIT2ISO_IOPRIO_LEVEL",
-    )
-    verify_progress_timeout: int = Field(
-        default=0,
-        alias="CHD_VERIFY_PROGRESS_TIMEOUT",
     )
 
     # Logging
