@@ -1,0 +1,35 @@
+docs/RELEASE_NOTES.md
+  s_6c976e0a175de9::t_8a27bfa728041d 26-32
+app/services/tools/chdman.py
+  s_6c976e0a175de9::t_1b03f007736a3b 20,229-234
+docs/DESIGN_tool_plugin_architecture.md
+  s_6c976e0a175de9::t_8a27bfa728041d 655-687
+app/services/disc_id.py
+  s_6c976e0a175de9::t_1b03f007736a3b 52-53,68-78,1191-1204,1267-1278
+tests/test_abandoned_match_scan_268.py
+  s_6c976e0a175de9::t_df2e1f82b969d9 522-525,532,536,542
+  s_6c976e0a175de9::t_7c638d67d08152 449
+  s_6c976e0a175de9::t_678374af7d2de4 477,549
+  s_6c976e0a175de9::t_dd859804d14973 428-448,450-476,478-509,511-521,526-531,533-535,537-538,545
+  s_6c976e0a175de9::t_16c6b9ba430a64 510,539-541,543-544,546-548,550-552
+app/services/subprocess_runner.py
+  s_6c976e0a175de9::t_1b03f007736a3b 105-140
+app/services/dolphin_tool.py
+  s_6c976e0a175de9::t_1b03f007736a3b 11,182-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "3c84042c7907f772e8f0352ca9e10448300541bc",
+  "prompts": {},
+  "sessions": {
+    "s_6c976e0a175de9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24d5a97d-772a-4b32-b5c3-50d0c48bb4e0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "pacnpal <183241239+pacnpal@users.noreply.github.com>"
+    }
+  }
+}
