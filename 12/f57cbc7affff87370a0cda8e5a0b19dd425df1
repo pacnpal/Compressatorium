@@ -1,0 +1,25 @@
+app/routes/info.py
+  s_6c976e0a175de9::t_703b7f210614c7 748-749,753-757,759-765,768-771,799-801
+app/services/subprocess_runner.py
+  s_6c976e0a175de9::t_703b7f210614c7 1083-1094
+tests/test_abandoned_match_scan_268.py
+  s_6c976e0a175de9::t_9c8171d5de5f6b 621-627,631-656,659-665
+  s_6c976e0a175de9::t_703b7f210614c7 657-658
+  s_6c976e0a175de9::t_0096edb3b0f423 620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "12f57cbc7affff87370a0cda8e5a0b19dd425df1",
+  "prompts": {},
+  "sessions": {
+    "s_6c976e0a175de9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24d5a97d-772a-4b32-b5c3-50d0c48bb4e0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "pacnpal <183241239+pacnpal@users.noreply.github.com>"
+    }
+  }
+}
