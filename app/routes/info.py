@@ -1290,18 +1290,21 @@ def _sse_from_verify_stream(
                         break
                     continue
 
-                if _expired():
-                    # Checked on the update path too: a verifier that keeps
-                    # printing progress forever never reaches the heartbeat
-                    # branch above, and is exactly the run this bounds.
-                    yield {
-                        "event": "verify_error",
-                        "data": json.dumps(
-                            {"type": "error", **_verify_timed_out(bound)},
-                        ),
-                    }
-                    break
                 if update.get("type") == "progress":
+                    # The expiry check lives on the *progress* branch, after a
+                    # terminal update has had its chance: a verifier that keeps
+                    # printing progress forever never reaches the heartbeat
+                    # branch above and is exactly the run this bounds, but a
+                    # verdict that lands in the same instant the bound expires is
+                    # a real answer and must not be thrown away as a timeout.
+                    if _expired():
+                        yield {
+                            "event": "verify_error",
+                            "data": json.dumps(
+                                {"type": "error", **_verify_timed_out(bound)},
+                            ),
+                        }
+                        break
                     yield {"event": "verify_progress", "data": json.dumps(update)}
                 elif update.get("type") == "complete":
                     if update.get("valid"):
@@ -1394,10 +1397,12 @@ def _sse_batch_from_verify_stream(
                 verify_task = asyncio.create_task(run_verify())
                 try:
                     while not done.is_set() or not queue.empty():
-                        if _expired():
+                        if _expired() and queue.empty():
                             # Same bound the job pipeline applies, per file: one
                             # wedged verify must not hold the batch (and the
-                            # verify lane) open indefinitely.
+                            # verify lane) open indefinitely. Only when nothing
+                            # is already queued, so a verdict that landed in the
+                            # same instant is reported instead of discarded.
                             final_result = _verify_timed_out(bound)
                             break
                         try:

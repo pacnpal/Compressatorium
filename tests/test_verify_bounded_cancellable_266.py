@@ -405,7 +405,7 @@ async def _z3ds_cancel_during_bound_resolution(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
     monkeypatch.setattr(z3ds_module, "resolve_verify_timeout", _slow_bound)
-    async def _offset(_path):
+    async def _offset(_path, *, cancel_event=None):
         return 0
 
     monkeypatch.setattr(z3ds_module.z3ds_compress_service, "_get_verify_payload_offset", _offset)
@@ -541,13 +541,21 @@ async def test_verify_preflight_is_bounded_and_shared(tmp_path, monkeypatch):
     assert "extension" in wrong["message"]
 
     # A stat that never answers gives up instead of blocking the loop forever.
-    def _never_returns(_path):
+    # Narrow to this one path: `runner_mod.os` is the process-wide os module,
+    # so an unconditional fake would sleep out every other getsize in the
+    # interpreter (pytest plugins, logging, tasks left by earlier tests).
+    real_getsize = runner_mod.os.path.getsize
+
+    def _never_returns_for_target(path):
         import time as _time
 
+        if str(path) != str(target):
+            return real_getsize(path)
         _time.sleep(30)
+        return 0
 
     monkeypatch.setattr(runner_mod, "_STAT_TIMEOUT", 0.2)
-    monkeypatch.setattr(runner_mod.os.path, "getsize", _never_returns)
+    monkeypatch.setattr(runner_mod.os.path, "getsize", _never_returns_for_target)
     wedged, _ = await asyncio.wait_for(
         runner_mod.verify_preflight(str(target), {".wux"}), timeout=10,
     )
@@ -613,7 +621,7 @@ async def _z3ds_disconnect_leaves_no_orphan_feeder(tmp_path: Path, monkeypatch):
     async def _fake_exec(*_args, **_kwargs):
         return child
 
-    async def _offset(_path):
+    async def _offset(_path, *, cancel_event=None):
         return 0
 
     monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
@@ -628,6 +636,7 @@ async def _z3ds_disconnect_leaves_no_orphan_feeder(tmp_path: Path, monkeypatch):
         async for _update in service.verify_stream(str(rom)):
             pass
 
+    before = {t for t in asyncio.all_tasks()}
     task = asyncio.create_task(_drain())
     for _ in range(100):
         if child.pid in set(service.active_pids()):
@@ -635,16 +644,17 @@ async def _z3ds_disconnect_leaves_no_orphan_feeder(tmp_path: Path, monkeypatch):
         await asyncio.sleep(0.05)
     assert child.pid in set(service.active_pids()), "verify did not start in time"
 
+    # The feeder must be observably alive *before* the cancel, so this can never
+    # pass vacuously because the helper was renamed or inlined.
+    helpers = {t for t in asyncio.all_tasks() if t not in before and t is not task}
+    assert helpers, "the stdin feeder task was never started"
+
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
     await asyncio.sleep(0)
 
-    feeders = [
-        t for t in asyncio.all_tasks()
-        if "_stream_and_wait" in str(t.get_coro()) and not t.done()
-    ]
-    assert feeders == []
+    assert [t for t in helpers if not t.done()] == []
     assert child.pid not in set(service.active_pids())
 
 
@@ -704,3 +714,121 @@ def test_verify_paths_never_use_the_shared_threadpool():
         assert "run_in_threadpool" not in source, tool
         assert "to_thread" not in source, tool
         assert "run_detached" in source, tool
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_landing_at_the_bound_is_not_reported_as_a_timeout(
+    tmp_path, monkeypatch,
+):
+    """The deadline must not discard an answer that already arrived.
+
+    The expiry check ran before the dequeued update was classified, so a
+    `complete` landing in the same instant the bound expired was thrown away:
+    the route reported a timeout and skipped `mark_verified` for a file that had
+    just verified successfully.
+    """
+    monkeypatch.setattr(info_routes.settings, "chd_volumes", str(tmp_path))
+    monkeypatch.setattr(info_routes.settings, "data_mount_root", str(tmp_path))
+    store = Mock()
+    store.mark_verified = AsyncMock()
+    monkeypatch.setattr(info_routes, "verification_store", store)
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 1024)
+
+    service = Mock()
+
+    async def _verify_stream(path, *, cancel_event=None):
+        # Outlive the bound, then answer: the verdict is real and must win.
+        await asyncio.sleep(0.3)
+        yield {"type": "complete", "valid": True, "message": "verified"}
+
+    service.verify_stream = _verify_stream
+    monkeypatch.setattr(info_routes, "jwudtool_service", service)
+
+    async def _tiny_bound(_path):
+        return 0.1
+
+    monkeypatch.setattr(info_routes.registry.get("jwud"), "verify_timeout", _tiny_bound)
+
+    response = await info_routes.verify_jwud_events(path=str(target))
+    events = [e async for e in response.body_iterator if isinstance(e, dict)]
+
+    assert events[-1]["event"] == "verify_complete"
+    store.mark_verified.assert_called_once_with(str(target))
+
+
+def test_cancel_reaches_a_detached_verify_read(tmp_path, monkeypatch):
+    """Cancel must not wait out a blocking read that has already started.
+
+    jwud's index scan is the case: minutes of reading on a 25 GB image with no
+    interruption point. The read itself cannot be stopped, but the await on it
+    can, and that is what frees the job (and the single-slot dispatcher).
+    """
+    asyncio.run(_cancel_reaches_detached_read(tmp_path, monkeypatch))
+
+
+async def _cancel_reaches_detached_read(tmp_path: Path, monkeypatch):
+    import threading
+
+    from app.services import jwudtool as jwud_module
+
+    target = tmp_path / "game.wux"
+    target.write_bytes(b"WUX0" + b"\0" * 4096)
+
+    reading = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def _endless_header(_path):
+        loop.call_soon_threadsafe(reading.set)
+        release.wait(30)
+        return {}
+
+    monkeypatch.setattr(jwud_module, "read_wux_header", _endless_header)
+
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(
+        jwud_module.jwudtool_service.verify(str(target), cancel_event=cancel_event),
+    )
+    await asyncio.wait_for(reading.wait(), timeout=5)
+
+    cancel_event.set()
+    result = await asyncio.wait_for(task, timeout=5)
+
+    assert result["cancelled"] is True
+    assert result["valid"] is False
+    release.set()
+
+
+def test_an_unkillable_verifier_is_not_reaped_twice(tmp_path, monkeypatch):
+    """One exhausted TERM->KILL ladder is enough.
+
+    A child that survived SIGKILL will survive it again, so repeating the ladder
+    in teardown just holds the verify lane — and the single-slot queue behind it
+    — for another 15 seconds with no possible new outcome.
+    """
+    asyncio.run(_unkillable_verifier_reaped_once(tmp_path, monkeypatch))
+
+
+async def _unkillable_verifier_reaped_once(tmp_path: Path, monkeypatch):
+    from app.services.chdman import ChdmanService
+
+    service = ChdmanService()
+    service.chdman_path = _fake_tool_binary(tmp_path / "quick.py", "pass\n")
+    runner = service._runner
+    calls: list[float] = []
+
+    async def _never_reaped(_self, _process, *, exit_timeout=None):
+        calls.append(exit_timeout if exit_timeout is not None else -1)
+        return False
+
+    monkeypatch.setattr(type(runner), "reap", _never_reaped)
+
+    result = await asyncio.wait_for(
+        service.verify(str(tmp_path / "sample.chd")), timeout=20,
+    )
+
+    assert result["valid"] is False
+    assert "could not be killed" in result["message"]
+    assert len(calls) == 1, f"the ladder ran {len(calls)}x on an abandoned child"

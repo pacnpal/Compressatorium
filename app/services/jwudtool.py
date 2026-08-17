@@ -55,6 +55,7 @@ from services.subprocess_runner import (
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    ReadCancelled,
     run_detached,
     verify_preflight,
 )
@@ -614,9 +615,13 @@ class JwudToolService:
         truncated copy and a corrupt index table — and it is the deepest check
         the format allows: WUX carries no content checksums.
 
-        The two heavy steps run in the threadpool and cannot be interrupted
-        mid-read, so ``cancel_event`` is honoured *between* them: a cancel is
-        observed within one index scan rather than at the end of the job.
+        The two heavy steps are blocking reads on a throwaway daemon thread
+        (never a shared pool worker, which a wedged read would occupy for the
+        life of the process). A read
+        cannot be interrupted, but the *wait* on it can, so ``cancel_event`` is
+        raced against each one (and checked between them): pressing Cancel
+        returns here at once and abandons the read, instead of leaving the job
+        on "Cancelling..." until the index scan of a 25 GB image finishes.
         """
         def _cancelled() -> bool:
             return cancel_event is not None and cancel_event.is_set()
@@ -644,7 +649,9 @@ class JwudToolService:
                 return
             yield {"type": "progress", "progress": 0, "message": "Reading WUX header..."}
             try:
-                header = await run_detached(read_wux_header, file_path)
+                header = await run_detached(
+                    read_wux_header, file_path, cancel_event=cancel_event,
+                )
             except ValueError as e:
                 yield {
                     "type": "error",
@@ -662,7 +669,9 @@ class JwudToolService:
                 "message": f"Checking {header['entry_count']} sector index entries...",
             }
             try:
-                highest = await run_detached(_scan_index_table, file_path, header)
+                highest = await run_detached(
+                    _scan_index_table, file_path, header, cancel_event=cancel_event,
+                )
             except ValueError as e:
                 yield {"type": "error", "valid": False, "message": f"Corrupt WUX: {e}"}
                 return
@@ -693,6 +702,10 @@ class JwudToolService:
                     f"entries over {highest + 1} stored sectors"
                 ),
             }
+        except ReadCancelled:
+            # The operator cancelled mid-read: no verdict was reached, so this is
+            # a cancellation, not a verification failure.
+            yield cancelled_event
         except Exception as e:
             logger.exception("Error during Wii U verification: %s", e)
             yield {"type": "error", "valid": False, "message": f"Verification error: {e}"}

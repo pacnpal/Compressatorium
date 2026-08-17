@@ -262,7 +262,21 @@ async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
         return verify_timeout(owner)
 
 
-async def run_detached(func: Callable, *args: object, **kwargs: object) -> object:
+class ReadCancelled(Exception):
+    """A detached read was abandoned because its ``cancel_event`` fired.
+
+    Distinct from :class:`ConversionCancelled` (which belongs to the conversion
+    pipeline) so a verify can translate it into its own terminal
+    ``{"cancelled": True}`` event rather than letting it read as a failure.
+    """
+
+
+async def run_detached(
+    func: Callable,
+    *args: object,
+    cancel_event: asyncio.Event | None = None,
+    **kwargs: object,
+) -> object:
     """Run a blocking call off the event loop **without** a shared pool worker.
 
     The un-pooled counterpart of ``run_in_threadpool`` / ``asyncio.to_thread``
@@ -278,8 +292,34 @@ async def run_detached(func: Callable, *args: object, **kwargs: object) -> objec
 
     Unbounded by design: the caller supplies the bound (a route deadline, the
     job's ``verify_timeout``), because the right limit depends on the file.
+
+    ``cancel_event`` is raced against the read and raises :class:`ReadCancelled`
+    the moment it fires. The read itself cannot be stopped — it is abandoned, on
+    its own disposable thread — but the *awaiter* returns immediately, which is
+    the part that matters: without it, pressing Cancel during a long index scan
+    or archive listing left the job (and the single-slot dispatcher behind it)
+    on "Cancelling..." until the outer bound expired, possibly hours later.
     """
-    return await _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
+    future = _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
+    if cancel_event is None:
+        return await future
+    waiter = asyncio.ensure_future(cancel_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            [future, waiter], return_when=asyncio.FIRST_COMPLETED,
+        )
+        if future in done:
+            return future.result()
+        raise ReadCancelled("Read cancelled")
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+        if not future.done():
+            # Abandons the thread, not the syscall: nothing can stop the latter,
+            # and the thread dies with the process.
+            future.cancel()
 
 
 async def verify_preflight(
@@ -736,11 +776,18 @@ class SubprocessRunner:
         start = time.monotonic()
         last_output_at = start
         terminal: dict | None = None
+        # Set once the ladder has run and given up, so teardown does not repeat
+        # TERM/KILL on a child known to be unkillable -- that second pass is
+        # another 15s holding the verify lane (and, at MAX_CONCURRENT_JOBS=1,
+        # the queue) for no possible gain. Same guard run() carries.
+        reap_failed = False
 
         async def _stop() -> None:
             # TERM -> KILL with grace, then give up rather than waiting forever:
             # the point of every bound here is that this coroutine ends.
-            await self.reap(process, exit_timeout=0)
+            nonlocal reap_failed
+            if not await self.reap(process, exit_timeout=0):
+                reap_failed = True
 
         async def _check_limits(now: float) -> bool:
             nonlocal terminal
@@ -793,6 +840,7 @@ class SubprocessRunner:
                         "message": line,
                     }
                 if not await self.reap(process):
+                    reap_failed = True
                     # An abandoned child is reported as a terminal error event
                     # here, matching run()'s message. Issue #268 argues an
                     # abandonment should *raise* instead, so a batch stops
@@ -821,7 +869,10 @@ class SubprocessRunner:
                 output = "\n".join(output_lines[-20:]).strip()
                 yield self._verify_error(output or failure_message)
         finally:
-            await self.reap(process, exit_timeout=0)
+            # Skipped when the ladder already exhausted itself: repeating it on a
+            # child that survived SIGKILL only burns another 15s.
+            if not reap_failed:
+                await self.reap(process, exit_timeout=0)
             self.untrack_pid(process.pid)
 
     async def run(

@@ -41,6 +41,7 @@ from logging_setup import get_logger
 from services import ps3
 from services.subprocess_runner import (
     ConversionCancelled,
+    ReadCancelled,
     SubprocessRunner,
     ioprio_prefix,
     run_detached,
@@ -314,9 +315,10 @@ class MakePs3IsoService:
         wired to delete-on-verify (deleting a curated source folder is
         destructive), so it only runs when explicitly requested.
 
-        ``cancel_event`` is checked before the readback rather than during it:
-        the read is a single PARAM.SFO lookup in a threadpool, seconds at worst,
-        with nothing to interrupt in between.
+        ``cancel_event`` is both checked before the readback and raced against
+        it: the read is a single PARAM.SFO lookup on a throwaway daemon thread
+        (never a shared pool worker), seconds at worst on a healthy volume, but
+        on a dead one it is exactly the wait a cancel has to escape.
         """
         if cancel_event is not None and cancel_event.is_set():
             return {
@@ -329,7 +331,16 @@ class MakePs3IsoService:
         # Detached, not pooled: an ISO on a dead mount can only be abandoned,
         # and a shared worker abandoned per cancelled verify would starve the
         # pool every other offload in the process depends on.
-        title_id = await run_detached(ps3.ps3_iso_title_id, iso_path)
+        try:
+            title_id = await run_detached(
+                ps3.ps3_iso_title_id, iso_path, cancel_event=cancel_event,
+            )
+        except ReadCancelled:
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         if title_id:
             return {"valid": True, "message": f"PS3 ISO TITLE_ID {title_id}"}
         return {

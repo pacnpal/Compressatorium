@@ -52,8 +52,13 @@
     sooner. The two are independent knobs: setting the first to `0` switches off
     the overall bound but leaves the stall bound running, so zero both for the
     old fully unbounded behaviour.
-  - Cancel terminates the verifier, and a cancelled verify is reported as a
-    **cancelled job, not a failed verification** — it reached no verdict, so the
+  - Cancel now reaches the verify stage, and the job stops waiting on it at
+    once instead of sitting on *Cancelling...*. A verifier that runs as a
+    subprocess is terminated and reaped; a pure-Python one (the Wii U container
+    walk, the PS3 title readback) stops at its next checkpoint, and a blocking
+    read already in flight is abandoned rather than killed — the operating
+    system offers no way to interrupt one. Either way the job is reported as a
+    **cancelled job, not a failed verification**: it reached no verdict, so the
     source is never deleted on the strength of it.
   - The bound applies to verification started from the Verify buttons too, not
     just to delete-on-verify jobs. Those run through the same verifiers and hold

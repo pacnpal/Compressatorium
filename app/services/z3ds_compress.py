@@ -15,6 +15,7 @@ from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
+    ReadCancelled,
     resolve_verify_timeout,
     run_detached,
     verify_preflight,
@@ -92,7 +93,9 @@ class Z3DSCompressService:
         return self._runner.active_pids()
 
     @staticmethod
-    async def _get_verify_payload_offset(file_path: str) -> int:
+    async def _get_verify_payload_offset(
+        file_path: str, *, cancel_event: asyncio.Event | None = None,
+    ) -> int:
         """Return the byte offset where the seekable zstd payload begins.
 
         Read on a detached thread rather than a pooled one: on an unresponsive
@@ -130,7 +133,7 @@ class Z3DSCompressService:
                 raise ValueError("Invalid Z3DS file: payload offset is out of range")
             return payload_offset
 
-        return await run_detached(_read_offset)
+        return await run_detached(_read_offset, cancel_event=cancel_event)
 
     def get_output_path(self, input_path: str, output_dir: str | None = None) -> str:
         """Calculate output path for a 3DS file.
@@ -369,7 +372,9 @@ class Z3DSCompressService:
                 }
                 return
 
-            payload_offset = await self._get_verify_payload_offset(file_path)
+            payload_offset = await self._get_verify_payload_offset(
+                file_path, cancel_event=cancel_event,
+            )
 
             # Size-scaled bound, resolved from the file actually being read, so
             # this verify ends even if zstd never does (issue #266). Resolved
@@ -390,6 +395,10 @@ class Z3DSCompressService:
             )
             self._runner.track_pid(process.pid)
 
+            # Set once the TERM -> KILL ladder has run and given up; repeating
+            # it on a child that survived SIGKILL only burns another 15s of the
+            # verify lane for no possible new outcome.
+            reap_failed = False
             try:
                 yield {"type": "progress", "progress": 0, "message": "Verifying integrity..."}
 
@@ -469,8 +478,11 @@ class Z3DSCompressService:
 
                 if feed not in done:
                     # Cancelled or timed out: stop zstd, drain the feeder, and
-                    # report which one it was. The finally below reaps.
-                    await self._runner.reap(process, exit_timeout=0)
+                    # report which one it was. Remember whether the ladder gave
+                    # up, so the finally below doesn't spend another TERM/KILL
+                    # cycle on a child already known to be unkillable.
+                    if not await self._runner.reap(process, exit_timeout=0):
+                        reap_failed = True
                     feed.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await feed
@@ -509,9 +521,20 @@ class Z3DSCompressService:
                 # Bounded TERM -> KILL ladder rather than kill()+wait(): a child
                 # blocked in uninterruptible I/O never answers either, and an
                 # unbounded wait here would hold the queue's only slot forever.
-                await self._runner.reap(process, exit_timeout=0)
+                # Skipped when that ladder already exhausted itself above.
+                if not reap_failed:
+                    await self._runner.reap(process, exit_timeout=0)
                 self._runner.untrack_pid(process.pid)
 
+        except ReadCancelled:
+            # Cancelled while reading the header: no verdict, so report the
+            # cancellation rather than a verification error.
+            yield {
+                "type": "error",
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         except Exception as e:
             logger.exception("Error during 3DS verification: %s", e)
             yield {

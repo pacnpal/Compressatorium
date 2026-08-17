@@ -279,7 +279,12 @@ class BaseTool:
 
     def __init__(self, binary_path: str):
         self.binary_path = binary_path
-        self._runner = SubprocessRunner(owner=self.id)
+        # `policy_owner or id`, never bare `id`: the owner keys the shared
+        # nice/ioprio/timeout policy's per-tool overrides, and it differs from
+        # the plugin id wherever the service kept its historical name
+        # (dolphin/dolphin_tool, cso/maxcso). In the tree today each *service*
+        # constructs its own runner with that owner as a literal.
+        self._runner = SubprocessRunner(owner=self.policy_owner or self.id)
 
     # derived sets (no per-tool duplication)
     @property
@@ -528,8 +533,11 @@ Three pieces, none of them per-tool:
 Three rules follow for any code that runs a verifier:
 
 - **Never offload a verify's blocking read to a shared pool.** Use
-  `run_detached`; cancellation abandons the thread either way, and a pooled one
-  is capacity the whole process shares.
+  `run_detached`, and pass it the `cancel_event`: cancellation abandons the
+  thread either way, a pooled one is capacity the whole process shares, and
+  without the event a Cancel pressed mid-read is not observed until the read
+  finishes. Translate its `ReadCancelled` into the tool's own
+  `{"cancelled": True}` terminal event.
 - **Resolve the bound before the spawn.** It stats the file, and an `await`
   between the spawn and the `try/finally` is a window where a cancelled SSE
   request unwinds the coroutine with the child running, tracked, and nothing
@@ -1184,9 +1192,16 @@ def register_verify_routes(router, tool: ToolPlugin):
         _guard(path, tool.verify_extensions)
         token = await _acquire_verify_lane_or_429()
         try:
-            r = await tool.verify(path)
+            # Inside the try: an await between taking the token and installing
+            # this finally leaks the lane's only slot if the client disconnects.
+            bound = await tool.verify_timeout(path)          # issue #266
+            r = await asyncio.wait_for(tool.verify(path), timeout=bound or None)
+            # `valid` alone, so neither a timeout nor a cancelled run (which
+            # reach no verdict) is ever recorded as a verification.
             if r.get("valid"): await verification_store.mark_verified(path)
             return r
+        except asyncio.TimeoutError:
+            return _verify_timed_out(bound)   # a verdict-shaped answer, not a 500
         finally: token.release()
     @router.get(f"/{base}-verify/events")
     async def _verify_events(path: str = Query(...)):

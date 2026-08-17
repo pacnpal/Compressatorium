@@ -38,6 +38,7 @@ from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
+    ReadCancelled,
     run_detached,
     verify_preflight,
 )
@@ -567,7 +568,17 @@ class RomzService:
         # stopped, only abandoned, and abandoning a *shared* worker per cancelled
         # request would eventually starve every offload in the process.
         try:
-            await run_detached(self._single_rom_member, file_path)
+            await run_detached(
+                self._single_rom_member, file_path, cancel_event=cancel_event,
+            )
+        except ReadCancelled:
+            yield {
+                "type": "error",
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
+            return
         except ValueError as exc:
             yield {"type": "error", "valid": False, "message": str(exc)}
             return
