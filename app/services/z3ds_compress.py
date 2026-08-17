@@ -458,6 +458,15 @@ class Z3DSCompressService:
                                 except BrokenPipeError:
                                     # zstd closed stdin early due to integrity failure.
                                     break
+                        except (asyncio.CancelledError, GeneratorExit):
+                            # The feeder task itself was cancelled (SSE
+                            # disconnect, timeout, the cancel race below). Same
+                            # rule as ReadCancelled: a read may still hold the
+                            # handle's lock, so closing it here would block
+                            # behind that read and turn cleanup into one more
+                            # unbounded wait. Abandon it with its thread.
+                            abandoned = True
+                            raise
                         finally:
                             if not abandoned:
                                 with contextlib.suppress(Exception):

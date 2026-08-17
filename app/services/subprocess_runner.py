@@ -876,7 +876,20 @@ class SubprocessRunner:
                         "progress": parse_progress(line),
                         "message": line,
                     }
-                if not await self.reap(process):
+                # The voluntary-exit grace is capped by what is actually left:
+                # a verifier that closed stdout without exiting must not hold
+                # the lane for the full default grace past its own deadline,
+                # and a cancel that has already fired means don't wait at all.
+                if cancel_event is not None and cancel_event.is_set():
+                    exit_grace = 0.0
+                elif overall_timeout > 0:
+                    exit_grace = max(
+                        0.0,
+                        min(_EXIT_GRACE, overall_timeout - (time.monotonic() - start)),
+                    )
+                else:
+                    exit_grace = _EXIT_GRACE
+                if not await self.reap(process, exit_timeout=exit_grace):
                     reap_failed = True
                     # An abandoned child is reported as a terminal error event
                     # here, matching run()'s message. Issue #268 argues an

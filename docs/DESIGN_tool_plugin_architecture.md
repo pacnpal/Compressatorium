@@ -440,7 +440,10 @@ class SubprocessRunner:
         has — the size-scaled overall bound from `resolve_verify_timeout(path)`,
         the no-output stall bound, `cancel_event`, and the `reap()` ladder
         instead of a bare `process.wait()` (which on a D-state child never
-        returns and freezes the queue). `parse_progress` is the only per-tool
+        returns and freezes the queue). The post-EOF voluntary-exit grace is
+        capped by whatever is left of the verify's own bound — and skipped
+        entirely once a cancel has fired — so a verifier that closes its pipe
+        without exiting cannot hold the lane past its deadline. `parse_progress` is the only per-tool
         knob; it replaced two near-identical ~120-line loops.
         """
 

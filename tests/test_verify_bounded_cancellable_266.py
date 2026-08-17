@@ -984,3 +984,121 @@ def test_streaming_verify_spawns_without_a_preexec_fork_hook():
     # is absent, and should keep explaining it.
     assert "preexec_fn=" not in source
     assert "nice_prefix(self._owner)" in source
+
+
+def test_cancelling_the_z3ds_feeder_does_not_close_behind_a_stuck_read(
+    tmp_path, monkeypatch,
+):
+    """A cancelled feeder abandons its handle instead of closing it.
+
+    Only `ReadCancelled` marked the handle abandoned, so a *task* cancellation
+    (SSE disconnect, the timeout race) fell through to the close in the finally
+    — and that close waits on the lock the abandoned read still holds, which is
+    the unbounded wait again, now in cleanup.
+    """
+    asyncio.run(_z3ds_feeder_cancel_abandons_handle(tmp_path, monkeypatch))
+
+
+async def _z3ds_feeder_cancel_abandons_handle(tmp_path: Path, monkeypatch):
+    import threading
+
+    rom = tmp_path / "game.z3ds"
+    rom.write_bytes(b"Z3DS" + b"\0" * 65536)
+    child = _HangingChild(pid=5150)
+
+    reading = asyncio.Event()
+    release = threading.Event()
+    closed: list[str] = []
+    loop = asyncio.get_running_loop()
+
+    class _StuckHandle:
+        def seek(self, _offset):
+            return 0
+
+        def read(self, _size):
+            loop.call_soon_threadsafe(reading.set)
+            release.wait(30)  # the read that never comes back
+            return b""
+
+        def close(self):
+            # Would block behind the read on a real handle; recorded so the test
+            # can assert the cancelled path never gets here.
+            closed.append("closed")
+
+    monkeypatch.setattr(z3ds_module, "open", lambda *_a, **_k: _StuckHandle(), raising=False)
+
+    async def _fake_exec(*_args, **_kwargs):
+        return child
+
+    async def _offset(_path, *, cancel_event=None):
+        return 0
+
+    monkeypatch.setattr(z3ds_module.shutil, "which", lambda _name: "/usr/bin/zstd")
+    monkeypatch.setattr(z3ds_module.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        z3ds_module.z3ds_compress_service, "_get_verify_payload_offset", _offset,
+    )
+
+    service = z3ds_module.z3ds_compress_service
+
+    async def _drain():
+        async for _update in service.verify_stream(str(rom)):
+            pass
+
+    task = asyncio.create_task(_drain())
+    await asyncio.wait_for(reading.wait(), timeout=5)
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
+
+    assert closed == [], "the cancelled feeder closed a handle a stuck read still holds"
+    release.set()
+
+
+def test_post_eof_grace_respects_the_remaining_bound(tmp_path, monkeypatch):
+    """A verifier that closes stdout without exiting doesn't get a free minute.
+
+    The teardown reap used its default 60s voluntary-exit grace regardless of
+    the verify's own (possibly much shorter) deadline or a cancel that had
+    already fired, so the lane stayed held well past both.
+    """
+    asyncio.run(_post_eof_grace_bounded(tmp_path, monkeypatch))
+
+
+async def _post_eof_grace_bounded(tmp_path: Path, monkeypatch):
+    service = ChdmanService()
+    # Closes the pipe outright, then lingers well past the grace. Both fds: the
+    # runner points stderr at the same pipe, so closing stdout alone leaves the
+    # write end open and the parent never sees EOF.
+    service.chdman_path = _fake_tool_binary(
+        tmp_path / "quiet_chdman.py",
+        "import os\nos.close(1)\nos.close(2)\ntime.sleep(60)\n",
+    )
+    runner_mod = _runner_module(service)
+
+    async def _short_bound(_path, _owner=None):
+        return 2
+
+    monkeypatch.setattr(runner_mod, "resolve_verify_timeout", _short_bound)
+
+    graces: list[float] = []
+    real_reap = type(service._runner).reap
+
+    _DEFAULTED = object()
+
+    async def _recording_reap(self, process, *, exit_timeout=_DEFAULTED):
+        graces.append(exit_timeout)
+        if exit_timeout is _DEFAULTED:
+            return await real_reap(self, process)
+        return await real_reap(self, process, exit_timeout=exit_timeout)
+
+    monkeypatch.setattr(type(service._runner), "reap", _recording_reap)
+
+    await asyncio.wait_for(service.verify(str(tmp_path / "sample.chd")), timeout=30)
+
+    # Every reap states its grace explicitly — falling back to the 60s default
+    # is the regression — and none exceeds what was left of the 2s bound.
+    assert graces, "reap was never called"
+    assert _DEFAULTED not in graces, "a reap used the default 60s grace"
+    assert max(graces) <= 2, f"grace exceeded the remaining bound: {graces}"

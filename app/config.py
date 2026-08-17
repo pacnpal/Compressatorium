@@ -370,11 +370,12 @@ class Settings(BaseSettings):
     maxcso_verify_timeout: int | None = Field(
         default=None, alias="COMPRESSATORIUM_MAXCSO_VERIFY_TIMEOUT",
     )
-    # makeps3iso (PS3 folder -> ISO): one packing subprocess. Its verify is a
-    # pure-Python PARAM.SFO readback with no child process, so the verify
-    # timeout bounds the *call* (the job pipeline applies it) rather than a
-    # subprocess -- which is exactly why it is exposed: a readback that never
-    # returns has nothing else to stop it.
+    # makeps3iso (PS3 folder -> ISO): one packing subprocess, and no *reachable*
+    # verify -- the mode declines delete-on-verify, the tool registers no verify
+    # extensions or route, and the post-build PARAM.SFO readback is part of
+    # convert(), not verify(). So no _VERIFY_TIMEOUT here: a knob no flow reads
+    # is worse than no knob. Add one alongside a bounded verify entry point if
+    # this tool ever gains one.
     makeps3iso_nice: int | None = Field(
         default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_NICE",
     )
@@ -383,9 +384,6 @@ class Settings(BaseSettings):
     )
     makeps3iso_ioprio_level: int | None = Field(
         default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_IOPRIO_LEVEL",
-    )
-    makeps3iso_verify_timeout: int | None = Field(
-        default=None, alias="COMPRESSATORIUM_MAKEPS3ISO_VERIFY_TIMEOUT",
     )
     # romz (7z ROM packer): like nsz/z3ds/maxcso, info() is a filesystem read so
     # only a verify-timeout override is exposed, no info-timeout.
