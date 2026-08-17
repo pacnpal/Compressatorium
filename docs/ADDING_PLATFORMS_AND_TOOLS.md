@@ -777,7 +777,10 @@ class NszipTool(BaseTool):
   `verify_preflight(path, extensions)` rather than your own
   `os.path.exists`/`getsize`: those run on the event loop before your first
   await, and a stat that blocks on a dead mount there freezes every task in the
-  process — including the timeout meant to bound your verify.
+  process — including the timeout meant to bound your verify. For the heavy
+  reads themselves use `run_detached(...)`, not `run_in_threadpool` /
+  `asyncio.to_thread`: a cancelled read abandons its thread either way, and a
+  pooled one is capacity the whole process shares.
 - Track PIDs so the debug heartbeat can report them.
 
 ### 5.4 Register the plugin: `app/services/tools/__init__.py`

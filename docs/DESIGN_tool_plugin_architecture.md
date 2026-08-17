@@ -525,11 +525,17 @@ Three pieces, none of them per-tool:
    out after Ns"}`, widened with `"type": "error"` on the SSE paths), not a 500:
    the file is not known bad, the check just did not finish.
 
-Two rules follow for any code that spawns a verifier: **resolve the bound
-before the spawn** (it stats the file, and an `await` between the spawn and the
-`try/finally` is a window where a cancelled SSE request unwinds the coroutine
-with the child running, tracked, and nothing left to reap it), and never record
-a verification result from a run that did not reach a verdict.
+Three rules follow for any code that runs a verifier:
+
+- **Never offload a verify's blocking read to a shared pool.** Use
+  `run_detached`; cancellation abandons the thread either way, and a pooled one
+  is capacity the whole process shares.
+- **Resolve the bound before the spawn.** It stats the file, and an `await`
+  between the spawn and the `try/finally` is a window where a cancelled SSE
+  request unwinds the coroutine with the child running, tracked, and nothing
+  left to reap it.
+- **Never record a verification result from a run that did not reach a
+  verdict.**
 
 With verify genuinely bounded, the stalled-job warning no longer *skips* jobs in
 the verify phase (it did, to avoid calling a long checksum stalled — at the cost

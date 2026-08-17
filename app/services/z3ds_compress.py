@@ -10,13 +10,13 @@ from pathlib import Path
 
 import aiofiles
 from config import settings
-from fastapi.concurrency import run_in_threadpool
 from services.chdman import ConversionCancelled
 from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
     resolve_verify_timeout,
+    run_detached,
     verify_preflight,
 )
 
@@ -93,7 +93,13 @@ class Z3DSCompressService:
 
     @staticmethod
     async def _get_verify_payload_offset(file_path: str) -> int:
-        """Return the byte offset where the seekable zstd payload begins."""
+        """Return the byte offset where the seekable zstd payload begins.
+
+        Read on a detached thread rather than a pooled one: on an unresponsive
+        mount this open/read cannot be stopped, only abandoned, and abandoning a
+        *shared* worker for every cancelled verify would eventually starve the
+        pool the rest of the app offloads to.
+        """
 
         def _read_offset() -> int:
             with open(file_path, "rb") as fh:
@@ -124,7 +130,7 @@ class Z3DSCompressService:
                 raise ValueError("Invalid Z3DS file: payload offset is out of range")
             return payload_offset
 
-        return await run_in_threadpool(_read_offset)
+        return await run_detached(_read_offset)
 
     def get_output_path(self, input_path: str, output_dir: str | None = None) -> str:
         """Calculate output path for a 3DS file.

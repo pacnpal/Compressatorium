@@ -38,6 +38,7 @@ from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
+    run_detached,
     verify_preflight,
 )
 from utils.junk import is_junk_path
@@ -562,8 +563,11 @@ class RomzService:
         # applies the shared archive size/entry/path limits before testing.
         # Off the event loop: listing a large/NAS-backed archive must not stall
         # the sync, SSE, and batch verify routes that consume this on the loop.
+        # Detached rather than pooled: a listing wedged on a dead mount cannot be
+        # stopped, only abandoned, and abandoning a *shared* worker per cancelled
+        # request would eventually starve every offload in the process.
         try:
-            await asyncio.to_thread(self._single_rom_member, file_path)
+            await run_detached(self._single_rom_member, file_path)
         except ValueError as exc:
             yield {"type": "error", "valid": False, "message": str(exc)}
             return

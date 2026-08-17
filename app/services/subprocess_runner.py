@@ -262,6 +262,26 @@ async def resolve_verify_timeout(path: str, owner: str | None = None) -> int:
         return verify_timeout(owner)
 
 
+async def run_detached(func: Callable, *args: object, **kwargs: object) -> object:
+    """Run a blocking call off the event loop **without** a shared pool worker.
+
+    The un-pooled counterpart of ``run_in_threadpool`` / ``asyncio.to_thread``
+    for work that may never return: a verify's whole-file reads (the WUX index
+    scan, an archive listing, a header probe, a PARAM.SFO readback). Cancelling
+    a thread is impossible — Python can abandon the future, never the OS thread
+    — so the only question is *whose* thread is abandoned. In a shared pool it
+    is one of a small fixed set: now that verify is genuinely cancellable and
+    bounded, a client disconnecting repeatedly against an unresponsive mount
+    would strand one pooled worker per attempt and eventually starve every
+    unrelated offload in the process. Here it is a throwaway daemon thread,
+    which holds up nothing at interpreter exit and occupies no shared capacity.
+
+    Unbounded by design: the caller supplies the bound (a route deadline, the
+    job's ``verify_timeout``), because the right limit depends on the file.
+    """
+    return await _probe_in_daemon_thread(functools.partial(func, *args, **kwargs))
+
+
 async def verify_preflight(
     path: str, extensions: frozenset[str] | set[str],
 ) -> tuple[dict | None, int]:

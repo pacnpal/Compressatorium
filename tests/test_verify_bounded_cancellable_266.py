@@ -646,3 +646,61 @@ async def _z3ds_disconnect_leaves_no_orphan_feeder(tmp_path: Path, monkeypatch):
     ]
     assert feeders == []
     assert child.pid not in set(service.active_pids())
+
+
+@pytest.mark.asyncio
+async def test_verify_reads_do_not_occupy_shared_pool_workers(tmp_path, monkeypatch):
+    """A wedged verify read must not cost a shared worker.
+
+    A thread cannot be cancelled, only abandoned — so the question is *whose*
+    thread. Cancelling a `run_in_threadpool` read abandons one of the process's
+    small fixed set of workers, and now that verify is genuinely cancellable and
+    bounded, a client disconnecting repeatedly against a dead mount would strand
+    one per attempt until unrelated offloads had none left.
+    """
+    from app.services import subprocess_runner as runner_mod
+
+    started = asyncio.Event()
+    release = __import__("threading").Event()
+    finished: list[str] = []
+
+    def _blocking_read() -> str:
+        started.set()
+        release.wait(30)
+        finished.append("done")
+        return "done"
+
+    task = asyncio.create_task(runner_mod.run_detached(_blocking_read))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    # The awaiter is free immediately, and the abandoned work runs on its own
+    # throwaway thread rather than holding a pooled slot.
+    assert finished == []
+    release.set()
+
+
+def test_verify_paths_never_use_the_shared_threadpool():
+    """The verify reads stay off `run_in_threadpool` / `asyncio.to_thread`.
+
+    Pinned by inspection rather than behaviour: the failure this prevents (a
+    starved shared pool) only shows up under a dead mount plus repeated
+    cancellation, which no unit test can stage honestly.
+    """
+    import inspect as _inspect
+
+    from app.services import jwudtool, makeps3iso, romz
+    from app.services import z3ds_compress as z3ds
+
+    sources = {
+        "jwud": _inspect.getsource(jwudtool.JwudToolService.verify_stream),
+        "romz": _inspect.getsource(romz.RomzService.verify_stream),
+        "z3ds": _inspect.getsource(z3ds.Z3DSCompressService._get_verify_payload_offset),
+        "makeps3iso": _inspect.getsource(makeps3iso.MakePs3IsoService.verify),
+    }
+    for tool, source in sources.items():
+        assert "run_in_threadpool" not in source, tool
+        assert "to_thread" not in source, tool
+        assert "run_detached" in source, tool

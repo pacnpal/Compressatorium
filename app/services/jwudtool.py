@@ -49,13 +49,13 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from config import settings
-from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from services.subprocess_runner import (
     SubprocessRunner,
     collect_verify,
     ioprio_prefix,
     nice_prefix,
+    run_detached,
     verify_preflight,
 )
 
@@ -644,7 +644,7 @@ class JwudToolService:
                 return
             yield {"type": "progress", "progress": 0, "message": "Reading WUX header..."}
             try:
-                header = await run_in_threadpool(read_wux_header, file_path)
+                header = await run_detached(read_wux_header, file_path)
             except ValueError as e:
                 yield {
                     "type": "error",
@@ -662,7 +662,7 @@ class JwudToolService:
                 "message": f"Checking {header['entry_count']} sector index entries...",
             }
             try:
-                highest = await run_in_threadpool(_scan_index_table, file_path, header)
+                highest = await run_detached(_scan_index_table, file_path, header)
             except ValueError as e:
                 yield {"type": "error", "valid": False, "message": f"Corrupt WUX: {e}"}
                 return

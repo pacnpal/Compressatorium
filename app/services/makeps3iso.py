@@ -43,6 +43,7 @@ from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
     ioprio_prefix,
+    run_detached,
 )
 
 # SubprocessRunner "owner" for the shared priority/timeout policy. An optional
@@ -325,7 +326,10 @@ class MakePs3IsoService:
             }
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("makeps3iso verify (TITLE_ID readback) for %s", iso_path)
-        title_id = await asyncio.to_thread(ps3.ps3_iso_title_id, iso_path)
+        # Detached, not pooled: an ISO on a dead mount can only be abandoned,
+        # and a shared worker abandoned per cancelled verify would starve the
+        # pool every other offload in the process depends on.
+        title_id = await run_detached(ps3.ps3_iso_title_id, iso_path)
         if title_id:
             return {"valid": True, "message": f"PS3 ISO TITLE_ID {title_id}"}
         return {
