@@ -990,18 +990,31 @@ def test_cancellation_propagates_without_undoing_the_removal(tmp_path):
     assert not partial.exists()
 
 
-def test_cleanup_reports_failure_when_no_thread_can_be_started(monkeypatch):
-    """Out of threads is a cleanup failure, not the job's reported outcome.
+@pytest.mark.parametrize(
+    "dispatch_error",
+    [
+        RuntimeError("can't start new thread"),
+        # ProbeCapacityExceeded is an asyncio.TimeoutError, not a RuntimeError,
+        # so it needs its own coverage: catching only the latter let it escape.
+        runner_module.ProbeCapacityExceeded("64 probes are already blocked"),
+    ],
+    ids=["no-threads", "probe-capacity"],
+)
+def test_cleanup_reports_failure_when_it_cannot_be_dispatched(
+    monkeypatch, dispatch_error,
+):
+    """A dispatch that fails is a cleanup failure, not the job's outcome.
 
-    Plausible precisely here: a run of dead-mount sweeps deliberately writes
-    threads off. Letting the RuntimeError escape would stand in for the
+    Both are plausible precisely here: a run of dead-mount sweeps deliberately
+    writes threads off, which is what exhausts threads *and* what fills the
+    probe-capacity budget. Letting either escape would stand in for the
     converter's real error on a failure path, and would fail an already-
     published conversion from the success-path `finally` callers.
     """
-    def _no_threads(_func):
-        raise RuntimeError("can't start new thread")
+    def _cannot_dispatch(_func):
+        raise dispatch_error
 
-    monkeypatch.setattr(runner_module, "_probe_in_daemon_thread", _no_threads)
+    monkeypatch.setattr(runner_module, "_probe_in_daemon_thread", _cannot_dispatch)
 
     async def _go():
         return await runner_module.remove_partial_output("/vol/game.cso")
@@ -1071,7 +1084,31 @@ def test_remove_partial_output_discovers_inside_the_bound(tmp_path):
     assert probed_on == ["fs-probe"]  # not the event loop's thread
 
 
-def test_remove_partial_output_bounds_a_wedged_discovery(monkeypatch):
+def test_an_already_abandoned_sweep_does_not_even_discover(tmp_path):
+    """Given up on before the thread ran: touch the storage at all.
+
+    Discovery is itself a round trip to the volume the sweep would unlink from,
+    and it holds a probe slot the next job's cleanup may need. Nothing here is
+    this job's any more, so the whole sweep is skipped rather than just its
+    unlinks.
+    """
+    partial = tmp_path / "Game.iso"
+    partial.write_bytes(b"a retry's valid output")
+    discovered = threading.Event()
+
+    def _discover() -> list[str]:
+        discovered.set()
+        return [str(partial)]
+
+    already = threading.Event()
+    already.set()
+    runner_module._unlink_all((), _discover, already)
+
+    assert not discovered.is_set()
+    assert partial.read_bytes() == b"a retry's valid output"
+
+
+def test_remove_partial_output_bounds_a_wedged_discovery():
     """A discovery that never returns is given up on like a wedged unlink."""
     release = threading.Event()
 

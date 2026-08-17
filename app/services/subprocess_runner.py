@@ -235,17 +235,23 @@ def _unlink_all(
     permission problem) is collected and raised at the end so one bad path is
     logged without stopping the sweep of the rest.
 
-    ``abandoned`` is checked before each unlink and stops the sweep once the
-    waiter has given up (timed out, or was cancelled). A sweep that outlives its
-    bound must not keep deleting: the job has finalised and released those
-    paths, the mount can recover minutes later, and by then a retry may own the
-    names -- this thread would be deleting the *new* job's good output. The one
-    unlink already issued when the bound expired cannot be recalled (an
-    in-flight syscall is not cancellable), so that single path stays at risk;
-    every path after it does not. On a responsive filesystem the whole sweep
-    finishes long before either giving-up path is reached, so this costs the
-    normal case nothing.
+    ``abandoned`` is checked before the discovery and before each unlink, and
+    stops the sweep once the waiter has given up (timed out, or was cancelled).
+    A sweep that outlives its bound must not keep deleting: the job has
+    finalised and released those paths, the mount can recover minutes later, and
+    by then a retry may own the names -- this thread would be deleting the *new*
+    job's good output. The one unlink already issued when the bound expired
+    cannot be recalled (an in-flight syscall is not cancellable), so that single
+    path stays at risk; every path after it does not. On a responsive filesystem
+    the whole sweep finishes long before either giving-up path is reached, so
+    this costs the normal case nothing.
     """
+    if abandoned.is_set():
+        # Given up on before this thread even ran. Return without touching the
+        # storage: the paths are no longer this job's, and the discovery is
+        # itself a round trip to the volume in question -- one that would also
+        # hold a probe slot the next job's cleanup may need.
+        return
     targets = list(paths)
     if discover is not None:
         targets.extend(discover())
@@ -270,8 +276,16 @@ def _unlink_all(
 def _rmtree_quietly(path: str, _abandoned: threading.Event) -> None:
     """``rmtree`` ignoring errors. Takes the flag for the ``work`` signature.
 
-    Nothing to check it against: ``rmtree`` is one call, so there is no next
-    path to stop before.
+    Deliberately does *not* bail out when the flag is set, unlike
+    :func:`_unlink_all`. The two guard different risks. A sweep of output paths
+    stops because a retry can take those names and would lose real data; a work
+    dir comes from ``mkdtemp``, so its name is unique to this run and no later
+    job can ever own it -- there is nothing to protect, and skipping would only
+    orphan the temp dir. Which is the likely case, not the rare one: the flag is
+    set either by the full timeout (by which point ``rmtree`` has certainly
+    started, making a check a no-op) or by a cancel that can land microseconds
+    after dispatch -- and a cancelled job's work dir is exactly one that should
+    still be swept.
     """
     shutil.rmtree(path, ignore_errors=True)
 
@@ -319,13 +333,18 @@ async def _bounded_cleanup(
 
     try:
         future = _probe_in_daemon_thread(_run_work)
-    except RuntimeError as exc:
-        # Out of threads -- plausible precisely here, since a run of dead-mount
-        # sweeps deliberately writes threads off. Nothing was dispatched, so
-        # report it like any other cleanup failure rather than letting it
-        # escape and stand in for the conversion's own outcome.
+    except (RuntimeError, ProbeCapacityExceeded) as exc:
+        # Two ways the dispatch itself fails, both plausible precisely here
+        # because a run of dead-mount sweeps deliberately writes threads off:
+        # RuntimeError, the process cannot start another thread; and
+        # ProbeCapacityExceeded, _MAX_DETACHED_PROBES already wedged against the
+        # volume. (The latter is an asyncio.TimeoutError, not a RuntimeError, so
+        # it needs naming here rather than riding along.) Neither dispatched anything,
+        # so both are reported like any other cleanup failure rather than
+        # escaping to stand in for the conversion's own outcome -- which on the
+        # `finally` callers would fail a job whose output is already published.
         _cleanup_logger.warning(
-            "Could not start a cleanup thread for %s: %s", what, exc,
+            "Could not start the cleanup of %s: %s", what, exc,
         )
         return False
     try:
