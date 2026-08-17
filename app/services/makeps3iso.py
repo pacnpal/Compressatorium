@@ -43,6 +43,7 @@ from services.subprocess_runner import (
     ConversionCancelled,
     SubprocessRunner,
     ioprio_prefix,
+    remove_partial_output,
 )
 
 # SubprocessRunner "owner" for the shared priority/timeout policy. An optional
@@ -195,13 +196,18 @@ class MakePs3IsoService:
             # partial behind: a non-zero exit / stall (RuntimeError), a cancel
             # (ConversionCancelled), AND task cancellation / generator close,
             # which raise the BaseException-derived CancelledError / GeneratorExit
-            # — caught here too so the partial is never orphaned. Remove it
-            # *synchronously* (local unlinks): awaiting during a cancellation
-            # could be re-cancelled and skip the cleanup. A split run may have
-            # left several parts (output.0, .1, …) plus the not-yet-renamed base,
-            # so clear them all. Re-raise so cancellation semantics are preserved.
-            # (run() does not clean the output itself.)
-            self.remove_outputs(output_path)
+            # — caught here too so the partial is never orphaned. A split run may
+            # have left several parts (output.0, .1, …) plus the not-yet-renamed
+            # base, so clear them all, in one bounded sweep: this is several
+            # unlinks in a row on a volume the run may have just died on, and it
+            # must not hold the job (and with it the queue) open. The removals
+            # are dispatched even if this coroutine is torn down mid-wait, which
+            # is what the previous synchronous unlinks bought. Re-raise so
+            # cancellation semantics are preserved. (run() does not clean the
+            # output itself.)
+            await remove_partial_output(
+                *self.output_artifacts(output_path), label="makeps3iso output",
+            )
             raise
 
         # ``-s`` only splits past 4 GB and the part names aren't known until now,
@@ -227,23 +233,14 @@ class MakePs3IsoService:
         ``split_parts`` (which stops at the base when it exists) — that one
         describes a finished output, this one describes everything to sweep.
 
-        Backs both the failure cleanup here and the plugin's
-        ``overwrite_targets``, so the two can't drift.
+        Backs both the failure cleanup here (fed to the runner's shared bounded
+        ``remove_partial_output``) and the plugin's ``overwrite_targets``, so the
+        two can't drift. Authorized-overwrite cleanup goes through the job
+        pipeline's tool-neutral path instead, which additionally rejects
+        non-file occupants rather than logging past them the way the failure
+        sweep does.
         """
         return [output_path, *cls._numbered_parts(output_path)]
-
-    @classmethod
-    def remove_outputs(cls, output_path: str) -> None:
-        """Synchronously unlink the base output *and* any split parts.
-
-        Failure cleanup. Authorized-overwrite cleanup goes through the job
-        pipeline's tool-neutral path instead (``overwrite_targets``), which
-        additionally rejects non-file occupants rather than silently skipping
-        them the way this ``suppress(OSError)`` does.
-        """
-        for target in cls.output_artifacts(output_path):
-            with contextlib.suppress(OSError):
-                os.remove(target)
 
     @staticmethod
     def _readback_message(folder: str, iso_path: str) -> str:

@@ -17,6 +17,7 @@ from app.models import ConversionJob, ConversionMode, InputKind, JobStatus
 from app.routes import convert as convert_routes
 from app.routes import files as files_routes
 from app.services.makeps3iso import ConversionCancelled, makeps3iso_service
+from app.services.subprocess_runner import remove_partial_output
 from app.services.tools import registry
 
 from .ps3_helpers import make_ps3_folder as _make_ps3_folder
@@ -641,24 +642,30 @@ def test_split_parts_single_vs_multipart(tmp_path):
 def test_split_parts_ignores_noncontiguous_siblings(tmp_path):
     """An unrelated numbered sibling is never treated as part of the split set.
 
-    ``split_parts``/``remove_outputs`` only enumerate the contiguous run from
+    ``split_parts``/``output_artifacts`` only enumerate the contiguous run from
     ``.0``; a ``Game.iso.2024`` backup with no ``.0`` (or one beyond a gap) must
     be left alone so authorized-overwrite cleanup can't silently delete it.
+    Sweeps through the same bounded helper ``convert()``'s failure path uses.
     """
     base = str(tmp_path / "Game.iso")
+
+    def _sweep() -> None:
+        asyncio.run(
+            remove_partial_output(*makeps3iso_service.output_artifacts(base)),
+        )
 
     # No .0 at all -> the lone numbered sibling is not a split part.
     stray = Path(f"{base}.2024")
     stray.write_bytes(b"backup")
     assert makeps3iso_service.split_parts(base) == []
-    makeps3iso_service.remove_outputs(base)
+    _sweep()
     assert stray.exists()
 
     # A gap stops enumeration: .0/.1 belong to the set, .2024 sits past the gap.
     for n in (0, 1):
         Path(f"{base}.{n}").write_bytes(b"x")
     assert makeps3iso_service.split_parts(base) == [f"{base}.0", f"{base}.1"]
-    makeps3iso_service.remove_outputs(base)
+    _sweep()
     assert stray.exists()
     assert not Path(f"{base}.0").exists()
     assert not Path(f"{base}.1").exists()
@@ -920,8 +927,9 @@ def test_detect_output_surfaces_split_set(tmp_path):
 @pytest.mark.asyncio
 async def test_clear_existing_output_rejects_directory(tmp_path, monkeypatch):
     # When the overwrite target already exists as a *directory* named like the
-    # output, remove_outputs can't clear it (os.remove fails on a dir and is
-    # suppressed) and makeps3iso would write *inside* it. Reject instead.
+    # output, the failure sweep can't clear it (os.remove fails on a dir, and
+    # the shared helper logs rather than raises) and makeps3iso would write
+    # *inside* it. Reject instead.
     import app.services.job_manager as jm_module
     from app.services.job_manager import job_manager
 

@@ -395,6 +395,21 @@ class SubprocessRunner:
         (the Dolphin disc-hash source for `embedded_hashes`) aborts promptly
         when a scan/match job is cancelled.
         """
+
+
+# Module-level, not methods: cleanup runs after run() has already given up, and
+# chains (which own no runner) need the same bound. See "Cleaning up partial
+# output is bounded too" below.
+async def remove_partial_output(*paths: str, label="partial output",
+                                timeout=None) -> bool:
+    """Bounded unlink of every file a failed run may have left behind.
+    True if the sweep finished, False if it timed out / failed / was
+    interrupted. Never raises.
+    """
+
+async def remove_partial_tree(path: str, *, label="work directory",
+                              timeout=None) -> bool:
+    """The same bound for a private work/scratch dir (rmtree, errors ignored)."""
 ```
 
 Per-tool `convert()` becomes ~15 lines: build argv, then
@@ -451,6 +466,50 @@ it only after the output is derived and skip/locked collisions short-circuit,
 and the create/batch routes apply queue-depth backpressure (HTTP 429) *before*
 planning when the queue is already full — so a doomed submit never pays for the
 tree walk.
+
+### Cleaning up partial output is bounded too (issue #267)
+
+Every tool that writes its output in place sweeps the partial away when a run
+ends abnormally — a cancel, a stall, a non-zero exit, a task cancellation or
+generator close. That sweep is **not** a per-tool block: it goes through
+`remove_partial_output(*paths)` (files) or `remove_partial_tree(path)` (a
+private work dir), both module-level in `services/subprocess_runner.py` and
+re-exported from `services/tools/runner.py`.
+
+Why they exist at all: the sweep runs *after* the runner has given up, on the
+same storage the run just failed on. `stat`/`unlink`/`rmtree` on an
+unresponsive mount block in uninterruptible I/O and cannot be cancelled, so a
+hand-rolled `os.remove` there defeated the bounded reap ladder — the child was
+abandoned promptly (#263/#265) and then the job hung on cleanup instead, and at
+`MAX_CONCURRENT_JOBS=1` (the default, jobs inline in the dispatcher) the queue
+froze anyway. These helpers run the blocking call on a throwaway daemon thread
+(the `_bounded_probe` shape) with a hard `_CLEANUP_TIMEOUT`.
+
+The contract, which is what makes them safe to use everywhere:
+
+- **They never raise.** The caller is already unwinding the failure that
+  explains the job's outcome and re-raises it immediately; a cleanup problem
+  must not replace that error. Failure is a logged warning and a `False`
+  return, so the job finishes as failed with a leftover partial file — a much
+  smaller problem than a frozen queue.
+- **The removal is dispatched unconditionally; only the wait is bounded.** So
+  cleanup still happens in full even when the coroutine is torn down mid-wait.
+  That is the property the old blocks bought by unlinking *synchronously* on
+  the event loop (awaiting during a cancellation could be re-cancelled and skip
+  the cleanup) — kept, without the unbounded block.
+- **An absent path is success**, so no caller needs a separate `os.path.exists`
+  round trip on the mount in question.
+- **One bad path does not stop the sweep**: the rest are still removed, and
+  everything that failed is named in one warning.
+
+Two rules for a new tool: catch the abnormal exits *after* the spawn only (a
+setup or pre-spawn failure wrote nothing, so deleting a pre-existing output
+there would destroy a good file), and pass **every** path the run could have
+written — a split makeps3iso build leaves numbered parts alongside the base, so
+it feeds the sweep from `output_artifacts()`, the same enumeration that backs
+`overwrite_targets`. Where the result is load-bearing rather than best-effort,
+check it: romz clears a stale archive *before* running `7z a` (which appends),
+and refuses to start if that sweep reports failure.
 
 ### 3.3.1 Shared archive-limit enforcement (`services/archive.py`)
 
@@ -759,7 +818,7 @@ The first user, **`MakePs3IsoTool`** (`folder_to_iso`, the only
     `output_artifacts`, which also backs its failure cleanup so the two can't
     drift) — wider than `companion_outputs`, which reports only the finished
     set. This used to be an `input_kind == DIRECTORY` branch calling
-    `makeps3iso_service.remove_outputs` directly, which meant a *second*
+    makeps3iso's own part-removal helper directly, which meant a *second*
     directory-input tool would have had its outputs swept by makeps3iso's
     part logic.
   - **Completed size:** the completion block sums `output_path` plus

@@ -7,11 +7,13 @@ disk is enough for the ``_keys_home`` symlink path to work.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
 
 from app.services import nsz as nsz_module
+from app.services import subprocess_runner as runner_module
 from app.services.chdman import ConversionCancelled
 
 NSZ_OUTPUT_FORMATS = nsz_module.NSZ_OUTPUT_FORMATS
@@ -240,6 +242,53 @@ async def test_convert_cancel_leaves_no_output(tmp_path, monkeypatch, keys_prese
         )
     assert not out_path.exists()
     assert not any(p.name.startswith(".nsz-") for p in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_convert_failure_finishes_even_if_the_work_dir_wont_delete(
+    tmp_path, monkeypatch, keys_present,
+):
+    """A wedged work-dir sweep must not hold the job (issue #267).
+
+    nsz writes its partial inside a private work dir, so the ``rmtree`` in the
+    ``finally`` *is* its partial-output cleanup — on the destination volume,
+    which on a failed run is exactly what may have stopped responding. It is
+    bounded now: the conversion still reports its own error, promptly, and the
+    stray temp dir is logged rather than waited on.
+    """
+    src_path = tmp_path / "game.nsp"
+    src_path.write_bytes(b"input")
+    out_path = tmp_path / "game.nsz"
+
+    async def fake_exec(*_args, **_kwargs):
+        return _FakeProcess(pid=5, chunks=[b"bad input\n"], returncode=1)
+
+    release = threading.Event()
+    real_rmtree = runner_module.shutil.rmtree
+
+    def _wedged(path, *args, **kwargs):
+        # Only the work dir wedges; the private keys-HOME (a local tmpdir the
+        # service also rmtrees) must still be cleaned up normally.
+        if ".nsz-home-" in str(path):
+            return real_rmtree(path, *args, **kwargs)
+        return release.wait(30)  # an rmtree stuck in uninterruptible I/O
+
+    monkeypatch.setattr(nsz_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(runner_module.shutil, "rmtree", _wedged)
+    monkeypatch.setattr(runner_module, "_CLEANUP_TIMEOUT", 0.05)
+
+    try:
+        with pytest.raises(RuntimeError, match="return code 1"):
+            await asyncio.wait_for(
+                _drain(
+                    nsz_module.nsz_service.convert(
+                        str(src_path), str(out_path), "nsz_compress",
+                    ),
+                ),
+                timeout=10,
+            )
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio

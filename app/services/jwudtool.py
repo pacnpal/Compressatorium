@@ -51,7 +51,12 @@ from pathlib import Path
 from config import settings
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
-from services.subprocess_runner import SubprocessRunner, ioprio_prefix, nice_prefix
+from services.subprocess_runner import (
+    SubprocessRunner,
+    ioprio_prefix,
+    nice_prefix,
+    remove_partial_tree,
+)
 
 # Compress takes the raw dump, decompress takes the compressed container.
 JWUD_COMPRESS_EXTENSIONS = {".wud"}
@@ -474,7 +479,11 @@ class JwudToolService:
             await asyncio.to_thread(os.replace, produced_path, output_path)
             yield {"progress": 100, "message": f"Wii U {verb} complete"}
         finally:
-            await asyncio.to_thread(shutil.rmtree, work_dir, True)
+            # Also the failure path's partial-output sweep (JWUDTool names the
+            # file inside work_dir), so it is bounded like every other tool's:
+            # an unresponsive destination mount leaves a stray temp dir rather
+            # than a job that never finalises.
+            await remove_partial_tree(work_dir, label="JWUDTool work dir")
 
     async def _run_convert(
         self, input_path, produced_path, work_dir, mode, verb, cancel_event,
