@@ -1,0 +1,22 @@
+tests/test_abandoned_match_scan_268.py
+  s_6c976e0a175de9::t_376b5e82f6bc31 598
+  s_6c976e0a175de9::t_a4747f758446ee 573-597,599-623
+app/routes/info.py
+  s_6c976e0a175de9::t_84eac8acbaa571 30,742-749,752-754,757-761
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "edf7c7dba59a1b2b559870ed823ea2a17a29a598",
+  "prompts": {},
+  "sessions": {
+    "s_6c976e0a175de9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24d5a97d-772a-4b32-b5c3-50d0c48bb4e0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "pacnpal <183241239+pacnpal@users.noreply.github.com>"
+    }
+  }
+}
