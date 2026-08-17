@@ -595,8 +595,13 @@ Three rules follow for any code that runs a verifier:
   `run_capture`'s `on_abandoned` hook, since a `None` return code alone cannot
   tell an abort from a failed ladder. A verify with **no child at all** still
   leaves a trace when an outer deadline cancels it — the detached read it
-  abandoned — so `run_detached` counts those (`detached_abandon_count`) and the
-  routes compare the count across a file. Both kinds of wreckage mean the same
+  abandoned — so `run_detached` reports those too. Both report into the sink
+  `collect_abandonment()` opens around *one file's* work rather than into global
+  state: a context variable, because `asyncio.create_task` copies the context,
+  so the producer task reports into its own caller's sink and no other. Global
+  tallies cannot answer "did **this** verify abandon something" once
+  `MAX_VERIFY_CONCURRENCY > 1` — one request's dead mount would stop another
+  request's batch on healthy storage. Both kinds of wreckage mean the same
   thing to a caller walking a list: the storage just cost us something we cannot
   get back, so stop. An *outer* deadline (the route's or the
   job's) is the one case that cannot carry the flag on an event at all — it

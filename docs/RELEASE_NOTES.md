@@ -67,18 +67,17 @@
     source is never deleted on the strength of it.
   - A **Verify all** run now stops if one file's verifier cannot be stopped —
     for any tool, whether the stop was a cancel or a timeout, and whether the
-    verifier was a subprocess or a plain read that is still blocked. The stop
+    verifier was a subprocess or a plain read that is still blocked. Every
+    remaining file is on the same storage, so continuing used to leave one
+    unkillable verifier (or one blocked thread) behind per file. The stop
     carries across tool groups too: a mixed selection no longer starts the next
     tool against storage that just proved it can wedge one.
   - Selecting a folder full of files on a mount that has gone away now fails
     fast, with one message, instead of spending ten seconds per file finding out
     the same thing — which used to delay the whole run by minutes and could
     leave enough stuck threads behind to make verification fail on healthy
-    volumes too.
-    That only happens when storage has wedged a process past `SIGKILL`, and
-    every remaining file in the batch is on that same storage — so continuing
-    used to leave one unkillable verifier behind per file. The batch ends with
-    an explanation instead.
+    volumes too. (This one needs no wedged verifier — an unreachable mount is
+    enough.)
   - Closing the browser tab mid-verify, or leaving it on a stalled connection,
     no longer costs the verification slot. It used to be handed back only when
     the page came back for the next event, so a client that went quiet at the

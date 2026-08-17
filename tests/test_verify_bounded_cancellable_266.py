@@ -1885,11 +1885,12 @@ async def _reap_records_abandonment(monkeypatch):
     assert runner.abandoned_pids() == [os.getpid()]
 
     # And it reads through to the route's verdict helper.
-    service = Mock()
-    service.abandoned_pids = runner.abandoned_pids
-    detached = runner_mod.detached_abandon_count()
-    assert info_routes._abandonment(service, detached) == {"abandoned": True}
-    assert info_routes._abandonment(Mock(spec=[]), detached) == {}
+    # ...and it lands in the sink the routes open around a single file's work,
+    # which is what actually decides whether a batch stops.
+    with runner_mod.collect_abandonment() as abandoned:
+        assert await runner.reap(_Unkillable(), exit_timeout=0) is False
+    assert info_routes._abandonment(abandoned) == {"abandoned": True}
+    assert info_routes._abandonment([]) == {}
 
 
 def test_a_batch_frees_the_lane_when_the_reader_parks_mid_file(tmp_path, monkeypatch):
@@ -2006,7 +2007,7 @@ async def _detached_abandonment_stops_the_batch(tmp_path: Path, monkeypatch):
     # The module *the route reads*: `app.services.x` and `services.x` are
     # distinct module objects here, so the counter has to be driven through the
     # same one info.py imported from (see `_runner_module`).
-    runner_mod = sys.modules[info_routes.detached_abandon_count.__module__]
+    runner_mod = sys.modules[info_routes.collect_abandonment.__module__]
 
     release = threading.Event()
 
@@ -2014,20 +2015,146 @@ async def _detached_abandonment_stops_the_batch(tmp_path: Path, monkeypatch):
         release.wait(30)
         return b""
 
-    before = runner_mod.detached_abandon_count()
-    task = asyncio.ensure_future(runner_mod.run_detached(_wedged_read))
-    await asyncio.sleep(0.1)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    with runner_mod.collect_abandonment() as abandoned:
+        task = asyncio.ensure_future(runner_mod.run_detached(_wedged_read))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     release.set()
 
-    assert runner_mod.detached_abandon_count() == before + 1
+    # A verify with no subprocess still yields the stop signal, because the
+    # stranded thread is evidence enough.
+    assert abandoned, "the abandoned read was not reported"
+    assert info_routes._abandonment(abandoned) == {"abandoned": True}
+    # ...and work that abandoned nothing does not raise a false alarm.
+    with runner_mod.collect_abandonment() as quiet:
+        await runner_mod.run_detached(lambda: 1)
+    assert info_routes._abandonment(quiet) == {}
 
-    # A service with no subprocess to report still yields the stop signal,
-    # because the stranded thread is evidence enough.
-    assert info_routes._abandonment(Mock(spec=[]), before) == {"abandoned": True}
-    # ...and a read that was never abandoned does not raise a false alarm.
-    assert info_routes._abandonment(
-        Mock(spec=[]), runner_mod.detached_abandon_count(),
-    ) == {}
+
+def test_one_wedged_request_does_not_abort_another_healthy_one(monkeypatch):
+    """Abandonment is attributed per operation, not read off global state.
+
+    With MAX_VERIFY_CONCURRENCY > 1 a service-wide pid set and a process-wide
+    counter cannot say *which* verification abandoned something — so one
+    request stuck on a dead mount would mark an unrelated batch's ordinary
+    timeout as abandoned and stop it, possibly mid-way through healthy storage.
+    """
+    asyncio.run(_abandonment_is_per_operation())
+
+
+async def _abandonment_is_per_operation():
+    import threading
+
+    runner_mod = sys.modules[info_routes.collect_abandonment.__module__]
+
+    release = threading.Event()
+
+    def _wedged_read():
+        release.wait(30)
+        return b""
+
+    async def _wedged_request(sink_out: list) -> None:
+        with runner_mod.collect_abandonment() as sink:
+            sink_out.append(sink)
+            task = asyncio.ensure_future(runner_mod.run_detached(_wedged_read))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _healthy_request(sink_out: list) -> None:
+        with runner_mod.collect_abandonment() as sink:
+            sink_out.append(sink)
+            # Runs concurrently with the wedged one, and answers fine.
+            await runner_mod.run_detached(lambda: 7)
+            await asyncio.sleep(0.2)
+
+    wedged_sink: list = []
+    healthy_sink: list = []
+    await asyncio.gather(
+        _wedged_request(wedged_sink), _healthy_request(healthy_sink),
+    )
+    release.set()
+
+    assert info_routes._abandonment(wedged_sink[0]) == {"abandoned": True}
+    assert info_routes._abandonment(healthy_sink[0]) == {}, (
+        "one request's wedged mount was blamed on another"
+    )
+
+
+def test_a_preflight_that_times_out_reports_abandonment(monkeypatch):
+    """Giving up on the size probe leaves a thread on it — that stops a batch.
+
+    The preflight bounds its own stat, but the thread it gives up on is still
+    reading. Reported as an ordinary file failure, a batch moved on to the next
+    path on the same storage and stranded one more thread per file, up to the
+    process-wide ceiling.
+    """
+    asyncio.run(_preflight_timeout_reports_abandonment(monkeypatch))
+
+
+async def _preflight_timeout_reports_abandonment(monkeypatch):
+    import threading
+
+    runner_mod = sys.modules[info_routes.collect_abandonment.__module__]
+
+    release = threading.Event()
+
+    def _wedged_size(_path):
+        release.wait(30)
+        return 4096
+
+    monkeypatch.setattr(runner_mod.os.path, "getsize", _wedged_size)
+    monkeypatch.setattr(runner_mod, "_STAT_TIMEOUT", 0.3)
+
+    with runner_mod.collect_abandonment() as abandoned:
+        event, size = await runner_mod.verify_preflight(
+            "/vol/game.wux", frozenset({".wux"}),
+        )
+    release.set()
+
+    assert size == 0
+    assert event["valid"] is False
+    assert event["abandoned"] is True, event
+    # Both routes to the same conclusion: the event says so, and so does the
+    # sink the routes actually consult.
+    assert info_routes._abandonment(abandoned) == {"abandoned": True}
+
+
+def test_a_readback_that_finishes_under_a_cancel_is_not_a_verdict(tmp_path, monkeypatch):
+    """The PS3 title readback and the cancel can land together.
+
+    `run_detached` resolves whichever it sees first, so the read could win and
+    the verify would report a clean pass for a run the operator had already
+    stopped — which, through delete-on-verify, is a pass that deletes a source.
+    """
+    asyncio.run(_readback_under_cancel_is_cancelled(tmp_path, monkeypatch))
+
+
+async def _readback_under_cancel_is_cancelled(tmp_path: Path, monkeypatch):
+    from app.services import makeps3iso as ps3_module
+
+    target = tmp_path / "game.iso"
+    target.write_bytes(b"\0" * 4096)
+
+    cancel_event = asyncio.Event()
+
+    def _reads_as_the_cancel_lands(_path):
+        cancel_event.set()
+        return "BLES00000"
+
+    monkeypatch.setattr(
+        ps3_module.ps3, "ps3_iso_title_id", _reads_as_the_cancel_lands,
+    )
+
+    result = await asyncio.wait_for(
+        ps3_module.makeps3iso_service.verify(
+            str(target), cancel_event=cancel_event,
+        ),
+        timeout=10,
+    )
+
+    assert result["cancelled"] is True, result
+    assert result["valid"] is False

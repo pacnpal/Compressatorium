@@ -345,6 +345,16 @@ class MakePs3IsoService:
                 "cancelled": True,
                 "message": "Verification cancelled",
             }
+        if cancel_event is not None and cancel_event.is_set():
+            # The read and the cancel can land together, and `run_detached`
+            # resolves whichever it sees first. A verdict reached under a cancel
+            # is still a verdict nobody asked for: report the cancellation, so
+            # no caller records a verification (or deletes a source) on it.
+            return {
+                "valid": False,
+                "cancelled": True,
+                "message": "Verification cancelled",
+            }
         if title_id:
             return {"valid": True, "message": f"PS3 ISO TITLE_ID {title_id}"}
         return {

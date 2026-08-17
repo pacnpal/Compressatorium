@@ -458,7 +458,11 @@ class Z3DSCompressService:
                                     # Stop feeding immediately; the waiter below
                                     # reports the cancel and the finally reaps
                                     # zstd. One chunk of latency at most.
-                                    abandoned = True
+                                    # Not `abandoned`: this break happens
+                                    # *between* reads, so no thread holds the
+                                    # handle and closing it is safe and bounded.
+                                    # Only a read still in flight makes close
+                                    # itself a wait we cannot afford.
                                     break
                                 try:
                                     chunk = await run_detached(

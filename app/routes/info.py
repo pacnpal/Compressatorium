@@ -41,7 +41,7 @@ from services.jwudtool import (
 )
 from services.tools import registry
 from services.tools.base import ToolPlugin
-from services.subprocess_runner import bounded_path_check, detached_abandon_count
+from services.subprocess_runner import bounded_path_check, collect_abandonment
 from services.workload_limiter import WorkloadToken, workload_limiter
 from services.job_manager import ExternalJobCancelled, job_manager
 from services.maxcso import (
@@ -124,31 +124,21 @@ async def _offer_verify_update(queue: asyncio.Queue, update: dict) -> None:
     queue.put_nowait(update)
 
 
-def _abandonment(service: object, detached_before: int) -> dict:
+def _abandonment(abandoned: list) -> dict:
     """``{"abandoned": True}`` when this verify left something stuck behind.
 
-    An outer deadline cancels the verify generator rather than letting it reach
-    a terminal event, so the flag cannot ride out on the event the way it does
-    when the runner's own bound fires. Two kinds of wreckage can be left, and
-    both are checked here because both mean the same thing to a caller walking
-    a list -- the storage just cost us a resource we cannot get back, so stop:
+    Two kinds of wreckage count, because both mean the same thing to a caller
+    walking a list -- the storage just cost us a resource we cannot get back, so
+    stop: a child that outlived SIGKILL, and a detached read whose awaiter gave
+    up while it was still blocked (the only trace a verify with no child leaves).
 
-    * a **child that outlived SIGKILL** (``SubprocessRunner.abandoned_pids``),
-      which the runner records when its reap ladder gives up; and
-    * an **abandoned detached read** -- the only trace a pure-Python verify
-      (the WUX index walk, an archive listing, the key search) leaves, since it
-      has no child at all. Compared against a count taken before this file so a
-      thread stranded by some earlier request is not blamed on this one.
-
-    Asked of the service rather than switched on the tool: a verifier that
-    spawns nothing simply has no pids to report.
+    Both are reported into the sink opened by ``collect_abandonment()`` around
+    *this* file's work, rather than read off global state, so a second request
+    wedged on its own mount cannot make this batch abort files on a healthy one.
+    An outer deadline is the case that needs it most: it cancels the verify
+    before any terminal event exists, so there is nothing to carry a flag.
     """
-    pids = getattr(service, "abandoned_pids", None)
-    if pids and pids():
-        return {"abandoned": True}
-    if detached_abandon_count() > detached_before:
-        return {"abandoned": True}
-    return {}
+    return {"abandoned": True} if abandoned else {}
 
 
 async def _acquire_verify_lane_or_429() -> WorkloadToken:
@@ -1334,8 +1324,6 @@ def _sse_from_verify_stream(
             delivery backpressure, and no terminal result can arrive after the
             timeout has been reported, because the same task decides both.
             """
-            detached_before = detached_abandon_count()
-
             async def _pump() -> None:
                 async for update in cfg.service().verify_stream(path):
                     await _offer_verify_update(queue, update)
@@ -1351,7 +1339,7 @@ def _sse_from_verify_stream(
                     {
                         "type": "error",
                         **_verify_timed_out(bound),
-                        **_abandonment(cfg.service(), detached_before),
+                        **_abandonment(abandoned),
                     },
                 )
             except Exception as exc:
@@ -1376,7 +1364,10 @@ def _sse_from_verify_stream(
         verify_task = None
         try:
             bound = await tool.verify_timeout(path)
-            verify_task = asyncio.create_task(run_verify())
+            # Started inside the sink's block so the task's copied context
+            # reports into `abandoned` -- and only into it.
+            with collect_abandonment() as abandoned:
+                verify_task = asyncio.create_task(run_verify())
             while True:
                 try:
                     update = await asyncio.wait_for(queue.get(), timeout=2)
@@ -1493,7 +1484,6 @@ def _sse_batch_from_verify_stream(
                     the timeout because one task produces both.
                     """
                     nonlocal final_result
-                    detached_before = detached_abandon_count()
 
                     async def _pump() -> None:
                         nonlocal final_result
@@ -1513,7 +1503,7 @@ def _sse_batch_from_verify_stream(
                     except asyncio.TimeoutError:
                         final_result = {
                             **_verify_timed_out(bound),
-                            **_abandonment(cfg.service(), detached_before),
+                            **_abandonment(abandoned),
                         }
                         await _offer_verify_update(
                             queue, {"type": "error", **final_result},
@@ -1541,7 +1531,10 @@ def _sse_batch_from_verify_stream(
                     lane["token"] = await workload_limiter.acquire("verify")
 
                 start = time.monotonic()
-                verify_task = asyncio.create_task(run_verify())
+                # Started inside the sink's block so the task's copied context
+                # reports into this file's `abandoned` -- and only into it.
+                with collect_abandonment() as abandoned:
+                    verify_task = asyncio.create_task(run_verify())
                 try:
                     while not done.is_set() or not queue.empty():
                         try:
@@ -1610,7 +1603,7 @@ def _sse_batch_from_verify_stream(
                     ),
                 }
 
-                if final_result.get("abandoned"):
+                if final_result.get("abandoned") or abandoned:
                     # The verifier outlived SIGKILL, so it is still reading the
                     # storage this batch is walking. Every remaining file lives
                     # on that same storage, so continuing would spawn one more

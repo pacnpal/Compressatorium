@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import logging
 import os
@@ -65,28 +66,45 @@ _STAT_TIMEOUT = 10.0
 _MAX_DETACHED_PROBES = 64
 _probe_slots = threading.Semaphore(_MAX_DETACHED_PROBES)
 
-# Monotonic count of detached calls whose awaiter gave up while the call was
-# still blocked -- one written-off thread each, holding a probe slot until the
-# kernel unblocks it. Not an error on its own (it is the deliberate trade for
-# never hanging), but it is the only evidence a *pure-Python* verify leaves
-# behind when an outer deadline cancels it: no child, so nothing for
-# ``abandoned_pids`` to report. A caller walking a list compares the count
-# across a file to decide whether the storage just cost it a thread, and stops
-# rather than spending one more per remaining path.
-_detached_abandoned = 0
-_detached_abandoned_lock = threading.Lock()
+# Whatever the current operation has had to abandon: a child that outlived
+# SIGKILL, or a detached read whose awaiter gave up while it was still blocked
+# (one written-off thread each, holding a probe slot until the kernel unblocks
+# it). Neither is an error on its own -- both are the deliberate trade for never
+# hanging -- but a caller working through a list has to know, because the next
+# file is on the same storage and will cost another one.
+#
+# A context variable rather than a global tally, because "did *this* verify
+# abandon something" is the actual question. Globals cannot answer it once
+# MAX_VERIFY_CONCURRENCY > 1: one request's wedged mount would mark another
+# request's ordinary timeout as abandoned and stop its batch, possibly on
+# perfectly healthy storage. ``asyncio.create_task`` copies the current context,
+# so a producer task started inside ``collect_abandonment()`` reports into that
+# sink and no other.
+_abandon_sink: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "verify_abandon_sink", default=None,
+)
 
 
-def detached_abandon_count() -> int:
-    """How many detached calls have been abandoned mid-flight, process-wide."""
-    with _detached_abandoned_lock:
-        return _detached_abandoned
+@contextlib.contextmanager
+def collect_abandonment():
+    """Collect what the work started inside this block had to abandon.
+
+    Yields the list it collects into; truthy afterwards means this operation
+    left something stuck behind. Nests and interleaves safely: each caller gets
+    its own sink, and work outside any block simply reports nowhere.
+    """
+    sink: list[str] = []
+    token = _abandon_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _abandon_sink.reset(token)
 
 
-def _note_detached_abandon() -> None:
-    global _detached_abandoned
-    with _detached_abandoned_lock:
-        _detached_abandoned += 1
+def _note_abandoned(detail: str) -> None:
+    sink = _abandon_sink.get()
+    if sink is not None:
+        sink.append(detail)
 
 
 class ProbeCapacityExceeded(asyncio.TimeoutError):
@@ -436,12 +454,12 @@ async def run_detached(
             # verify that spawns no child this is the only trace left when an
             # outer deadline cancels it.
             future.cancel()
-            _note_detached_abandon()
+            _note_abandoned("detached read")
         elif future.cancelled():
             # Cancelling the awaiting task propagates straight into the future
             # it is awaiting, so it is already "done" here -- cancelled, not
             # answered. The thread is every bit as stuck; count it the same.
-            _note_detached_abandon()
+            _note_abandoned("detached read")
 
 
 async def verify_preflight(
@@ -484,6 +502,10 @@ async def verify_preflight(
         return {
             "type": "error",
             "valid": False,
+            # The stat is still running on its own thread -- giving up on it is
+            # abandonment, and a caller walking a list has to stop rather than
+            # spend one more thread per remaining path on the same storage.
+            "abandoned": True,
             "message": (
                 f"File stopped responding (no answer in {_STAT_TIMEOUT:.0f}s); "
                 "the volume may be offline"
@@ -755,6 +777,7 @@ class SubprocessRunner:
         )
         with self._pid_lock:
             self._abandoned_pids.add(process.pid)
+        _note_abandoned(f"pid {process.pid}")
         return False
 
     async def run_capture(
