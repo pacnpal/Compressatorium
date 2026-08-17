@@ -235,6 +235,26 @@ class Settings(BaseSettings):
             "as /romm/library). RomM's fs_path/full_path are relative to it."
         ),
     )
+    # Unattended conversion. Off by default: it queues real jobs that rewrite
+    # the operator's library, so it must be asked for, not inherited. The
+    # per-platform target formats live in the `romm.rules` preference (editable
+    # from the RomM view) rather than here -- they are user policy, not
+    # deployment config, and env vars cannot express a per-platform map.
+    romm_auto_convert: bool = Field(
+        default=False, alias="ROMM_AUTO_CONVERT",
+        description="Periodically queue conversions for RomM ROMs matching the saved rules",
+    )
+    romm_auto_convert_interval_minutes: int = Field(
+        default=60, alias="ROMM_AUTO_CONVERT_INTERVAL_MINUTES", ge=5,
+        description="Minutes between automatic RomM conversion sweeps (minimum 5)",
+    )
+    romm_auto_convert_max_per_run: int = Field(
+        default=25, alias="ROMM_AUTO_CONVERT_MAX_PER_RUN", ge=1,
+        description=(
+            "Most jobs one automatic sweep may queue. Bounds how much of the "
+            "library a single sweep commits to converting."
+        ),
+    )
 
     # Process-priority and timeout policy shared by EVERY conversion tool's
     # subprocess (chdman, Dolphin, 3DS, Switch) and the shared SubprocessRunner.

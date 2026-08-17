@@ -58,6 +58,8 @@ def _build_modes() -> list[ModeSpec]:
 
 class DolphinTool(BaseTool):
     id = "dolphin"
+    # Nintendo optical discs. RVZ/WIA/GCZ are Dolphin's own formats.
+    platform_slugs = frozenset({"ngc", "gamecube", "wii"})
     policy_owner = "dolphin_tool"
     display_name = "Dolphin"
     modes = _build_modes()

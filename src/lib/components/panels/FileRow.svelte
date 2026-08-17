@@ -110,7 +110,13 @@
       title={entry?.path}
     >
       <Icon size={16} class="ftype" />
-      <span class="name-text">{entry?.name}</span>
+      <!-- A library manager's curated title when there is one (the RomM
+           catalog), with the real filename beneath it. `name` stays the
+           filename everywhere else, because rename/delete/convert act on it. -->
+      <span class="name-text">{entry?.display_name || entry?.name}</span>
+      {#if entry?.display_name}
+        <span class="file-name" title={entry.name}>{entry.name}</span>
+      {/if}
       {#if isArchive}
         {@const summary = archiveItemSummary(entry)}
         {#if summary}<span class="archive-summary">{summary}</span>{/if}
@@ -190,6 +196,15 @@
   }
   .dir .name-button :global(.ftype) { color: var(--accent); }
   .archive .name-button :global(.ftype) { color: var(--badge-archive); }
+  .file-name {
+    color: var(--text-2);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 1;
+    min-width: 0;
+  }
   .name-text {
     overflow: hidden;
     text-overflow: ellipsis;

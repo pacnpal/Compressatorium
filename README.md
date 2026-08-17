@@ -264,27 +264,128 @@ the file is bad.
 ### RomM integration
 
 Point Compressatorium at a [RomM](https://romm.app) instance and the **RomM** view
-lists your library by platform, with real game names instead of filenames. The more
-useful half is that RomM's platform tells Compressatorium what a file *is*: a bare
-`.iso` is a PS2 disc (CHD, CSO) or a GameCube disc (RVZ), and extensions alone can't
-tell you which — so today you pick the tool tab yourself. Here it's already narrowed.
-The rows are the ordinary file list, so selection, per-row actions, Verify, the
-convert panel, and the job queue behave exactly as they do on a volume, and the view
-reports how much of the platform is already converted and what the rest still costs.
+becomes a second workspace: your library, by platform, with real game names instead
+of filenames — and the ability to convert all of it, by hand or on a schedule.
 
-Set `ROMM_URL`, `ROMM_TOKEN` (a RomM *client API token*), and `ROMM_LIBRARY_ROOT` —
-the path where RomM's library folder is mounted **in this container**. Compressatorium
-reads RomM's catalog over the API but the ROM files through the filesystem, so no disc
-image is ever copied over HTTP; a remote RomM works by mounting its library over
-NFS/SMB/rclone. See [docs/DOCKER-COMPOSE.md](docs/DOCKER-COMPOSE.md) for a compose
-example and the UID/GID caveat.
+Everything is configured in the app. Environment variables still work as first-run
+defaults, but nothing here needs a redeploy to change.
 
-**Metadata survives conversion.** RomM identifies a CHD by the SHA1 embedded in its
-header and an archive by its largest member, so converting to CHD/ZIP/7z keeps the
-Redump/No-Intro match by itself. RVZ, CSO, NSZ, WUX and Z3DS are matched on the file's
-own hash, which conversion changes — so Compressatorium saves each ROM's metadata
-before converting and re-applies it after RomM rescans (**Re-match in RomM**). The view
-tells you which target formats need that step before you queue anything.
+#### Why the platform matters
+
+The headline feature isn't the pretty names — it's that RomM knows what a file
+**is**. A bare `.iso` could be a PS2 disc, a GameCube disc, a PSP disc or a Wii
+disc, and the extension cannot tell you which; today you resolve that yourself by
+picking a tool tab. RomM's platform resolves it:
+
+| The same `.iso`, per RomM's platform | Tools offered |
+|---|---|
+| GameCube / Wii | Dolphin (RVZ/WIA/GCZ), NKit |
+| PlayStation 2 | CHDMAN (CHD), maxcso (CSO/ZSO/DAX) |
+| PSP | CHDMAN, maxcso |
+| PlayStation 3 | PS3 ISO |
+
+Narrowing is conservative on purpose: a tool that declares no platforms is never
+filtered out, and an unrecognised RomM platform falls back to plain
+extension-matching, so a new console never leaves you with an unconvertible row.
+
+#### Setting it up
+
+1. In RomM, go to **Administration → Client API Tokens** and create one. Grant
+   `platforms.read` and `roms.read`, plus `roms.write` if you want Compressatorium
+   to restore metadata after conversion (recommended — see below).
+2. Mount RomM's library folder into the Compressatorium container, and make sure
+   it's inside a configured Compressatorium volume.
+3. Open **RomM → Settings**, paste the URL, token and library path, and press
+   **Test connection**.
+
+The test reports three things separately, because they fail independently and
+"it doesn't work" is useless when it could be any of them:
+
+- **RomM reachable** — the URL is right and the instance is up.
+- **Token accepted** — the token is valid and has the scopes it needs.
+- **Library folder mounted here** — Compressatorium can actually see the files.
+
+**The library path is the path inside *this* container**, not the one RomM sees.
+RomM reports each ROM's location relative to its own library root, and
+Compressatorium joins that onto your path. Also match the UID/GID the two
+containers run as, or RomM won't be able to read what Compressatorium writes.
+
+Remote RomM needs no special mode: mount the library over NFS/SMB/rclone and it
+behaves exactly like a local one. No ROM is ever copied over HTTP — only the
+catalog travels over the API.
+
+#### Converting
+
+Pick a platform and you get the ordinary workspace — the same file list, row
+actions, Verify, convert panel and job queue you use on a volume. Select what you
+want, choose a format, convert. The header also reports how much of the platform
+is already converted and roughly how much space converting the rest would save.
+
+#### Automatic conversion
+
+**RomM → Automation** gives every platform its own rule. A library isn't
+homogeneous, so one global setting can't describe it: GameCube can convert to RVZ
+hourly while PS2 converts to CHD overnight, ten at a time, largest first.
+
+| Setting | What it does |
+|---|---|
+| **Convert to** | Target format for this platform. Off means "leave it alone". |
+| **Enabled** | Pause a rule without deleting it. |
+| **Run every** | Minutes between sweeps for this platform (minimum 5). |
+| **Only between** | Time-of-day window. Wraps midnight, so `22:00`–`04:00` works. |
+| **On these days** | Weekday mask — weekends only, weeknights only, whatever. |
+| **Max jobs per run** | Ceiling per sweep, so one rule can't flood the queue. |
+| **Priority** | Lower runs first when several platforms are due at once. |
+| **Convert in this order** | Name, largest first, smallest first, oldest or newest added. |
+| **Output folder** | Blank writes beside the source. |
+| **Smallest / largest ROM** | Size thresholds in MB. |
+| **Only names matching / Skip names matching** | Regex filters — convert only `(USA)`, skip `(Beta)`. |
+| **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. |
+| **Delete source after verify** | Offered only for modes that support it. |
+
+**Preview** shows exactly what a sweep would queue, without queueing it — and
+without moving the schedule clock, so looking never postpones a run. **Run now**
+does it for real.
+
+Sweeps are safe to repeat. A ROM is queued only when its target output is
+genuinely missing, and that comes from the same detector that badges rows in the
+file list — so the filesystem is the state. Running twice, restarting mid-sweep,
+or racing a manual conversion all converge instead of duplicating work. Sweeps also
+stop when the queue is full and resume where they left off.
+
+#### Your metadata survives conversion
+
+This is the part most conversion workflows get wrong. RomM identifies a CHD by the
+SHA1 embedded in its header and an archive by its largest member, so **converting
+to CHD, ZIP or 7z keeps the Redump/No-Intro match automatically**.
+
+RVZ, CSO, NSZ, WUX and Z3DS are different: RomM matches those on the file's own
+hash, which conversion necessarily changes, so the ROM would go unidentified and
+lose its artwork and metadata. Compressatorium handles it — it saves each ROM's
+metadata **before** converting and re-applies it afterwards:
+
+1. Convert as usual. The view tells you up front which formats need this step.
+2. Let RomM rescan (its watcher, a scheduled scan, or a manual one).
+3. Press **Re-match in RomM** — or leave it to run automatically on page load.
+
+The match uses the converted file's SHA1, so it's exact and survives you renaming
+the file in between. Re-matching is idempotent: already-restored ROMs are skipped,
+and anything RomM hasn't scanned yet just waits for the next attempt.
+
+#### Settings reference
+
+| Setting | Default | What it does |
+|---|---|---|
+| RomM URL | *(unset)* | Base URL of your instance. Unset hides the feature. |
+| API token | *(unset)* | Client API token. Stored server-side; never sent back to the browser. |
+| Library path | *(unset)* | Where RomM's library is mounted **in this container**. |
+| Run automatically | off | Master switch for scheduled sweeps. |
+| Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. |
+| Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |
+
+The matching environment variables — `ROMM_URL`, `ROMM_TOKEN`,
+`ROMM_LIBRARY_ROOT`, `ROMM_AUTO_CONVERT` and friends — seed these on first run.
+See [docs/DOCKER-COMPOSE.md](docs/DOCKER-COMPOSE.md) for a full compose example.
 
 ### Archives
 

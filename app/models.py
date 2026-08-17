@@ -86,6 +86,12 @@ class OutputStatus(BaseModel):
 
 class FileEntry(BaseModel):
     name: str
+    # Human-facing label when it differs from the filename: a library manager's
+    # curated game title ("Super Mario Bros." for smb_u_rev1.sfc). Display only
+    # -- `name` remains the real filename that rename/delete/convert act on, so
+    # nothing that touches the filesystem may read this. None for ordinary
+    # directory listings.
+    display_name: str | None = None
     path: str
     type: str  # "file", "directory", or "archive"
     size: int | None = None

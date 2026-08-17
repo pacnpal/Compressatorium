@@ -1,6 +1,7 @@
 <script>
   import { conversion } from '$lib/stores/conversion.svelte.js';
   import { fileBrowser } from '$lib/stores/fileBrowser.svelte.js';
+  import { romm } from '$lib/stores/romm.svelte.js';
   import { ui } from '$lib/stores/ui.svelte.js';
   import Button from '$lib/components/ui/Button.svelte';
   import Checkbox from '$lib/components/ui/Checkbox.svelte';
@@ -124,12 +125,17 @@
         // the submit will queue zero jobs and conversion.submit's
         // toast will surface that. No need to show a plan modal.
       }
+      const fromRomm = fileBrowser.rommPlatformId !== null;
       await conversion.submit(selectedPaths, {
         duplicateAction,
         // Only rows that came from the RomM catalog have RomM metadata to carry
         // across; a normal directory browse has nothing to snapshot.
-        rommRepin: fileBrowser.rommPlatformId !== null,
+        rommRepin: fromRomm,
       });
+      // Surface the follow-up straight away: the "Re-match in RomM" badge is
+      // driven by this count, and leaving it stale hides the one action these
+      // conversions will need once RomM rescans.
+      if (fromRomm) romm.notePendingRepins(conversion.lastRepinRecorded);
       conversion.clearDuplicateCheck();
       fileBrowser.clearSelection();
       // Honor the per-deployment auto-return-from-search setting

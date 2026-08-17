@@ -30,6 +30,7 @@ from .spec import ModeKind, ModeSpec
 
 class JwudTool(BaseTool):
     id = "jwud"
+    platform_slugs = frozenset({"wiiu", "wii-u"})
     policy_owner = "jwud"
     display_name = "Wii U"
     modes = (

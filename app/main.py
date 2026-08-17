@@ -281,6 +281,36 @@ async def lifespan(app: FastAPI):
 
     process_queue_task.add_done_callback(_log_process_queue_error)
 
+    # Prime the RomM settings cache before anything can serve a request.  The
+    # RomM client reads it synchronously from worker threads, so it must be
+    # populated first; without this the first catalog call would fall back to
+    # the environment and ignore whatever the operator saved in the app.
+    from services import romm_auto, romm_settings
+
+    try:
+        romm_cfg = await romm_settings.load()
+    except Exception:
+        logger.exception("Failed to load RomM settings; using environment defaults")
+        romm_cfg = {}
+    if romm_cfg.get("url"):
+        logger.info("RomM integration configured (%s)", romm_cfg["url"])
+
+    # The unattended-conversion scheduler always runs; it checks the master
+    # switch each tick, so toggling auto-convert in the app takes effect
+    # without a restart.  It sleeps first, so startup never queues anything.
+    romm_auto_task = asyncio.create_task(romm_auto.run_forever())
+    app.state.background_tasks.add(romm_auto_task)
+    romm_auto_task.add_done_callback(app.state.background_tasks.discard)
+
+    def _log_romm_auto_error(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "RomM auto-convert scheduler exited unexpectedly",
+                exc_info=t.exception(),
+            )
+
+    romm_auto_task.add_done_callback(_log_romm_auto_error)
+
     # Auto-sync MAMERedump DATs on startup.  Two independent triggers:
     #   1. MAMEREDUMP_AUTO_SYNC=true AND the store is empty  → fresh-install sync.
     #   2. Any DAT has file_count=0 (regardless of MAMEREDUMP_AUTO_SYNC) →

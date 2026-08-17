@@ -109,6 +109,14 @@ def _build_modes() -> list[ModeSpec]:
 
 class ChdmanTool(BaseTool):
     id = "chdman"
+    # CD/DVD-based systems whose images CHD is the standard container for.
+    # Deliberately excludes GameCube/Wii: those are .iso too, but RVZ is the
+    # format for them, and that is exactly the ambiguity the platform resolves.
+    platform_slugs = frozenset({
+        "ps", "psx", "ps2", "psp", "dc", "segacd", "sega-cd", "saturn",
+        "segasaturn", "3do", "pcfx", "neogeocd", "turbografx-cd", "philips-cd-i",
+        "arcade", "mame", "neo-geo-cd", "pc-fx",
+    })
     policy_owner = "chdman"
     display_name = "CHDMAN"
     modes = _build_modes()

@@ -27,6 +27,7 @@ from .spec import ModeKind, ModeSpec
 
 class NszTool(BaseTool):
     id = "nsz"
+    platform_slugs = frozenset({"switch", "nintendo-switch"})
     policy_owner = "nsz"
     display_name = "Switch"
     modes = (

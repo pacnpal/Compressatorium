@@ -650,13 +650,25 @@ class FileBrowserStore {
     await this._loadRommEntries(platformId);
   }
 
-  /** Return to ordinary filesystem browsing. */
+  /** Return to ordinary filesystem browsing.
+   *
+   * Re-loads the directory the user was in rather than only clearing the
+   * catalog rows: `WorkArea` does not refresh on mount and `VolumeList` only
+   * fetches when it has no volumes, so leaving the entries empty would show a
+   * blank file list until something else happened to trigger a reload.
+   */
   exitRomm() {
     if (this.rommPlatformId === null) return;
     this.rommPlatformId = null;
     this.clearSelection();
     this.entries = [];
     this.entriesError = null;
+    // Drop the memo of the last loaded directory so the refresh is not
+    // collapsed as a duplicate of the listing we just discarded.
+    this._loadedPath = null;
+    if (this.currentPath) {
+      this.refresh({ force: true });
+    }
   }
 
   async _loadRommEntries(platformId) {

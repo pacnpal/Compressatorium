@@ -179,7 +179,10 @@ async def test_roms_route_drops_unresolvable_records(tmp_path: Path) -> None:
             patch.object(romm_routes, "is_within_configured_volumes", return_value=True):
         listing = await romm_routes.romm_roms(platform_id=1)
 
-    assert [e.name for e in listing.entries] == ["Real Game"]
+    # The filename is the contract every reused row action depends on; the
+    # curated title rides along separately.
+    assert [e.name for e in listing.entries] == ["Game.iso"]
+    assert [e.display_name for e in listing.entries] == ["Real Game"]
     assert listing.entries[0].path == str(real)
     assert listing.entries[0].size == 16
 
@@ -195,7 +198,10 @@ async def test_roms_route_uses_romm_name_over_filename(tmp_path: Path) -> None:
             patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(romm_routes, "is_within_configured_volumes", return_value=True):
         listing = await romm_routes.romm_roms(platform_id=1)
-    assert listing.entries[0].name == "Super Mario Bros."
+    # `name` must stay the real filename: Rename pre-fills from it, so seeding
+    # it with the title would rename the file without its extension.
+    assert listing.entries[0].name == "smb_u_rev1.sfc"
+    assert listing.entries[0].display_name == "Super Mario Bros."
 
 
 @pytest.mark.asyncio
@@ -326,7 +332,7 @@ async def test_repin_leaves_unscanned_rows_pending(repin_db, tmp_path: Path) -> 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
             patch.object(
-                romm_routes, "compute_file_sha1", AsyncMock(return_value="abc123"),
+                romm_routes, "run_detached", AsyncMock(return_value="abc123"),
             ), \
             patch.object(romm_routes.romm_client, "rom_by_sha1", return_value=None), \
             patch.object(
@@ -353,7 +359,7 @@ async def test_repin_applies_metadata_once_romm_has_scanned(
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
             patch.object(
-                romm_routes, "compute_file_sha1", AsyncMock(return_value="abc123"),
+                romm_routes, "run_detached", AsyncMock(return_value="abc123"),
             ), \
             patch.object(
                 romm_routes.romm_client, "rom_by_sha1", return_value={"id": 108},
@@ -428,3 +434,410 @@ def test_dat_safe_set_matches_romm_lookup_hashes() -> None:
     conversion changes — so this set is exactly the formats that need no re-pin.
     """
     assert DAT_SAFE_OUTPUT_EXTS == {".chd", ".zip", ".7z"}
+
+
+# ----------------------------------------------------------------------
+# platform narrowing (the feature the whole overlay exists for)
+# ----------------------------------------------------------------------
+
+
+def test_platform_narrows_ambiguous_iso() -> None:
+    """A bare .iso is the case extensions cannot resolve.
+
+    chdman, dolphin and maxcso all accept `.iso`; only the platform says
+    whether it is a GameCube disc (RVZ) or a PS2 disc (CHD/CSO).
+    """
+    from services.tools import registry as reg
+
+    candidates = ["chdman", "dolphin", "cso", "nkit"]
+    gamecube = reg.narrow_to_platform(candidates, "ngc")
+    ps2 = reg.narrow_to_platform(candidates, "ps2")
+
+    assert "dolphin" in gamecube and "nkit" in gamecube
+    assert "chdman" not in gamecube and "cso" not in gamecube
+    assert "chdman" in ps2 and "cso" in ps2
+    assert "dolphin" not in ps2
+
+
+def test_unknown_platform_never_narrows_to_nothing() -> None:
+    """An unrecognised RomM slug must degrade to extension-only behaviour.
+
+    Wrongly excluding every tool would make the row unconvertible, which is far
+    worse than showing one option too many.
+    """
+    from services.tools import registry as reg
+
+    candidates = ["chdman", "dolphin", "cso"]
+    assert reg.narrow_to_platform(candidates, "some-new-console-2031") == candidates
+    assert reg.narrow_to_platform(candidates, None) == candidates
+    assert reg.narrow_to_platform(candidates, "") == candidates
+
+
+def test_tool_without_platform_opinion_is_never_dropped() -> None:
+    from services.tools import registry as reg
+
+    # romz declares cartridge platforms, so it is droppable; a tool declaring
+    # nothing must survive every slug.
+    for tool in reg.all():
+        if not tool.platform_slugs:
+            assert tool.id in reg.narrow_to_platform([tool.id], "ps2")
+
+
+# ----------------------------------------------------------------------
+# runtime settings
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture(name="settings_db")
+def _settings_db(tmp_path: Path):
+    from services import romm_settings
+
+    if _db.engine is not None:
+        _db.engine.dispose()
+    _db.init_engine(str(tmp_path / "compressatorium.db"), create_schema=True)
+    romm_settings.reset_for_tests()
+    yield romm_settings
+    romm_settings.reset_for_tests()
+    if _db.engine is not None:
+        _db.engine.dispose()
+    _db.engine = None
+    _db.SessionLocal = None
+
+
+@pytest.mark.asyncio
+async def test_saved_settings_override_env(settings_db, monkeypatch) -> None:
+    monkeypatch.setenv("ROMM_URL", "http://from-env:8080")
+    await settings_db.load(force=True)
+    assert settings_db.effective()["url"] == "http://from-env:8080"
+
+    await settings_db.save({"url": "http://from-app:8080"})
+    assert settings_db.effective()["url"] == "http://from-app:8080"
+
+
+@pytest.mark.asyncio
+async def test_token_is_never_returned_by_the_api(settings_db) -> None:
+    await settings_db.save({"token": "rmm_" + "b" * 64})
+    public = settings_db.public()
+    assert "token" not in public
+    assert public["token_set"] is True
+    assert settings_db.token() == "rmm_" + "b" * 64
+
+
+@pytest.mark.asyncio
+async def test_empty_token_leaves_the_stored_one_alone(settings_db) -> None:
+    """The form never shows the secret, so submitting it must not blank it."""
+    await settings_db.save({"token": "rmm_" + "c" * 64})
+    await settings_db.save({"url": "http://romm:8080", "token": ""})
+    assert settings_db.token() == "rmm_" + "c" * 64
+
+    await settings_db.save({"token": settings_db.CLEAR_TOKEN})
+    assert settings_db.token() is None
+
+
+@pytest.mark.asyncio
+async def test_partial_save_does_not_clobber_other_fields(settings_db) -> None:
+    await settings_db.save({"url": "http://romm:8080", "auto_convert": True})
+    await settings_db.save({"auto_convert_max_per_run": 5})
+    values = settings_db.effective()
+    assert values["url"] == "http://romm:8080"
+    assert values["auto_convert"] is True
+    assert values["auto_convert_max_per_run"] == 5
+
+
+@pytest.mark.asyncio
+async def test_numeric_settings_are_bounded(settings_db) -> None:
+    await settings_db.save({"auto_convert_interval_minutes": 1})
+    assert settings_db.effective()["auto_convert_interval_minutes"] == 5
+    await settings_db.save({"auto_convert_max_per_run": 99999})
+    assert settings_db.effective()["auto_convert_max_per_run"] == 1000
+
+# ----------------------------------------------------------------------
+# per-platform automation rules
+# ----------------------------------------------------------------------
+
+
+def test_rule_normalizes_to_full_schema() -> None:
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({"mode": "dolphin_rvz", "enabled": True})
+    assert rule is not None
+    # Every field the engine reads is present, so a sweep never KeyErrors on a
+    # rule written by an older version of the UI.
+    for field in romm_auto.default_rule():
+        assert field in rule
+
+
+def test_rule_with_unknown_mode_is_dropped() -> None:
+    from services import romm_auto
+
+    assert romm_auto.normalize_rule({"mode": "not_a_real_mode"}) is None
+    assert romm_auto.normalize_rules({"7": {"mode": "nope"}}) == {}
+
+
+def test_rule_numeric_fields_are_bounded() -> None:
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "interval_minutes": 1, "max_per_run": 99999,
+    })
+    assert rule["interval_minutes"] == 5
+    assert rule["max_per_run"] == 1000
+
+
+def test_invalid_filter_pattern_is_ignored_not_fatal() -> None:
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({"mode": "dolphin_rvz", "include_pattern": "([a"})
+    assert rule["include_pattern"] is None
+
+
+def test_compression_only_kept_where_the_mode_supports_it() -> None:
+    from services import romm_auto
+
+    # dolphin_gcz takes no compression setting; storing one would be dropped
+    # at submit time anyway, so it must not be persisted as if it applied.
+    rule = romm_auto.normalize_rule({"mode": "dolphin_gcz", "compression": "zstd"})
+    assert rule["compression"] is None
+
+
+def test_contradictory_match_filters_cancel_out() -> None:
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "only_matched": True, "only_unmatched": True,
+    })
+    assert rule["only_matched"] is False
+    assert rule["only_unmatched"] is False
+
+
+def test_overnight_window_wraps_midnight() -> None:
+    from datetime import datetime, timezone
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["window_start"], rule["window_end"] = "22:00", "04:00"
+    inside = datetime(2026, 8, 17, 23, 30, tzinfo=timezone.utc)   # Monday
+    outside = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+    early = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+    assert romm_auto._in_window(rule, inside)
+    assert romm_auto._in_window(rule, early)
+    assert not romm_auto._in_window(rule, outside)
+
+
+def test_day_mask_excludes_other_days() -> None:
+    from datetime import datetime, timezone
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["days"] = [5, 6]  # weekends only
+    monday = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+    saturday = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+    assert not romm_auto._in_window(rule, monday)
+    assert romm_auto._in_window(rule, saturday)
+
+
+def test_disabled_rule_is_never_due() -> None:
+    from datetime import datetime, timezone
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["enabled"] = False
+    assert not romm_auto._is_due(rule, {}, datetime.now(timezone.utc))
+
+
+def test_interval_gates_a_second_run() -> None:
+    from datetime import datetime, timedelta, timezone
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["enabled"] = True
+    rule["interval_minutes"] = 60
+    now = datetime.now(timezone.utc)
+    just_ran = {"last_run_at": (now - timedelta(minutes=5)).isoformat()}
+    long_ago = {"last_run_at": (now - timedelta(hours=3)).isoformat()}
+    assert not romm_auto._is_due(rule, just_ran, now)
+    assert romm_auto._is_due(rule, long_ago, now)
+    assert romm_auto._is_due(rule, {}, now)   # never run
+
+
+def test_size_and_name_filters() -> None:
+    from services import romm_auto
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["min_size_mb"] = 100
+    big = {"fs_name": "Big Game (USA).iso", "fs_size_bytes": 4_400_000_000}
+    small = {"fs_name": "Tiny.iso", "fs_size_bytes": 1024}
+    assert romm_auto._passes_filters(big, rule)
+    assert not romm_auto._passes_filters(small, rule)
+
+    rule = romm_auto.default_rule("dolphin_rvz")
+    rule["exclude_pattern"] = r"\(Japan\)"
+    assert not romm_auto._passes_filters({"fs_name": "Game (Japan).iso"}, rule)
+    assert romm_auto._passes_filters({"fs_name": "Game (USA).iso"}, rule)
+
+
+def test_rom_ordering_is_deterministic() -> None:
+    from services import romm_auto
+
+    roms = [
+        {"id": 3, "name": "Charlie", "fs_size_bytes": 10},
+        {"id": 1, "name": "alpha", "fs_size_bytes": 300},
+        {"id": 2, "name": "Bravo", "fs_size_bytes": 200},
+    ]
+    rule = romm_auto.default_rule("dolphin_rvz")
+    by_name = [r["id"] for r in sorted(roms, key=romm_auto._rom_sort_key(rule))]
+    assert by_name == [1, 2, 3]
+
+    rule["order"] = "size_desc"
+    by_size = [r["id"] for r in sorted(roms, key=romm_auto._rom_sort_key(rule))]
+    assert by_size == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_idempotent_against_the_filesystem(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The second sweep must queue nothing once the output exists.
+
+    This is the property the whole engine rests on: state lives on disk, not in
+    a table, so a sweep that runs twice — or after a restart, or racing a
+    manual conversion — converges instead of duplicating work.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({
+        "7": {"mode": "dolphin_rvz", "enabled": True, "max_per_run": 10},
+    })
+
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "fs_size_bytes": 32, "platform_slug": "ngc",
+    }]
+    queued: list[list[str]] = []
+
+    async def _fake_batch(paths, mode, **kwargs):
+        queued.append(list(paths))
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        first = await romm_auto.sweep(ignore_schedule=True)
+        assert first["queued"] == 1, first
+        assert queued == [[str(lib / "Game.iso")]]
+
+        # The conversion lands: the output now sits beside the source, which is
+        # the only thing the next sweep consults.
+        (lib / "Game.rvz").write_bytes(b"\0" * 16)
+        second = await romm_auto.sweep(ignore_schedule=True)
+
+    assert second["queued"] == 0, second
+    assert second["skipped_existing"] == 1
+    assert len(queued) == 1, "the second sweep must not enqueue anything"
+
+
+@pytest.mark.asyncio
+async def test_sweep_preview_queues_nothing_and_does_not_move_the_clock(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Looking at what *would* run must not postpone the run that should."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "create_batch_jobs",
+            ) as create, \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        preview = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    create.assert_not_called()
+    assert preview["queued"] == 1
+    assert preview["dry_run"] is True
+    # No run recorded, so the real sweep is still due.
+    assert await romm_auto.get_state() == {}
+
+
+@pytest.mark.asyncio
+async def test_sweep_respects_the_overall_cap(settings_db, tmp_path: Path) -> None:
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    roms = []
+    for i in range(10):
+        (lib / f"Game{i}.iso").write_bytes(b"\0" * 8)
+        roms.append({
+            "id": i, "name": f"Game{i}", "full_path": f"roms/gc/Game{i}.iso",
+            "fs_name": f"Game{i}.iso", "platform_slug": "ngc",
+        })
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        preview = await romm_auto.sweep(
+            ignore_schedule=True, dry_run=True, overall_limit=3,
+        )
+    assert preview["queued"] == 3
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_sources_already_being_converted(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A job already working on a source must not get a second one queued."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    source = lib / "Game.iso"
+    source.write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates",
+                return_value=[("job-1", [str(source)])],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0
+    assert result["skipped_active"] == 1

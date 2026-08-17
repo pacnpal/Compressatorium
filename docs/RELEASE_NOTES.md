@@ -5,34 +5,61 @@
 ### Added
 
 - **RomM library integration.** A new **RomM** view lists your
-  [RomM](https://romm.app) library by platform and converts it in place. Pick a
-  platform and you get real game names instead of filenames — and, more usefully,
-  the platform tells Compressatorium what a bare `.iso` actually *is*, so a
-  GameCube disc offers RVZ and a PS2 disc offers CHD/CSO without you choosing a
-  tool tab first. The rows are the ordinary file list, so selection, per-row
-  actions, Verify, the convert panel and the job queue all behave exactly as they
-  do when browsing a volume.
+  [RomM](https://romm.app) library by platform and converts it in place — by
+  hand or on a schedule. Pick a platform and you get real game names instead of
+  filenames, in the ordinary workspace: the same file list, row actions, Verify,
+  convert panel and job queue you already use on a volume.
 
-  Point `ROMM_URL` at your RomM instance and `ROMM_LIBRARY_ROOT` at the local
-  mount of its library folder (`ROMM_TOKEN` holds a RomM **client API token**;
-  create one under *Administration → Client API Tokens*). No ROM ever travels
-  over HTTP — Compressatorium reads RomM's catalog over the API but the files
-  themselves through the filesystem, so a remote RomM works by mounting its
-  library over NFS/SMB/rclone rather than by copying multi-GB discs twice.
+  The real win is that RomM knows what a file *is*. A bare `.iso` could be a PS2
+  disc or a GameCube disc and the extension cannot tell you which — today you
+  resolve that by picking a tool tab. Now the platform does it: the same `.iso`
+  offers Dolphin RVZ on GameCube and CHD/CSO on PS2. Narrowing is conservative,
+  so an unrecognised platform falls back to plain extension matching rather than
+  leaving you with an unconvertible row.
 
-  The view also reports, per platform, how much of the library is already
-  converted and how many bytes the rest still occupies.
+  **Everything is configured in the app** — connection, credentials, library
+  path, and automation. The environment variables (`ROMM_URL`, `ROMM_TOKEN`,
+  `ROMM_LIBRARY_ROOT`, …) still work as first-run defaults, but nothing needs a
+  redeploy to change. **Test connection** checks *reachable*, *token accepted*
+  and *library mounted here* separately, because they fail independently.
 
-- **Converted ROMs keep their RomM metadata.** RomM identifies a CHD by the
-  SHA-1 embedded in its header and an archive by its largest member, so
-  converting to CHD, ZIP or 7z keeps the Redump/No-Intro match automatically.
-  Every other format — RVZ, CSO, NSZ, WUX, Z3DS — is matched on the file's own
-  hash, which conversion necessarily changes, and those ROMs would go
-  unidentified. Compressatorium now saves each ROM's metadata *before* the
-  conversion and re-applies it afterwards: convert, let RomM rescan, then press
-  **Re-match in RomM**. The view says up front which target formats need this and
-  which do not, so the trade-off is visible before you queue anything rather than
-  discovered afterwards.
+  No ROM ever crosses the network: Compressatorium reads RomM's catalog over the
+  API but the files themselves through the filesystem. A remote RomM works by
+  mounting its library over NFS/SMB/rclone — there is no separate mode to learn.
+
+- **Per-platform automatic conversion.** Every platform gets its own rule, because
+  a library is not homogeneous: GameCube can convert to RVZ hourly while PS2
+  converts to CHD overnight, ten at a time, largest first. Each rule sets the
+  target format, its own schedule (interval, time-of-day window that may wrap
+  midnight, and a weekday mask), queueing limits (max jobs per run, priority,
+  conversion order), an output folder, and selection filters — size thresholds,
+  name patterns, and whether to include ROMs RomM has or hasn't identified.
+
+  **Preview** shows exactly what a sweep would queue without queueing it, and
+  without moving the schedule clock, so looking never postpones a run.
+
+  Sweeps are safe to repeat: a ROM is queued only when its target output is
+  genuinely missing, judged by the same detector that badges rows in the file
+  list. Running twice, restarting mid-sweep, or racing a manual conversion all
+  converge instead of duplicating work, and a sweep that hits a full queue stops
+  and resumes where it left off.
+
+- **Converted ROMs keep their RomM metadata.** RomM identifies a CHD by the SHA1
+  embedded in its header and an archive by its largest member, so converting to
+  CHD, ZIP or 7z keeps the Redump/No-Intro match automatically. RVZ, CSO, NSZ,
+  WUX and Z3DS are matched on the file's own hash, which conversion necessarily
+  changes — those ROMs would go unidentified and lose their artwork.
+
+  Compressatorium now saves each ROM's metadata *before* the conversion and
+  re-applies it afterwards: convert, let RomM rescan, then press **Re-match in
+  RomM** (or leave it to run automatically when the view loads). The match uses
+  the converted file's SHA1, so it is exact and survives a rename. The view says
+  up front which target formats need this, so the trade-off is visible before you
+  queue anything rather than discovered afterwards.
+
+- **The RomM view reports library health.** Per platform: how much is already
+  converted, how much is left, and an estimate of the space converting the rest
+  would reclaim, using the same size-ratio table the progress bar estimates from.
 
 ### Fixed
 

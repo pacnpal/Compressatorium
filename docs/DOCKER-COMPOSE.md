@@ -95,6 +95,11 @@ services:
       - "8080:8080"
 ```
 
+> **You can skip all of this and configure RomM in the app instead.** These
+> variables only seed the first run; **RomM → Settings** in the web UI sets the
+> same values, saves them, and applies them without a restart. They are here for
+> operators who prefer a declarative compose file.
+
 **Getting a token:** in RomM, go to *Administration → Client API Tokens* and
 create one. Client API tokens (`rmm_` + 64 hex characters) are per-user, do not
 expire unless you set an expiry, and carry only the scopes you grant. Give it
@@ -121,7 +126,13 @@ instead after converting.
 **After converting:** RomM has to rescan before it sees the new files. Either
 enable its filesystem watcher or run a scan from RomM. Then, if you converted to
 a format RomM cannot hash-match, press **Re-match in RomM** in the RomM view to
-re-apply the saved metadata.
+re-apply the saved metadata (or leave it to run automatically on page load).
+
+**Unattended conversion:** set `ROMM_AUTO_CONVERT=true` to enable the scheduler,
+then configure per-platform rules under **RomM → Automation** — target format,
+schedule, queueing limits and selection filters, all per platform. The rules
+themselves live in the app, not in environment variables: a per-platform map is
+not something an env var can express.
 
 ---
 
@@ -203,6 +214,13 @@ Volume behavior:
 | `ROMM_URL` | *(unset)* | Base URL of your RomM instance, e.g. `http://romm:8080`. Unset disables the RomM view entirely. |
 | `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. Read from the environment only — never stored in the database. |
 | `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
+| `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. Rules are configured in the app (**RomM → Automation**). |
+| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Ceiling on jobs queued by one sweep, across all platforms. |
+| `ROMM_REPIN` | `true` | Save a ROM's metadata before converting to a format RomM cannot hash-match, so it can be restored afterwards. |
+| `ROMM_REPIN_ON_LOAD` | `true` | Re-apply saved metadata automatically when the RomM view loads. |
+
+All of these are editable in **RomM → Settings**; the environment only supplies
+the first-run default.
 | `CHDMAN_MODE` | `createcd` | Conversion mode: `createcd` or `createdvd` (CLI mode) |
 | `CHDMAN_PATH` | `/usr/bin/chdman` | Path to chdman binary |
 | `DOLPHIN_TOOL_PATH` | `/usr/local/bin/dolphin-tool` | Path to dolphin-tool binary |

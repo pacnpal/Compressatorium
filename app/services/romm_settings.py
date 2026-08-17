@@ -1,0 +1,197 @@
+"""Runtime-editable RomM settings.
+
+Everything about the RomM integration is configurable from the app: connection,
+credentials, library location, unattended-conversion policy, and the
+per-platform rules. Environment variables remain the *first-run defaults* — an
+operator can still bake a working configuration into a compose file — but the
+saved settings win once anything has been set, and take effect without a
+restart.
+
+Layering, highest priority first:
+
+1. what the operator saved in the app (SQLite ``preferences`` row)
+2. the environment (``ROMM_URL`` / ``ROMM_TOKEN`` / ``ROMM_LIBRARY_ROOT`` / …)
+3. the field's built-in default
+
+A **sync** snapshot is what the client actually reads: ``RommClient``'s methods
+are blocking and run through ``run_in_threadpool``, so they cannot await a
+store. ``effective()`` serves a cached dict that ``load()`` primes at startup
+and ``save()`` refreshes, which also keeps a settings read off the hot path of
+every catalog request.
+
+The token is held here too, and that is a deliberate trade: the alternative is
+an env-only secret the user cannot change without redeploying, which is exactly
+what "configure it in the app" rules out. It is never returned by the API —
+callers only ever learn whether one is set — and the store is the same SQLite
+file that already holds the rest of the app's state.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Any
+
+from logging_setup import get_logger
+from services.preferences_store import preferences_store
+
+logger = get_logger("romm_settings")
+
+SETTINGS_KEY = "romm.settings"
+
+# Sentinel a client sends to clear the stored token. An empty string means
+# "unchanged" instead, so a form that never displays the secret (it can't --
+# the API does not return it) cannot blank it out just by being submitted.
+CLEAR_TOKEN = "__clear__"
+
+# field -> (env var, default, kind). One table, so a new setting is one row and
+# every layer (env fallback, coercion, serialization) picks it up for free.
+_FIELDS: dict[str, tuple[str, Any, str]] = {
+    "url": ("ROMM_URL", "", "str"),
+    "library_root": ("ROMM_LIBRARY_ROOT", "", "str"),
+    "auto_convert": ("ROMM_AUTO_CONVERT", False, "bool"),
+    "auto_convert_interval_minutes": ("ROMM_AUTO_CONVERT_INTERVAL_MINUTES", 60, "int"),
+    "auto_convert_max_per_run": ("ROMM_AUTO_CONVERT_MAX_PER_RUN", 25, "int"),
+    # Whether a conversion to a format RomM cannot hash-match records the
+    # source's metadata so it can be re-applied after RomM rescans.
+    "repin_enabled": ("ROMM_REPIN", True, "bool"),
+    # Re-apply metadata automatically whenever the RomM view loads, rather than
+    # only when the operator presses the button.
+    "repin_on_load": ("ROMM_REPIN_ON_LOAD", True, "bool"),
+    # Days after which a pending re-pin whose output never appeared is retired.
+    "repin_abandon_days": ("ROMM_REPIN_ABANDON_DAYS", 7, "int"),
+    # Verify each conversion before its metadata is re-applied.
+    "verify_after_convert": ("ROMM_VERIFY_AFTER_CONVERT", False, "bool"),
+    # Delete the source once the new output verifies. Off by default: it is
+    # destructive, and the RomM library is the user's collection.
+    "delete_source_after_verify": ("ROMM_DELETE_SOURCE_AFTER_VERIFY", False, "bool"),
+}
+
+_INT_BOUNDS = {
+    "auto_convert_interval_minutes": (5, 10080),
+    "auto_convert_max_per_run": (1, 1000),
+    "repin_abandon_days": (1, 365),
+}
+
+_cache: dict[str, Any] | None = None
+_token: str | None = None
+_lock = threading.Lock()
+
+
+def _coerce(kind: str, value: Any, default: Any, field: str | None = None) -> Any:
+    try:
+        if kind == "bool":
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if kind == "int":
+            out = int(value)
+            if field in _INT_BOUNDS:
+                low, high = _INT_BOUNDS[field]
+                out = max(low, min(high, out))
+            return out
+        return str(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _from_env() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for field, (env, default, kind) in _FIELDS.items():
+        raw = os.environ.get(env)
+        out[field] = default if raw is None else _coerce(kind, raw, default, field)
+    return out
+
+
+def _merge(stored: Any) -> dict[str, Any]:
+    merged = _from_env()
+    if isinstance(stored, dict):
+        for field, (_, default, kind) in _FIELDS.items():
+            if field in stored and stored[field] is not None:
+                merged[field] = _coerce(kind, stored[field], default, field)
+    return merged
+
+
+def effective() -> dict[str, Any]:
+    """The settings in force right now. Safe to call from a worker thread."""
+    with _lock:
+        if _cache is not None:
+            return dict(_cache)
+    # Never primed (a unit test, or a call before startup): fall back to the
+    # environment rather than reporting the feature unconfigured.
+    return _from_env()
+
+
+def token() -> str | None:
+    """The RomM API token in force, or None. Never leaves the backend."""
+    with _lock:
+        if _token is not None:
+            return _token or None
+    return os.environ.get("ROMM_TOKEN") or None
+
+
+async def load(*, force: bool = False) -> dict[str, Any]:
+    """Prime the cache from the store. Called once at startup."""
+    global _cache, _token
+    with _lock:
+        if _cache is not None and not force:
+            return dict(_cache)
+    stored = await preferences_store.get(SETTINGS_KEY)
+    merged = _merge(stored)
+    stored_token = (stored or {}).get("token") if isinstance(stored, dict) else None
+    with _lock:
+        _cache = merged
+        _token = stored_token if stored_token else None
+    return dict(merged)
+
+
+async def save(patch: dict[str, Any]) -> dict[str, Any]:
+    """Apply *patch* and persist it. Unknown keys are ignored.
+
+    Only the fields present in *patch* change, so a form that edits one card
+    cannot blank the settings another card owns.
+    """
+    global _cache, _token
+    stored = await preferences_store.get(SETTINGS_KEY)
+    stored = dict(stored) if isinstance(stored, dict) else {}
+
+    for field, (_, default, kind) in _FIELDS.items():
+        if field in patch and patch[field] is not None:
+            stored[field] = _coerce(kind, patch[field], default, field)
+
+    if "token" in patch:
+        raw = patch["token"]
+        if raw == CLEAR_TOKEN:
+            stored.pop("token", None)
+        elif isinstance(raw, str) and raw.strip():
+            stored["token"] = raw.strip()
+        # An empty/omitted token means "leave it alone".
+
+    await preferences_store.put(SETTINGS_KEY, stored)
+    merged = _merge(stored)
+    with _lock:
+        _cache = merged
+        _token = stored.get("token") or None
+    return dict(merged)
+
+
+def public(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Settings as the API returns them: everything except the secret itself."""
+    values = values if values is not None else effective()
+    out = dict(values)
+    out.pop("token", None)
+    out["token_set"] = bool(token())
+    # Tell the UI which fields the environment pins a default for, so it can
+    # explain where a value came from on a fresh install.
+    out["env_defaults"] = sorted(
+        field for field, (env, _, _) in _FIELDS.items() if os.environ.get(env)
+    )
+    return out
+
+
+def reset_for_tests() -> None:
+    """Drop the cached snapshot (tests re-prime against their own store)."""
+    global _cache, _token
+    with _lock:
+        _cache = None
+        _token = None

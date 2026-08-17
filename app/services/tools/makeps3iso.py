@@ -25,6 +25,7 @@ from .spec import InputKind, ModeKind, ModeSpec
 
 class MakePs3IsoTool(BaseTool):
     id = "makeps3iso"
+    platform_slugs = frozenset({"ps3"})
     policy_owner = "makeps3iso"
     display_name = "PS3 ISO"
     modes = (

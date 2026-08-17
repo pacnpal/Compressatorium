@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat as stat_module
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
@@ -25,15 +26,22 @@ from models import DirectoryListing, FileEntry
 from pydantic import BaseModel
 from routes.files import detect_file_outputs, verifiable_tools
 from services import db as _db
-from services.file_hasher import compute_file_sha1
+from services import romm_auto, romm_settings
+from services.file_hasher import compute_file_sha1_sync
 from services.romm import (
     DAT_SAFE_OUTPUT_EXTS,
     METADATA_ID_FIELDS,
+    RommClient,
     RommError,
     RommNotConfigured,
     romm_client,
 )
-from services.subprocess_runner import bounded_path_check
+from services.lock_manager import lock_manager
+from services.subprocess_runner import (
+    SIZE_RATIOS,
+    bounded_path_check,
+    run_detached,
+)
 from services.tools import registry
 from services.workload_limiter import workload_limiter
 from utils.path_utils import is_within_configured_volumes
@@ -46,10 +54,16 @@ logger = get_logger("romm")
 # would be retried forever, so retire it once it is clearly not coming.
 _ABANDON_AFTER = timedelta(days=7)
 
-# Ceiling on rows settled in one pass. Each miss costs a RomM round trip and each
-# hit costs a full-file SHA-1, so a large backlog is drained over several calls
-# rather than in one request that runs for an hour.
+# Ceiling on rows *settled* in one pass. Each hit costs a full-file SHA-1, so a
+# large backlog is drained over several calls rather than in one request that
+# runs for an hour.
 _MAX_SETTLE_PER_CALL = 25
+# Ceiling on rows *examined*. A row that is merely waiting costs one cheap
+# probe, but a backlog of thousands of them would still walk forever looking
+# for work, so the pass gives up scanning long before that.
+_MAX_EXAMINE_PER_CALL = 250
+# Rows fetched per query while walking the pending set.
+_SETTLE_PAGE = 50
 
 
 def _utcnow_iso() -> str:
@@ -123,10 +137,14 @@ async def romm_status() -> dict:
         "configured": configured,
         "library_root": library_root,
         "library_root_mounted": False,
-        "token_set": bool(os.environ.get("ROMM_TOKEN")),
+        "token_set": bool(romm_settings.token()),
         # SSOT for which targets keep RomM's DAT match. The frontend renders the
         # warning from this rather than carrying its own copy of the list.
         "dat_safe_output_exts": sorted(DAT_SAFE_OUTPUT_EXTS),
+        # Expected output/input size ratio per mode, so the view can estimate
+        # what converting would save. Served rather than duplicated in JS:
+        # SIZE_RATIOS is the same table the progress estimator reads.
+        "size_ratios": dict(SIZE_RATIOS),
         "connected": False,
         "version": None,
         "error": None,
@@ -206,13 +224,18 @@ async def romm_roms(
     except RommError as exc:
         raise _romm_call(exc, context="listing roms") from exc
 
-    entries = await run_in_threadpool(_build_entries, roms)
+    # RomM stamps the platform on every ROM record, so the slug that narrows
+    # the tool list costs no extra request. `platform_slug` is the canonical
+    # one (`platform_fs_slug` is the on-disk folder, which the operator may
+    # have renamed and which therefore does not identify the system).
+    slug = next((r.get("platform_slug") for r in roms if r.get("platform_slug")), None)
+    entries = await run_in_threadpool(_build_entries, roms, slug)
     return DirectoryListing(
         volume="RomM", path=f"romm://platform/{platform_id}", entries=entries,
     )
 
 
-def _build_entries(roms: list[dict]) -> list[FileEntry]:
+def _build_entries(roms: list[dict], platform_slug: str | None) -> list[FileEntry]:
     """Turn RomM records into FileEntry rows. Runs off the event loop."""
     entries: list[FileEntry] = []
     for rom in roms:
@@ -224,15 +247,24 @@ def _build_entries(roms: list[dict]) -> list[FileEntry]:
         except OSError:
             # missing_from_fs, a permissions problem, or a stale record.
             continue
-        if not os.path.isfile(path):
+        if not stat_module.S_ISREG(stat.st_mode):
             continue
         convertible_by, outputs, _ = detect_file_outputs(path)
+        # This is what the platform buys us. Extensions alone cannot tell a
+        # GameCube .iso from a PS2 .iso, so an unnarrowed list offers chdman and
+        # maxcso on a GameCube disc -- conversions that are wrong for the
+        # system. The registry decides; see ToolRegistry.narrow_to_platform.
+        convertible_by = registry.narrow_to_platform(convertible_by, platform_slug)
         name = os.path.basename(path)
         entries.append(
             FileEntry(
-                # RomM's curated game name is the point of the overlay; fall
-                # back to the filename when a ROM is unidentified.
-                name=rom.get("name") or name,
+                # `name` stays the real filename: it is the filename contract
+                # every reused row action depends on -- Rename pre-fills from it,
+                # and seeding that with "Super Mario Bros." would rename the file
+                # without its extension. RomM's curated title rides along in
+                # `display_name`, which the row shows and nothing acts on.
+                name=name,
+                display_name=rom.get("name") or None,
                 path=path,
                 type="file",
                 size=stat.st_size,
@@ -242,8 +274,9 @@ def _build_entries(roms: list[dict]) -> list[FileEntry]:
                 verifiable_by=verifiable_tools(path),
             ),
         )
-    # Deterministic ordering, independent of RomM's paging.
-    entries.sort(key=lambda e: (e.name.lower(), e.path))
+    # Deterministic ordering, independent of RomM's paging. Sorts on the title
+    # the user actually reads, falling back to the filename.
+    entries.sort(key=lambda e: ((e.display_name or e.name).lower(), e.path))
     return entries
 
 
@@ -323,14 +356,29 @@ async def romm_repin() -> dict:
     call.  Safe to invoke on every view load.
     """
     _require_configured()
-    rows = await run_in_threadpool(_pending_rows, _MAX_SETTLE_PER_CALL)
     repinned = 0
     waiting = 0
     abandoned = 0
     failed = 0
+    # Walk forward through the pending rows rather than re-reading the oldest
+    # page each time: rows that are merely waiting stay pending, and without a
+    # cursor a prefix of them would occupy every page and starve the rows
+    # behind. `settled` counts only the work that actually finished, so a page
+    # full of waiters still advances to the next page.
+    cursor = 0
+    settled = 0
+    examined = 0
+    rows = await run_in_threadpool(_pending_rows, _SETTLE_PAGE, after_id=cursor)
 
-    for row in rows:
-        output_path, sha1, rom_id, ids, created_at = row
+    while rows and settled < _MAX_SETTLE_PER_CALL and examined < _MAX_EXAMINE_PER_CALL:
+        row = rows.pop(0)
+        examined += 1
+        output_path, sha1, rom_id, ids, created_at, row_id = row
+        cursor = row_id
+        if not rows:
+            rows = await run_in_threadpool(
+                _pending_rows, _SETTLE_PAGE, after_id=cursor,
+            )
         try:
             exists = await bounded_path_check(os.path.isfile, output_path)
         except (asyncio.TimeoutError, OSError):
@@ -344,8 +392,25 @@ async def romm_repin() -> dict:
                     "Output never appeared", None,
                 )
                 abandoned += 1
+                settled += 1
             else:
                 waiting += 1
+            continue
+
+        # Never hash a file a converter is still writing. An output becomes a
+        # regular file the moment the tool creates it, so without this the pass
+        # could cache the SHA-1 of a partial file -- and because the hash is
+        # cached, every later attempt would reuse that wrong digest and the ROM
+        # could never be matched again. A locked source means the job is still
+        # running, which is simply "not yet".
+        try:
+            _, locked = await run_in_threadpool(
+                lock_manager.check_file_status, output_path,
+            )
+        except OSError:
+            locked = False
+        if locked:
+            waiting += 1
             continue
 
         try:
@@ -353,8 +418,14 @@ async def romm_repin() -> dict:
                 # Hashing a multi-GB image is heavy disk work: take the same
                 # lane the DAT matcher uses so a re-pin pass cannot compete
                 # with a running conversion for the array.
+                #
+                # `run_detached`, not the shared threadpool: this reads the
+                # whole file, and on a mount that stops answering mid-read the
+                # thread cannot be cancelled. AGENTS.md is explicit that such a
+                # read must never take a pooled worker -- repeated attempts
+                # would strand one each time and starve unrelated API work.
                 async with await workload_limiter.acquire("match"):
-                    sha1 = await compute_file_sha1(output_path)
+                    sha1 = await run_detached(compute_file_sha1_sync, output_path)
                 # Cache it: a row may be retried many times before RomM scans.
                 await run_in_threadpool(_store_sha1, output_path, sha1)
 
@@ -369,6 +440,7 @@ async def romm_repin() -> dict:
                 _settle, rom_id, output_path, "done", None, match["id"],
             )
             repinned += 1
+            settled += 1
         except RommError as exc:
             # Upstream trouble: leave the row pending and stop the pass rather
             # than burning the rest of the backlog against a sick RomM.
@@ -378,6 +450,7 @@ async def romm_repin() -> dict:
         except OSError as exc:
             logger.warning("romm: could not hash %s: %s", output_path, exc)
             failed += 1
+            settled += 1
             continue
 
     return {
@@ -450,6 +523,10 @@ def _record_repin(rom: dict, output_path: str, ids: dict) -> bool:
             existing.metadata_ids = ids
             # The output is about to be rewritten, so any cached hash is stale.
             existing.output_sha1 = None
+            # Restart the abandonment clock too. A conversion re-planned long
+            # after the original would otherwise be retired the moment it was
+            # re-recorded, and could never have its metadata restored.
+            existing.created_at = _utcnow_iso()
             session.commit()
             return True
         session.add(
@@ -466,11 +543,19 @@ def _record_repin(rom: dict, output_path: str, ids: dict) -> bool:
         return True
 
 
-def _pending_rows(limit: int) -> list[tuple]:
+def _pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
+    """A page of pending rows, oldest first, starting after *after_id*.
+
+    The cursor matters: rows whose job was cancelled (or whose output RomM
+    never scans) stay pending until they age out, and always taking the oldest
+    N would let such a prefix occupy the whole page forever, so conversions
+    behind it would never be examined. The caller walks past them.
+    """
     with _session() as session:
         rows = (
             session.query(_db.RommRepin)
             .filter(_db.RommRepin.state == "pending")
+            .filter(_db.RommRepin.id > after_id)
             .order_by(_db.RommRepin.id)
             .limit(limit)
             .all()
@@ -478,7 +563,7 @@ def _pending_rows(limit: int) -> list[tuple]:
         # Detach into plain tuples: the session closes before the caller awaits.
         return [
             (r.output_path, r.output_sha1, r.source_rom_id, dict(r.metadata_ids or {}),
-             r.created_at)
+             r.created_at, r.id)
             for r in rows
         ]
 
@@ -517,3 +602,167 @@ def _count_pending() -> int:
             .filter(_db.RommRepin.state == "pending")
             .count()
         )
+
+
+# ----------------------------------------------------------------------
+# settings, rules, and unattended conversion
+# ----------------------------------------------------------------------
+#
+# Everything about the integration is editable here rather than only through
+# the environment, so an operator can connect RomM, tune per-platform policy
+# and watch a preview without redeploying the container.
+
+
+class RommSettingsPatch(BaseModel):
+    """A partial settings update. Omitted fields keep their current value."""
+
+    url: str | None = None
+    token: str | None = None
+    library_root: str | None = None
+    auto_convert: bool | None = None
+    auto_convert_interval_minutes: int | None = None
+    auto_convert_max_per_run: int | None = None
+    repin_enabled: bool | None = None
+    repin_on_load: bool | None = None
+    repin_abandon_days: int | None = None
+    verify_after_convert: bool | None = None
+    delete_source_after_verify: bool | None = None
+
+
+@router.get("/romm/settings")
+async def get_romm_settings() -> dict:
+    """Current settings. The token is never returned, only whether one is set."""
+    return romm_settings.public()
+
+
+@router.put("/romm/settings")
+async def put_romm_settings(patch: RommSettingsPatch) -> dict:
+    """Save settings and apply them immediately (no restart)."""
+    values = await romm_settings.save(patch.model_dump(exclude_unset=True))
+    return romm_settings.public(values)
+
+
+@router.post("/romm/settings/test")
+async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
+    """Probe a RomM instance and report what works, without saving anything.
+
+    Deliberately granular: "it doesn't work" is useless when there are three
+    independent things to get right. This separates *reachable* (the public
+    heartbeat), *authorised* (a scoped call the token must pass), and *mounted*
+    (the library visible to this container), so the answer names the one that
+    is wrong.
+    """
+    override = patch.model_dump(exclude_unset=True) if patch else {}
+    url = (override.get("url") or romm_settings.effective().get("url") or "").rstrip("/")
+    token = override.get("token")
+    if not token or token == romm_settings.CLEAR_TOKEN:
+        token = romm_settings.token()
+    library_root = override.get("library_root") or romm_settings.effective().get(
+        "library_root",
+    )
+
+    result: dict = {
+        "reachable": False,
+        "authorized": False,
+        "library_root_mounted": False,
+        "version": None,
+        "platform_count": None,
+        "error": None,
+    }
+    if not url:
+        result["error"] = "Set the RomM URL first."
+        return result
+
+    probe = RommClient(base_url=url, token=token or "")
+    try:
+        heartbeat = await run_in_threadpool(probe.heartbeat)
+        result["reachable"] = True
+        result["version"] = heartbeat.get("VERSION") or heartbeat.get("version")
+    except RommError as exc:
+        logger.warning("romm: connection test failed: %s", exc)
+        result["error"] = _safe_error(exc)
+        return result
+
+    try:
+        platforms = await run_in_threadpool(probe.platforms)
+        result["authorized"] = True
+        result["platform_count"] = len(platforms)
+    except RommError as exc:
+        logger.warning("romm: connection test auth failed: %s", exc)
+        result["error"] = _safe_error(exc)
+
+    if library_root:
+        try:
+            result["library_root_mounted"] = bool(
+                await bounded_path_check(os.path.isdir, library_root),
+            )
+        except (asyncio.TimeoutError, OSError):
+            result["library_root_mounted"] = False
+    if result["authorized"] and not result["library_root_mounted"]:
+        result["error"] = result["error"] or (
+            "Connected to RomM, but its library folder is not mounted here. "
+            "Check the library path and the volume mount."
+        )
+    return result
+
+
+@router.get("/romm/rules")
+async def get_romm_rules() -> dict:
+    """Per-platform automation rules, plus the schema the editor renders from.
+
+    ``defaults`` and ``options`` ship with the rules so the UI never carries a
+    second copy of what a valid rule looks like.
+    """
+    rules = await romm_auto.get_rules()
+    state = await romm_auto.get_state()
+    return {
+        "rules": rules,
+        "state": state,
+        "defaults": romm_auto.default_rule(),
+        "options": {
+            "orders": list(romm_auto.ORDERS),
+            "duplicate_actions": list(romm_auto.DUPLICATE_ACTIONS),
+            "days": list(romm_auto.ALL_DAYS),
+        },
+    }
+
+
+@router.put("/romm/rules")
+async def put_romm_rules(payload: dict) -> dict:
+    """Replace the rule set. Rules naming an unknown mode are dropped."""
+    rules = await romm_auto.set_rules(payload.get("rules", payload))
+    return {"rules": rules}
+
+
+@router.post("/romm/auto-convert/preview")
+async def preview_auto_convert(payload: dict | None = None) -> dict:
+    """What a sweep would queue right now, without queueing anything.
+
+    Ignores each rule's schedule so the operator can see the effect of a rule
+    they just wrote instead of waiting for its next window.
+    """
+    _require_configured()
+    payload = payload or {}
+    return await romm_auto.sweep(
+        platform_ids=payload.get("platform_ids"),
+        ignore_schedule=True,
+        dry_run=True,
+        overall_limit=payload.get("limit"),
+    )
+
+
+@router.post("/romm/auto-convert/run")
+async def run_auto_convert(payload: dict | None = None) -> dict:
+    """Run a sweep now, queueing real jobs.
+
+    Manual runs ignore the schedule -- pressing the button means "now" -- but
+    still honour every other part of each rule (filters, caps, ordering).
+    """
+    _require_configured()
+    payload = payload or {}
+    return await romm_auto.sweep(
+        platform_ids=payload.get("platform_ids"),
+        ignore_schedule=True,
+        dry_run=False,
+        overall_limit=payload.get("limit"),
+    )

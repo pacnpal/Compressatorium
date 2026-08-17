@@ -62,6 +62,9 @@ class ConversionStore {
   split = $state(false);
   customFilterMode = $state(false);
 
+  // How many re-pin rows the last submit recorded, for the caller to surface.
+  lastRepinRecorded = $state(0);
+
   duplicateCheck = $state(null);
   deletePlan = $state(null);
   converting = $state(false);
@@ -444,10 +447,17 @@ class ConversionStore {
   async submit(filePaths, { duplicateAction = 'skip', rommRepin = false } = {}) {
     if (!filePaths?.length) return null;
     this.converting = true;
+    this.lastRepinRecorded = 0;
     try {
       if (rommRepin) {
         try {
-          await api.planRommRepin(filePaths, this.mode, this.outputDir || null);
+          const planned = await api.planRommRepin(
+            filePaths, this.mode, this.outputDir || null,
+          );
+          // Reported back to the caller rather than pushed into the RomM store
+          // from here: conversion is imported by fileBrowser, which the RomM
+          // store imports, so a static import back would be a cycle.
+          this.lastRepinRecorded = planned?.recorded ?? 0;
         } catch (e) {
           // Best-effort, like the disc-ID tagging hook: losing the metadata
           // snapshot costs a re-match in RomM, while refusing to convert costs

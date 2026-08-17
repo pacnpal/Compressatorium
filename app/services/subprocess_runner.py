@@ -879,6 +879,15 @@ def _split_stream_lines(buffer: str) -> tuple[list[str], str]:
 # row, and adding one only sharpens its percentage estimate. The ratio only
 # smooths the bar (see `output_size_progress`), so an approximate value is fine.
 SIZE_RATIOS: dict[str, float] = {
+    # chdman: CD/DVD image -> CHD, and back. chdman prints its own percentage,
+    # so these rows never drive the progress bar (native parsing wins); they
+    # exist so a *savings estimate* has a figure for the most common conversion
+    # in the app. Approximate by nature -- a data-heavy DVD compresses far less
+    # than a mostly-audio CD.
+    "createcd": 0.6, "createdvd": 0.65, "createraw": 0.7, "createhd": 0.7,
+    "createld": 0.7,
+    "extractcd": 1.7, "extractdvd": 1.5, "extractraw": 1.4,
+    "extracthd": 1.4, "extractld": 1.4,
     # dolphin-tool: RVZ/WIA/GCZ compression, and decompression back to ISO.
     "dolphin_rvz": 0.5, "dolphin_wia": 0.5, "dolphin_gcz": 0.7,
     "dolphin_iso": 2.0,

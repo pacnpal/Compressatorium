@@ -30,6 +30,13 @@ _PRIMARY_OUTPUT_EXT = ".7z"
 
 class RomzTool(BaseTool):
     id = "romz"
+    # Cartridge/handheld ROMs, where plain .zip/.7z is the archival norm.
+    platform_slugs = frozenset({
+        "gb", "gbc", "gba", "nds", "nes", "snes", "n64", "sms", "genesis",
+        "sega-master-system", "segamd", "genesis-slash-megadrive", "gg",
+        "game-gear", "virtualboy", "vb", "wonderswan", "ngp", "lynx", "c64",
+        "atari2600", "atari7800",
+    })
     policy_owner = "romz"
     display_name = "Handheld ROM"
     modes = (

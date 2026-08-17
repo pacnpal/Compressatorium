@@ -329,6 +329,19 @@ class BaseTool:
     # Default False: a tool whose container file SHA1 might be DAT-indexed
     # still falls back to a file-level hash after an embedded-hash miss.
     embedded_hash_is_exhaustive: bool = False
+    # Library-manager platform slugs (RomM's vocabulary, which is IGDB's) whose
+    # media this tool handles. Purely *narrowing*: an extension match still
+    # decides convertibility, but when a library manager tells us the platform,
+    # this disambiguates what the extension cannot. A bare ``.iso`` is accepted
+    # by chdman, dolphin and maxcso alike; only the platform says whether it is
+    # a GameCube disc (RVZ) or a PS2 disc (CHD/CSO).
+    #
+    # Declared per tool, so adding a tool stays a one-module change and the
+    # mapping never becomes an if-ladder in a route. Empty means "no platform
+    # opinion" — such a tool is never filtered out, so an unknown or new RomM
+    # slug degrades to today's extension-only behaviour rather than to an empty
+    # list.
+    platform_slugs: frozenset[str] = frozenset()
 
     def __init__(self, binary_path: str) -> None:
         self.binary_path = binary_path

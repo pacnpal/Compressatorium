@@ -32,6 +32,8 @@ from .spec import ModeKind, ModeSpec
 
 class Nkit2IsoTool(BaseTool):
     id = "nkit"
+    # NKit is a GameCube/Wii shrink format.
+    platform_slugs = frozenset({"ngc", "gamecube", "wii"})
     policy_owner = "nkit2iso"
     display_name = "NKit"
     modes = (

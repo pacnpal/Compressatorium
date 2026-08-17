@@ -33,6 +33,8 @@ _PRIMARY_OUTPUT_EXT = ".cso"
 
 class MaxcsoTool(BaseTool):
     id = "cso"
+    # CSO/ZSO/DAX are PSP and PS2 formats.
+    platform_slugs = frozenset({"psp", "ps2"})
     policy_owner = "maxcso"
     display_name = "CSO"
     modes = (

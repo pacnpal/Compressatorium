@@ -93,13 +93,16 @@ class RommNotConfigured(RommError):
 
 
 def _token() -> str | None:
-    """Return the RomM client API token, if the operator supplied one.
+    """The RomM client API token in force, or None.
 
-    Read from the environment rather than ``Settings`` — the same choice made
-    for ``MAMEREDUMP_GITHUB_TOKEN``.  A secret held on the settings singleton
-    leaks into every ``repr()`` and config dump.
+    Resolved through :mod:`services.romm_settings`, so a token saved in the app
+    wins over the ``ROMM_TOKEN`` environment default and takes effect without a
+    restart. Deliberately not a field on the global ``Settings`` object: a
+    secret there leaks into every ``repr()`` and config dump.
     """
-    return os.environ.get("ROMM_TOKEN") or None
+    from services import romm_settings
+
+    return romm_settings.token()
 
 
 class RommClient:
@@ -117,15 +120,15 @@ class RommClient:
     def base_url(self) -> str:
         if self._explicit_base is not None:
             return self._explicit_base.rstrip("/")
-        from config import settings  # local import: settings load lazily
+        from services import romm_settings
 
-        return (settings.romm_url or "").rstrip("/")
+        return str(romm_settings.effective().get("url") or "").rstrip("/")
 
     @property
     def library_root(self) -> str:
-        from config import settings
+        from services import romm_settings
 
-        return settings.romm_library_root or ""
+        return str(romm_settings.effective().get("library_root") or "")
 
     @property
     def configured(self) -> bool:
@@ -203,6 +206,12 @@ class RommClient:
             ) from exc
         except urllib.error.URLError as exc:
             raise RommError(f"RomM {method} {path} failed: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            # The socket can time out or drop *while reading the body*, after
+            # urlopen has already returned. urllib raises the bare OS error
+            # there rather than URLError, so without this the failure escapes
+            # as a 500 instead of the documented 502 / status payload.
+            raise RommError(f"RomM {method} {path} failed: {exc}") from exc
 
         if len(raw) > _MAX_RESPONSE_SIZE:
             raise RommError(

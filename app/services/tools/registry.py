@@ -114,6 +114,37 @@ class ToolRegistry:
             if match_extension(filename, t.input_extensions) is not None
         ]
 
+    def narrow_to_platform(self, tool_ids: list[str], slug: str | None) -> list[str]:
+        """Drop tool ids that a library manager's platform rules out.
+
+        Extension matching decides *convertibility*; this only removes
+        candidates the platform contradicts — a GameCube ``.iso`` keeping
+        dolphin/nkit while losing chdman and maxcso.
+
+        Conservative by construction, because a wrong exclusion is worse than a
+        missing one: with no slug, an unrecognised slug, or a slug no tool
+        claims, the list is returned untouched, and a tool that declares no
+        ``platform_slugs`` is never dropped. So a RomM platform we have never
+        heard of degrades to today's extension-only behaviour instead of an
+        empty list.
+        """
+        if not slug:
+            return tool_ids
+        key = slug.strip().lower()
+        if not key:
+            return tool_ids
+        # Only tools that actually claim a platform can be narrowed away, and
+        # only when some tool claims THIS one -- otherwise an unknown slug
+        # would silently delete every opinionated tool.
+        if not any(key in t.platform_slugs for t in self._tools.values()):
+            return tool_ids
+        kept = []
+        for tool_id in tool_ids:
+            tool = self._tools.get(tool_id)
+            if tool is None or not tool.platform_slugs or key in tool.platform_slugs:
+                kept.append(tool_id)
+        return kept
+
     def tools_for_directory(self, path: str) -> list[ToolPlugin]:
         """Tools that accept ``path`` (a directory) as their input unit.
 

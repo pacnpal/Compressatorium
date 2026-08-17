@@ -520,6 +520,46 @@ export const api = {
   // Records the metadata to carry across a conversion. MUST be called before
   // the batch is submitted: the provider ids are read from the RomM record for
   // the source file, which goes stale once that file is converted.
+  // ── RomM settings, rules, and unattended conversion ──────────────────
+  getRommSettings: () =>
+    fetchJson(`${API_BASE}/romm/settings`, undefined, 'Failed to load RomM settings'),
+
+  saveRommSettings: (patch) =>
+    fetchJson(
+      `${API_BASE}/romm/settings`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      },
+      'Failed to save RomM settings',
+    ),
+
+  // Probes without saving, so the user can check a URL/token before committing.
+  testRommConnection: (patch = {}) =>
+    jsonPost(`${API_BASE}/romm/settings/test`, patch, {}, 'Connection test failed'),
+
+  getRommRules: () =>
+    fetchJson(`${API_BASE}/romm/rules`, undefined, 'Failed to load RomM rules'),
+
+  saveRommRules: (rules) =>
+    fetchJson(
+      `${API_BASE}/romm/rules`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rules }),
+      },
+      'Failed to save RomM rules',
+    ),
+
+  // Shows what a sweep would queue, without queueing it.
+  previewRommAutoConvert: (body = {}) =>
+    jsonPost(`${API_BASE}/romm/auto-convert/preview`, body, {}, 'Preview failed'),
+
+  runRommAutoConvert: (body = {}) =>
+    jsonPost(`${API_BASE}/romm/auto-convert/run`, body, {}, 'Auto-convert run failed'),
+
   planRommRepin: (paths, mode, outputDir = null) =>
     jsonPost(
       `${API_BASE}/romm/repin/plan`,
