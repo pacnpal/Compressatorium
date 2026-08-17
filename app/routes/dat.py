@@ -676,15 +676,11 @@ async def _run_match_job(
             if result.get("matched"):
                 matched += 1
 
-            # A cancellable embedded-hash hook (e.g. dolphin run_capture) may
-            # have been aborted mid-file, returning a non-cacheable error
-            # rather than raising. Re-check after the per-file work (the
-            # completed result is already persisted, the cache is durable
-            # across cancellation by design) so a cancel during the last/only
-            # path finalizes the job as cancelled instead of failed/complete.
-            if job_manager.is_cancelled(job_id):
-                raise ExternalJobCancelled()
-
+            # Abandonment is checked *before* cancellation, because a cancel
+            # is what usually triggers the teardown that then fails to kill the
+            # child -- so both are true at once, and reporting a clean CANCELLED
+            # would be the more misleading of the two: the process is still
+            # running. `run()` makes the same call for the same reason.
             if abandoned:
                 # The only per-file outcome that is not about the file: a hash
                 # helper outlived SIGKILL and is still reading the storage every
@@ -695,6 +691,15 @@ async def _run_match_job(
                     f"unresponsive storage ({', '.join(abandoned)}); "
                     "it is still running, so the remaining files were skipped"
                 )
+
+            # A cancellable embedded-hash hook (e.g. dolphin run_capture) may
+            # have been aborted mid-file, returning a non-cacheable error
+            # rather than raising. Re-check after the per-file work (the
+            # completed result is already persisted, the cache is durable
+            # across cancellation by design) so a cancel during the last/only
+            # path finalizes the job as cancelled instead of failed/complete.
+            if job_manager.is_cancelled(job_id):
+                raise ExternalJobCancelled()
 
         # If every single file errored, something structural is wrong
         # (volume unmounted, DB down, etc.).  Flip the job to failure so

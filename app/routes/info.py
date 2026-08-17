@@ -216,12 +216,10 @@ async def _scan_phase_dat_match(
                     result = await _match_single_file(
                         path, cancel_event=cancel_event,
                     )
-                # A cancellable hook (dolphin verify) may have been aborted
-                # mid-file, returning a non-cacheable error. Treat that as
-                # cancellation rather than deleting/keeping a stale row or
-                # finishing "successfully" on the last/only file.
-                if job_manager.is_cancelled(scan_job_id):
-                    raise ExternalJobCancelled()
+                # Abandonment before cancellation: a cancel is usually what
+                # triggered the teardown that then could not kill the child, so
+                # both are true at once and a clean CANCELLED would be the more
+                # misleading report -- the process is still running.
                 if abandoned:
                     # Not a fact about this file: the hash helper outlived
                     # SIGKILL and is still reading the volume the rest of the
@@ -232,6 +230,12 @@ async def _scan_phase_dat_match(
                         f"process stuck on unresponsive storage "
                         f"({', '.join(abandoned)}); it is still running"
                     )
+                # A cancellable hook (dolphin verify) may have been aborted
+                # mid-file, returning a non-cacheable error. Treat that as
+                # cancellation rather than deleting/keeping a stale row or
+                # finishing "successfully" on the last/only file.
+                if job_manager.is_cancelled(scan_job_id):
+                    raise ExternalJobCancelled()
                 # Don't cache size-cap skips or transient errors (same policy
                 # as the /dat/match-batch job).
                 if not result.get("reason") and not result.get("error"):
