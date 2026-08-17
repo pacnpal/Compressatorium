@@ -820,3 +820,46 @@ def test_activity_flag_marks_real_movement_only(tmp_path):
     assert heartbeats, "expected the keep-alive to fire during the silent stretch"
     assert not any(u.get("activity") for u in heartbeats)
     assert growth and all(u.get("activity") for u in growth)
+
+
+def test_stall_timeout_is_clamped_to_the_sampling_floor(tmp_path, monkeypatch):
+    """A sub-cadence stall timeout must not kill a converter that is writing.
+
+    Growth is sampled every couple of seconds, so a shorter window cannot tell a
+    stalled child from an unsampled one. The timeout is raised to the floor
+    rather than believed.
+    """
+    monkeypatch.setattr(
+        runner_module, "compute_progress_stall_timeout", lambda **_: 1,
+    )
+    out = tmp_path / "out.bin"
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"s" * 2000)
+    # Writes and prints every 100ms: continuously alive, but between samples the
+    # last-known size is stale, which a 1s window would misread as a stall.
+    script = (
+        "import sys, time\n"
+        f"out = {str(out)!r}\n"
+        "with open(out, 'wb') as f:\n"
+        "    for i in range(80):\n"
+        "        f.write(b'x' * 4096); f.flush()\n"
+        "        sys.stdout.write(f'chunk {i}\\n'); sys.stdout.flush()\n"
+        "        time.sleep(0.1)\n"
+    )
+    runner = SubprocessRunner(owner="test")
+
+    updates = asyncio.run(
+        _drain(
+            runner.run(
+                _py_cmd(script),
+                input_path=str(src),
+                output_path=str(out),
+                parse_progress=lambda _line: None,
+                mode="cso_compress",
+                fail_label="testproc",
+            )
+        )
+    )
+
+    assert updates[-1]["progress"] == 100
+    assert not runner.active_pids()

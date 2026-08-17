@@ -123,6 +123,14 @@ _FIRST_SAMPLE_GRACE = 6.0
 # whose responsiveness is in question.
 _PROBE_INTERVAL = 2.0
 
+# Floor for the stall timeout. Growth is sampled every _PROBE_INTERVAL and read
+# a tick later, so the detector cannot resolve a window shorter than a few
+# sample periods: below that, "no growth observed" only means "not looked at
+# recently", and a converter writing steadily gets killed for it. Clamped rather
+# than trusted, so no configuration can ask the watchdog for a precision it does
+# not have.
+_MIN_STALL_TIMEOUT = 3 * _PROBE_INTERVAL
+
 _EXIT_GRACE = 60.0
 _TERM_GRACE = 5.0
 _KILL_GRACE = 10.0
@@ -598,6 +606,14 @@ class SubprocessRunner:
                 )
             except asyncio.TimeoutError:
                 stall_timeout = max(0, int(getattr(settings, "progress_timeout", 0) or 0))
+            if 0 < stall_timeout < _MIN_STALL_TIMEOUT:
+                self._logger.warning(
+                    "Stall timeout of %ss is below the %ss sampling floor; using %ss. "
+                    "A shorter window cannot tell a stalled converter from one that "
+                    "simply has not been sampled yet.",
+                    stall_timeout, _MIN_STALL_TIMEOUT, _MIN_STALL_TIMEOUT,
+                )
+                stall_timeout = _MIN_STALL_TIMEOUT
             # Seed the progress floor with the caller's preamble (e.g. the
             # service's "Starting..." yield at 1/5%) so an early non-parseable
             # stdout line — which emits last_progress_value — can't drop the bar
