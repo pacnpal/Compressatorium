@@ -12,7 +12,7 @@ import asyncio
 import os
 import re
 import sys
-import time
+import threading
 
 import pytest
 
@@ -708,12 +708,19 @@ def test_bounded_probe_gives_up_instead_of_waiting(monkeypatch):
     fallback rather than the job hanging (issue #263).
     """
     monkeypatch.setattr(runner_module, "_STAT_TIMEOUT", 0.05)
+    # An Event, not a sleep: shutdown(wait=False) cannot stop the worker, and
+    # the interpreter joins it at exit, so an uninterruptible sleep would stall
+    # the whole test process on the way out.
+    release = threading.Event()
 
     async def _go():
-        return await runner_module._bounded_probe(time.sleep, 30)
+        return await runner_module._bounded_probe(release.wait, 30)
 
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(_go())
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(_go())
+    finally:
+        release.set()
 
 
 def test_bounded_probe_returns_the_value_when_it_lands():

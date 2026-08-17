@@ -53,7 +53,7 @@ class ConversionCancelled(Exception):
 _STAT_TIMEOUT = 10.0
 
 
-async def _bounded_probe(func, *args, **kwargs):
+async def _bounded_probe(func: Callable, *args: object, **kwargs: object) -> object:
     """Run a one-shot blocking filesystem call with a hard bound.
 
     Raises :class:`asyncio.TimeoutError` if it does not finish within
@@ -85,6 +85,12 @@ async def _bounded_probe(func, *args, **kwargs):
 
 # Bounds on reaping a subprocess: how long to let it exit on its own once its
 # output stream closes, then the SIGTERM and SIGKILL grace periods.
+# How long a stall check will wait for the first growth measurement to land
+# before judging without one. Spans a few read-loop ticks: long enough that
+# probe lag cannot fake a stall, short enough that a probe which never returns
+# cannot disable the watchdog.
+_FIRST_SAMPLE_GRACE = 6.0
+
 _EXIT_GRACE = 60.0
 _TERM_GRACE = 5.0
 _KILL_GRACE = 10.0
@@ -729,13 +735,20 @@ class SubprocessRunner:
                 if stall_timeout <= 0:
                     return False
                 _update_output_activity(now)
-                if not probe_completed:
+                if not probe_completed and now - start < _FIRST_SAMPLE_GRACE:
                     # No growth measurement has landed yet: the probe is off the
                     # event loop and read one tick later, so the very first
-                    # checks have nothing to judge by. Never call a stall on the
+                    # checks have nothing to judge by. Don't call a stall on the
                     # absence of a measurement -- with a stall timeout shorter
                     # than the ~2s probe cadence that would kill a converter
                     # whose output is growing steadily.
+                    #
+                    # Bounded by the grace, though: a probe against a dead mount
+                    # never completes, and waiting on it forever would disable
+                    # the watchdog entirely and hang the queue on exactly the
+                    # storage failure this exists to catch. Past the grace the
+                    # check proceeds without a sample, so an unresponsive output
+                    # still stalls out on schedule.
                     return False
                 if now - last_activity_at < stall_timeout:
                     return False

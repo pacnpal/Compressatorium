@@ -2077,6 +2077,11 @@ class JobManager:
 
         job.status = JobStatus.PROCESSING
         job.started_at = datetime.now(timezone.utc)
+        # Restart the progress clock at the moment work actually begins. It was
+        # last set when the job was created, so a job that waited in the queue
+        # longer than debug_progress_timeout -- routine on a deep queue -- would
+        # otherwise be reported stalled the instant it started running.
+        self._last_progress_at[job_id] = time.monotonic()
         processing_now = sum(
             1 for candidate in self.jobs.values() if candidate.status == JobStatus.PROCESSING
         )
@@ -2255,10 +2260,20 @@ class JobManager:
             ):
                 if cancel_event.is_set():
                     continue
+                now = time.monotonic()
+                # Only *advancing* progress counts as activity. Several tools
+                # emit a keep-alive every couple of seconds whose message
+                # changes while the percentage does not (dolphin's
+                # "Converting... (Ns)"), and treating each arrival as activity
+                # made this clock unable to distinguish a working job from a
+                # hung one -- which is precisely what the stalled-job warning
+                # reads (issue #263). Output growth advances the percentage via
+                # the runner's size fallback, so a job that is writing still
+                # refreshes this even when its tool prints nothing.
+                if update["progress"] > job.progress:
+                    self._last_progress_at[job_id] = now
                 job.progress = update["progress"]
                 job.message = update["message"]
-                now = time.monotonic()
-                self._last_progress_at[job_id] = now
                 if logger.isEnabledFor(logging.DEBUG):
                     last_log = self._last_progress_log_at.get(job_id, 0)
                     if now - last_log >= settings.debug_progress_interval:

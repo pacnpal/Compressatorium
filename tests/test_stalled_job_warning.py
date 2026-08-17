@@ -75,3 +75,4 @@ def test_chdman_parse_progress_returns_none_for_non_progress_lines():
     assert svc._parse_progress("chdman - MAME Compressed Hunks of Data") is None
     assert svc._parse_progress("Compressing, 45.2% complete...") == 45
     assert svc._parse_progress("Compressing, 99.9% complete...") == 99
+
