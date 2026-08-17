@@ -4,27 +4,51 @@
 
 ### Added
 
-- **Hasheous fallback: match files that aren't in your DATs.** Set
+- **Hasheous integration: match files that aren't in your DATs.** Set
   `COMPRESSATORIUM_HASHEOUS_ENABLED=true` and any hash the imported DATs don't
   recognise is looked up at [hasheous.org](https://hasheous.org), which indexes
-  Redump, No-Intro, TOSEC, MAMEArcade/Mess, MAMERedump, WHDLoad,
-  RetroAchievements and FBNeo. Remote matches carry more than a local one does —
-  platform, publisher, year, region, and which preservation DAT the hash
-  actually came from — all shown in the badge tooltip, and they get a **HASH**
-  badge to distinguish them from a local **DAT** hit. This also means a fresh
-  install matches your library immediately, without syncing hundreds of MB of
-  DATs first.
+  **14 preservation databases** — Redump, No-Intro, TOSEC, MAMERedump,
+  MAMEArcade, MAMEMess, WHDLoad, RetroAchievements, FBNeo, PureDOSDAT,
+  Pleasuredome, TotalDOSCollection, eXo and ScreenScraper. No account and no API
+  key: the hash-lookup endpoint is public. Because MAMERedump is among the
+  sources, it is a strict superset of what the one-click sync pulls, so nothing
+  you match today stops matching.
+
+  Remote hits carry considerably more than a local one: **game name, ROM name,
+  the source DAT that actually knew the hash, platform, publisher, year,
+  region**, and links out to IGDB, TheGamesDB, RetroAchievements, Wikipedia,
+  LaunchBox and SteamGridDB. All of it shows in the badge tooltip, and these
+  matches get a **HASH** badge to distinguish them from a local **DAT** hit. A
+  fresh install now matches your library immediately, without syncing hundreds
+  of MB of DATs first.
 
   It is **off by default and stays off until you turn it on**: a lookup sends
-  the SHA1 of your file to a third-party service, which should be your call, not
-  a default. Local DATs are always consulted first, so a library your DATs
-  already cover never makes a network call. Point
-  `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you self-host Hasheous,
-  and `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default 15s) bounds each lookup.
+  the SHA1 of your file — and nothing else, no filenames or paths — to a
+  third-party service, which should be your call, not a default. Local DATs are
+  always consulted first, so a library your DATs already cover never makes a
+  network call, and a file your own DATs can identify is never disclosed. When a
+  file offers several hashes (a CHD carries both a header and a data SHA1),
+  *all* of them are checked locally before *any* is sent remotely.
+
+  Enabling it on an existing install works retroactively: files already recorded
+  as "no match" by the local-only matcher are automatically re-checked against
+  the new source, with no forced rescan needed.
+
+  Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you self-host
+  Hasheous (it is open source), and `COMPRESSATORIUM_HASHEOUS_TIMEOUT`
+  (default 15s) bounds each lookup. Lookups are HTTPS-only and a redirect that
+  would downgrade to plain HTTP is refused rather than followed.
 
   A lookup that fails — timeout, server error, unreachable — is reported as an
   error rather than recorded as "not in any DAT", so one bad minute of network
-  can't permanently mark your library unmatched.
+  can't permanently mark your library unmatched. After a failure the client
+  stops calling out for a minute, so an outage during a large scan costs one
+  timeout rather than one per file.
+
+  Cover art, descriptions and hash submissions are **not** included: those
+  Hasheous endpoints require a client API key, and only the key-free lookup is
+  used. The metadata links above give you the IDs if you want to fetch artwork
+  yourself.
 
 ### Fixed
 

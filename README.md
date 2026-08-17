@@ -80,21 +80,135 @@ Compressatorium can sync [MAME Redump](https://github.com/MetalSlug/MAMERedump) 
 - **Library scan**: The background scan discovers and DAT-matches tool outputs by extension (CHD, Dolphin RVZ/WIA/GCZ, 3DS, Switch, CSO/ZSO, `.iso`, and the `.bin` data track from CHDMAN extract), not just CHDs, so non-CHD libraries get cached match results too. A single PS3-packed `.iso` is matched like any other `.iso`; a 4 GB split set is not, since its `.iso.0`/`.iso.1` parts aren't scanned extensions. Heavy Dolphin disc-hashing during the scan honors `MATCH_MAX_FILE_SIZE` and stops promptly if you cancel the scan.
 - **DAT management**: Import, list, and delete DATs via the web UI "DAT Files" button
 - **Match badges**: Files matching a DAT entry show a blue "DAT" badge in the file list
+- **Wider coverage without curating DATs**: see [Hasheous Integration](#hasheous-integration-optional) to fall back on 14 preservation databases for anything your imported DATs don't recognise
 
-#### Hasheous fallback (optional)
+### Hasheous Integration (optional)
 
-[Hasheous](https://hasheous.org) is a hosted hash-lookup service indexing Redump, No-Intro, TOSEC, MAMEArcade/Mess, **MAMERedump**, WHDLoad, RetroAchievements and FBNeo — a superset of the DATs above. Enable it and any hash your imported DATs don't recognise is looked up remotely, so a fresh install matches your library without syncing DATs first.
+[Hasheous](https://hasheous.org) is a hosted hash-lookup service run by the
+[Gaseous](https://github.com/gaseous-project/hasheous) project. It indexes **14
+preservation databases** and answers "what game is this hash?" for all of them
+at once. Turn it on and every hash your imported DATs *don't* recognise is
+looked up there, so your library gets identified without you curating DATs for
+every system you own.
 
 ```bash
 COMPRESSATORIUM_HASHEOUS_ENABLED=true
 ```
 
-- **Off by default.** A lookup sends the SHA1 of your file to a third-party service, so turning it on is a deliberate choice. Nothing is sent while it is off.
-- **Local DATs win.** Hasheous is consulted only when the local index misses, so a library your DATs already cover never makes a network call.
-- **Richer matches**: remote hits carry platform, publisher, year, region, and which preservation DAT the hash came from, all shown in the badge tooltip. They get a **HASH** badge to distinguish them from a local **DAT** hit.
-- **Self-hosting**: Hasheous is open source. Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance to keep lookups on your network.
-- **Bounded**: `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default `15` seconds) caps each lookup. A failed lookup is reported as an error rather than cached as "not in any DAT", so a network blip can't permanently mark files unmatched.
-- **One request per file**: Hasheous has no bulk endpoint, so a first scan of a large library makes one request per uncached file. Results are cached locally afterwards.
+That single variable is the whole setup. **No account, no API key, no signup** —
+the hash-lookup endpoint is public.
+
+#### What it covers
+
+Redump · No-Intro · TOSEC · **MAMERedump** · MAMEArcade · MAMEMess · WHDLoad ·
+RetroAchievements · FBNeo · PureDOSDAT · Pleasuredome · TotalDOSCollection ·
+eXo · ScreenScraper
+
+Because MAMERedump is among them, Hasheous is a strict **superset** of the DATs
+the one-click sync pulls — including the CHD header hashes that only MAMERedump
+records. Nothing you get today is lost by enabling it.
+
+#### What you get per match
+
+A local DAT hit tells you the game name and the ROM filename. A Hasheous hit
+carries considerably more, all of it shown in the file-list badge tooltip:
+
+| Field | Example |
+|---|---|
+| Game name | `Jumpman Junior` |
+| ROM name | `Jumpman Junior (1983)(Epyx).bin` |
+| **Source DAT** | `Redump` / `No-Intro` / `TOSEC` / `MAMERedump` … — which database actually knew the hash |
+| Platform | `Commodore 64` |
+| Publisher | `Epyx` |
+| Year | `1983` |
+| Region | `US`, `EU`, … (when the source records it) |
+| Metadata links | IGDB, TheGamesDB, RetroAchievements, Wikipedia, LaunchBox, SteamGridDB |
+
+The links are IDs and URLs into those databases, so a match is a jumping-off
+point for artwork or achievements even though Compressatorium doesn't fetch
+them itself (see [What it deliberately does not do](#what-it-deliberately-does-not-do)).
+
+#### How a file gets matched
+
+The order is fixed, and **local always wins**:
+
+1. **Your imported DATs**, using every hash the file can offer. A CHD reports
+   both its header SHA1 and its data SHA1; a Dolphin RVZ/WIA/GCZ reports the
+   reconstructed disc SHA1. *All* of them are checked locally first.
+2. **Hasheous**, only if none of them matched, and only if you enabled it.
+
+So a library your own DATs already cover never makes a single network call, and
+a file your DATs *can* identify is never disclosed to a third party. Matching is
+also deterministic: the same file resolves the same way whether or not the
+network is healthy.
+
+Results are cached in the local database, so a file is looked up once, not once
+per browse. If you enable Hasheous *after* files were already recorded as "no
+match", those old verdicts are automatically re-checked against the new source —
+you don't have to force a rescan to pick the feature up.
+
+#### Badges
+
+| Badge | Meaning |
+|---|---|
+| **DAT** (blue) | Matched one of your imported DATs |
+| **HASH** | Matched via Hasheous — hover for platform, year, region and source DAT |
+
+#### Privacy
+
+Enabling this sends **the SHA1 of your files** (and nothing else — no filenames,
+no paths, no account identifier) to whatever server `COMPRESSATORIUM_HASHEOUS_URL`
+points at. That is why it ships **off**, and why nothing is transmitted at all
+until you set the variable. Requests are HTTPS-only, and a redirect that would
+downgrade to plain HTTP is refused rather than followed.
+
+If you'd rather not talk to a third party at all, Hasheous is open source and
+self-hostable — point the URL at your own instance and lookups stay on your
+network.
+
+#### Behaviour when Hasheous is unreachable
+
+A failed lookup is reported as an **error**, never recorded as "not in any DAT".
+A network blip therefore can't permanently mark your library unmatched; the
+affected files are simply retried next time.
+
+To keep an outage cheap, the client stops calling out for 60 seconds after a
+failure. Without that, a 1,000-file scan against a dead endpoint would spend
+over four hours re-learning the same fact once per file.
+
+#### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Master switch. Nothing is sent while unset. |
+| `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Per-request timeout in seconds. This call sits in the file-browse path, so keep it short. |
+
+Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
+accepted as aliases.
+
+The DAT Library page shows the current state — whether the fallback is on, and
+which server it is pointed at.
+
+#### Scale
+
+Hasheous has **no bulk endpoint** (its API accepts several hashes for *one*
+file, not a batch of files), so the first pass over an uncached library makes one
+request per file. Responses are cached both locally and by Hasheous' CDN, so this
+is a one-time cost per file rather than a per-browse one. If you have a very
+large uncached library, run the background library scan once and let it prime the
+cache rather than browsing folder by folder.
+
+#### What it deliberately does not do
+
+- **No cover art or descriptions.** Hasheous proxies IGDB, TheGamesDB, GiantBomb
+  and ScreenScraper, but those endpoints require a Hasheous client API key. Only
+  the key-free hash lookup is used here. The metadata *links* above give you the
+  IDs if you want to fetch artwork yourself.
+- **No submissions.** Hasheous accepts hash corrections and dump reports; those
+  endpoints also need an API key, and are not called.
+- **Nothing is uploaded about your library.** Lookups are reads. Your file names,
+  paths, and collection contents are never sent.
 
 ---
 

@@ -327,11 +327,28 @@
     <p>
       Hasheous also works the other way round. Set
       <code>COMPRESSATORIUM_HASHEOUS_ENABLED=true</code> and anything your DATs don't
-      recognise gets looked up at hasheous.org, which covers Redump, No-Intro, TOSEC, MAME
-      and RetroAchievements. Those hits show a <strong>HASH</strong> badge instead of DAT,
-      and their tooltip carries the platform, year and region a local match doesn't have.
-      It's off until you turn it on, because a lookup sends your file's SHA1 to that
-      service — and your own DATs are always checked first.
+      recognise gets looked up at hasheous.org, which indexes 14 preservation databases —
+      Redump, No-Intro, TOSEC, MAMERedump, MAME arcade and MESS, WHDLoad,
+      RetroAchievements, FBNeo and more. No account or API key is needed. Since MAMERedump
+      is one of them, it covers everything the sync above pulls and a great deal besides,
+      so a fresh install matches your library without syncing any DATs first.
+    </p>
+    <p>
+      Those hits show a <strong>HASH</strong> badge instead of DAT, and their tooltip
+      carries the game name, platform, year, region and which database actually knew the
+      hash. It's off until you turn it on, because a lookup sends your file's SHA1 — and
+      nothing else, no names or paths — to that service. Your own DATs are always checked
+      first, so a library they already cover never makes a network call, and when a file
+      offers several hashes all of them are tried locally before any goes out. Turning it
+      on later re-checks files already marked "no match", so you don't need a rescan.
+    </p>
+    <p>
+      A lookup that times out is reported as an error rather than recorded as "no match",
+      so a network blip can't permanently mark your library unmatched. Cover art and
+      descriptions aren't fetched — those Hasheous endpoints need an API key — but the
+      match links out to IGDB, TheGamesDB and RetroAchievements if you want them. Point
+      <code>COMPRESSATORIUM_HASHEOUS_URL</code> at your own instance to keep lookups on
+      your network.
     </p>
     <p>
       CHDs match on the header SHA1, which is codec-independent. Dolphin RVZ/WIA/GCZ match on
