@@ -2,6 +2,38 @@
 
 ## 4.4.2 (unreleased)
 
+### Added
+
+- **RomM library integration.** A new **RomM** view lists your
+  [RomM](https://romm.app) library by platform and converts it in place. Pick a
+  platform and you get real game names instead of filenames — and, more usefully,
+  the platform tells Compressatorium what a bare `.iso` actually *is*, so a
+  GameCube disc offers RVZ and a PS2 disc offers CHD/CSO without you choosing a
+  tool tab first. The rows are the ordinary file list, so selection, per-row
+  actions, Verify, the convert panel and the job queue all behave exactly as they
+  do when browsing a volume.
+
+  Point `ROMM_URL` at your RomM instance and `ROMM_LIBRARY_ROOT` at the local
+  mount of its library folder (`ROMM_TOKEN` holds a RomM **client API token**;
+  create one under *Administration → Client API Tokens*). No ROM ever travels
+  over HTTP — Compressatorium reads RomM's catalog over the API but the files
+  themselves through the filesystem, so a remote RomM works by mounting its
+  library over NFS/SMB/rclone rather than by copying multi-GB discs twice.
+
+  The view also reports, per platform, how much of the library is already
+  converted and how many bytes the rest still occupies.
+
+- **Converted ROMs keep their RomM metadata.** RomM identifies a CHD by the
+  SHA-1 embedded in its header and an archive by its largest member, so
+  converting to CHD, ZIP or 7z keeps the Redump/No-Intro match automatically.
+  Every other format — RVZ, CSO, NSZ, WUX, Z3DS — is matched on the file's own
+  hash, which conversion necessarily changes, and those ROMs would go
+  unidentified. Compressatorium now saves each ROM's metadata *before* the
+  conversion and re-applies it afterwards: convert, let RomM rescan, then press
+  **Re-match in RomM**. The view says up front which target formats need this and
+  which do not, so the trade-off is visible before you queue anything rather than
+  discovered afterwards.
+
 ### Fixed
 
 - **The Convert and Jobs panel no longer collapses into a narrow strip on

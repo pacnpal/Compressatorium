@@ -499,6 +499,38 @@ export const api = {
     );
   },
 
+  // ─── RomM catalog overlay ─────────────────────────────────────────────
+  // The ROM listing comes back as a DirectoryListing of FileEntry, the same
+  // shape /files returns, so FileList/FileRow/ConvertPanel render it unchanged
+  // and conversions submit through the ordinary createBatchJobs.
+
+  getRommStatus: () =>
+    fetchJson(`${API_BASE}/romm/status`, undefined, 'Failed to get RomM status'),
+
+  getRommPlatforms: () =>
+    fetchJson(`${API_BASE}/romm/platforms`, undefined, 'Failed to list RomM platforms'),
+
+  getRommRoms: (platformId) =>
+    fetchJson(
+      buildApiUrl('/romm/roms', { platform_id: platformId }),
+      undefined,
+      'Failed to list RomM ROMs',
+    ),
+
+  // Records the metadata to carry across a conversion. MUST be called before
+  // the batch is submitted: the provider ids are read from the RomM record for
+  // the source file, which goes stale once that file is converted.
+  planRommRepin: (paths, mode, outputDir = null) =>
+    jsonPost(
+      `${API_BASE}/romm/repin/plan`,
+      { paths, mode, output_dir: outputDir },
+      {},
+      'Failed to record RomM metadata',
+    ),
+
+  runRommRepin: () =>
+    jsonPost(`${API_BASE}/romm/repin`, {}, {}, 'Failed to re-match RomM entries'),
+
   listDATs: () => fetchJson(`${API_BASE}/dat/list`, undefined, 'Failed to list DATs'),
 
   deleteDAT: (datId) =>

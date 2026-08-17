@@ -111,6 +111,52 @@ class DATSyncState(Base):
     last_sync_files = Column(Integer, nullable=False, default=0)
 
 
+class RommRepin(Base):
+    """One pending metadata re-pin for a converted RomM ROM.
+
+    RomM matches a CHD by the raw+meta SHA-1 embedded in its v5 header, and an
+    archive by its largest member, so those keep their Redump/No-Intro identity
+    across a conversion.  Every other format we emit (RVZ/CSO/NSZ/WUX/Z3DS) is
+    matched on the container's own hash, which conversion necessarily changes --
+    the ROM goes unidentified until something re-attaches the metadata.
+
+    A row is written *before* the conversion (the source's provider ids are only
+    readable while the source is still the file RomM knows about) and settled
+    after RomM has rescanned.  It is a queue, not a preference, which is why it
+    is a table rather than a ``preferences`` blob: the settle step may be minutes
+    or hours later, across restarts, and the read-modify-write of a JSON blob
+    would race the next conversion.
+
+    ``output_sha1`` is the join key.  RomM computes the converted file's own
+    SHA-1 on scan and ``file_hasher.compute_file_sha1`` computes the same one, so
+    ``GET /api/roms/by-hash`` identifies the new record exactly -- no filename
+    guessing, and correct even when the user renamed it in between.  It is
+    cached here because hashing a multi-GB image is the expensive half of the
+    settle pass and a row may be retried many times before RomM rescans.
+    """
+
+    __tablename__ = "romm_repin"
+    __table_args__ = (
+        Index("ix_romm_repin_state", "state"),
+        Index("ix_romm_repin_output_path", "output_path"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # RomM's id for the *source* ROM, captured before conversion.
+    source_rom_id = Column(Integer, nullable=False)
+    source_name = Column(String, nullable=True)
+    # Absolute local path of the conversion output this row is waiting on.
+    output_path = Column(String, nullable=False)
+    output_sha1 = Column(String, nullable=True)
+    # {"igdb_id": 123, "moby_id": ..., ...} -- only the providers that were set.
+    metadata_ids = Column(JSON, nullable=False, default=dict)
+    # "pending" -> "done" | "abandoned"
+    state = Column(String, nullable=False, default="pending")
+    detail = Column(String, nullable=True)
+    created_at = Column(String, nullable=False, default="")
+    settled_at = Column(String, nullable=True)
+
+
 class CHDMetadata(Base):
     __tablename__ = "chd_metadata"
     chd_path = Column(String, primary_key=True)

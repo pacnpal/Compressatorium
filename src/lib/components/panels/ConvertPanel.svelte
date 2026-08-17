@@ -124,7 +124,12 @@
         // the submit will queue zero jobs and conversion.submit's
         // toast will surface that. No need to show a plan modal.
       }
-      await conversion.submit(selectedPaths, { duplicateAction });
+      await conversion.submit(selectedPaths, {
+        duplicateAction,
+        // Only rows that came from the RomM catalog have RomM metadata to carry
+        // across; a normal directory browse has nothing to snapshot.
+        rommRepin: fileBrowser.rommPlatformId !== null,
+      });
       conversion.clearDuplicateCheck();
       fileBrowser.clearSelection();
       // Honor the per-deployment auto-return-from-search setting

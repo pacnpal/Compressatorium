@@ -432,10 +432,32 @@ class ConversionStore {
   }
 
   // ─── Submission ───────────────────────────────────────────────────────
-  async submit(filePaths, { duplicateAction = 'skip' } = {}) {
+  /**
+   * @param {string[]} filePaths
+   * @param {{ duplicateAction?: string, rommRepin?: boolean }} [opts]
+   *   `rommRepin` records each source's RomM metadata before the jobs are
+   *   queued, so a format RomM cannot hash-match (RVZ/CSO/NSZ/WUX/Z3DS) can be
+   *   re-identified after its rescan. It must happen BEFORE the conversion:
+   *   the provider ids are read from the RomM record for the source file, and
+   *   that record is what goes stale once the source is converted or deleted.
+   */
+  async submit(filePaths, { duplicateAction = 'skip', rommRepin = false } = {}) {
     if (!filePaths?.length) return null;
     this.converting = true;
     try {
+      if (rommRepin) {
+        try {
+          await api.planRommRepin(filePaths, this.mode, this.outputDir || null);
+        } catch (e) {
+          // Best-effort, like the disc-ID tagging hook: losing the metadata
+          // snapshot costs a re-match in RomM, while refusing to convert costs
+          // the user the thing they actually asked for.
+          toast.warning(
+            `Could not save RomM metadata (${e?.message ?? 'unknown error'}); `
+            + 'converted files may need re-matching in RomM',
+          );
+        }
+      }
       const result = await jobs.createBatch(filePaths, this.mode, {
         outputDir: this.outputDir || null,
         duplicateAction,

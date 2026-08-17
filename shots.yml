@@ -188,6 +188,23 @@
   wait: 1800
   javascript: *js_theme_dark
 
+# --- RomM library ---------------------------------------------------------
+# The screenshot environment has no RomM instance and sets no ROMM_URL, so this
+# captures the unconfigured empty state. That is deliberate: it is the first
+# thing a new user sees, and it documents the two variables to set.
+- url: http://127.0.0.1:8099/?s=romm-light#/romm
+  output: docs/screenshots/romm-light.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: *js_theme_light
+- url: http://127.0.0.1:8099/?s=romm-dark#/romm
+  output: docs/screenshots/romm-dark.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: *js_theme_dark
+
 # --- DAT Library ----------------------------------------------------------
 - url: http://127.0.0.1:8099/?s=dat-light#/dat
   output: docs/screenshots/dat-light.png

@@ -14,7 +14,7 @@ import { STORAGE_KEYS, readBool, writeBool, readString, writeString } from '$lib
 import { api } from '$lib/api/endpoints.js';
 import { registry } from '$lib/tools/registry.js';
 
-const VIEWS = Object.freeze(['dashboard', 'workspace', 'dat', 'help']);
+const VIEWS = Object.freeze(['dashboard', 'workspace', 'romm', 'dat', 'help']);
 // Tool ids come from the registry, single source of truth, no
 // hardcoded set to keep in sync when a 4th tool is added.
 const VALID_TOOLS = registry.ids();

@@ -261,6 +261,31 @@ aren't synced, the title isn't in the DAT, or the file is larger than
 `MATCH_MAX_FILE_SIZE` (which skips the expensive full-disc reconstruction) — not that
 the file is bad.
 
+### RomM integration
+
+Point Compressatorium at a [RomM](https://romm.app) instance and the **RomM** view
+lists your library by platform, with real game names instead of filenames. The more
+useful half is that RomM's platform tells Compressatorium what a file *is*: a bare
+`.iso` is a PS2 disc (CHD, CSO) or a GameCube disc (RVZ), and extensions alone can't
+tell you which — so today you pick the tool tab yourself. Here it's already narrowed.
+The rows are the ordinary file list, so selection, per-row actions, Verify, the
+convert panel, and the job queue behave exactly as they do on a volume, and the view
+reports how much of the platform is already converted and what the rest still costs.
+
+Set `ROMM_URL`, `ROMM_TOKEN` (a RomM *client API token*), and `ROMM_LIBRARY_ROOT` —
+the path where RomM's library folder is mounted **in this container**. Compressatorium
+reads RomM's catalog over the API but the ROM files through the filesystem, so no disc
+image is ever copied over HTTP; a remote RomM works by mounting its library over
+NFS/SMB/rclone. See [docs/DOCKER-COMPOSE.md](docs/DOCKER-COMPOSE.md) for a compose
+example and the UID/GID caveat.
+
+**Metadata survives conversion.** RomM identifies a CHD by the SHA1 embedded in its
+header and an archive by its largest member, so converting to CHD/ZIP/7z keeps the
+Redump/No-Intro match by itself. RVZ, CSO, NSZ, WUX and Z3DS are matched on the file's
+own hash, which conversion changes — so Compressatorium saves each ROM's metadata
+before converting and re-applies it after RomM rescans (**Re-match in RomM**). The view
+tells you which target formats need that step before you queue anything.
+
 ### Archives
 
 Browse straight into a ZIP, 7z, or RAR and convert a file from inside it — no need
@@ -412,6 +437,14 @@ An at-a-glance view of the job queue, verification cache, mounted volumes, recen
 | Light | Dark |
 |-------|------|
 | ![Dashboard, light](docs/screenshots/dashboard-light.png) | ![Dashboard, dark](docs/screenshots/dashboard-dark.png) |
+
+#### RomM library
+
+Browse a [RomM](https://romm.app) library by platform and convert it in place — real game names instead of filenames, and the platform tells Compressatorium what a bare `.iso` actually is. See [RomM integration](#romm-integration).
+
+| Light | Dark |
+|-------|------|
+| ![RomM library, light](docs/screenshots/romm-light.png) | ![RomM library, dark](docs/screenshots/romm-dark.png) |
 
 #### DAT Library
 

@@ -213,6 +213,29 @@ class Settings(BaseSettings):
         default=False, alias="MAMEREDUMP_AUTO_SYNC",
         description="Auto-sync DATs from MAMERedump on startup if none loaded",
     )
+
+    # RomM catalog overlay. Compressatorium reads RomM's catalog over HTTP but
+    # touches the ROM bytes only through the filesystem: RomM's library is
+    # mounted as an ordinary Compressatorium volume (locally via the same bind
+    # mount, remotely via NFS/SMB/rclone), so no ROM ever crosses the network.
+    # Unset romm_url disables the feature and hides the view.
+    #
+    # The credential is deliberately NOT a Settings field. It is read from the
+    # environment inside services.romm, the same choice made for
+    # MAMEREDUMP_GITHUB_TOKEN: a secret on the settings singleton ends up in
+    # every repr()/log line that dumps config.
+    romm_url: str = Field(
+        default="", alias="ROMM_URL",
+        description="Base URL of the RomM instance, e.g. http://romm:8080",
+    )
+    romm_library_root: str = Field(
+        default="", alias="ROMM_LIBRARY_ROOT",
+        description=(
+            "Local mount point of RomM's library directory (the path RomM sees "
+            "as /romm/library). RomM's fs_path/full_path are relative to it."
+        ),
+    )
+
     # Process-priority and timeout policy shared by EVERY conversion tool's
     # subprocess (chdman, Dolphin, 3DS, Switch) and the shared SubprocessRunner.
     # These began life as chdman-only knobs; prefer the tool-neutral
