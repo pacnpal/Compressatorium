@@ -458,6 +458,30 @@ class DATStore:
         """
         session.execute(delete(_db.DATMatch).where(~_remote_hit_clause()))
 
+    @staticmethod
+    def _local_index_now_covers(session, match: dict) -> bool:
+        """True when a remote hit's hash has since been learned locally.
+
+        Read inside the writing transaction, which is the point: the route
+        decides local-first, but the decision and the write are separate
+        operations, and a DAT import can commit in between -- for a path with
+        no prior row the import's rematch snapshot cannot cover it either, so
+        the remote hit would be written *after* invalidation and then served
+        unconditionally. Checking here closes that window at the boundary where
+        the write actually happens.
+
+        Skipping the write (rather than rewriting the payload) keeps DAT-record
+        shape out of the store: the path is simply left uncached, and the next
+        match recomputes it local-first. That costs nothing extra remotely,
+        because this only fires when the local index *does* know the hash.
+        """
+        if not match.get("matched") or match.get("source") != "hasheous":
+            return False
+        sha1 = match.get("file_hash")
+        if not sha1:
+            return False
+        return session.get(_db.DATHash, (sha1, "sha1")) is not None
+
     def _upsert_match_sync(self, file_path: str, match: dict) -> None:
         normalized = self._normalize(file_path)
         with self._session() as session:
@@ -468,6 +492,10 @@ class DATStore:
             if dat_id is not None:
                 if session.get(_db.DAT, dat_id) is None:
                     dat_id = None
+            if self._local_index_now_covers(session, match):
+                # A DAT covering this hash landed while the match was running.
+                # Leave the path uncached so the next one resolves it locally.
+                return
             payload = dict(match)
             existing = session.get(_db.DATMatch, normalized)
             if self._would_downgrade_remote_hit(existing, match):
@@ -555,6 +583,9 @@ class DATStore:
                 dat_id = match.get("dat_id")
                 if dat_id is not None and dat_id not in valid_dat_ids:
                     dat_id = None
+                if self._local_index_now_covers(session, match):
+                    # Same rule as _upsert_match_sync.
+                    continue
                 payload = dict(match)
                 existing = existing_matches.get(normalized)
                 if self._would_downgrade_remote_hit(existing, match):

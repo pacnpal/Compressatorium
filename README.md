@@ -100,10 +100,26 @@ round-trip time.
 **No account, no API key, no signup** — the hash-lookup endpoint is public.
 
 If you'd rather set it declaratively (a fresh container that should come up with
-it already on), the environment variable does the same thing:
+it already on), the environment variable does the same thing — but it has to
+reach the process, so put it where the process will actually see it.
+
+In `docker-compose.yml`, add it to the service's `environment:` list. That list
+is enumerated rather than inherited, so a value in your shell or in a `.env`
+file will **not** reach the container on its own:
+
+```yaml
+    environment:
+      - COMPRESSATORIUM_HASHEOUS_ENABLED=true
+```
+
+Running from a checkout, export it (or prefix the command) so the child process
+inherits it — a bare assignment on its own line sets a shell variable and
+launches nothing:
 
 ```bash
-COMPRESSATORIUM_HASHEOUS_ENABLED=true
+COMPRESSATORIUM_HASHEOUS_ENABLED=true ./run_dev.sh
+# or, for the whole shell session:
+export COMPRESSATORIUM_HASHEOUS_ENABLED=true
 ```
 
 The UI toggle wins over the variable when both are set, and the panel tells you

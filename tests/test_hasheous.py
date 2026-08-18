@@ -2565,3 +2565,45 @@ async def test_a_dat_import_mid_lookup_beats_an_all_miss_pass(hasheous_on, monke
 
     assert match is not None, "a miss was stamped over a DAT that had just landed"
     assert match["game_name"] == "Local Name"
+
+
+@pytest.mark.asyncio
+async def test_a_dat_landing_before_the_write_is_not_overwritten(tmp_path):
+    """The decision and the write are separate operations.
+
+    The route resolves local-first, but a DAT import can commit between that
+    decision and ``set_match``. For a path with no prior row the import's
+    rematch snapshot cannot cover it either, so the remote hit would be
+    written *after* invalidation and then served unconditionally. The store
+    re-checks inside the writing transaction and leaves the path uncached, so
+    the next match resolves it locally.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    await store.import_dat(SAMPLE_DAT_XML)
+
+    # A hash the imported DAT knows -- i.e. the import has landed by the time
+    # this remote result is being persisted.
+    known_sha1 = "aabbccddaabbccddaabbccddaabbccddaabbccdd"
+    known = store.lookup_sha1(known_sha1)
+    assert known is not None, "fixture DAT does not contain the expected hash"
+
+    path = "/vol/late.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Remote Name",
+        "match_type": "file_sha1", "file_hash": known_sha1, "source": "hasheous",
+    })
+
+    assert store.get_match(path) is None, (
+        "a remote hit was cached over a DAT that had already landed"
+    )
+
+    # The batch writer takes the same rule.
+    await store.set_matches_batch({path: {
+        "path": path, "matched": True, "game_name": "Remote Name",
+        "match_type": "file_sha1", "file_hash": known_sha1, "source": "hasheous",
+    }})
+    assert store.get_match(path) is None, "the batch writer bypassed the guard"
