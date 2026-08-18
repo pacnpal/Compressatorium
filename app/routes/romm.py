@@ -751,7 +751,25 @@ async def romm_repin_cancel(payload: RepinCancelRequest) -> dict:
     does not exist.
     """
     _require_configured()
-    cancelled = await run_in_threadpool(romm_repin.cancel, payload.ids)
+    # ...unless a job is writing there. Two tabs can plan the same destination
+    # before either submits, and the second `record()` supersedes the first
+    # row. If the *first* tab then wins job creation, the second is told the
+    # destination is taken and tidies up after itself -- retiring the row that
+    # the accepted conversion now depends on, since its own was already
+    # superseded. The row a live job is writing to belongs to that job,
+    # whoever planned it.
+    rows = await run_in_threadpool(romm_repin.outputs_for, payload.ids)
+    keep = set()
+    for row_id, output_path in rows.items():
+        if await _probe(_destination_has_pending_job, output_path, default=True):
+            keep.add(row_id)
+    if keep:
+        logger.info(
+            "romm: keeping %d re-pin row(s) a queued job is writing to", len(keep),
+        )
+    cancelled = await run_in_threadpool(
+        romm_repin.cancel, [i for i in payload.ids if i not in keep],
+    )
     return {"cancelled": cancelled}
 
 
@@ -1286,7 +1304,15 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
         # metadata snapshot for nothing.
         proposed = {
             **before,
-            **{k: v for k, v in submitted.items() if k in _IDENTITY_FIELDS},
+            # `None` means "leave it alone" to `save()`, so it has to mean the
+            # same here. Reading an explicit null as an empty identity made
+            # `{"url": null}` look like a move to nowhere, and the request then
+            # cleared the conversion history and irreversibly retired every
+            # pending snapshot while changing no connection setting at all.
+            **{
+                k: v for k, v in submitted.items()
+                if k in _IDENTITY_FIELDS and v is not None
+            },
         }
         changed = await _identity_moved(before, proposed)
         # The new identity and the promise to clean up after it go into one

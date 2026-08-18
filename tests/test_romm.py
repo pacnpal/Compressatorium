@@ -3682,6 +3682,164 @@ async def test_a_plan_refuses_to_record_across_an_identity_change(
     assert romm_routes.romm_repin.count_pending() == 0
 
 
+@pytest.mark.asyncio
+async def test_a_null_identity_field_is_not_a_move(settings_db, tmp_path: Path) -> None:
+    """`None` means "leave it alone" to `save()`, so it has to mean it here.
+
+    Reading an explicit null as an empty identity made `{"url": null}` look
+    like a move to nowhere — and the request then cleared the conversion
+    history and irreversibly retired every pending snapshot while changing no
+    connection setting at all.
+    """
+    from services.romm import repin as romm_repin, settings as romm_settings
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+    romm_repin.record({"id": 5, "igdb_id": 42}, str(tmp_path / "A.rvz"), {"igdb_id": 42})
+    assert romm_repin.count_pending() == 1
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)):
+        await romm_routes.put_romm_settings(
+            romm_routes.RommSettingsPatch(url=None, repin_on_load=False),
+        )
+
+    assert romm_repin.count_pending() == 1, "a null URL retired a live snapshot"
+    assert romm_settings.effective()["url"] == "http://romm:8080"
+    assert romm_settings.cleanup_owed() is False
+
+
+@pytest.mark.asyncio
+async def test_retargeting_a_rule_does_not_outlive_its_history_reset(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Two writes, and either can be the one an interruption spares.
+
+    Saving the retarget first and losing the history clear is the silent
+    failure: a retry compares the new rule with itself, computes no stale
+    platform, and `overwrite`/`rename` then skip every ROM as already
+    converted — against outputs belonging to the *former* target. Clearing
+    first and losing the save costs a re-conversion instead, which is visible
+    and recoverable.
+    """
+    from services.romm import auto as romm_auto
+
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "duplicate_action": "overwrite"}})
+    await romm_auto._mark_converted(
+        "7", romm_auto._converted_entries([(1, str(tmp_path / "Game.rvz"), "", None)]),
+    )
+    assert (await romm_auto.get_state())["7"]["converted"]
+
+    # The history clear fails while the rule is being retargeted.
+    with patch.object(
+        romm_auto, "forget_converted_locked", side_effect=RuntimeError("disk full"),
+    ), pytest.raises(RuntimeError):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_gcz", "duplicate_action": "overwrite",
+        }})
+
+    # The retarget did not land, so it is still pending and still detectable.
+    rules = await romm_auto.get_rules()
+    assert rules["7"]["mode"] == "dolphin_rvz", rules
+    # Retrying now sees the change and clears the history it was meant to.
+    await romm_auto.set_rules({"7": {
+        "mode": "dolphin_gcz", "duplicate_action": "overwrite",
+    }})
+    assert not (await romm_auto.get_state()).get("7", {}).get("converted")
+
+
+@pytest.mark.asyncio
+async def test_a_targeted_run_will_not_start_a_rule_validation_paused(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Naming a platform overrides *the operator's* pause, not validation's.
+
+    Normalization replaces a value it refuses with the wider fallback — an
+    out-of-volume output directory becomes None (write beside every source), a
+    backtracking filter becomes None (match the whole platform). Running such a
+    rule does more than the saved rule says, unattended, possibly with
+    delete-on-verify attached.
+    """
+    from services.romm import auto as romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        # Refused at save time, so the rule is paused with the reason recorded.
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True,
+            "exclude_pattern": "(a+)+$",
+        }})
+        rules = await romm_auto.get_rules()
+        assert rules["7"]["enabled"] is False
+        assert rules["7"]["invalid_pattern"] is True
+        # ...and naming it explicitly does not start it anyway.
+        result = await romm_auto.sweep(
+            platform_ids=["7"], ignore_schedule=True, dry_run=True,
+        )
+
+    assert result["queued"] == 0, result
+    assert {"platform_id": 7, "error": "rule_invalid"} in result["errors"], result
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_spares_the_row_a_queued_job_is_writing(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Two tabs can plan one destination before either submits.
+
+    The second `record()` supersedes the first row. If the *first* tab then
+    wins job creation, the second is told the destination is taken and tidies
+    up after itself — retiring the row the accepted conversion now depends on,
+    since its own was already superseded. The row a live job is writing to
+    belongs to that job, whoever planned it.
+    """
+    from services.romm import repin as romm_repin
+
+    output = tmp_path / "Game.rvz"
+    first = romm_repin.record({"id": 5}, str(output), {"igdb_id": 42})
+    second = romm_repin.record({"id": 5}, str(output), {"igdb_id": 42})
+    assert second != first
+    assert romm_repin.count_pending() == 1
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "_destination_has_pending_job", return_value=True,
+            ):
+        result = await romm_routes.romm_repin_cancel(
+            romm_routes.RepinCancelRequest(ids=[second]),
+        )
+
+    assert result["cancelled"] == 0, result
+    assert romm_repin.count_pending() == 1, "the running conversion lost its row"
+
+    # And with nothing queued there, the row is retired as before.
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "_destination_has_pending_job", return_value=False,
+            ):
+        result = await romm_routes.romm_repin_cancel(
+            romm_routes.RepinCancelRequest(ids=[second]),
+        )
+    assert result["cancelled"] == 1, result
+
+
 def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:
     """A prefix of a regex is usually a valid regex that means something else.
 

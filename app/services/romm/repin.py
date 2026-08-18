@@ -249,6 +249,26 @@ def produced_companions(output_path: str, mode: str | None) -> list[str]:
         return []
 
 
+def outputs_for(row_ids: list[int]) -> dict[int, str]:
+    """``{row id: output_path}`` for the pending rows among *row_ids*.
+
+    So a caller can ask something this module has no business knowing -- is a
+    job writing there right now? -- before deciding to retire them.
+    """
+    if not row_ids:
+        return {}
+    with _session() as session:
+        return {
+            int(row_id): str(path)
+            for row_id, path in session.query(
+                _db.RommRepin.id, _db.RommRepin.output_path,
+            ).filter(
+                _db.RommRepin.id.in_(list(row_ids)),
+                _db.RommRepin.state == "pending",
+            ).all()
+        }
+
+
 def cancel(row_ids: list[int]) -> int:
     """Retire the pending rows *row_ids*. Returns how many were retired.
 

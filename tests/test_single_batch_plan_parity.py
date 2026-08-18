@@ -784,8 +784,72 @@ async def test_a_job_queued_during_another_preflight_still_claims_its_output(
 
     manager._reject_claimed_destinations_locked(first, mode, keys_first)
     manager._queue_job_locked(
-        file_path=str(link / "game.iso"), mode=mode, resolved=keys_first,
+        file_path=str(link / "game.iso"), mode=mode, reservation=keys_first,
     )
 
     with pytest.raises(OutputClaimedError):
         manager._reject_claimed_destinations_locked(second, mode, keys_second)
+
+
+@pytest.mark.asyncio
+async def test_companion_enumeration_never_runs_on_the_event_loop(
+    tmp_path, monkeypatch,
+) -> None:
+    """`companion_outputs` is not pure path math for every tool.
+
+    makeps3iso probes the disk for its numbered split parts, so enumerating a
+    live job's sidecars inline blocks the event loop on exactly the mount the
+    pre-flight bound exists to survive — and it happens *before* that bound is
+    reached, while inspecting a job that is merely queued.
+    """
+    import asyncio
+    import threading
+
+    from services import job_manager as jm
+
+    loop_thread = threading.get_ident()
+    stuck = threading.Event()
+    real = os.path.realpath
+
+    def _realpath(path):
+        assert threading.get_ident() != loop_thread, (
+            f"realpath({path}) ran on the event loop"
+        )
+        return real(path)
+
+    def _slow_companions(mode, output_path):
+        assert threading.get_ident() != loop_thread, (
+            f"companion_outputs({output_path}) ran on the event loop"
+        )
+        if "/dead-mount/" in str(output_path):
+            stuck.wait(30)
+        return []
+
+    monkeypatch.setattr(jm.os.path, "realpath", _realpath)
+    monkeypatch.setattr(jm.JobManager, "_companions", staticmethod(_slow_companions))
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.2)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        jobs = await asyncio.wait_for(
+            manager.create_batch_jobs(
+                ["/dead-mount/game.iso"], ConversionMode.CREATECD,
+            ),
+            timeout=5,
+        )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    assert [job.output_path for job in jobs] == ["/dead-mount/game.chd"]
+    assert ticks > 0

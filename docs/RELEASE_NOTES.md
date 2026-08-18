@@ -604,6 +604,40 @@
   its late reply left the library reporting the new instance as unusable while
   its catalog had already loaded.
 
+- **Naming a platform on Run now no longer starts a rule that validation
+  paused.** Running one platform by hand deliberately overrides the scheduler
+  being off — but a rule paused because its output folder was outside the
+  volumes, its filter backtracked, or its time window was half-filled has
+  already had that value replaced with the wider fallback. Running it would
+  write beside every source, or convert the whole platform, unattended and
+  possibly with delete-after-verify. Those stay paused, and the run says so.
+- **The reason a rule is paused survives a reload.** The refused value is
+  replaced by the fallback, so re-reading the saved rule found nothing wrong
+  with it and cleared the flag — leaving the editor showing a paused rule with
+  no explanation.
+- **Retargeting a rule can no longer keep the history that belonged to its old
+  target.** Changing the format or output folder clears what the rule
+  remembers producing, and those were two separate writes: if the second one
+  was lost, a retry compared the new rule with itself, saw no change, and left
+  Overwrite and Write-alongside skipping every ROM as already converted against
+  outputs of the *former* format. The history is now cleared first, so an
+  interruption costs a re-conversion rather than a silent skip.
+- **Discarding a plan no longer takes a running conversion's metadata with
+  it.** Two tabs can prepare the same output before either submits; the second
+  replaces the first's snapshot, and if the *first* tab then wins the queue the
+  second tidies up after itself — retiring the row the accepted conversion
+  depended on. A snapshot for a file a queued job is writing is now left alone,
+  whoever prepared it.
+- **Submitting `null` for the RomM URL is no longer read as moving away from
+  it.** Every other setting treats an omitted value as "leave it alone", but
+  this one path read it as an empty connection and cleared the conversion
+  history and every pending snapshot without a single setting having changed.
+- **One more way a dead mount could freeze job submission.** The queue lists
+  each job's companion files when reserving a destination, and for PS3 split
+  builds that means asking the disk which numbered parts exist. That ran on the
+  thread serving the app, before the deadline meant to cover it, while
+  inspecting a job that was merely queued.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

@@ -612,6 +612,16 @@ def normalize_rule(
         # Pause rather than run wider than asked. The editor shows why.
         out["invalid_pattern"] = True
         out["enabled"] = False
+    # A refused value is replaced by the wider fallback, so the *reason* has to
+    # survive the round trip or the pause becomes unreadable: re-normalizing a
+    # stored rule sees `exclude_pattern: None`, finds nothing wrong with it, and
+    # clears the flag -- leaving the editor showing a rule paused for no stated
+    # reason, and the sweep unable to tell an operator's pause from this one.
+    for flag in ("invalid_pattern", "invalid_window"):
+        if raw.get(flag):
+            out[flag] = True
+            out["enabled"] = False
+
     out["only_unmatched"] = bool(raw.get("only_unmatched", False))
     out["only_matched"] = bool(raw.get("only_matched", False))
     # Mutually exclusive; "both" is the same as neither, and silently meaning
@@ -799,10 +809,29 @@ async def set_rules(raw: Any) -> dict[str, dict]:
             pid for pid in previous
             if _output_identity(previous[pid]) != _output_identity(rules.get(pid))
         ]
-        await preferences_store.put(RULES_KEY, rules)
+        # History first, rules second. They are two writes and either can be
+        # the one an interruption spares, so the order decides which failure
+        # you get: clearing history for a retarget that then fails to save
+        # costs a re-conversion, while saving a retarget whose history survives
+        # makes `overwrite`/`rename` skip every ROM as already converted --
+        # against outputs that belong to the *former* target, and with no way
+        # to notice, because a retry compares the new rule with itself and
+        # computes no stale platform at all. Recoverable beats silent.
         if stale:
             await forget_converted_locked(stale)
+        await preferences_store.put(RULES_KEY, rules)
         return rules
+
+
+# What `normalize_rule` sets when it refuses a value. Each one has already
+# replaced that value with a *wider* fallback, which is why a rule carrying any
+# of them must not run -- see the sweep's `enabled` gate.
+_VALIDATION_FLAGS = ("invalid_output_dir", "invalid_window", "invalid_pattern")
+
+
+def _validation_paused(rule: dict) -> bool:
+    """Was this rule disabled by validation rather than by the operator?"""
+    return any(rule.get(flag) for flag in _VALIDATION_FLAGS)
 
 
 async def forget_converted(platform_ids: list[str] | None = None) -> int:
@@ -1490,7 +1519,20 @@ async def _sweep_locked(
         # explicitly -- that is a deliberate per-platform action, and it keeps
         # the "configure a rule, leave the scheduler off, run it by hand"
         # workflow working.
-        if not rule["enabled"] and wanted is None:
+        #
+        # But only for a rule the *operator* paused. A rule paused by
+        # validation is a different thing: normalization has already replaced
+        # the value it refused with the wider fallback -- an out-of-volume
+        # output directory becomes None (write beside every source), a
+        # backtracking filter becomes None (match the whole platform), half a
+        # window becomes no window -- so running it would do more than the
+        # saved rule says, unattended, possibly with delete-on-verify. Those
+        # stay paused until the operator fixes what is wrong.
+        if not rule["enabled"] and (wanted is None or _validation_paused(rule)):
+            if wanted is not None:
+                result["errors"].append(
+                    {"platform_id": int(platform_id), "error": "rule_invalid"},
+                )
             continue
         # ignore_schedule bypasses only the clock (interval, window, weekday).
         if not ignore_schedule and not _is_due(rule, state.get(platform_id, {}), now):

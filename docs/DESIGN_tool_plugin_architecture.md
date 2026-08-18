@@ -1403,6 +1403,12 @@ bound, instead of taking the process with it.
 Calling `_canonical_path` without one is the blocking form, and it is only
 correct off the event loop.
 
+`companion_outputs` is enumerated in that same detached pass, not under the
+lock: it is **not** pure path math for every tool -- makeps3iso probes the disk
+for its numbered split parts -- so the pre-flight returns a `_Reservation`
+carrying both the canonical map and each destination's full key set, and the
+locked check reads them.
+
 Moving the resolution ahead of the lock opens one gap the map alone cannot
 close: two submissions can both pre-resolve before either takes the lock, so
 the second's map cannot contain a job the first queues in between. Falling back

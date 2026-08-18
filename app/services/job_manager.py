@@ -12,7 +12,18 @@ import uuid
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Deque, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import (
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -107,6 +118,22 @@ def _paths_collide(
 # submit and a healthy mount answers in microseconds; the point is only that a
 # mount which never answers cannot hold up job creation forever.
 _CANONICAL_PROBE_SECONDS = 20.0
+
+
+class _Reservation(NamedTuple):
+    """What the locked destination check needs, all of it computed off-loop.
+
+    ``resolved`` maps each path to its canonical key; ``keys`` maps each
+    destination to every key a job writing it claims -- itself plus the
+    sidecars its mode writes beside it. Both are frozen before the lock is
+    taken, so the check does no filesystem work at all: `companion_outputs` is
+    *not* pure path math for every tool (makeps3iso probes the disk for its
+    numbered split parts), so enumerating it inline would block the event loop
+    on exactly the mount the bound exists to survive.
+    """
+
+    resolved: Dict[str, str]
+    keys: Dict[str, Tuple[str, ...]]
 
 
 async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
@@ -332,7 +359,7 @@ class JobManager:
         verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
-        resolved: Optional[Mapping[str, str]] = None,
+        reservation: Optional[_Reservation] = None,
     ) -> ConversionJob:
         """Queue a job while holding _create_lock (no backpressure check here)."""
         job_id = str(uuid.uuid4())[:8]
@@ -340,7 +367,7 @@ class JobManager:
 
         output_path = self._resolve_output_locked(
             file_path, mode, output_dir=output_dir, output_path=output_path,
-            resolved=resolved,
+            resolved=reservation.resolved if reservation else None,
         )
 
 
@@ -375,7 +402,7 @@ class JobManager:
         # Every key this job claims -- its destination and the sidecars the
         # mode writes beside it -- for the reservation that runs after this
         # one. See `_output_keys`.
-        self._output_keys[job_id] = self._reserved_keys(mode, output_path, resolved)
+        self._output_keys[job_id] = self._reserved_keys(output_path, reservation)
         if delete_on_verify and delete_snapshot:
             self._delete_plans[job_id] = delete_snapshot
         ticket = concurrency_manager.reserve_ticket(job_id)
@@ -417,12 +444,12 @@ class JobManager:
             "output_path": output_path,
         }]
         # Outside the lock, and off the event loop: see `_reservation_keys`.
-        resolved = await self._reservation_keys(specs, mode)
+        reservation = await self._reservation_keys(specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(1)
             # Same destination reservation the batch path gets: a single
             # submit racing a sweep is the same collision with one fewer file.
-            self._reject_claimed_destinations_locked(specs, mode, resolved)
+            self._reject_claimed_destinations_locked(specs, mode, reservation)
             job = self._queue_job_locked(
                 file_path=file_path,
                 mode=mode,
@@ -435,7 +462,7 @@ class JobManager:
                 verify_after=verify_after,
                 split=split,
                 delete_snapshot=delete_snapshot,
-                resolved=resolved,
+                reservation=reservation,
             )
         await self._prune_jobs()
         return job
@@ -455,10 +482,10 @@ class JobManager:
 
         jobs: List[ConversionJob] = []
         # Outside the lock, and off the event loop: see `_reservation_keys`.
-        resolved = await self._reservation_keys(job_specs, mode)
+        reservation = await self._reservation_keys(job_specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(len(job_specs))
-            self._reject_claimed_destinations_locked(job_specs, mode, resolved)
+            self._reject_claimed_destinations_locked(job_specs, mode, reservation)
             for spec in job_specs:
                 file_path = str(spec["file_path"])
                 output_dir = spec.get("output_dir")
@@ -481,7 +508,7 @@ class JobManager:
                         verify_after=verify_after,
                         split=split,
                         delete_snapshot=spec.get("delete_snapshot"),
-                        resolved=resolved,
+                        reservation=reservation,
                     )
                 )
         await self._prune_jobs()
@@ -548,19 +575,24 @@ class JobManager:
         except (KeyError, ValueError, OSError):
             return []
 
+    @staticmethod
     def _reserved_keys(
-        self,
-        mode: ConversionMode,
-        output_path: str,
-        resolved: Optional[Mapping[str, str]] = None,
+        output_path: str, reservation: Optional[_Reservation] = None,
     ) -> Tuple[str, ...]:
-        """Every canonical key a job writing *output_path* claims."""
-        keys = [_canonical_path(output_path, resolved)]
-        keys.extend(
-            _canonical_path(path, resolved)
-            for path in self._companions(mode, output_path)
-        )
-        return tuple(dict.fromkeys(keys))
+        """Every canonical key a job writing *output_path* claims.
+
+        Read from the pre-flight, never recomputed: enumerating companions can
+        touch the disk (see :meth:`_reservation_keys`), and this runs under
+        ``_create_lock``. Without a pre-flight entry the answer is the primary
+        alone -- the honest one, since the sidecars cannot be known here
+        without the I/O this exists to avoid.
+        """
+        if reservation is not None:
+            found = reservation.keys.get(output_path)
+            if found is not None:
+                return found
+            return (_canonical_path(output_path, reservation.resolved),)
+        return (_canonical_path(output_path),)
 
     @staticmethod
     def _derive_output(
@@ -580,18 +612,29 @@ class JobManager:
 
     async def _reservation_keys(
         self, job_specs: List[Dict[str, object]], mode: ConversionMode,
-    ) -> Dict[str, str]:
+    ) -> _Reservation:
         """Pre-resolve every path the destination reservation will compare.
 
         Runs before ``_create_lock`` is taken, so the critical section itself
         does no filesystem work: see :func:`_canonical_path`. Covers each
         spec's source and derived destination plus every live job's output,
-        because the reservation compares the first set against the second.
+        because the reservation compares the first set against the second --
+        and each destination's *companions*, because a mode that writes
+        `Game.cue` also writes `Game.bin`, which another mode can claim as its
+        primary.
+
+        The companion lookup happens **here**, inside the bounded detached
+        work, not under the lock: it is not pure path math for every tool --
+        makeps3iso probes the disk for its numbered split parts -- so calling
+        it inline would block the event loop on precisely the unresponsive
+        mount this bound exists to survive.
 
         A spec whose destination cannot be derived (unknown mode, unsupported
         extension) is skipped rather than raised on -- the locked pass runs the
         same derivation and produces the caller-facing error there, once.
         """
+        # (destination, mode) pairs whose sidecars have to be enumerated.
+        wanted: List[Tuple[str, ConversionMode]] = []
         paths: List[str] = []
         for spec in job_specs:
             file_path = str(spec["file_path"])
@@ -610,16 +653,48 @@ class JobManager:
                 except (KeyError, ValueError):
                     continue
             paths.append(destination)
-            # The sidecars count as claimed too, so they need keys as well.
-            paths.extend(self._companions(mode, destination))
+            wanted.append((destination, mode))
         for job in self.jobs.values():
             if not job.output_path:
                 continue
             if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 continue
             paths.append(job.output_path)
-            paths.extend(self._companions(job.mode, job.output_path))
-        return await _resolve_paths_bounded(paths)
+            wanted.append((job.output_path, job.mode))
+
+        companions: Dict[str, List[str]] = {}
+
+        def _enumerate() -> None:
+            for destination, job_mode in wanted:
+                if destination in companions:
+                    continue
+                companions[destination] = self._companions(job_mode, destination)
+
+        try:
+            await asyncio.wait_for(
+                run_detached(_enumerate), _CANONICAL_PROBE_SECONDS,
+            )
+        except (asyncio.TimeoutError, OSError):
+            logger.warning(
+                "Enumerating companion outputs did not finish in %.1fs; "
+                "reserving primaries only (a volume is not answering)",
+                _CANONICAL_PROBE_SECONDS,
+            )
+        # Snapshot, for the reason `_resolve_paths_bounded` explains: the
+        # abandoned worker keeps writing into its own dict.
+        found = dict(companions)
+        for extra in found.values():
+            paths.extend(extra)
+
+        resolved = await _resolve_paths_bounded(paths)
+        keys = {
+            destination: tuple(dict.fromkeys(
+                [_canonical_path(destination, resolved)]
+                + [_canonical_path(path, resolved) for path in extra]
+            ))
+            for destination, extra in found.items()
+        }
+        return _Reservation(resolved=resolved, keys=keys)
 
     def _resolve_output_locked(
         self,
@@ -667,7 +742,7 @@ class JobManager:
         self,
         job_specs: List[Dict[str, object]],
         mode: ConversionMode,
-        resolved: Optional[Mapping[str, str]] = None,
+        reservation: Optional[_Reservation] = None,
     ) -> None:
         """Refuse the batch if any destination is already spoken for.
 
@@ -695,7 +770,7 @@ class JobManager:
         # off the loop before the lock: even one `realpath` here is a stat
         # chain into the same remote mount, and one that never returns takes
         # the whole process with it.
-        active = self._active_output_map(resolved)
+        active = self._active_output_map(reservation)
         planned: Dict[str, str] = {}   # canonical destination -> source
         for spec in job_specs:
             file_path = str(spec["file_path"])
@@ -706,11 +781,11 @@ class JobManager:
                 mode,
                 output_dir=str(output_dir) if output_dir is not None else None,
                 output_path=str(explicit) if explicit is not None else None,
-                resolved=resolved,
+                resolved=reservation.resolved if reservation else None,
             )
             # Destination *and* sidecars: a mode that writes `Game.cue` also
             # writes `Game.bin`, which another mode can claim as its primary.
-            for key in self._reserved_keys(mode, destination, resolved):
+            for key in self._reserved_keys(destination, reservation):
                 claimed_by = active.get(key)
                 if claimed_by is not None:
                     raise OutputClaimedError(
@@ -728,7 +803,7 @@ class JobManager:
                 planned[key] = file_path
 
     def _active_output_map(
-        self, resolved: Optional[Mapping[str, str]] = None,
+        self, reservation: Optional[_Reservation] = None,
     ) -> Dict[str, str]:
         """``{canonical output path: job id}`` for every live job.
 
@@ -750,7 +825,7 @@ class JobManager:
                 # would miss an alias of a path already claimed.
                 keys = self._output_keys.get(job.id)
                 if keys is None:
-                    keys = self._reserved_keys(job.mode, job.output_path, resolved)
+                    keys = self._reserved_keys(job.output_path, reservation)
                 for key in keys:
                     active.setdefault(key, job.id)
         return active
