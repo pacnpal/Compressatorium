@@ -63,9 +63,17 @@
     let pending = 0;
     let pendingBytes = 0;
     let convertedBytes = 0;
+    // Judge each ROM against the target the panel is actually configured to
+    // produce. Counting any ready output from any tool called a PS2 ISO
+    // "converted" because a CSO sat beside it, even with CHD selected — so the
+    // count and the savings estimate described a different conversion than the
+    // one the button would run.
+    const activeToolId = conversion.currentTool?.id ?? null;
+    const forActiveTool = (o) => !activeToolId || o.tool_id === activeToolId;
     for (const e of entries) {
-      const done = (e.outputs ?? []).some((o) => o.ready);
-      const working = (e.outputs ?? []).some((o) => o.exists && !o.ready);
+      const outs = (e.outputs ?? []).filter(forActiveTool);
+      const done = outs.some((o) => o.ready);
+      const working = outs.some((o) => o.exists && !o.ready);
       if (done) {
         converted += 1;
         convertedBytes += e.size ?? 0;

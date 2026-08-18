@@ -19,6 +19,7 @@ import os
 import stat as stat_module
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 from routes.files import detect_file_outputs, verifiable_tools
 from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
+from services.job_manager import job_manager
 from services.lock_manager import lock_manager
 from services.output_conflicts import QUEUE, resolve_destination
 from services.preferences_store import preferences_store
@@ -200,7 +202,14 @@ async def romm_platforms() -> list[dict]:
         platforms = await run_in_threadpool(romm_client.platforms)
     except RommError as exc:
         raise _romm_call(exc, context="listing platforms") from exc
-    all_tool_ids = [t.id for t in registry.all()]
+    # Only tools that can actually run here. A Switch install without
+    # prod.keys reports NSZ unavailable everywhere else (GET /api/tools hides
+    # it in the sidebar), so offering an NSZ rule in the automation editor
+    # would queue jobs that fail at runtime, on a schedule.
+    ready = await asyncio.gather(*(t.is_ready() for t in registry.all()))
+    all_tool_ids = [
+        tool.id for tool, ok in zip(registry.all(), ready, strict=True) if ok
+    ]
     out = [
         {
             "id": p.get("id"),
@@ -401,6 +410,27 @@ class _Outcome(str, Enum):
     UPSTREAM_ERROR = "upstream"  # RomM is unwell; stop the whole pass
 
 
+def _destination_has_pending_job(output_path: str) -> bool:
+    """Whether a queued or running job is going to write *output_path*.
+
+    ``check_file_status`` only reports a lock once a job starts, so it cannot
+    see a conversion that is merely queued -- exactly the window in which an
+    overwrite job leaves the previous artifact in place.
+    """
+    try:
+        target = str(Path(output_path).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError):
+        return False
+    for _job_id, paths in job_manager.get_active_job_candidates():
+        for candidate in paths:
+            try:
+                if str(Path(candidate).expanduser().resolve(strict=False)) == target:
+                    return True
+            except (OSError, RuntimeError):
+                continue
+    return False
+
+
 async def _settle_one_repin(row: tuple) -> _Outcome:
     """Drive one pending re-pin row as far as it can go this pass.
 
@@ -436,6 +466,13 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
     except OSError:
         locked = False
     if locked:
+        return _Outcome.WAITING
+
+    # A *queued* job holds no lock yet, so under the overwrite policy the file
+    # sitting at this destination is still the OLD artifact. Hashing it now
+    # would cache the wrong digest -- and because the hash is cached, the ROM
+    # could never be matched once the real output replaced it.
+    if await run_in_threadpool(_destination_has_pending_job, output_path):
         return _Outcome.WAITING
 
     try:

@@ -24,6 +24,7 @@ from routes import romm as romm_routes
 from services import db as _db
 from services import romm as romm_service
 from services import romm_repin
+from services.tools import registry
 from services.romm import DAT_SAFE_OUTPUT_EXTS, RommClient, RommError
 
 # ----------------------------------------------------------------------
@@ -1817,3 +1818,121 @@ async def test_repin_plan_records_the_path_the_batch_will_write(
     assert renamed["recorded"] == 1, renamed
     rows = romm_repin.pending_rows(10)
     assert rows[0][0] == str(lib / "Game_1.rvz"), rows
+
+
+# ----------------------------------------------------------------------
+# fifth review pass
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rename_rule_converts_each_source_exactly_once(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A standing `rename` rule must not reconvert forever.
+
+    Once a sweep writes an output the base path is occupied, so the next sweep
+    would pick `Game_1`, then `Game_2`, and a scheduled rule would reconvert
+    the same ROM until the destination filled up.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    (lib / "Game.rvz").write_bytes(b"\0" * 8)  # something already at the base
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "rename",
+        }})
+        first = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+        assert first["queued"] == 1, first
+
+        # That conversion completes.
+        (lib / "Game_1.rvz").write_bytes(b"\0" * 8)
+        second = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert second["queued"] == 0, second
+    assert second["skipped_existing"] == 1
+
+
+def test_directory_modes_use_the_directory_predicate(tmp_path: Path) -> None:
+    """makeps3iso declares no input extensions, so `converts_path` rejects all.
+
+    Gating the sweep on it made an advertised PS3 rule report every decrypted
+    folder "unconvertible" and queue nothing, ever.
+    """
+    from services import ps3
+    from services import romm_auto
+
+    folder = tmp_path / "MyGame"
+    (folder / "PS3_GAME" / "USRDIR").mkdir(parents=True)
+    (folder / "PS3_GAME" / "PARAM.SFO").write_bytes(b"\0" * 16)
+    assert ps3.is_ps3_iso_source(str(folder))
+
+    tool = registry.for_mode("folder_to_iso")
+    spec = registry.spec("folder_to_iso")
+    assert tool.converts_path(str(folder)) is False  # the old, wrong gate
+    assert romm_auto._accepts_source(tool, spec, str(folder)) is True
+
+    # A file mode is still judged on its extensions.
+    dolphin, dolphin_spec = registry.for_mode("dolphin_rvz"), registry.spec("dolphin_rvz")
+    assert romm_auto._accepts_source(dolphin, dolphin_spec, "/vol/Game.iso") is True
+    assert romm_auto._accepts_source(dolphin, dolphin_spec, "/vol/Game.txt") is False
+
+
+@pytest.mark.asyncio
+async def test_settle_waits_while_a_job_is_queued_for_the_output(
+    repin_db, tmp_path: Path,
+) -> None:
+    """An overwrite job leaves the OLD artifact in place until it starts.
+
+    `check_file_status` reports no lock while a job is merely queued, so the
+    pass would hash the previous file and cache that digest — after which the
+    real output could never be matched.
+    """
+    output = tmp_path / "Game.rvz"
+    output.write_bytes(b"stale" * 8)
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.job_manager, "get_active_job_candidates",
+                return_value=[("job1", [str(output)])],
+            ), \
+            patch.object(romm_routes, "run_detached", AsyncMock()) as hashed:
+        result = await romm_routes.settle_romm_repins()
+
+    assert result["waiting"] == 1, result
+    assert result["repinned"] == 0
+    hashed.assert_not_awaited()  # the stale file was never hashed
+    assert romm_repin.count_pending() == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_tool_ids_exclude_unavailable_tools() -> None:
+    """A tool the deployment cannot run must not be offered as a rule target."""
+    platforms = [{"id": 9, "name": "Switch", "slug": "switch"}]
+
+    nsz = registry.for_mode("nsz_compress")
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", "/data/library"), \
+            patch.object(romm_routes.romm_client, "platforms", return_value=platforms), \
+            patch.object(type(nsz), "is_ready", AsyncMock(return_value=False)):
+        rows = await romm_routes.romm_platforms()
+
+    assert "nsz" not in rows[0]["tool_ids"], rows

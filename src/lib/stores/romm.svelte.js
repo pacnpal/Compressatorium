@@ -9,6 +9,9 @@
 
 import { api } from '$lib/api/endpoints.js';
 import { fileBrowser } from '$lib/stores/fileBrowser.svelte.js';
+import { conversion } from '$lib/stores/conversion.svelte.js';
+import { ui } from '$lib/stores/ui.svelte.js';
+import { registry } from '$lib/tools/registry.js';
 
 /** Weekday labels for the schedule editor; index === Date.getDay() - 1 (Mon=0). */
 export const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -201,7 +204,31 @@ class RommStore {
     const id = Number(platformId);
     if (!Number.isFinite(id)) return;
     this.selectedPlatformId = id;
+    this.#adoptPlatformTool(id);
     await fileBrowser.enterRomm(id);
+  }
+
+  /**
+   * Point the workspace at a tool this platform can actually use.
+   *
+   * Narrowing the row's `convertible_by` is only an annotation: the shared
+   * submit path deliberately does not gate on it (chdman's extract/copy modes
+   * take a `.chd` that is badged convertible by nothing). So a workspace left
+   * on CHDMAN from a previous session would happily accept a GameCube `.iso`
+   * and produce a CHD — exactly the disambiguation this view exists to remove.
+   * Switching the active tool is the enforcement point the picker respects.
+   */
+  #adoptPlatformTool(platformId) {
+    const allowed = this.platforms.find((p) => p.id === platformId)?.tool_ids;
+    // No opinion from the backend (unknown slug, older server) changes nothing,
+    // matching narrow_to_platform's conservative contract.
+    if (!Array.isArray(allowed) || allowed.length === 0) return;
+    if (allowed.includes(conversion.primaryTool)) return;
+    const next = registry.all().find((t) => allowed.includes(t.id));
+    if (next) {
+      conversion.setPrimaryTool(next.id);
+      ui.workspaceTool = next.id;
+    }
   }
 
   // ─── automation rules ─────────────────────────────────────────────────

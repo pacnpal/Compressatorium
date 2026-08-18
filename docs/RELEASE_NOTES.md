@@ -54,7 +54,13 @@
   asked: an output folder outside the configured volumes, or a name filter that
   is not a valid regular expression, both stop the rule and say so in the editor
   — the alternative was a filter silently becoming "no filter" and the next
-  sweep converting the entire platform.
+  sweep converting the entire platform. Only tools the deployment can actually
+  run are offered, so a Switch install without `prod.keys` cannot be scheduled
+  to fail every hour.
+
+  Selecting a platform also points the workspace at a tool that platform can
+  use, so the disambiguation holds for hand-picked conversions too — not just
+  for the badge on the row.
 
   **Preview** shows exactly what a sweep would queue without queueing it, and
   without moving the schedule clock, so looking never postpones a run.

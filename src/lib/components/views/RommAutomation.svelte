@@ -72,6 +72,12 @@
     const rule = {
       ...current,
       timezone: isNew ? browserZone : (current.timezone || browserZone),
+      // Changing the target invalidates everything that described the old one.
+      // Carrying `compression: "max"` from a CSO rule into a CHDMAN one passes
+      // normalization and then fails every queued job on `chdman -c max`.
+      ...(patch.mode !== undefined && patch.mode !== current.mode
+        ? { compression: null, compression_level: null, split: false }
+        : {}),
       ...patch,
     };
     if (!rule.mode) romm.removeRule(platformId);

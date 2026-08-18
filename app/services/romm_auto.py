@@ -45,11 +45,12 @@ from services.output_conflicts import (
     QUEUE,
     SKIP_EXISTING,
     SKIP_LOCKED,
+    check_output_conflicts,
     resolve_destination,
 )
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
-from services.tools import registry
+from services.tools import InputKind, registry
 from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes
 
@@ -505,27 +506,77 @@ def _compression_arg(rule: dict) -> str | None:
     return f"{codec or ''}:{level}"
 
 
-def _inspect_candidate(path: str, rule: dict, tool) -> dict:
+def _accepts_source(tool, spec, path: str) -> bool:
+    """Whether this tool takes *path* as an input unit for its mode.
+
+    Directory modes (makeps3iso's decrypted PS3 folder) declare no input
+    extensions at all, so the extension-based `converts_path` rejects every
+    one of them and the sweep called an advertised mode "unconvertible" for
+    every single candidate. The registry says which predicate applies.
+    """
+    if InputKind.DIRECTORY in spec.input_kinds:
+        return tool.accepts_directory(path)
+    return tool.converts_path(path)
+
+
+def _rename_already_ran(tool, mode: str, path: str, output_dir: str | None) -> bool:
+    """Whether a ``rename`` rule has already converted *path* once.
+
+    Rename is the one policy that cannot be idempotent from the base path
+    alone: once a sweep writes an output, the base is occupied, so the next
+    sweep picks ``Game_1``, then ``Game_2``, and a standing schedule reconverts
+    the same ROM forever until the destination fills up.
+
+    The first numbered sibling is the evidence a run happened — a rename writes
+    ``name_1`` before anything higher. Checking it keeps rename meaningful (it
+    still writes alongside a file that was already there) while making it run
+    exactly once per source. `skip` and `overwrite` need none of this: their
+    base-path answer is already stable across sweeps.
+    """
+    try:
+        base = tool.output_path(mode, path, output_dir)
+    except (KeyError, ValueError, OSError):
+        return False
+    candidate = Path(base)
+    first = candidate.parent / f"{candidate.stem}_1{candidate.suffix}"
+    exists, locked = check_output_conflicts(mode, str(first))
+    return exists or locked
+
+
+def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
     """Every disk-touching question about one candidate, answered in one hop.
 
-    Convertibility, path resolution and the duplicate-policy destination all
-    stat the filesystem. Asked separately from the sweep they would each need
-    their own thread hop per ROM; asked here the sweep pays one per candidate.
+    Mapping the RomM record onto a local path, the volume check, the input
+    predicate, path resolution and the duplicate-policy destination all stat
+    the filesystem — and on the NFS/SMB/rclone deployments this integration
+    explicitly supports, a mount that stops answering would otherwise block the
+    event loop for the length of the catalog.
 
-    ``skip`` is None when the ROM should be queued, otherwise the reason —
-    ``"unconvertible"``, ``"unresolvable"``, or one of the duplicate-policy
-    decisions. ``resolved`` is still filled in whenever it could be, because
-    the caller checks it against the in-flight set before acting on ``skip``.
+    ``skip`` is None when the ROM should be queued, otherwise the reason.
+    ``resolved`` is still filled in whenever it could be, because the caller
+    checks it against the in-flight set before acting on ``skip``.
     """
-    if not tool.converts_path(path):
-        return {"skip": "unconvertible", "resolved": None, "destination": None}
+    miss = {"skip": "unresolvable", "resolved": None, "destination": None, "path": None}
+    path = romm_client.local_path(rom)
+    if not path or not is_within_configured_volumes(path):
+        return miss
+    if not _accepts_source(tool, spec, path):
+        return {**miss, "skip": "unconvertible", "path": path}
     resolved = _resolve_source(path)
     if resolved is None:
-        return {"skip": "unresolvable", "resolved": None, "destination": None}
+        return miss
+    if rule["duplicate_action"] == "rename" and _rename_already_ran(
+        tool, rule["mode"], path, rule["output_dir"],
+    ):
+        return {
+            "skip": SKIP_EXISTING, "resolved": resolved,
+            "destination": None, "path": path,
+        }
     destination, decision = resolve_destination(
         tool, path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
     )
     return {
+        "path": path,
         "skip": None if decision == QUEUE else decision,
         "resolved": resolved,
         "destination": destination,
@@ -703,20 +754,17 @@ async def _sweep_locked(
             if not _passes_filters(rom, rule):
                 result["skipped_filtered"] += 1
                 continue
-            path = romm_client.local_path(rom)
-            if not path or not is_within_configured_volumes(path):
-                continue
             # One hop to a worker thread for every disk-touching check on this
-            # candidate: converts_path stats, resolve() stats each component,
-            # and the destination probe scans companions. Done inline they add
-            # up to a stalled event loop for the length of the catalog.
+            # candidate — the local-path mapping and volume check included,
+            # since both resolve paths against a mount that may be remote.
             decision = await run_in_threadpool(
-                _inspect_candidate, path, rule, tool,
+                _inspect_candidate, rom, rule, tool, spec,
             )
+            path = decision["path"]
+            if decision["skip"] == "unresolvable":
+                continue
             if decision["skip"] == "unconvertible":
                 result["skipped_unconvertible"] += 1
-                continue
-            if decision["skip"] == "unresolvable":
                 continue
             if decision["resolved"] in active_paths:
                 result["skipped_active"] += 1
