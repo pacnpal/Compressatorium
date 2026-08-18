@@ -390,8 +390,22 @@ def claim(row_id: int) -> bool:
     with _session() as session:
         updated = session.query(_db.RommRepin).filter(
             _db.RommRepin.id == row_id,
-            _db.RommRepin.state == "pending",
-        ).update({"state": SETTLING, "settled_at": utcnow_iso()})
+            or_(
+                _db.RommRepin.state == "pending",
+                # A claim the holder never released: the only way to outlive
+                # `_CLAIM_STALE_SECONDS` is the process dying mid-write.
+                # `pending_rows` hands such a row back out, so refusing it here
+                # would mean every later pass fetched it and then failed on it,
+                # forever.
+                and_(
+                    _db.RommRepin.state == SETTLING,
+                    _db.RommRepin.settled_at < _iso_seconds_ago(_CLAIM_STALE_SECONDS),
+                ),
+            ),
+        ).update(
+            {"state": SETTLING, "settled_at": utcnow_iso()},
+            synchronize_session=False,
+        )
         session.commit()
         return bool(updated)
 
@@ -452,8 +466,13 @@ def count_pending() -> int:
     if _db.SessionLocal is None:
         return 0
     with _session() as session:
+        # Rows mid-write count as outstanding, and so does a claim whose
+        # holder died: both still need re-matching, and hiding them understated
+        # the badge and let the background settler think there was no work.
         return (
             session.query(_db.RommRepin)
-            .filter(_db.RommRepin.state == "pending")
+            .filter(
+                _db.RommRepin.state.in_(("pending", SETTLING)),
+            )
             .count()
         )

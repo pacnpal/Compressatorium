@@ -1372,6 +1372,17 @@ the file like any other locked output; the sweep simply drops the candidate and
 picks it up next time. Both touch the disk (a directory mode's companion lookup
 scans), so call them off the event loop.
 
+#### One destination, one source (`output_conflicts.collapse_to_winners`)
+
+Two inputs can resolve to the same output — a `.cue` beside its `.bin`, two
+`Game.iso` files aimed at one output folder — and `/jobs/batch` collapses them
+into a single job, keeping the highest-priority source (`input_priority`; first
+wins a tie). Anything that records *per source* has to reach the same answer or
+it describes a job that was never created: the RomM metadata snapshot was
+written for whichever source came last, so the conversion that ran could be
+re-pinned with the skipped ROM's identity. Both the batch route and the re-pin
+plan call the same helper.
+
 ### 3.3.9 Re-pin queue and conversion provenance (`services/romm_repin.py`)
 
 Two questions the filesystem cannot answer on its own, both owned here so the

@@ -285,6 +285,18 @@ class FileBrowserStore {
     // stuck on the old search results under the new currentPath if we
     // didn't drop search state first.
     this.exitSearch();
+    // RomM mode short-circuits refresh() the same way, and a catalog row can
+    // be a directory — a decrypted PS3 game folder. Clicking one set
+    // `currentPath` and then reloaded the platform catalog instead, so the
+    // folder looked clickable and did nothing. Asking to go somewhere is
+    // asking to leave the catalog; `exitRomm` clears its rows but must not
+    // also refresh the old path, since this call is about to set a new one.
+    if (this.rommPlatformId !== null) {
+      this.rommPlatformId = null;
+      this.entries = [];
+      this.entriesError = null;
+      this._loadedPath = null;
+    }
     this.currentPath = path;
     this.currentArchivePath = null;
     this.clearSelection();

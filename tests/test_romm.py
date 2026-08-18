@@ -3024,6 +3024,92 @@ async def test_the_settle_pass_bounds_the_hash_by_its_own_budget() -> None:
     assert seen["timeout"] > romm_routes._HASH_TIMEOUT_FLOOR_S, seen
 
 
+@pytest.mark.asyncio
+async def test_two_sources_for_one_output_record_the_source_the_queue_keeps(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The batch collapses them into one job; the snapshot must agree.
+
+    Two selected ROMs can resolve to one destination — repeated `Game.iso`
+    names aimed at a single output folder, or a `.cue` beside its `.bin`.
+    `/jobs/batch` keeps one source; recording per source in submission order
+    left the row holding whichever came *last*, so the conversion that actually
+    ran could be re-pinned with the identity of the ROM the queue skipped.
+    """
+    from services import romm_repin
+    from services.output_conflicts import collapse_to_winners, input_priority
+
+    # The shared rule the batch route uses: the disc description outranks the
+    # data track, and equal claims keep the first submitted.
+    assert input_priority("/x/Game.cue") > input_priority("/x/Game.bin")
+    assert collapse_to_winners({
+        "/x/Game.bin": "/out/Game.chd", "/x/Game.cue": "/out/Game.chd",
+    }) == {"/x/Game.cue": "/out/Game.chd"}
+
+    lib = tmp_path / "library"
+    (lib / "a").mkdir(parents=True)
+    (lib / "b").mkdir(parents=True)
+    (lib / "a" / "Game.iso").write_bytes(b"\0" * 32)
+    (lib / "b" / "Game.iso").write_bytes(b"\0" * 32)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    await settings_db.save({"url": "http://romm:8080", "library_root": str(lib)})
+    roms = [
+        {"id": 1, "name": "Game A", "full_path": "a/Game.iso",
+         "fs_name": "Game.iso", "platform_slug": "ngc", "igdb_id": 11},
+        {"id": 2, "name": "Game B", "full_path": "b/Game.iso",
+         "fs_name": "Game.iso", "platform_slug": "ngc", "igdb_id": 22},
+    ]
+
+    payload = romm_routes.RepinPlanRequest(
+        paths=[str(lib / "a" / "Game.iso"), str(lib / "b" / "Game.iso")],
+        mode="dolphin_rvz", platform_id=7, output_dir=str(out),
+        duplicate_action="overwrite",
+    )
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_routes, "is_within_configured_volumes", return_value=True), \
+            patch.object(
+                romm_routes, "_destination_has_pending_job", return_value=False,
+            ):
+        result = await romm_routes.romm_repin_plan(payload)
+
+    # One destination, one row — and the second source counted as skipped
+    # rather than silently overwriting the first one's snapshot.
+    assert result["recorded"] == 1, result
+    assert result["skipped"] == 1, result
+    rows = romm_repin.pending_rows(10)
+    assert len(rows) == 1, rows
+    assert rows[0][3] == {"igdb_id": 11}, rows[0]
+
+
+def test_a_claim_its_holder_never_released_is_taken_back(sqlite_db, tmp_path: Path) -> None:
+    """A process that dies mid-write must not park the row forever.
+
+    `pending_rows` hands a stale claim back out, so refusing to re-claim it
+    meant every later pass fetched that row and failed on it — and
+    `count_pending` hid it from the badge and from the background settler, so
+    nothing ever restored its metadata.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.rvz"
+    romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
+    row_id = romm_repin.pending_rows(10)[0][5]
+    assert romm_repin.claim(row_id) is True
+
+    # Fresh claim: invisible to another pass, but still counted as outstanding.
+    assert [r for r in romm_repin.pending_rows(10) if r[5] == row_id] == []
+    assert romm_repin.count_pending() == 1
+
+    # Aged past the stale window, it comes back and can be taken again.
+    with patch.object(
+        romm_repin, "_iso_seconds_ago", return_value="2999-01-01T00:00:00Z",
+    ):
+        assert [r[5] for r in romm_repin.pending_rows(10)] == [row_id]
+        assert romm_repin.claim(row_id) is True
+
+
 def test_claiming_a_row_is_atomic(sqlite_db, tmp_path: Path) -> None:
     """Whoever claims the row is the only one that may write to RomM.
 

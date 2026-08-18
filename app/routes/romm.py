@@ -36,7 +36,11 @@ from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
 from services.job_manager import job_manager
 from services.lock_manager import lock_manager
-from services.output_conflicts import QUEUE, resolve_destination
+from services.output_conflicts import (
+    QUEUE,
+    collapse_to_winners,
+    resolve_destination,
+)
 from services.preferences_store import preferences_store
 from services.romm import (
     DAT_SAFE_OUTPUT_EXTS,
@@ -468,6 +472,10 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # because that is what the caller submits and what the created jobs report
     # back; the destination is what a row is identified by.
     recorded_paths: dict[str, str] = {}
+    # Filled by the resolve loop below, then collapsed per destination before
+    # anything is written: recording is per source, the queue is per output.
+    planned: dict[str, str] = {}
+    roms_by_path: dict[str, tuple[dict, dict]] = {}
 
     def _resolve_batch(paths: list[str]) -> dict[str, str | None]:
         """Volume check and canonical key for each path, in one worker hop.
@@ -543,6 +551,21 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         ):
             skipped += 1
             continue
+        planned[path] = destination
+        roms_by_path[path] = (rom, ids)
+
+    # Two selected ROMs can resolve to one destination -- repeated `disc.iso`
+    # names aimed at a single output folder, a `.cue` beside its `.bin`. The
+    # batch route collapses those into ONE job and keeps the highest-priority
+    # source; recording per source in submission order instead left the row
+    # holding whichever came last, because each `record()` supersedes the
+    # previous one for that path. The conversion that ran could then be
+    # re-pinned with the identity of the ROM the queue skipped. Same rule as
+    # the batch, from the same helper.
+    winners = collapse_to_winners(planned)
+    skipped += len(planned) - len(winners)
+    for path, destination in winners.items():
+        rom, ids = roms_by_path[path]
         if await run_in_threadpool(
             romm_repin.record, rom, destination, ids, payload.mode,
         ):

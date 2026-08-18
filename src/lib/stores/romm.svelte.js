@@ -205,7 +205,16 @@ class RommStore {
       // view clears the catalog on exit, so returning to it with a platform
       // still selected must re-fetch rather than show an empty list.
       const stillThere = this.platforms.some((p) => p.id === this.selectedPlatformId);
-      if (this.platforms.length > 0 && (force || !stillThere || !fileBrowser.rommPlatformId)) {
+      if (this.platforms.length === 0) {
+        // A successful call that lists nothing is still a change of world —
+        // an instance with no platforms, or one whose library was emptied.
+        // Leaving the selection and the previous instance's rows on screen
+        // showed "No platforms in RomM" above a live catalog, and with no
+        // selected platform to narrow it the target picker fell back to every
+        // mode in the registry, wired to those stale paths.
+        this.selectedPlatformId = null;
+        fileBrowser.exitRomm();
+      } else if (force || !stillThere || !fileBrowser.rommPlatformId) {
         const target = stillThere ? this.selectedPlatformId : this.platforms[0].id;
         await this.selectPlatform(target);
       }

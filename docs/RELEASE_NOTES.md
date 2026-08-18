@@ -299,6 +299,22 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **Two selected ROMs that write the same file keep the right metadata.** The
+  batch collapses them into one conversion and keeps one source; the snapshot
+  was recorded per source in submission order, so the row ended up holding
+  whichever came last — and the conversion that actually ran could be
+  re-matched as the ROM the queue skipped. Both now use the same rule.
+- **A re-match interrupted by a restart is picked up again.** A row claimed for
+  writing by a process that then died stayed claimed: later passes fetched it
+  and failed on it, and the badge and the background pass could not see it at
+  all.
+- **Clicking into a folder in the RomM catalog works.** A record can resolve to
+  a directory (a decrypted PS3 game folder); clicking one set the path and then
+  reloaded the same platform listing, so the folder looked clickable and did
+  nothing.
+- **A RomM instance with no platforms clears the previous one's rows** instead
+  of showing "No platforms in RomM" above a live catalog whose files were still
+  wired to the Convert panel.
 - **A PS3 conversion split into parts verifies the parts.** With verification
   now reachable for that format, the check was still being pointed at the
   single ISO the job planned — which a `-s` build past 4 GB never writes — so a

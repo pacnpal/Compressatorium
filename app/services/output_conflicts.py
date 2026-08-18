@@ -161,3 +161,40 @@ def resolve_destination(
         except (OutputPathLocked, OutputPathExhausted):
             return None, SKIP_LOCKED
     return None, SKIP_EXISTING
+
+
+def input_priority(path: str) -> int:
+    """How strongly *path* claims a destination two inputs both resolve to.
+
+    A `.cue` describes the disc its `.bin` holds, so when both are submitted
+    they produce one CHD and the `.cue` is the one to convert from. Shared with
+    :func:`collapse_to_winners` so every caller collapses the same way.
+    """
+    name = path.split("::", 1)[-1]
+    ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+    if ext in {".cue", ".gdi"}:
+        return 4
+    if ext == ".iso":
+        return 3
+    if ext == ".bin":
+        return 1
+    return 0
+
+
+def collapse_to_winners(destinations: dict[str, str]) -> dict[str, str]:
+    """``{source: destination}`` reduced to one source per destination.
+
+    The batch route collapses inputs that resolve to the same output down to
+    the highest-priority one (first wins a tie), because they are one
+    conversion. Anything that records *per source* has to agree with that
+    choice or it describes a job that was never created: the metadata snapshot
+    for a collapsed batch was written for whichever source came last, so the
+    conversion that actually ran could be re-pinned with the skipped ROM's
+    identity.
+    """
+    winners: dict[str, str] = {}
+    for source, destination in destinations.items():
+        current = winners.get(destination)
+        if current is None or input_priority(source) > input_priority(current):
+            winners[destination] = source
+    return {source: destination for destination, source in winners.items()}

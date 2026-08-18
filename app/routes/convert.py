@@ -32,6 +32,7 @@ from services.output_conflicts import (
     OutputPathExhausted,
     OutputPathLocked,
     check_output_conflicts,
+    input_priority,
 )
 from services.output_conflicts import (
     get_unique_output_path as _get_unique_output_path,
@@ -251,16 +252,6 @@ def _declares_input(path: str, spec) -> bool:
     """
     name = path.split("::", 1)[1] if "::" in path else path
     return match_extension(name, spec.input_extensions) is not None
-
-
-def _priority(ext: str) -> int:
-    if ext in {".cue", ".gdi"}:
-        return 4
-    if ext == ".iso":
-        return 3
-    if ext == ".bin":
-        return 1
-    return 0
 
 
 @dataclass
@@ -764,7 +755,7 @@ async def plan_job(
         allow_overwrite=allow_overwrite,
         display_filename=display_filename,
         delete_snapshot=delete_snapshot,
-        priority=_priority(_input_extension(file_path)),
+        priority=input_priority(file_path),
     )
 
 
