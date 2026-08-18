@@ -507,11 +507,27 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # One catalog read for the whole batch, indexed by local path, instead of a
     # by-hash lookup per file.
     try:
-        platform_roms = await run_in_threadpool(
-            romm_repin.roms_by_local_path, payload.paths, payload.platform_id,
+        # Bounded: this resolves every submitted path against the platform's
+        # catalog, and the resolve half is a stat chain per ROM. The deadline
+        # scales with the batch, like the path resolution below it.
+        platform_roms = await asyncio.wait_for(
+            run_detached(
+                romm_repin.roms_by_local_path,
+                payload.paths,
+                payload.platform_id,
+            ),
+            _plan_deadline(len(payload.paths)),
         )
     except RommError as exc:
         raise _romm_call(exc, context="reading the catalog") from exc
+    except (asyncio.TimeoutError, OSError) as exc:
+        # The library stopped answering mid-resolve. Saying so beats recording
+        # a partial set and reporting it as complete.
+        logger.warning("romm: resolving the submitted paths timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="The library did not respond while matching these files",
+        ) from exc
 
     recorded = 0
     skipped = 0
@@ -594,10 +610,15 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if payload.output_paths and path in payload.output_paths:
             destination, decision = payload.output_paths[path], QUEUE
         else:
-            destination, decision = await run_in_threadpool(
+            # Bounded: this looks for an existing output and, under Rename,
+            # walks suffixes until one is free -- both filesystem work. An
+            # unreadable answer skips the row, which is what `decision != QUEUE`
+            # already means everywhere below.
+            destination, decision = await _probe(
                 resolve_destination,
                 tool, path, payload.mode, payload.output_dir,
                 payload.duplicate_action,
+                default=(None, None),
             )
         if decision != QUEUE or not destination:
             skipped += 1
@@ -638,16 +659,31 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     skipped += len(planned) - len(winners)
     for path, destination in winners.items():
         rom, ids = roms_by_path[path]
+        # Taken here, bounded, rather than inside `record()`:
+        #
+        # * a re-record for a path the queue chose runs AFTER the jobs were
+        #   accepted, and on an idle queue a fast conversion can finish in
+        #   between -- stating the destination then saves the *finished* output
+        #   as the "before" picture, the settler sees nothing change, and the
+        #   row is abandoned. The caller only supplies `output_paths` for the
+        #   redirect case, where the queue picked a free name, so the state
+        #   before this conversion is "nothing there": "".
+        # * and a stat that cannot be read must not become `""`. Under
+        #   `overwrite` that would tell the settler the destination changed the
+        #   moment it reads it again, sending it off to hash the file this
+        #   conversion has not replaced yet. No row is better than a row
+        #   pointing at the wrong artifact, so the source is skipped instead.
+        if payload.output_paths:
+            pre = ""
+        else:
+            pre = await _probe(
+                romm_repin.path_fingerprint, destination, default=None,
+            )
+            if pre is None:
+                skipped += 1
+                continue
         row_id = await run_in_threadpool(
-            romm_repin.record, rom, destination, ids, payload.mode,
-            # A re-record for a path the queue chose runs AFTER the jobs were
-            # accepted, and on an idle queue a fast conversion can finish in
-            # between -- fingerprinting then saves the *finished* output as the
-            # "before" picture, the settler sees nothing change, and the row is
-            # abandoned. The caller only supplies `output_paths` for the
-            # redirect case, where the queue picked a free name, so the state
-            # before this conversion is "nothing there": "".
-            "" if payload.output_paths else None,
+            romm_repin.record, rom, destination, ids, payload.mode, pre,
         )
         if row_id:
             recorded += 1
