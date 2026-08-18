@@ -56,6 +56,14 @@ class DATMatchingStore {
   // hydration have to discard responses that were in flight across a change,
   // and giving them separate counters was how the second case got missed.
   _generation = 0;
+  // Hydration ordering. _hydrateSeq numbers each request as it goes out;
+  // _appliedSeq records the newest one that has actually written to the map.
+  // Two counters, not one: discarding on "a newer request exists" would throw
+  // away an in-order answer whenever two hydrations overlap, while discarding
+  // on "a newer answer already applied" only drops the responses that are
+  // genuinely stale.
+  _hydrateSeq = 0;
+  _appliedSeq = 0;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
@@ -179,6 +187,12 @@ class DATMatchingStore {
     // effect need not re-run) the newly enabled fallback stayed dead until a
     // reload.
     const generation = this._generation;
+    // Responses can land out of order, and the reconcile below made that
+    // observable: hydration A reads a hit, a rescan deletes it, hydration B
+    // correctly evicts it -- and then A's delayed answer put the obsolete hit
+    // back, indefinitely, because returned rows were merged unconditionally.
+    // Only apply an answer if nothing newer has already applied.
+    const seq = ++this._hydrateSeq;
     // Snapshot the entries this hydration can invalidate. Overlaying returned
     // rows is not enough: the server omits a path it no longer has a usable
     // row for -- one dropped because a rescan proved the file changed, or one
@@ -199,6 +213,8 @@ class DATMatchingStore {
     try {
       const data = await api.getMatchCache(paths);
       if (generation !== this._generation) return;
+      if (seq < this._appliedSeq) return;
+      this._appliedSeq = seq;
       const results = data?.results ?? {};
       // Compare-and-delete against the snapshotted value, not just the key: a
       // match job can land between the request and this response, and its
