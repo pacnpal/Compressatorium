@@ -1455,6 +1455,37 @@ written for whichever source came last, so the conversion that ran could be
 re-pinned with the skipped ROM's identity. Both the batch route and the re-pin
 plan call the same helper.
 
+#### A row is keyed by its destination, and owned by its source
+
+The dedupe key is `output_path`, which is right — one destination is produced
+once, so re-recording *supersedes* rather than stacking, and re-submitting a
+batch is harmless. But the key alone cannot say **which conversion** a row
+belongs to, and that is a different question with a real answer.
+
+It matters when a planned batch is not the one the queue accepts. Two clients
+can plan different sources onto one destination; the second `record()`
+supersedes the first's row, and if the *first* then wins job creation, the
+second's failed submit tidies up. Retiring its row would take the accepted
+conversion's only remaining snapshot with it — which is why the cancel route
+keeps a row a queued job is writing to. Keeping it on *those* grounds was its
+own bug: the surviving row holds the second source's provider ids while the
+queued job converts the first, so the settle pass hashes one game's output and
+stamps the other game's identity onto it, confidently, with nothing to notice.
+
+So the row records `source_path` (migration `0007`), and the test is
+`_destination_job_matches_source`: keep the row only when a queued job carries
+**both** this destination and this source — `get_active_job_candidates` reports
+a job's input and output together, so one job holding both is this row's
+conversion. `_destination_has_pending_job` remains for the weaker question,
+which still has uses ("may I treat what is on disk as settled"); the two are
+distinct and both are needed.
+
+A row with no `source_path` — written before the column existed — cannot answer
+and answers **no**. Retiring it costs a manual re-match; keeping it can cost a
+game its identity, which is the whole failure being removed. The column rides
+through the unique-index retry path too, or a row that lost that race would come
+back unable to prove ownership.
+
 ### 3.3.9 Re-pin queue and conversion provenance (`services/romm/repin.py`)
 
 Two questions the filesystem cannot answer on its own, both owned here so the
@@ -1518,13 +1549,38 @@ otherwise finds the new identity already cached, computes no change, and
 returns success while the marker still says the old instance's records are
 live.
 
-The re-pin **plan** holds neither `_settle_lock` nor the sweep pause, and it
-reads the catalog and then writes rows carrying that catalog's provider ids.
-`romm_settings.identity_generation()` is read before and re-checked after: a
-change landing in that window means the ids belong to an instance nobody is
-pointed at, and the plan answers 409 rather than recording them. A batch
-converted without a snapshot needs a manual re-match, which is recoverable; a
-row holding another library's ids is not.
+The re-pin **plan** reads the catalog and then writes rows carrying that
+catalog's provider ids, so it has to be sure the catalog is still the one in
+use. `romm_settings.identity_generation()` is read up front and re-checked
+before recording: a change landing in that window means the ids belong to an
+instance nobody is pointed at, and the plan answers 409 rather than recording
+them. A batch converted without a snapshot needs a manual re-match, which is
+recoverable; a row holding another library's ids is not.
+
+A re-check is not a guarantee, though — it is true at an instant, and the
+inserts come after it. A save landing in between could install the new identity
+*and finish its cleanup* while the rows were still going in, leaving them alive
+against the new library, holding the old one's ids, and invisible to the pass
+that was supposed to retire them. So the plan is split: the fingerprint probes
+run unlocked (they are bounded filesystem reads, and holding a lock the settler
+and the settings route both need across a dead mount, once per destination,
+would trade this race for a much longer stall), and **only the inserts run
+under `_settle_lock`** — the lock `_run_identity_cleanup` requires — with the
+generation re-read inside it. That is what makes "the identity has not moved"
+true *for the duration of* the writes.
+
+**And while a cleanup is owed, nothing acts on the records it has not reached
+yet.** The marker can outlive startup: `replay_identity_cleanup()` is
+best-effort, a briefly locked SQLite file is enough to fail it, and the app
+starts anyway by design. Until it lands, the conversion history and the pending
+re-pin rows still belong to the previous instance — so `sweep()` refuses
+(`identity_cleanup_pending`) rather than reading the old library's history, the
+plan route answers 409 rather than adding a row the cleanup has already passed
+over, and the settler skips its tick. The settler is also where the **retry**
+lives: it takes `_settle_lock` and the sweep pause, runs the cleanup, and only
+then proceeds. A sweep cannot retry it — it holds `_sweep_lock` and so is the
+one caller that cannot take those — which is why the refusal and the retry sit
+in different places.
 
 Deciding *whether* the identity moved is itself bounded (`_identity_moved`),
 because it resolves both library roots and the old one is the unresponsive

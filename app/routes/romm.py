@@ -523,6 +523,17 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # cleanup never saw, and the conversion would be re-pinned as a game from a
     # library it does not belong to.
     generation = romm_settings.identity_generation()
+    if romm_settings.cleanup_owed():
+        # The identity moved and the rows belonging to the old one are still in
+        # the table. Recording now adds a row that the pending cleanup will
+        # retire the moment it lands -- or, worse, one it has already passed
+        # over. Refusing costs a manual re-match; recording costs a ROM its
+        # identity.
+        raise HTTPException(
+            status_code=409,
+            detail="The RomM connection changed and its cleanup has not "
+                   "finished; submit again in a moment to save the metadata",
+        )
 
     # One catalog read for the whole batch, indexed by local path, instead of a
     # by-hash lookup per file.
@@ -677,6 +688,7 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # the batch, from the same helper.
     winners = collapse_to_winners(planned)
     skipped += len(planned) - len(winners)
+    ready: list[tuple] = []
     if romm_settings.identity_generation() != generation:
         # The catalog these ids came from belongs to an instance nobody is
         # pointed at any more. Nothing is recorded, and the caller is told --
@@ -715,15 +727,48 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
             if pre is None:
                 skipped += 1
                 continue
-        row_id = await run_in_threadpool(
-            romm_repin.record, rom, destination, ids, payload.mode, pre,
-        )
-        if row_id:
-            recorded += 1
-            recorded_paths[path] = destination
-            recorded_ids[path] = row_id
-        else:
-            skipped += 1
+        ready.append((path, rom, destination, ids, pre))
+
+    # The write phase, and the only part that has to be atomic with respect to
+    # an identity change.
+    #
+    # Checking the generation before the loop was a check-before-write: a save
+    # landing in between could install the new URL and finish its cleanup
+    # while these rows were still going in, so they survived it -- holding the
+    # OLD instance's provider ids, against the new library, invisible to the
+    # pass that was supposed to retire them. `_run_identity_cleanup` runs under
+    # `_settle_lock`, so holding it here is what makes "the identity has not
+    # moved" true for the duration of the inserts rather than at one instant
+    # before them.
+    #
+    # Only the inserts are inside it. The fingerprint probes above are
+    # filesystem reads with their own bound, and holding a lock the settler and
+    # the settings route both need across a dead mount, once per destination,
+    # would trade this race for a much longer stall.
+    async with _settle_lock:
+        if (
+            romm_settings.identity_generation() != generation
+            or romm_settings.cleanup_owed()
+        ):
+            logger.warning(
+                "romm: the RomM identity changed while planning; recording nothing",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="The RomM connection changed while this batch was being "
+                       "planned; submit it again to save the metadata",
+            )
+        for path, rom, destination, ids, pre in ready:
+            row_id = await run_in_threadpool(
+                romm_repin.record, rom, destination, ids, payload.mode, pre,
+                path,
+            )
+            if row_id:
+                recorded += 1
+                recorded_paths[path] = destination
+                recorded_ids[path] = row_id
+            else:
+                skipped += 1
     return {
         "recorded": recorded,
         "skipped": skipped,
@@ -762,17 +807,26 @@ async def romm_repin_cancel(payload: RepinCancelRequest) -> dict:
     does not exist.
     """
     _require_configured()
-    # ...unless a job is writing there. Two tabs can plan the same destination
-    # before either submits, and the second `record()` supersedes the first
-    # row. If the *first* tab then wins job creation, the second is told the
-    # destination is taken and tidies up after itself -- retiring the row that
-    # the accepted conversion now depends on, since its own was already
-    # superseded. The row a live job is writing to belongs to that job,
-    # whoever planned it.
+    # ...unless the job writing there is this row's own conversion. Two tabs
+    # can plan the same destination before either submits, and the second
+    # `record()` supersedes the first row. If the *first* tab then wins job
+    # creation, the second is told the destination is taken and tidies up after
+    # itself -- retiring the row the accepted conversion now depends on, since
+    # its own was already superseded.
+    #
+    # "Something is writing there" is not enough to keep a row, though, and
+    # keeping one on those grounds was its own bug: when the two tabs planned
+    # *different sources* onto one destination, the surviving row held the
+    # second source's ids while the queued job converts the first, so the
+    # settle pass hashed one game's output and stamped the other game's
+    # identity onto it. The row has to name its source, and the job writing
+    # there has to be converting that source.
     rows = await run_in_threadpool(romm_repin.outputs_for, payload.ids)
     keep = set()
-    for row_id, output_path in rows.items():
-        if await _probe(_destination_has_pending_job, output_path, default=True):
+    for row_id, (output_path, source_path) in rows.items():
+        if await _probe(
+            _destination_job_matches_source, output_path, source_path, default=True,
+        ):
             keep.add(row_id)
     if keep:
         logger.info(
@@ -825,6 +879,46 @@ def _destination_has_pending_job(output_path: str) -> bool:
                     return True
             except (OSError, RuntimeError):
                 continue
+    return False
+
+
+def _destination_job_matches_source(
+    output_path: str, source_path: str | None,
+) -> bool:
+    """Is the job writing *output_path* converting *source_path*?
+
+    The stronger form of :func:`_destination_has_pending_job`, and the one a
+    decision about a row's *ownership* needs. Both questions have a use: "is
+    anything writing here" is right for "may I treat what is on disk as
+    settled", while "is the conversion here the one this row describes" is the
+    only thing that justifies keeping a row whose ids belong to one source when
+    another source may be producing the file.
+
+    A row with no ``source_path`` cannot answer, and answers **no**: it was
+    written before the column existed, so keeping it would restore exactly the
+    behaviour this replaced. Retiring it costs a manual re-match; keeping it
+    can cost a game its identity.
+    """
+    if not source_path:
+        return False
+    try:
+        target = str(Path(output_path).expanduser().resolve(strict=False))
+        wanted = str(Path(source_path).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError):
+        return False
+    for _job_id, paths in job_manager.get_active_job_candidates():
+        resolved = set()
+        for candidate in paths:
+            try:
+                resolved.add(
+                    str(Path(candidate).expanduser().resolve(strict=False)),
+                )
+            except (OSError, RuntimeError):
+                continue
+        # `get_active_job_candidates` reports a job's input *and* output paths
+        # together, so one job carrying both is the job this row describes.
+        if target in resolved and wanted in resolved:
+            return True
     return False
 
 
@@ -1184,6 +1278,12 @@ async def settle_forever() -> None:
             await asyncio.sleep(_SETTLE_TICK_SECONDS)
             if not romm_settings.effective().get("repin_enabled", True):
                 continue
+            # Rows recorded against an instance nobody is pointed at any more
+            # are still in the table until the cleanup lands. Settling one
+            # stamps the previous library's ids onto whatever the current one
+            # matches -- so pause, and retry the cleanup while paused.
+            if await identity_cleanup_is_owed():
+                continue
             if _settle_lock.locked():
                 continue
             pending = await run_in_threadpool(romm_repin.count_pending)
@@ -1388,6 +1488,41 @@ async def _run_identity_cleanup() -> int:
         )
     await romm_settings.clear_cleanup_owed()
     return cleared
+
+
+async def identity_cleanup_is_owed() -> bool:
+    """Is a previous instance's data still live against the current identity?
+
+    The marker is written in the same row as the new URL and library root, so
+    while it is set the two records that belong to the *old* instance -- the
+    conversion history and every pending re-pin row -- have outlived it. Acting
+    on either is the failure the marker exists to prevent: the settler would
+    hand the old library's provider ids to whatever the new one matches, and a
+    sweep would read the old library's history and decide a ROM it has never
+    seen is already converted.
+
+    Startup replays the cleanup, but that attempt can fail transiently -- a
+    locked SQLite file is enough -- and the app deliberately starts anyway. So
+    the workers ask *here*, every tick, rather than trusting that one attempt:
+    each tick retries the cleanup and, until it succeeds, does nothing else.
+    Self-healing, and it keeps the app available, which not starting them would
+    not.
+    """
+    if not romm_settings.cleanup_owed():
+        return False
+    # Retry it, under the lock it requires, before reporting the pause. The
+    # caller must not already hold `_settle_lock`.
+    try:
+        # Same order as every other site takes these two (`_settle_lock`
+        # first, then the sweep pause). Taking them the other way round here
+        # would be the one place that could deadlock against the settings
+        # route.
+        async with _settle_lock, romm_auto.paused():
+            if romm_settings.cleanup_owed():
+                await _run_identity_cleanup()
+    except Exception:
+        logger.exception("romm: retrying the pending identity cleanup failed")
+    return romm_settings.cleanup_owed()
 
 
 async def replay_identity_cleanup() -> None:

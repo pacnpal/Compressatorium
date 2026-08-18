@@ -1495,6 +1495,28 @@ async def sweep(
     than reporting candidates a concurrent run is already claiming.
     """
     async with _sweep_lock:
+        if romm_settings.cleanup_owed():
+            # A change of RomM instance or library root has been installed but
+            # the cleanup that belongs with it has not finished -- the process
+            # died in between, or the startup replay failed transiently. Until
+            # it does, `converted` still holds the PREVIOUS library's history,
+            # and a sweep reading it decides a ROM of the *new* library is
+            # already converted because a same-named file was, somewhere else.
+            # Under skip that silently omits it forever; the other policies
+            # reconvert on a record that describes nothing here.
+            #
+            # Refused rather than retried here: the re-pin settler retries the
+            # cleanup on its own tick, under the locks it requires, and a sweep
+            # holding `_sweep_lock` is the one caller that cannot take them.
+            logger.warning(
+                "romm_auto: refusing to sweep while a RomM identity cleanup is "
+                "still owed; the previous instance's history is still live",
+            )
+            return {
+                "queued": 0, "considered": 0, "platforms": [],
+                "errors": [{"platform_id": None, "error": "identity_cleanup_pending"}],
+                "pending_repins": await run_in_threadpool(romm_repin.count_pending),
+            }
         return await _sweep_locked(
             platform_ids=platform_ids,
             ignore_schedule=ignore_schedule,
@@ -1893,7 +1915,7 @@ async def _sweep_locked(
                             # exactly the metadata this exists to protect.
                             if await run_in_threadpool(
                                 romm_repin.record, rom, destinations[path], ids,
-                                rule["mode"], pre_by_path[path],
+                                rule["mode"], pre_by_path[path], path,
                             ):
                                 repin_count += 1
                         except Exception:  # bookkeeping only; see below

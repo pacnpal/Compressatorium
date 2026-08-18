@@ -3646,7 +3646,6 @@ async def test_a_plan_refuses_to_record_across_an_identity_change(
     the conversion is re-pinned as a game from a library it does not belong to.
     """
     from fastapi import HTTPException
-
     from services.romm import settings as romm_settings
 
     lib = tmp_path / "roms" / "gc"
@@ -3797,7 +3796,7 @@ async def test_a_targeted_run_will_not_start_a_rule_validation_paused(
 
 
 @pytest.mark.asyncio
-async def test_a_cancel_spares_the_row_a_queued_job_is_writing(
+async def test_a_cancel_spares_the_row_the_queued_job_is_actually_producing(
     settings_db, tmp_path: Path,
 ) -> None:
     """Two tabs can plan one destination before either submits.
@@ -3805,38 +3804,124 @@ async def test_a_cancel_spares_the_row_a_queued_job_is_writing(
     The second `record()` supersedes the first row. If the *first* tab then
     wins job creation, the second is told the destination is taken and tidies
     up after itself — retiring the row the accepted conversion now depends on,
-    since its own was already superseded. The row a live job is writing to
-    belongs to that job, whoever planned it.
+    since its own was already superseded. When both tabs planned the *same*
+    source, the surviving row describes that conversion and must be kept.
+    """
+    from services.romm import repin as romm_repin
+
+    source = tmp_path / "Game.iso"
+    output = tmp_path / "Game.rvz"
+    first = romm_repin.record(
+        {"id": 5}, str(output), {"igdb_id": 42}, source_path=str(source),
+    )
+    second = romm_repin.record(
+        {"id": 5}, str(output), {"igdb_id": 42}, source_path=str(source),
+    )
+    assert second != first
+    assert romm_repin.count_pending() == 1
+
+    async def _cancel(row_id, *, job_source):
+        candidates = (
+            [("job1", [str(job_source), str(output)])] if job_source else []
+        )
+        with patch.object(RommClient, "base_url", "http://romm:8080"), \
+                patch.object(RommClient, "library_root", str(tmp_path)), \
+                patch.object(
+                    romm_routes.job_manager, "get_active_job_candidates",
+                    return_value=candidates,
+                ):
+            return await romm_routes.romm_repin_cancel(
+                romm_routes.RepinCancelRequest(ids=[row_id]),
+            )
+
+    kept = await _cancel(second, job_source=source)
+    assert kept["cancelled"] == 0, kept
+    assert romm_repin.count_pending() == 1, "the running conversion lost its row"
+
+    # And with nothing queued there, the row is retired as before.
+    dropped = await _cancel(second, job_source=None)
+    assert dropped["cancelled"] == 1, dropped
+
+
+@pytest.mark.asyncio
+async def test_a_kept_row_must_describe_the_conversion_that_won(
+    settings_db, tmp_path: Path,
+) -> None:
+    """"Something is writing there" is not proof the row belongs to it.
+
+    Two clients can plan *different* sources onto one destination — repeated
+    `disc.iso` names aimed at a single output folder. The second `record()`
+    supersedes the first's row, so if the FIRST wins job creation, the only
+    surviving row holds the SECOND source's provider ids while the queued job
+    converts the first. Keeping it on the grounds that a job targets that path
+    left the settle pass hashing one game's output and stamping the other
+    game's identity onto it — confidently, and with no way to notice.
+
+    So the row names its source, and is kept only when the job writing there is
+    converting it.
+    """
+    from services.romm import repin as romm_repin
+
+    winner = tmp_path / "Metroid Prime.iso"
+    loser = tmp_path / "elsewhere" / "Metroid Prime.iso"
+    output = tmp_path / "out" / "Metroid Prime.rvz"
+
+    romm_repin.record(
+        {"id": 1, "name": "winner"}, str(output), {"igdb_id": 11},
+        source_path=str(winner),
+    )
+    # The second client plans a different source onto the same destination,
+    # superseding the first row.
+    second = romm_repin.record(
+        {"id": 2, "name": "loser"}, str(output), {"igdb_id": 22},
+        source_path=str(loser),
+    )
+    assert romm_repin.count_pending() == 1
+
+    # The FIRST client's batch is the one the queue accepted.
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.job_manager, "get_active_job_candidates",
+                return_value=[("job1", [str(winner), str(output)])],
+            ):
+        result = await romm_routes.romm_repin_cancel(
+            romm_routes.RepinCancelRequest(ids=[second]),
+        )
+
+    assert result["cancelled"] == 1, (
+        "a row holding another source's ids was kept because *a* job targets "
+        "its destination"
+    )
+    assert romm_repin.count_pending() == 0
+    assert result["pending"] == 0, result
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_cannot_name_its_source_is_not_kept(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Rows written before `source_path` existed cannot prove ownership.
+
+    Answering "yes" for them would restore exactly the behaviour that mistook
+    "a job targets this path" for "this row belongs to that job". Retiring one
+    costs a manual re-match; keeping it can cost a game its identity.
     """
     from services.romm import repin as romm_repin
 
     output = tmp_path / "Game.rvz"
-    first = romm_repin.record({"id": 5}, str(output), {"igdb_id": 42})
-    second = romm_repin.record({"id": 5}, str(output), {"igdb_id": 42})
-    assert second != first
-    assert romm_repin.count_pending() == 1
+    row = romm_repin.record({"id": 5}, str(output), {"igdb_id": 42})
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
             patch.object(
-                romm_routes, "_destination_has_pending_job", return_value=True,
+                romm_routes.job_manager, "get_active_job_candidates",
+                return_value=[("job1", [str(tmp_path / "Game.iso"), str(output)])],
             ):
         result = await romm_routes.romm_repin_cancel(
-            romm_routes.RepinCancelRequest(ids=[second]),
+            romm_routes.RepinCancelRequest(ids=[row]),
         )
 
-    assert result["cancelled"] == 0, result
-    assert romm_repin.count_pending() == 1, "the running conversion lost its row"
-
-    # And with nothing queued there, the row is retired as before.
-    with patch.object(RommClient, "base_url", "http://romm:8080"), \
-            patch.object(RommClient, "library_root", str(tmp_path)), \
-            patch.object(
-                romm_routes, "_destination_has_pending_job", return_value=False,
-            ):
-        result = await romm_routes.romm_repin_cancel(
-            romm_routes.RepinCancelRequest(ids=[second]),
-        )
     assert result["cancelled"] == 1, result
 
 
@@ -4892,3 +4977,96 @@ async def test_cancelling_plans_reports_the_backlog_that_is_left(
     assert result["pending"] == 1, result
     assert romm_repin.count_pending() == 1
     assert keep is not None
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_refuses_while_an_identity_cleanup_is_owed(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The previous instance's conversion history is still live until it lands.
+
+    The marker rides in the same row as the new URL and library root, so while
+    it is set the records belonging to the *old* instance have outlived it.
+    A sweep reading `converted` then decides a ROM of the new library is
+    already converted because a same-named file was, in a different library —
+    silently omitting it forever under skip, and reconverting on a record that
+    describes nothing here under the others.
+
+    Startup replays the cleanup, but that attempt can fail transiently (a
+    locked SQLite file is enough) and the app deliberately starts anyway, so
+    the workers cannot assume one attempt settled it.
+    """
+    from services.romm import auto as romm_auto
+    from services.romm import settings as romm_settings
+
+    (tmp_path / "library").mkdir(parents=True)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({
+        "7": {"mode": "dolphin_rvz", "enabled": True, "max_per_run": 10},
+    })
+
+    with patch.object(romm_settings, "cleanup_owed", return_value=True), \
+            patch.object(romm_routes.romm_client, "roms", return_value=[]) as listed:
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["queued"] == 0, result
+    assert result["platforms"] == [], result
+    assert {"platform_id": None, "error": "identity_cleanup_pending"} in result["errors"]
+    listed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_planning_refuses_while_an_identity_cleanup_is_owed(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A row written now is one the pending cleanup has already passed over.
+
+    Refusing costs a manual re-match, which is recoverable. Recording costs the
+    ROM its identity, which is not.
+    """
+    from fastapi import HTTPException
+
+    from services.romm import settings as romm_settings
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+
+    with patch.object(romm_settings, "cleanup_owed", return_value=True), \
+            pytest.raises(HTTPException) as raised:
+        await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(tmp_path / "Game.iso")],
+                mode="dolphin_rvz",
+                platform_id=7,
+            ),
+        )
+    assert raised.value.status_code == 409, raised.value.detail
+
+
+@pytest.mark.asyncio
+async def test_an_identity_change_during_the_inserts_records_nothing(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Checking the generation before the loop was a check-before-write.
+
+    A save landing in between could install the new URL and finish its cleanup
+    while these rows were still going in, so they survived it — holding the old
+    instance's provider ids, against the new library, invisible to the pass
+    that was supposed to retire them. `_run_identity_cleanup` runs under
+    `_settle_lock`, so the inserts hold it too: the identity cannot move for
+    their duration rather than merely at one instant before them.
+    """
+    import inspect
+
+    source = inspect.getsource(romm_routes.romm_repin_plan)
+    write_phase = source[source.index("ready: list[tuple]"):]
+    assert "async with _settle_lock:" in write_phase, (
+        "the re-pin inserts do not hold the lock the identity cleanup takes"
+    )
+    # ...and the generation is re-read *inside* it, not merely before.
+    locked = write_phase[write_phase.index("async with _settle_lock:"):]
+    assert "identity_generation() != generation" in locked, locked[:400]
+    assert "romm_repin.record" in locked, "the inserts moved out of the lock"

@@ -183,6 +183,14 @@ class RommRepin(Base):
     source_name = Column(String, nullable=True)
     # Absolute local path of the conversion output this row is waiting on.
     output_path = Column(String, nullable=False)
+    # ...and the local file its provider ids were read from. The row is keyed
+    # by destination, because a destination is produced once -- but that alone
+    # cannot say *which* conversion a row belongs to, and two clients can plan
+    # different sources onto one destination. Without this, a row kept because
+    # "a job is writing there" could be re-pinned onto an output some other
+    # source produced. Nullable: rows written before it existed cannot name
+    # their source, and are treated as unproven rather than as a match.
+    source_path = Column(String, nullable=True)
     output_sha1 = Column(String, nullable=True)
     # {"igdb_id": 123, "moby_id": ..., ...} -- only the providers that were set.
     metadata_ids = Column(JSON, nullable=False, default=dict)

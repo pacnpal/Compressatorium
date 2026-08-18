@@ -155,13 +155,14 @@ def path_fingerprint(path: str) -> str:
 
 def _insert_pending(
     session, rom: dict, output_path: str, ids: dict, mode: str | None,
-    pre_fingerprint: str | None,
+    pre_fingerprint: str | None, source_path: str | None,
 ):
     """Add the new pending row and hand it back, so its id can be returned."""
     row = _db.RommRepin(
         source_rom_id=rom.get("id"),
         source_name=rom.get("name") or rom.get("fs_name"),
         output_path=output_path,
+        source_path=_canonical(source_path),
         pre_fingerprint=(
             path_fingerprint(output_path)
             if pre_fingerprint is None else pre_fingerprint
@@ -177,7 +178,7 @@ def _insert_pending(
 
 def record(
     rom: dict, output_path: str, ids: dict, mode: str | None = None,
-    pre_fingerprint: str | None = None,
+    pre_fingerprint: str | None = None, source_path: str | None = None,
 ) -> int:
     """Insert a pending row unless one already covers this output.
 
@@ -201,6 +202,14 @@ def record(
     finished file as the "before" picture. Omitted, it is taken now, which is
     correct for the manual path -- that records before the batch is submitted.
 
+    *source_path* is the local file the ids were read from. The dedupe key is
+    the destination, which is right -- one destination is produced once -- but
+    it leaves the row unable to say *which* conversion it belongs to. Two
+    clients can plan different sources onto one destination; recording the
+    source is what lets :func:`owned_by_job` answer "is the job writing there
+    the one this row describes" instead of the weaker "is anything writing
+    there".
+
     A partial unique index (``ux_romm_repin_pending_output``) is the actual
     guarantee that only one pending row exists, so a manual submit racing an
     automation sweep cannot stack two. Losing that race is not an error: retry
@@ -209,15 +218,20 @@ def record(
     with _session() as session:
         _supersede_pending(session, output_path)
         row = _insert_pending(
-            session, rom, output_path, ids, mode, pre_fingerprint,
+            session, rom, output_path, ids, mode, pre_fingerprint, source_path,
         )
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             _supersede_pending(session, output_path)
+            # `source_path` rides along here too: a row that loses the
+            # unique-index race and is re-inserted without it could not prove
+            # which conversion it belongs to, and would be retired as unproven
+            # the moment its planner tidied up.
             row = _insert_pending(
                 session, rom, output_path, ids, mode, pre_fingerprint,
+                source_path,
             )
             session.commit()
         return int(row.id)
@@ -249,19 +263,34 @@ def produced_companions(output_path: str, mode: str | None) -> list[str]:
         return []
 
 
-def outputs_for(row_ids: list[int]) -> dict[int, str]:
-    """``{row id: output_path}`` for the pending rows among *row_ids*.
+def _canonical(path: str | None) -> str | None:
+    """*path* as the job manager and the settle pass both spell it.
 
-    So a caller can ask something this module has no business knowing -- is a
-    job writing there right now? -- before deciding to retire them.
+    Pure string work: `normpath(abspath())`, no `realpath`. A comparison that
+    stats is a comparison that can block on a dead mount, and this one runs on
+    the request path.
+    """
+    if not path:
+        return None
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def outputs_for(row_ids: list[int]) -> dict[int, tuple[str, str | None]]:
+    """``{row id: (output_path, source_path)}`` for the pending rows given.
+
+    Both halves, because the caller's real question is not "is a job writing
+    there" but "is the job writing there **this row's** conversion" -- and a
+    row whose ``source_path`` is null (written before the column existed)
+    cannot answer it, so it is reported as unproven rather than as a match.
     """
     if not row_ids:
         return {}
     with _session() as session:
         return {
-            int(row_id): str(path)
-            for row_id, path in session.query(
+            int(row_id): (str(path), source)
+            for row_id, path, source in session.query(
                 _db.RommRepin.id, _db.RommRepin.output_path,
+                _db.RommRepin.source_path,
             ).filter(
                 _db.RommRepin.id.in_(list(row_ids)),
                 _db.RommRepin.state == "pending",

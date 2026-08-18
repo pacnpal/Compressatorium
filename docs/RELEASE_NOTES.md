@@ -92,6 +92,29 @@
 
 ### Fixed
 
+- **A conversion can no longer be re-matched as the wrong game.** When two
+  browser tabs (or a tab and a scheduled run) aim different ROMs at the same
+  output file, only one conversion is actually queued — but the saved metadata
+  could end up belonging to the *other* one, so RomM would confidently
+  re-identify the finished file as a game it isn't. Each saved snapshot now
+  records which file it was taken from, and is only kept when the queued job is
+  converting that file.
+
+- **Changing your RomM connection is now safe against anything in flight.**
+  Saving a new URL or library path clears the records belonging to the old
+  instance. A metadata snapshot being written at that exact moment could slip
+  in behind the clean-up and survive it, holding the previous library's
+  identifiers — so it would later be applied to a game in the new one. The
+  snapshot write now happens under the same lock the clean-up takes, and a
+  submit caught by the change is asked to try again instead.
+
+- **If that clean-up doesn't finish, nothing runs on stale records.** It is
+  retried at startup and that retry can fail transiently (a briefly locked
+  database is enough), and the app deliberately starts anyway. Until it
+  succeeds, scheduled conversions, metadata snapshots and re-matching all pause
+  rather than reading the previous instance's history — and the re-match worker
+  retries the clean-up on each tick, so it recovers on its own.
+
 - **ROMZ now accepts a ROM from every platform it is offered on.** The tool
   advertised itself for NES, SNES, N64, Master System, Genesis, Game Gear,
   Virtual Boy, WonderSwan, Neo Geo Pocket, Lynx, C64 and Atari while actually
