@@ -1291,7 +1291,15 @@ This is a payload field, not a schema change.
   keep its `HTTPSHandler(context=_ssl_context())` — rebuilding it without that
   removes the protection silently, so a test pins the wiring.
 
-  Two things sit outside the deadline, both deliberately. A peer that drips
+  Three things sit outside the deadline. The most serious is a **proxy
+  CONNECT tunnel**: with `HTTPS_PROXY` set, `http.client._tunnel` reads the
+  proxy's status line and headers off the raw socket before TLS wrapping, so a
+  dripping proxy pins the request and never raises — the same failure the
+  deadline exists to prevent, reachable only when a proxy is configured. It is
+  a known gap, not an accepted one: bounding it needs a deadline-aware raw
+  socket plus a custom connection/handler, which should be done as part of
+  consolidating the deadline handling rather than as a fourth partial patch.
+  The other two are accepted. A peer that drips
   one TLS *handshake record* at a time inside the remaining budget is not
   bounded, and **DNS is not bounded by `hasheous_timeout` at all** —
   `getaddrinfo` runs before the socket exists and ignores socket timeouts. The

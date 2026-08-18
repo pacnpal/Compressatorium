@@ -216,7 +216,19 @@ class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
     means leaving urllib. It is called out in the design doc rather than
     silently implied.
 
-    What the deadline does NOT cover is DNS: ``urllib`` resolves the hostname
+    Two other things sit outside it. **A proxy CONNECT tunnel**: when
+    ``HTTPS_PROXY`` is set, ``build_opener`` installs a ``ProxyHandler`` and
+    ``http.client._tunnel`` reads the proxy's status line and headers off the
+    *raw* socket, before ``wrap_socket`` exists, so a proxy dripping that
+    response pins the request exactly the way a dripping origin server used to.
+    This one is the same severity as the bugs that justified this class -- it
+    never raises -- and it is only unfixed here because bounding it means a
+    deadline-aware raw socket and a custom connection/handler pair, i.e. a
+    fifth deadline mechanism. It belongs in a consolidation that covers
+    CONNECT, handshake, headers and body from one place. Only reachable with a
+    proxy configured.
+
+    What the deadline also does not cover is DNS: ``urllib`` resolves the hostname
     before this socket exists, and ``getaddrinfo`` ignores socket timeouts. A
     stalled resolver is still bounded -- by ``/etc/resolv.conf`` (glibc default
     5s x 2 attempts per nameserver), not by ``hasheous_timeout`` -- and it
