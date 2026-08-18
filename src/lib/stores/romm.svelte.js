@@ -38,6 +38,9 @@ class RommStore {
   // Platforms
   platforms = $state([]);
   platformsLoading = $state(false);
+  // Monotonic ticket for `loadPlatforms`; see there. Not $state -- nothing
+  // renders it, and it changes on every load.
+  #platformsTicket = 0;
   platformsError = $state(null);
   selectedPlatformId = $state(null);
 
@@ -195,11 +198,20 @@ class RommStore {
   // ─── platforms ────────────────────────────────────────────────────────
 
   async loadPlatforms({ force = false } = {}) {
-    if (this.platformsLoading) return;
+    // `force` supersedes rather than waits. It is what runs after the
+    // connection details change, and the load already in flight is asking the
+    // OLD instance: bailing here let that answer arrive afterwards and select
+    // a platform belonging to a server nobody is pointed at any more.
+    if (this.platformsLoading && !force) return;
+    // Every load takes a ticket, and only the newest one is allowed to write.
+    // Two loads can be in flight at once now, and the slower is not
+    // necessarily the older.
+    const ticket = ++this.#platformsTicket;
     this.platformsLoading = true;
     this.platformsError = null;
     try {
       const data = await api.getRommPlatforms();
+      if (ticket !== this.#platformsTicket) return;
       this.platforms = Array.isArray(data) ? data : [];
       // Re-enter whichever platform is selected, not only on first load: the
       // view clears the catalog on exit, so returning to it with a platform
@@ -219,6 +231,7 @@ class RommStore {
         await this.selectPlatform(target);
       }
     } catch (e) {
+      if (ticket !== this.#platformsTicket) return;
       this.platformsError = e?.message ?? 'Failed to list RomM platforms';
       this.platforms = [];
       this.selectedPlatformId = null;
@@ -230,7 +243,9 @@ class RommStore {
       // directory listing, which is a working screen rather than a stale one.
       fileBrowser.exitRomm();
     } finally {
-      this.platformsLoading = false;
+      // Only the newest load clears the flag: a superseded one returning last
+      // would otherwise report "done" while its replacement is still running.
+      if (ticket === this.#platformsTicket) this.platformsLoading = false;
     }
   }
 

@@ -36,22 +36,44 @@ logger = get_logger()
 # (laserdisc) have no such structure, so disc-ID tagging is scoped to these two.
 _DISC_ID_MODES = frozenset({"createcd", "createdvd"})
 
+# chdman's media commands are not interchangeable: `createcd` writes a CD
+# track layout and `createdvd` a flat DVD image, so choosing by tool alone --
+# which is what a mode with no slugs of its own does -- offers a PS2 catalog
+# every one of them, with `createcd` (the first CREATE mode) as the default an
+# ISO submission lands on. Splitting the tool's platforms across its modes is
+# what makes "narrowed to this platform" mean the right *command*, not just the
+# right tool.
+#
+# Arcade appears in all three disc-shaped sets on purpose: MAME ships CD
+# (Naomi/GD-ROM), hard-disk, and raw CHDs alike, and a wrong exclusion is worse
+# than a missing one.
+_CD_PLATFORMS = frozenset({
+    "ps", "psx", "dc", "segacd", "sega-cd", "saturn", "segasaturn", "3do",
+    "pcfx", "pc-fx", "neogeocd", "neo-geo-cd", "turbografx-cd",
+    "philips-cd-i", "arcade", "mame",
+})
+_DVD_PLATFORMS = frozenset({"ps2", "psp"})
+# Hard-disk and raw CHDs: MAME's own, and nothing a console library holds.
+_HD_PLATFORMS = frozenset({"arcade", "mame"})
+_LD_PLATFORMS = frozenset({"laseractive"})
+
+# mode -> (label, the platforms that mode's media command actually serves).
 _CREATE_MODES = {
-    "createraw": "Create Raw",
-    "createhd": "Create HD",
-    "createcd": "Create CD",
-    "createdvd": "Create DVD",
-    "createld": "Create LD",
+    "createraw": ("Create Raw", _HD_PLATFORMS),
+    "createhd": ("Create HD", _HD_PLATFORMS),
+    "createcd": ("Create CD", _CD_PLATFORMS),
+    "createdvd": ("Create DVD", _DVD_PLATFORMS),
+    "createld": ("Create LD", _LD_PLATFORMS),
 }
 # mode -> (label, primary output ext, companion exts). extractcd is the only
 # multi-file extract: chdman writes the .cue track sheet plus a sibling .bin
 # data track, so its companion set is (".bin",). The rest produce one file.
 _EXTRACT_MODES = {
-    "extractraw": ("Extract Raw", ".raw", ()),
-    "extracthd": ("Extract HD", ".raw", ()),
-    "extractcd": ("Extract CD", ".cue", (".bin",)),
-    "extractdvd": ("Extract DVD", ".iso", ()),
-    "extractld": ("Extract LD", ".avi", ()),
+    "extractraw": ("Extract Raw", ".raw", (), _HD_PLATFORMS),
+    "extracthd": ("Extract HD", ".raw", (), _HD_PLATFORMS),
+    "extractcd": ("Extract CD", ".cue", (".bin",), _CD_PLATFORMS),
+    "extractdvd": ("Extract DVD", ".iso", (), _DVD_PLATFORMS),
+    "extractld": ("Extract LD", ".avi", (), _LD_PLATFORMS),
 }
 _CHD = frozenset({".chd"})
 
@@ -69,8 +91,9 @@ def _build_modes() -> list[ModeSpec]:
             supports_compression=True,
             supports_delete_on_verify=True,
             allows_archive_input=True,
+            platform_slugs=slugs,
         )
-        for mode, label in _CREATE_MODES.items()
+        for mode, (label, slugs) in _CREATE_MODES.items()
     ]
     modes += [
         ModeSpec(
@@ -88,8 +111,9 @@ def _build_modes() -> list[ModeSpec]:
             # is a pointless round trip.)
             allows_archive_input=True,
             companion_exts=companions,
+            platform_slugs=slugs,
         )
-        for mode, (label, ext, companions) in _EXTRACT_MODES.items()
+        for mode, (label, ext, companions, slugs) in _EXTRACT_MODES.items()
     ]
     modes.append(
         ModeSpec(
@@ -112,11 +136,12 @@ class ChdmanTool(BaseTool):
     # CD/DVD-based systems whose images CHD is the standard container for.
     # Deliberately excludes GameCube/Wii: those are .iso too, but RVZ is the
     # format for them, and that is exactly the ambiguity the platform resolves.
-    platform_slugs = frozenset({
-        "ps", "psx", "ps2", "psp", "dc", "segacd", "sega-cd", "saturn",
-        "segasaturn", "3do", "pcfx", "neogeocd", "turbografx-cd", "philips-cd-i",
-        "arcade", "mame", "neo-geo-cd", "pc-fx",
-    })
+    # Derived as the union of what the modes claim, so the tool-level answer
+    # cannot drift from the per-mode ones. ``copy`` declares nothing and
+    # inherits this: recompressing a finished .chd is media-agnostic.
+    platform_slugs = (
+        _CD_PLATFORMS | _DVD_PLATFORMS | _HD_PLATFORMS | _LD_PLATFORMS
+    )
     default_compression = "zlib"
     policy_owner = "chdman"
     display_name = "CHDMAN"

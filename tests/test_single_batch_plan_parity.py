@@ -683,3 +683,68 @@ def test_destination_reservation_resolves_each_path_once(monkeypatch) -> None:
     # One resolve per destination, not one per pair. The old shape cost
     # 60 * 59 / 2 = 1770 comparisons, each resolving two paths.
     assert len(calls) <= len(specs) * 2, len(calls)
+
+
+@pytest.mark.asyncio
+async def test_destination_canonicalisation_never_runs_on_the_event_loop(
+    monkeypatch,
+) -> None:
+    """Job creation must not `realpath` while it holds `_create_lock`.
+
+    The reservation resolves each destination to a canonical key, and
+    `realpath` is a stat chain: aimed at an unresponsive NFS/SMB/rclone mount
+    — the deployment this integration exists for — it blocks in
+    uninterruptible I/O. On the event loop, under the lock, that is not one
+    slow submit: it is every unrelated API request and all job creation,
+    frozen for as long as the mount stays quiet.
+
+    So the keys are pre-computed off the loop under a bound, and the locked
+    pass reads them. This asserts both halves: nothing resolves on the loop
+    thread, and a mount that never answers still lets the batch through (on
+    lexical keys) instead of hanging it.
+    """
+    import asyncio
+    import threading
+
+    from services import job_manager as jm
+
+    loop_thread = threading.get_ident()
+    real = os.path.realpath
+    stuck = threading.Event()
+
+    def _realpath(path):
+        assert threading.get_ident() != loop_thread, (
+            f"realpath({path}) ran on the event loop"
+        )
+        if "/dead-mount/" in str(path):
+            stuck.wait(30)  # a volume that is simply not going to answer
+        return real(path)
+
+    monkeypatch.setattr(jm.os.path, "realpath", _realpath)
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.2)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        jobs = await asyncio.wait_for(
+            manager.create_batch_jobs(
+                ["/dead-mount/game.iso"], ConversionMode.CREATECD,
+            ),
+            timeout=5,
+        )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    assert [job.output_path for job in jobs] == ["/dead-mount/game.chd"]
+    # The loop kept running while the mount did not answer.
+    assert ticks > 0

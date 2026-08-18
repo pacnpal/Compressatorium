@@ -613,19 +613,19 @@ async def test_repin_cancel_retires_rows_for_a_batch_that_never_ran(
 ) -> None:
     """A rejected batch must not leave a week's worth of phantom backlog."""
     output = tmp_path / "Game.rvz"
-    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+    row_id = romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
     assert romm_repin.count_pending() == 1
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)):
         result = await romm_routes.romm_repin_cancel(
-            romm_routes.RepinCancelRequest(paths=[str(output)]),
+            romm_routes.RepinCancelRequest(ids=[row_id]),
         )
 
     assert result["cancelled"] == 1
     assert romm_repin.count_pending() == 0
     # Retired, not deleted: the history of what was planned survives.
-    assert romm_repin.cancel([str(output)]) == 0
+    assert romm_repin.cancel([row_id]) == 0
 
 
 @pytest.mark.asyncio
@@ -661,7 +661,9 @@ async def test_repin_plan_reports_each_source_s_recorded_destination(
     assert result["recorded_paths"] == {
         str(lib / "Game.iso"): str(lib / "Game.rvz"),
     }
-    assert romm_repin.cancel(list(result["recorded_paths"].values())) == 1
+    # And the handle for retiring it, one id per recorded source.
+    assert list(result["recorded_ids"]) == [str(lib / "Game.iso")]
+    assert romm_repin.cancel(list(result["recorded_ids"].values())) == 1
     assert romm_repin.count_pending() == 0
 
 
@@ -2603,11 +2605,57 @@ def test_composite_modes_are_narrowed_per_platform() -> None:
     assert registry.mode_allows_platform("nkit_to_rvz", "ngc") is True
     assert registry.mode_allows_platform("nkit_to_rvz", "ps2") is False
 
-    # A mode with no opinion of its own inherits its tool's.
     assert registry.mode_allows_platform("createdvd", "ps2") is True
     assert registry.mode_allows_platform("createdvd", "ngc") is False
+    # A mode with no opinion of its own inherits its tool's: recompressing a
+    # finished .chd is the same operation on every system chdman serves.
+    assert registry.mode_allows_platform("copy", "ps2") is True
+    assert registry.mode_allows_platform("copy", "psx") is True
+    assert registry.mode_allows_platform("copy", "ngc") is False
     # An unrecognised slug narrows nothing, matching narrow_to_platform.
     assert registry.mode_allows_platform("cso_to_chd", "not-a-console") is True
+
+
+def test_chdman_media_commands_are_narrowed_per_platform() -> None:
+    """`createcd` and `createdvd` are not interchangeable.
+
+    Narrowing at tool granularity offered a PS2 catalog every chdman create
+    mode, and since `createcd` is the first of them it is the one an ISO
+    submission defaults to -- the wrong media command, chosen for the user by
+    a list that was only ever narrowed to the right *tool*.
+    """
+    dvd = ("ps2", "psp")
+    cd = ("psx", "ps", "dc", "saturn", "3do", "philips-cd-i")
+
+    for slug in dvd:
+        modes = registry.modes_for_platform(slug)
+        assert "createdvd" in modes, slug
+        assert "createcd" not in modes, slug
+        assert "createhd" not in modes and "createld" not in modes, slug
+        # And the default a platform-narrowed panel lands on is the DVD one.
+        assert modes[0] == "createdvd", slug
+
+    for slug in cd:
+        modes = registry.modes_for_platform(slug)
+        assert "createcd" in modes, slug
+        assert "createdvd" not in modes, slug
+        assert modes[0] == "createcd", slug
+
+    # MAME ships CD, hard-disk and raw CHDs alike, so arcade keeps all three:
+    # a wrong exclusion is worse than a missing one.
+    arcade = registry.modes_for_platform("arcade")
+    for mode in ("createcd", "createhd", "createraw"):
+        assert mode in arcade, mode
+
+    # The extract direction splits the same way -- extracting a PS2 CHD to a
+    # .cue track sheet is the same mistake in reverse.
+    assert registry.mode_allows_platform("extractdvd", "ps2") is True
+    assert registry.mode_allows_platform("extractcd", "ps2") is False
+
+    # The tool-level set stays the union, so nothing chdman serves is lost.
+    chdman = registry.for_mode("createcd")
+    for slug in dvd + cd + ("arcade",):
+        assert slug in chdman.platform_slugs, slug
 
 
 @pytest.mark.asyncio
@@ -3149,6 +3197,66 @@ def test_claiming_a_row_is_atomic(sqlite_db, tmp_path: Path) -> None:
     assert romm_repin.claim(second_id) is True
     assert romm_repin.release(second_id) is True
     assert romm_repin.claim(second_id) is True
+
+
+def test_cancelling_a_plan_cannot_retire_the_row_that_superseded_it(
+    sqlite_db, tmp_path: Path,
+) -> None:
+    """Plan-then-cancel is two requests, and another client fits between them.
+
+    Cancelling by *destination* retired whatever pending row that path held.
+    `record()` supersedes, so a second client planning the same output owns the
+    row by then — and its conversion, already queued, would run with no
+    snapshot at all because the first client tidied up after itself by path.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.rvz"
+    mine = romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
+    theirs = romm_repin.record({"id": 6, "igdb_id": 43}, str(out), {"igdb_id": 43})
+    assert theirs != mine
+
+    # My submit failed, so I retire what I recorded. Their row is not mine.
+    assert romm_repin.cancel([mine]) == 0
+    live = romm_repin.pending_rows(10)
+    assert [row[5] for row in live] == [theirs]
+    assert live[0][3] == {"igdb_id": 43}, live
+
+    # And my own live row still cancels, or the endpoint would do nothing.
+    assert romm_repin.cancel([theirs]) == 1
+    assert romm_repin.count_pending() == 0
+
+
+def test_releasing_a_superseded_claim_retires_it_instead_of_restoring_it(
+    sqlite_db, tmp_path: Path,
+) -> None:
+    """`pending` is a unique slot per output, and a re-plan can already hold it.
+
+    A claimed row is `settling`, which the partial unique index does not see,
+    so `record()` inserts a second row for the same output. Restoring the claim
+    to `pending` then violates `ux_romm_repin_pending_output` — inside the
+    failure handler that called release, replacing the real error with a 500
+    and parking the claim as `settling` until it aged out.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.rvz"
+    mine = romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
+    assert romm_repin.claim(mine) is True
+    theirs = romm_repin.record({"id": 6, "igdb_id": 43}, str(out), {"igdb_id": 43})
+
+    # The RomM write failed, so the claim goes back — and finds its slot taken.
+    assert romm_repin.release(mine) is False
+    # No exception, no stranded claim, and the newer row is untouched: it is
+    # the one describing the conversion that is actually going to happen.
+    assert [row[5] for row in romm_repin.pending_rows(10)] == [theirs]
+    assert romm_repin.count_pending() == 1
+    assert romm_repin.claim(mine) is False
+
+    # With nothing else holding the slot, release still hands the row back.
+    assert romm_repin.claim(theirs) is True
+    assert romm_repin.release(theirs) is True
+    assert romm_repin.claim(theirs) is True
 
 
 def test_a_split_build_is_verified_where_it_actually_landed(tmp_path: Path) -> None:

@@ -460,6 +460,11 @@ class ConversionStore {
     // backend filters out during per-file validation — leaves a row describing
     // a conversion that will never run. Source path -> recorded destination.
     let recorded = {};
+    // Source path -> the id of the row recorded for it. Retiring is keyed by
+    // id, not by destination: `record()` supersedes, so between this plan and
+    // its cancel another client can own the row that path now holds, and
+    // cancelling by path would retire its live conversion's metadata.
+    let recordedIds = {};
     try {
       if (rommRepin) {
         try {
@@ -481,6 +486,7 @@ class ConversionStore {
           // store imports, so a static import back would be a cycle.
           this.lastRepinRecorded = planned?.recorded ?? 0;
           recorded = planned?.recorded_paths ?? {};
+          recordedIds = planned?.recorded_ids ?? {};
         } catch (e) {
           // Best-effort, like the disc-ID tagging hook: losing the metadata
           // snapshot costs a re-match in RomM, while refusing to convert costs
@@ -576,6 +582,7 @@ class ConversionStore {
         // redirected source has to come back mapped to the path the queue
         // actually chose.
         const replannedPaths = replanned?.recorded_paths ?? {};
+        const replannedIds = replanned?.recorded_ids ?? {};
         const replanComplete = Object.entries(misdirected).every(
           ([source, destination]) => replannedPaths[source] === destination,
         );
@@ -587,10 +594,15 @@ class ConversionStore {
         }
         if (replanComplete) {
           await api
-            .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
+            .cancelRommRepin(
+              Object.keys(misdirected)
+                .map((k) => recordedIds[k])
+                .filter((id) => id != null),
+            )
             .catch(() => {});
           for (const [source, actual] of Object.entries(misdirected)) {
             recorded[source] = actual;
+            recordedIds[source] = replannedIds[source];
           }
         } else {
           // Retire the old rows anyway. They point at a path this batch is no
@@ -600,9 +612,16 @@ class ConversionStore {
           // sources did become jobs, so they are filtered out of `recorded`
           // below and would be left behind.
           await api
-            .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
+            .cancelRommRepin(
+              Object.keys(misdirected)
+                .map((k) => recordedIds[k])
+                .filter((id) => id != null),
+            )
             .catch(() => {});
-          for (const source of Object.keys(misdirected)) delete recorded[source];
+          for (const source of Object.keys(misdirected)) {
+            delete recorded[source];
+            delete recordedIds[source];
+          }
           // Only the ones that really were not re-recorded: a partial answer
           // still saved metadata for the sources it mapped, and counting
           // those as lost would under-report just as misleadingly.
@@ -652,7 +671,11 @@ class ConversionStore {
       // Retire the rows for everything that did not become a job. They are
       // harmless if this fails — a row whose output never changes is never
       // settled and ages out on its own — so it must not mask a real error.
-      const orphaned = Object.values(recorded);
+      // By id: `recorded` decides *which* rows (its keys are the sources that
+      // did not become jobs), `recordedIds` names them.
+      const orphaned = Object.keys(recorded)
+        .map((source) => recordedIds[source])
+        .filter((id) => id != null);
       if (orphaned.length) api.cancelRommRepin(orphaned).catch(() => {});
     }
   }

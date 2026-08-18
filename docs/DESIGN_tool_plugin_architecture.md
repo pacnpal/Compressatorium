@@ -1373,7 +1373,7 @@ the file like any other locked output; the sweep simply drops the candidate and
 picks it up next time. Both touch the disk (a directory mode's companion lookup
 scans), so call them off the event loop.
 
-#### Destination reservation is linear (`_canonical_path`)
+#### Destination reservation is linear, and does no I/O (`_canonical_path`)
 
 `JobManager._reject_claimed_destinations_locked` runs on the event loop while
 `_create_lock` is held, so its cost is the cost of accepting a batch. Every
@@ -1382,6 +1382,26 @@ dict, and the live-job map is built once per batch (`_active_output_map`) rather
 than re-derived per spec. The pairwise form re-resolved every earlier
 destination for every new one — quadratic in the batch size, in blocking
 `realpath` stat chains, against the remote mounts this integration exists for.
+
+Linear was not enough: *one* `realpath` into an unresponsive NFS/SMB/rclone
+mount blocks in uninterruptible I/O, on the event loop, under the lock — which
+is every unrelated API request and all job creation, frozen for as long as the
+mount stays quiet. So the reservation now does **no filesystem work at all**.
+`create_job` / `create_jobs_atomic` call **`_reservation_keys(job_specs, mode)`**
+*before* taking the lock: it derives each destination with `_derive_output`
+(pure string work — every tool's `output_path()` is stem + suffix, no stat),
+collects them with the sources and every live job's output, and resolves the lot
+in one `run_detached` thread under `asyncio.wait_for(_CANONICAL_PROBE_SECONDS)`.
+The result is a `{path: canonical}` map, pre-seeded lexically
+(`normpath(abspath())`) so a bound that expires part-way keeps whatever did
+answer. `_canonical_path(path, resolved)` reads that map and never touches the
+disk; a submit against a dead mount is reserved on lexical keys (exact-path
+collisions still caught, symlink aliases not) and the job then fails on its own
+bound, instead of taking the process with it.
+
+**A new caller of the reservation must pass a map from `_reservation_keys`.**
+Calling `_canonical_path` without one is the blocking form, and it is only
+correct off the event loop.
 
 #### One destination, one source (`output_conflicts.collapse_to_winners`)
 
@@ -1408,8 +1428,22 @@ readable while the source is still the file RomM knows about — and under the
 path was free) and the settle pass treats an unchanged destination as "not yet".
 Without it, a batch that was planned and then rejected leaves a row that hashes
 the *previous* artifact and pushes this ROM's ids onto whatever RomM identifies
-that as. `cancel(paths)` retires such rows immediately rather than waiting out
+that as. `cancel(row_ids)` retires such rows immediately rather than waiting out
 `repin_abandon_days`; the fingerprint is what makes leaving them safe until then.
+
+Cancelling is keyed by **row id**, which is why `record()` returns one and
+`/romm/repin/plan` answers with `recorded_ids` beside `recorded_paths`. A
+destination names whichever row holds it *now*: `record()` supersedes, so a
+second client planning the same output between this caller's plan and its
+cancel owns that path — and cancelling by path would retire the live row its
+queued conversion needs. The same asymmetry governs `release()`: a claimed row
+is `settling`, which the partial unique index does not see, so a re-plan can
+insert a new `pending` row for the same output while the claim is out.
+Restoring the claim to `pending` then violates
+`ux_romm_repin_pending_output` — inside the failure handler that called
+`release`, replacing the real error with a 500 and stranding the claim until it
+ages out — so `release()` retires a superseded claim instead, and returns
+whether the row went back to `pending`.
 
 **"Has this rule already converted this source?"** `skip` is idempotent from the
 destination alone, but the other two policies are not: `overwrite` resolves an
@@ -1576,6 +1610,21 @@ conservative rules as `narrow_to_platform` one level down, and
 browser as each platform's `mode_ids` beside its `tool_ids`, so neither the
 automation editor nor the RomM target picker carries a second copy of the
 platform table. The sweep checks the *mode*, not `spec.tool_id`.
+
+Composite tools are not the only case. A tool whose modes are *different
+commands over different media* has to declare per mode too: CHDMAN's
+`createcd` writes a CD track layout and `createdvd` a flat DVD image, and
+inheriting the tool's combined slug set offered a PS2 catalog both — with
+`createcd`, the first CREATE mode, as the default an ISO submission landed on.
+`chdman.py` therefore splits its platforms into `_CD_PLATFORMS` /
+`_DVD_PLATFORMS` / `_HD_PLATFORMS` / `_LD_PLATFORMS`, gives each create and
+extract mode the set its command actually serves, and derives the tool-level
+`platform_slugs` as their union so the two levels cannot drift. `copy` declares
+nothing and inherits: recompressing a finished `.chd` is media-agnostic.
+
+The rule for a new tool: declare `platform_slugs` on the *mode* whenever two of
+a tool's modes would be wrong for each other's platforms, and let the tool-level
+set be the union.
 
 #### How a job ended, after the queue forgets (`add_terminal_listener`)
 

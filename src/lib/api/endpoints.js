@@ -590,11 +590,13 @@ export const api = {
       'Failed to record RomM metadata',
     ),
 
-  // Retires rows recorded for a batch that was then rejected.
-  cancelRommRepin: (paths) =>
+  // Retires rows recorded for a batch that was then rejected. Row ids, from
+  // the plan response: a destination names whichever row holds it now, which
+  // after another client's re-plan is that client's live row.
+  cancelRommRepin: (ids) =>
     jsonPost(
       `${API_BASE}/romm/repin/cancel`,
-      { paths },
+      { ids },
       {},
       'Failed to discard the recorded RomM metadata',
     ),

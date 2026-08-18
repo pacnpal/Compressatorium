@@ -156,29 +156,34 @@ def path_fingerprint(path: str) -> str:
 def _insert_pending(
     session, rom: dict, output_path: str, ids: dict, mode: str | None,
     pre_fingerprint: str | None,
-) -> None:
-    session.add(
-        _db.RommRepin(
-            source_rom_id=rom.get("id"),
-            source_name=rom.get("name") or rom.get("fs_name"),
-            output_path=output_path,
-            pre_fingerprint=(
-                path_fingerprint(output_path)
-                if pre_fingerprint is None else pre_fingerprint
-            ),
-            mode=mode,
-            metadata_ids=ids,
-            state="pending",
-            created_at=utcnow_iso(),
+):
+    """Add the new pending row and hand it back, so its id can be returned."""
+    row = _db.RommRepin(
+        source_rom_id=rom.get("id"),
+        source_name=rom.get("name") or rom.get("fs_name"),
+        output_path=output_path,
+        pre_fingerprint=(
+            path_fingerprint(output_path)
+            if pre_fingerprint is None else pre_fingerprint
         ),
+        mode=mode,
+        metadata_ids=ids,
+        state="pending",
+        created_at=utcnow_iso(),
     )
+    session.add(row)
+    return row
 
 
 def record(
     rom: dict, output_path: str, ids: dict, mode: str | None = None,
     pre_fingerprint: str | None = None,
-) -> bool:
+) -> int:
     """Insert a pending row unless one already covers this output.
+
+    Returns the new row's id -- the handle :func:`cancel` needs. Truthy for
+    every real row (ids start at 1), so a caller that only asks "did this
+    record?" reads the same as it did when this returned a bool.
 
     The dedupe on ``output_path`` is what makes re-submitting the same batch
     harmless -- the second submit updates the existing row instead of stacking
@@ -203,15 +208,19 @@ def record(
     """
     with _session() as session:
         _supersede_pending(session, output_path)
-        _insert_pending(session, rom, output_path, ids, mode, pre_fingerprint)
+        row = _insert_pending(
+            session, rom, output_path, ids, mode, pre_fingerprint,
+        )
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             _supersede_pending(session, output_path)
-            _insert_pending(session, rom, output_path, ids, mode, pre_fingerprint)
+            row = _insert_pending(
+                session, rom, output_path, ids, mode, pre_fingerprint,
+            )
             session.commit()
-        return True
+        return int(row.id)
 
 
 def produced_companions(output_path: str, mode: str | None) -> list[str]:
@@ -240,25 +249,33 @@ def produced_companions(output_path: str, mode: str | None) -> list[str]:
         return []
 
 
-def cancel(output_paths: list[str]) -> int:
-    """Retire the pending rows for *output_paths*. Returns how many were retired.
+def cancel(row_ids: list[int]) -> int:
+    """Retire the pending rows *row_ids*. Returns how many were retired.
 
     The plan-then-submit pair is two requests, and the second one can fail
     (backpressure, a validation error, a closed tab). Without this the rows sit
     pending until they age out, counting against the badge and describing a
     conversion that is never going to happen.
 
+    Keyed by row id, which is why :func:`record` returns one. Cancelling by
+    *destination* retired whatever pending row that path happened to hold, and
+    the row is not necessarily the caller's: re-recording supersedes, so a
+    second client planning the same output between this caller's plan and its
+    cancel owns the row by then -- and its conversion, already queued, would
+    lose the metadata this caller was only tidying up after itself. An id names
+    one row, so a superseded caller retires nothing.
+
     Retire, never delete: a settled row is the history of what was planned, and
     the partial unique index only constrains *pending* rows, so retiring frees
     the path for the next attempt.
     """
-    if not output_paths:
+    if not row_ids:
         return 0
     with _session() as session:
         retired = (
             session.query(_db.RommRepin)
             .filter(
-                _db.RommRepin.output_path.in_(list(output_paths)),
+                _db.RommRepin.id.in_(list(row_ids)),
                 _db.RommRepin.state == "pending",
             )
             .update(
@@ -406,14 +423,52 @@ def claim(row_id: int) -> bool:
 
 
 def release(row_id: int) -> bool:
-    """Hand a claimed row back, unsettled. Used when the write did not happen."""
+    """Hand a claimed row back. Returns whether it went back to ``pending``.
+
+    Restores ``pending`` unless a newer pending row already covers the same
+    output, in which case this claim is retired instead. ``record()``
+    supersedes only *pending* rows, so a re-plan arriving while this row was
+    ``settling`` leaves both -- and restoring then violates
+    ``ux_romm_repin_pending_output``. The IntegrityError surfaces inside the
+    failure handler that called this, replacing the real error with a 500 and
+    stranding the claim as ``settling`` until it ages out.
+
+    Retiring is also the right answer on the merits: the newer row describes
+    the conversion that is actually going to happen, and this one's ids belong
+    to a generation that has been superseded.
+
+    The insert can also land between the check and the write, so the
+    constraint gets the last word: on IntegrityError, retire.
+    """
     with _session() as session:
-        updated = session.query(_db.RommRepin).filter(
-            _db.RommRepin.id == row_id,
-            _db.RommRepin.state == SETTLING,
-        ).update({"state": "pending", "settled_at": None})
+        row = session.get(_db.RommRepin, row_id)
+        if row is None or row.state != SETTLING:
+            return False
+        superseded = bool(
+            session.query(_db.RommRepin.id)
+            .filter(
+                _db.RommRepin.output_path == row.output_path,
+                _db.RommRepin.state == "pending",
+                _db.RommRepin.id != row_id,
+            )
+            .first()
+        )
+        if not superseded:
+            row.state = "pending"
+            row.settled_at = None
+            try:
+                session.commit()
+                return True
+            except IntegrityError:
+                session.rollback()
+                row = session.get(_db.RommRepin, row_id)
+                if row is None or row.state != SETTLING:
+                    return False
+        row.state = "abandoned"
+        row.detail = "Superseded by a re-planned conversion"
+        row.settled_at = utcnow_iso()
         session.commit()
-        return bool(updated)
+        return False
 
 
 def settle(

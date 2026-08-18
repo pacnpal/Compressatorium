@@ -472,6 +472,10 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # because that is what the caller submits and what the created jobs report
     # back; the destination is what a row is identified by.
     recorded_paths: dict[str, str] = {}
+    # Source -> the id of the row written for it. The handle the caller passes
+    # back to /romm/repin/cancel: the destination alone would retire whatever
+    # row holds that path by then, which after a re-plan is somebody else's.
+    recorded_ids: dict[str, int] = {}
     # Filled by the resolve loop below, then collapsed per destination before
     # anything is written: recording is per source, the queue is per output.
     planned: dict[str, str] = {}
@@ -566,22 +570,32 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     skipped += len(planned) - len(winners)
     for path, destination in winners.items():
         rom, ids = roms_by_path[path]
-        if await run_in_threadpool(
+        row_id = await run_in_threadpool(
             romm_repin.record, rom, destination, ids, payload.mode,
-        ):
+        )
+        if row_id:
             recorded += 1
             recorded_paths[path] = destination
+            recorded_ids[path] = row_id
         else:
             skipped += 1
     return {
-        "recorded": recorded, "skipped": skipped, "recorded_paths": recorded_paths,
+        "recorded": recorded,
+        "skipped": skipped,
+        "recorded_paths": recorded_paths,
+        "recorded_ids": recorded_ids,
     }
 
 
 class RepinCancelRequest(BaseModel):
-    """The output paths a caller recorded and is no longer going to write."""
+    """The rows a caller recorded and is no longer going to write.
 
-    paths: list[str]
+    Row ids, not output paths: ``/romm/repin/plan`` returns them for exactly
+    this, and a path names whichever row holds it *now* -- which, once another
+    client has re-planned the same destination, is that client's live row.
+    """
+
+    ids: list[int]
 
 
 @router.post("/romm/repin/cancel")
@@ -597,7 +611,7 @@ async def romm_repin_cancel(payload: RepinCancelRequest) -> dict:
     does not exist.
     """
     _require_configured()
-    cancelled = await run_in_threadpool(romm_repin.cancel, payload.paths)
+    cancelled = await run_in_threadpool(romm_repin.cancel, payload.ids)
     return {"cancelled": cancelled}
 
 

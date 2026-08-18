@@ -12,7 +12,7 @@ import uuid
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -23,6 +23,7 @@ from services.chdman import ConversionCancelled, chdman_service
 from services.disc_id import DiscIdStorageAbandoned
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
+from services.subprocess_runner import run_detached
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -63,22 +64,87 @@ def _is_active_conversion(job) -> bool:
     )
 
 
-def _canonical_path(path: str) -> str:
+def _lexical_path(path: str) -> str:
+    """*path* as a comparable key without touching the filesystem.
+
+    The answer when the volume will not say: absolute and normalised, so two
+    spellings of the same path still collide, but symlink aliases do not.
+    """
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _canonical_path(path: str, resolved: Optional[Mapping[str, str]] = None) -> str:
     """*path* as one comparable key: symlinks resolved, or the path as given.
 
     Split out from :func:`_paths_collide` so a caller comparing one path
     against many resolves each of them once instead of per comparison --
-    `realpath` is a blocking stat chain, and the batch reservation runs on the
-    event loop under `_create_lock`.
+    `realpath` is a blocking stat chain.
+
+    Pass *resolved* (from :func:`_resolve_paths_bounded`) and this never touches
+    the filesystem at all: it reads the pre-computed key, falling back to the
+    lexical one for a path the pre-flight did not see. That is the form the
+    reservation uses, because its work happens on the event loop under
+    ``_create_lock`` -- one `realpath` into a dead NFS/SMB mount there is
+    uninterruptible, and it freezes every unrelated request in the process
+    along with all job creation.
     """
+    if resolved is not None:
+        return resolved.get(path) or _lexical_path(path)
     try:
         return os.path.realpath(path)
     except OSError:
         return path
 
 
-def _paths_collide(path_a: str, path_b: str) -> bool:
-    return _canonical_path(path_a) == _canonical_path(path_b)
+def _paths_collide(
+    path_a: str, path_b: str, resolved: Optional[Mapping[str, str]] = None,
+) -> bool:
+    return _canonical_path(path_a, resolved) == _canonical_path(path_b, resolved)
+
+
+# How long the whole pre-flight canonicalisation may take before the batch
+# proceeds on lexical keys. Generous, because it covers every path in one
+# submit and a healthy mount answers in microseconds; the point is only that a
+# mount which never answers cannot hold up job creation forever.
+_CANONICAL_PROBE_SECONDS = 20.0
+
+
+async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
+    """``{path: canonical key}`` for *paths*, resolved off the event loop.
+
+    Every key is present before the resolution starts, seeded lexically, and
+    upgraded in place as each `realpath` returns -- so a bound that expires
+    part-way keeps the paths that did answer instead of discarding the lot.
+
+    Detached rather than pooled for the usual reason: a `realpath` on an
+    unresponsive mount cannot be cancelled, only abandoned, and abandoning a
+    shared pool worker per submit would eventually starve every unrelated
+    offload. The thread here is disposable.
+    """
+    pending = list(dict.fromkeys(paths))
+    resolved: Dict[str, str] = {path: _lexical_path(path) for path in pending}
+    if not pending:
+        return resolved
+
+    def _resolve_all() -> None:
+        for path in pending:
+            try:
+                resolved[path] = os.path.realpath(path)
+            except OSError:
+                pass  # keep the lexical seed
+
+    try:
+        await asyncio.wait_for(
+            run_detached(_resolve_all), _CANONICAL_PROBE_SECONDS,
+        )
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "Canonicalising %d destination(s) did not finish in %.1fs; "
+            "reserving on lexical paths (a volume is not answering)",
+            len(pending),
+            _CANONICAL_PROBE_SECONDS,
+        )
+    return resolved
 
 
 # The statuses a job never leaves. Anything else is still in flight.
@@ -243,6 +309,7 @@ class JobManager:
         verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
+        resolved: Optional[Mapping[str, str]] = None,
     ) -> ConversionJob:
         """Queue a job while holding _create_lock (no backpressure check here)."""
         job_id = str(uuid.uuid4())[:8]
@@ -250,6 +317,7 @@ class JobManager:
 
         output_path = self._resolve_output_locked(
             file_path, mode, output_dir=output_dir, output_path=output_path,
+            resolved=resolved,
         )
 
 
@@ -321,18 +389,18 @@ class JobManager:
         delete_snapshot: Optional[Dict[str, object]] = None,
     ) -> ConversionJob:
         """Create a new conversion job."""
+        specs: List[Dict[str, object]] = [{
+            "file_path": file_path,
+            "output_dir": output_dir,
+            "output_path": output_path,
+        }]
+        # Outside the lock, and off the event loop: see `_reservation_keys`.
+        resolved = await self._reservation_keys(specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(1)
             # Same destination reservation the batch path gets: a single
             # submit racing a sweep is the same collision with one fewer file.
-            self._reject_claimed_destinations_locked(
-                [{
-                    "file_path": file_path,
-                    "output_dir": output_dir,
-                    "output_path": output_path,
-                }],
-                mode,
-            )
+            self._reject_claimed_destinations_locked(specs, mode, resolved)
             job = self._queue_job_locked(
                 file_path=file_path,
                 mode=mode,
@@ -345,6 +413,7 @@ class JobManager:
                 verify_after=verify_after,
                 split=split,
                 delete_snapshot=delete_snapshot,
+                resolved=resolved,
             )
         await self._prune_jobs()
         return job
@@ -363,9 +432,11 @@ class JobManager:
             return []
 
         jobs: List[ConversionJob] = []
+        # Outside the lock, and off the event loop: see `_reservation_keys`.
+        resolved = await self._reservation_keys(job_specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(len(job_specs))
-            self._reject_claimed_destinations_locked(job_specs, mode)
+            self._reject_claimed_destinations_locked(job_specs, mode, resolved)
             for spec in job_specs:
                 file_path = str(spec["file_path"])
                 output_dir = spec.get("output_dir")
@@ -388,6 +459,7 @@ class JobManager:
                         verify_after=verify_after,
                         split=split,
                         delete_snapshot=spec.get("delete_snapshot"),
+                        resolved=resolved,
                     )
                 )
         await self._prune_jobs()
@@ -437,6 +509,61 @@ class JobManager:
             verify_after=verify_after,
         )
 
+    @staticmethod
+    def _derive_output(
+        file_path: str, mode: ConversionMode, output_dir: Optional[str],
+    ) -> str:
+        """Where *mode* would write *file_path*, as pure derivation.
+
+        Every tool's ``output_path()`` is string work over the stem and the
+        mode's suffix -- no stat, no listing. That is what lets the reservation
+        canonicalise its destinations *before* taking ``_create_lock``: the
+        paths are known without touching the filesystem, so only the
+        (bounded, off-loop) `realpath` needs the volume to answer.
+        """
+        return registry.for_mode(mode.value).output_path(
+            mode.value, file_path, output_dir,
+        )
+
+    async def _reservation_keys(
+        self, job_specs: List[Dict[str, object]], mode: ConversionMode,
+    ) -> Dict[str, str]:
+        """Pre-resolve every path the destination reservation will compare.
+
+        Runs before ``_create_lock`` is taken, so the critical section itself
+        does no filesystem work: see :func:`_canonical_path`. Covers each
+        spec's source and derived destination plus every live job's output,
+        because the reservation compares the first set against the second.
+
+        A spec whose destination cannot be derived (unknown mode, unsupported
+        extension) is skipped rather than raised on -- the locked pass runs the
+        same derivation and produces the caller-facing error there, once.
+        """
+        paths: List[str] = []
+        for spec in job_specs:
+            file_path = str(spec["file_path"])
+            paths.append(file_path)
+            explicit = spec.get("output_path")
+            if explicit is not None:
+                paths.append(str(explicit))
+                continue
+            output_dir = spec.get("output_dir")
+            try:
+                paths.append(self._derive_output(
+                    file_path,
+                    mode,
+                    str(output_dir) if output_dir is not None else None,
+                ))
+            except (KeyError, ValueError):
+                continue
+        paths.extend(
+            job.output_path
+            for job in self.jobs.values()
+            if job.output_path
+            and job.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
+        )
+        return await _resolve_paths_bounded(paths)
+
     def _resolve_output_locked(
         self,
         file_path: str,
@@ -444,6 +571,7 @@ class JobManager:
         *,
         output_dir: Optional[str] = None,
         output_path: Optional[str] = None,
+        resolved: Optional[Mapping[str, str]] = None,
     ) -> str:
         """The destination this job will write, with the pre-creation guards.
 
@@ -455,9 +583,7 @@ class JobManager:
         """
         if output_path is not None:
             return output_path
-        output_path = registry.for_mode(mode.value).output_path(
-            mode.value, file_path, output_dir,
-        )
+        output_path = self._derive_output(file_path, mode, output_dir)
         # The HTTP routes validate inputs before passing an explicit
         # output_path; direct service callers reach this fallback. Most
         # tools' output_path() raises for an unsupported extension, but
@@ -472,14 +598,19 @@ class JobManager:
         # Generic same-path guard: a non-copy mode must never write over its
         # own source (chdman copy is an intentional in-place .chd recompress;
         # every other mode changes the extension so output != input).
-        if spec.kind != ModeKind.COPY and _paths_collide(output_path, file_path):
+        if spec.kind != ModeKind.COPY and _paths_collide(
+            output_path, file_path, resolved,
+        ):
             raise ValueError(
                 "Output path matches input; refusing to overwrite source"
             )
         return output_path
 
     def _reject_claimed_destinations_locked(
-        self, job_specs: List[Dict[str, object]], mode: ConversionMode,
+        self,
+        job_specs: List[Dict[str, object]],
+        mode: ConversionMode,
+        resolved: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Refuse the batch if any destination is already spoken for.
 
@@ -496,30 +627,36 @@ class JobManager:
         at once.
         """
         # Canonicalise once per path and compare keys. The pairwise version of
-        # this re-resolved every earlier destination for every new one, and
-        # `_active_job_writing` re-resolved every live job's output per spec --
+        # this re-resolved every earlier destination for every new one, and the
+        # live-job lookup re-resolved every live job's output per spec --
         # quadratic in the batch size, in blocking `realpath` calls, on the
         # event loop while `_create_lock` is held. A Select-All submit of a few
         # thousand files made that millions of stat chains against exactly the
         # remote mounts this integration exists for.
-        active = self._active_output_map()
+        #
+        # The keys themselves come pre-resolved from `_reservation_keys`, run
+        # off the loop before the lock: even one `realpath` here is a stat
+        # chain into the same remote mount, and one that never returns takes
+        # the whole process with it.
+        active = self._active_output_map(resolved)
         planned: Dict[str, str] = {}   # canonical destination -> source
         for spec in job_specs:
             file_path = str(spec["file_path"])
             output_dir = spec.get("output_dir")
             explicit = spec.get("output_path")
-            resolved = self._resolve_output_locked(
+            destination = self._resolve_output_locked(
                 file_path,
                 mode,
                 output_dir=str(output_dir) if output_dir is not None else None,
                 output_path=str(explicit) if explicit is not None else None,
+                resolved=resolved,
             )
-            key = _canonical_path(resolved)
+            key = _canonical_path(destination, resolved)
             claimed_by = active.get(key)
             if claimed_by is not None:
                 raise OutputClaimedError(
                     f"Another queued job ({claimed_by}) is already writing "
-                    f"{os.path.basename(resolved)}",
+                    f"{os.path.basename(destination)}",
                     claimed_by=claimed_by,
                 )
             other = planned.get(key)
@@ -531,29 +668,26 @@ class JobManager:
                 )
             planned[key] = file_path
 
-    def _active_output_map(self) -> Dict[str, str]:
+    def _active_output_map(
+        self, resolved: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, str]:
         """``{canonical output path: job id}`` for every live job.
 
         Built once per batch rather than re-derived per spec: each entry costs
         a `realpath`, which is a blocking stat chain, and this runs under
-        ``_create_lock`` on the event loop. Primary outputs only -- companions
-        are covered by the conflict probe callers already run.
+        ``_create_lock`` on the event loop -- so the keys come from the
+        pre-flight in *resolved*. Primary outputs only -- companions are
+        covered by the conflict probe callers already run.
         """
         active: Dict[str, str] = {}
         for job in self.jobs.values():
             if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 continue
             if job.output_path:
-                active.setdefault(_canonical_path(job.output_path), job.id)
+                active.setdefault(
+                    _canonical_path(job.output_path, resolved), job.id,
+                )
         return active
-
-    def _active_job_writing(self, output_path: str) -> Optional[str]:
-        """Id of a queued/running job whose output is *output_path*, else None.
-
-        The single-path form of :meth:`_active_output_map`, for the callers that
-        ask about one destination rather than a batch.
-        """
-        return self._active_output_map().get(_canonical_path(output_path))
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
         """Get a job by ID."""

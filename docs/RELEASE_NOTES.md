@@ -450,6 +450,41 @@
   else (saving connection settings, a sweep finishing) no longer discards them
   either.
 
+- **A PS2 or PSP catalog is offered Create DVD, not Create CD.** Narrowing the
+  library to a platform picked the right *tool* but not the right *command*:
+  every CHDMAN mode was offered on every disc system, and Create CD — the first
+  one in the list — is what an ISO submission defaulted to. `createcd` writes a
+  CD track layout, so the conversion was wrong before you touched anything. The
+  create and extract modes now each declare the media they actually serve:
+  PS2/PSP get the DVD pair, PS1/Dreamcast/Saturn and the rest get the CD pair,
+  and arcade keeps CD, HD and raw because MAME ships all three. Copy /
+  Recompress is unchanged — it is media-agnostic.
+- **Queueing a conversion no longer freezes the whole app when a mount stops
+  answering.** Before creating jobs the queue resolves each destination to a
+  canonical path so two jobs cannot write the same file, and that resolution ran
+  on the thread serving the app while it held the lock every submission passes
+  through. One unresponsive NFS/SMB/rclone volume was enough: every request, and
+  all job creation, waited on a stat that never returned. The resolution now
+  happens off that thread with a deadline, and a volume that does not answer
+  costs the batch nothing but symlink-awareness for that submit.
+- **Discarding a planned metadata snapshot can no longer discard somebody
+  else's.** A plan that was never submitted is retired by the browser, and it
+  retired whatever row pointed at that destination — which, once another tab or
+  a sweep had re-planned the same output, was that conversion's live row. Rows
+  are retired by identity now, so tidying up after a rejected batch cannot take
+  a running conversion's metadata with it.
+- **A re-match that fails while the same output was re-planned no longer errors
+  out.** Handing the row back after a failed write collided with the newer row
+  for that path and surfaced as a server error, hiding the real failure and
+  leaving the row stuck for fifteen minutes. The superseded attempt is now
+  retired, and the re-planned one carries on.
+- **Saving new RomM connection settings can no longer leave the previous
+  server's platform selected.** The reload that runs after a save did nothing
+  while the first load of the session was still in flight, so the old instance's
+  answer arrived afterwards and selected one of *its* platforms — which the
+  Convert panel then narrowed to, against a server nobody was pointed at any
+  more.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped
