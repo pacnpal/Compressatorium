@@ -2230,6 +2230,11 @@ class JobManager:
                 job.error_message = "Could not acquire lock for output file"
             job.completed_at = datetime.now(timezone.utc)
 
+            # Terminal, and it returns below without reaching the try/finally
+            # that announces every other outcome -- so a listener recording how
+            # this job ended would never hear about the one case where the job
+            # failed *before* touching the output.
+            self._notify_terminal(job)
             await self._notify_subscribers(
                 job_id, {"type": "error", "job_id": job_id, "error": job.error_message}
             )
@@ -2262,6 +2267,9 @@ class JobManager:
                 job.status = JobStatus.FAILED
                 job.error_message = "Output file already exists"
                 job.completed_at = datetime.now(timezone.utc)
+                # Same as the lock failure above: an early return, so it has to
+                # announce itself.
+                self._notify_terminal(job)
                 await self._notify_subscribers(
                     job_id,
                     {"type": "error", "job_id": job_id, "error": job.error_message},

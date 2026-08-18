@@ -558,7 +558,23 @@ class ConversionStore {
             + 'Re-match those in RomM by hand after converting.',
           );
         }
-        if (replanned) {
+        // Truthy is not enough: the plan endpoint skips a path it cannot
+        // record (RomM no longer lists it, the destination is outside the
+        // volumes) and still answers 200, so a partial result would retire
+        // the old rows and report metadata that was never saved. Every
+        // redirected source has to come back mapped to the path the queue
+        // actually chose.
+        const replannedPaths = replanned?.recorded_paths ?? {};
+        const replanComplete = Object.entries(misdirected).every(
+          ([source, destination]) => replannedPaths[source] === destination,
+        );
+        if (replanned && !replanComplete) {
+          toast.warning(
+            'Metadata could not be saved for every file the queue redirected. '
+            + 'Re-match those in RomM by hand after converting.',
+          );
+        }
+        if (replanComplete) {
           await api
             .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
             .catch(() => {});
@@ -576,9 +592,13 @@ class ConversionStore {
             .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
             .catch(() => {});
           for (const source of Object.keys(misdirected)) delete recorded[source];
-          this.lastRepinRecorded = Math.max(
-            0, this.lastRepinRecorded - Object.keys(misdirected).length,
-          );
+          // Only the ones that really were not re-recorded: a partial answer
+          // still saved metadata for the sources it mapped, and counting
+          // those as lost would under-report just as misleadingly.
+          const lost = Object.entries(misdirected).filter(
+            ([source, destination]) => replannedPaths[source] !== destination,
+          ).length;
+          this.lastRepinRecorded = Math.max(0, this.lastRepinRecorded - lost);
         }
       }
       // What is left in `recorded` after this is the set the `finally` block

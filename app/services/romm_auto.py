@@ -56,6 +56,7 @@ from services.output_conflicts import (
 )
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
+from services.subprocess_runner import run_detached
 from services.tools import InputKind, registry
 from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes, match_extension
@@ -87,6 +88,10 @@ _BOUNDS = {
 # Cap on a user-supplied filter pattern. A pathological regex is the operator's
 # own doing, but length is a cheap first guard against the obvious ones.
 _MAX_PATTERN = 500
+# How long one candidate's disk probes may take before the library counts as
+# unresponsive. Generous for a healthy mount (these are a resolve and two
+# stats) and short enough that a dead one costs a sweep rather than a restart.
+_CANDIDATE_PROBE_SECONDS = 30
 
 # One sweep at a time, process-wide. The active-source snapshot is taken before
 # anything is queued, so the minute scheduler and a manual "Run now" could each
@@ -411,6 +416,7 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         # Set when a submitted include/exclude regex would not compile, so the
         # editor can say why the rule is paused instead of silently widening it.
         "invalid_pattern": False,
+        "invalid_window": False,
     }
 
 
@@ -532,6 +538,15 @@ def normalize_rule(
     )
     out["window_start"] = raw.get("window_start") or None
     out["window_end"] = raw.get("window_end") or None
+    # Half a window is not a window. One endpoint filled in (or one that does
+    # not parse) used to mean "no time restriction", so a rule an operator was
+    # narrowing to 22:00-04:00 ran all day on its selected weekdays the moment
+    # they typed the first field -- unattended, delete-on-verify included.
+    # Pause and say so, the same as an output folder outside the volumes.
+    starts, ends = _parse_hhmm(out["window_start"]), _parse_hhmm(out["window_end"])
+    if (out["window_start"] or out["window_end"]) and (starts is None or ends is None):
+        out["invalid_window"] = True
+        out["enabled"] = False
     out["timezone"] = _valid_timezone(raw.get("timezone"))
     days = raw.get("days")
     if isinstance(days, list):
@@ -743,8 +758,13 @@ def _in_window(rule: dict, now: datetime) -> bool:
     end = _parse_hhmm(rule["window_end"])
     current = now.time()
 
-    if start is None or end is None:
+    if start is None and end is None:
         return now.weekday() in rule["days"]
+    if start is None or end is None:
+        # Belt and braces: `normalize_rule` pauses a rule with half a window,
+        # but a blob edited straight in the database bypasses that, and the
+        # wrong answer here is the one that converts all day.
+        return False
 
     if start <= end:
         return now.weekday() in rule["days"] and start <= current <= end
@@ -1354,6 +1374,7 @@ async def _sweep_locked(
         # outcome announced while this process was not the one running.
         converted = await _persist_known_outcomes(platform_id, converted)
         batch: list[str] = []
+        unresponsive = False
         rom_by_path: dict[str, dict] = {}
         destinations: dict[str, str] = {}
         resolved_by_path: dict[str, str] = {}
@@ -1367,10 +1388,35 @@ async def _sweep_locked(
             # One hop to a worker thread for every disk-touching check on this
             # candidate — the local-path mapping and volume check included,
             # since both resolve paths against a mount that may be remote.
-            decision = await run_in_threadpool(
-                _inspect_candidate, rom, rule, tool, spec,
-                converted.get(str(rom.get("id"))),
-            )
+            try:
+                # Detached and bounded, not a pooled worker: this resolves a
+                # path, checks containment, and stats the destination, all on
+                # the NFS/SMB/rclone mounts this integration exists for. A
+                # mount that stops answering blocks in uninterruptible I/O --
+                # which in the shared pool strands a worker per candidate, and
+                # holds `_sweep_lock` for the whole wait, so previews, manual
+                # runs, and the rule edit that would switch this platform off
+                # all queue behind it until a restart.
+                decision = await asyncio.wait_for(
+                    run_detached(
+                        _inspect_candidate, rom, rule, tool, spec,
+                        converted.get(str(rom.get("id"))),
+                    ),
+                    _CANDIDATE_PROBE_SECONDS,
+                )
+            except (asyncio.TimeoutError, OSError):
+                # One unresponsive candidate means the mount is unresponsive,
+                # so the rest of this platform would time out one by one.
+                # Stop here and say why; the next sweep starts over.
+                logger.warning(
+                    "romm_auto: platform %s library stopped responding, "
+                    "stopping this platform", platform_id,
+                )
+                result["errors"].append(
+                    {"platform_id": int(platform_id), "error": "library_unresponsive"},
+                )
+                unresponsive = True
+                break
             path = decision["path"]
             if decision["skip"] == "filtered":
                 result["skipped_filtered"] += 1
@@ -1540,13 +1586,15 @@ async def _sweep_locked(
             summary["queued"] = len(batch)
             result["queued"] += len(batch)
 
+        if unresponsive:
+            summary["library_unresponsive"] = True
         summary["candidates"] = [Path(p).name for p in batch[:25]]
         result["platforms"].append(summary)
         # A real run updates the schedule clock; a preview must not, or looking
         # at what *would* happen would postpone the run that should. Nor does a
         # run that failed to queue anything: advancing the clock there would
         # make the platform sit out a full interval over a transient error.
-        if not dry_run and not summary.get("queue_failed"):
+        if not dry_run and not summary.get("queue_failed") and not unresponsive:
             await _record_run(platform_id, summary)
 
     return result

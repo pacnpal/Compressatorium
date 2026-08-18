@@ -90,10 +90,15 @@
   );
 
   const activeMode = $derived(registry.specFor(conversion.mode) ?? null);
-  // Absent means "not loaded yet"; the backend default is on, and promising
-  // the snapshot before the settings arrive is the safer of the two wrong
-  // states — the panel is unusable until they do.
-  const repinEnabled = $derived(romm.settings?.repin_enabled !== false);
+  // Three states, not two. `settings` stays null when the load *failed*, and
+  // reading that as "on" promises a metadata snapshot the backend may not be
+  // taking — next to a Convert button that can delete the source once it
+  // verifies. Unknown says so instead.
+  const repinState = $derived(
+    romm.settings == null
+      ? 'unknown'
+      : (romm.settings.repin_enabled === false ? 'off' : 'on'),
+  );
   const losesMatch = $derived(romm.losesDatMatch(activeMode));
 
   /**
@@ -163,6 +168,18 @@
     };
   });
 
+  /**
+   * Whether the counts above can be trusted for the current settings.
+   *
+   * Each row's `outputs` describes what the backend found *beside the source*.
+   * Point the Convert panel at an output folder and the finished files are
+   * somewhere else entirely, so every converted ROM reads as still to go — and
+   * the savings figure promises space that was already reclaimed. Rather than
+   * re-scanning a whole platform against a folder that changes as it is typed,
+   * the summary says what it does not cover.
+   */
+  const summaryCoversOutputs = $derived(!conversion.outputDir);
+
   onMount(() => {
     // The async init below outlives a fast navigation away, and its tail
     // calls enterRomm() — which would replace the ordinary workspace's
@@ -216,10 +233,24 @@
     try {
       const result = await romm.runRepin();
       const done = result?.repinned ?? 0;
+      const failed = result?.failed ?? 0;
       if (done > 0) {
         toast.success(`Re-matched ${done} ROM${done === 1 ? '' : 's'} in RomM`);
+      } else if (result?.busy) {
+        // Another pass owns the lock. The rows are still queued, so reporting
+        // "nothing waiting" would contradict the badge beside this button.
+        toast.info('A re-match pass is already running — its results will land shortly');
+      } else if (failed > 0) {
+        toast.error(
+          `${failed} re-match${failed === 1 ? '' : 'es'} failed; they stay queued `
+          + 'and are retried on the next pass',
+        );
       } else if ((result?.waiting ?? 0) > 0) {
         toast.info('RomM has not rescanned these yet — try again after a scan');
+      } else if ((result?.pending ?? 0) > 0) {
+        // Nothing was reached this pass (the wall-clock budget ran out), but
+        // rows remain. "Nothing waiting" would be plainly wrong.
+        toast.info('Ran out of time this pass — the rest are picked up next time');
       } else {
         toast.info('Nothing waiting to be re-matched');
       }
@@ -328,7 +359,7 @@
         {/if}
       </div>
 
-      {#if summary.total > 0}
+      {#if summary.total > 0 && summaryCoversOutputs}
         <div class="summary" aria-live="polite">
           <span><strong>{summary.converted}</strong> converted</span>
           <span><strong>{summary.pending}</strong> to go</span>
@@ -341,18 +372,32 @@
             </span>
           {/if}
         </div>
+      {:else if summary.total > 0}
+        <div class="summary" aria-live="polite">
+          <span class="muted">
+            {summary.total} ROMs — progress is not counted while the convert panel
+            writes to a custom output folder, which this listing does not scan.
+          </span>
+        </div>
       {/if}
     </div>
 
     {#if losesMatch}
       <div class="notice warn">
         <TriangleAlert size={16} />
-        {#if repinEnabled}
+        {#if repinState === 'on'}
           <span>
             RomM cannot hash-match <strong>{activeMode?.outputExt}</strong> files.
             Their metadata is saved before converting and restored by
             <em>Re-match in RomM</em> once RomM rescans. CHD and ZIP/7z keep their
             match automatically.
+          </span>
+        {:else if repinState === 'unknown'}
+          <span>
+            RomM cannot hash-match <strong>{activeMode?.outputExt}</strong> files,
+            and the metadata settings could not be read, so whether a snapshot
+            is taken is unknown. Check Settings → Metadata before converting
+            anything you cannot re-identify by hand.
           </span>
         {:else}
           <!-- The promise has to follow the setting. With re-pinning off,

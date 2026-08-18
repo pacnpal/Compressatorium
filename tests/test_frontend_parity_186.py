@@ -64,20 +64,37 @@ def _find_node() -> str | None:
     return None
 
 
-def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
+def _eval_registry(tmp_path: Path, dump: str, name: str) -> list[dict]:
+    """Evaluate ``registry.js`` under Node with *dump* appended, as JSON.
+
+    One helper for both parity views (per mode and per tool): the Node lookup,
+    the `$lib` stub, the temporary module and the subprocess are identical, and
+    only the trailing snippet that shapes the output differs.
+    """
     node = _find_node()
     if node is None:
         pytest.skip("node not available to evaluate registry.js")
 
     src = _REGISTRY_JS.read_text(encoding="utf-8")
     # registry.js imports the SvelteKit `$lib` alias only for the getInfo/verify
-    # bindings, which this dump never calls — stub it so plain Node can evaluate
-    # the module as-is (preserving every ext constant and spread).
-    stub = "const api = {};"
+    # bindings, which these dumps never call — stub it so plain Node can
+    # evaluate the module as-is (preserving every ext constant and spread).
     needle = "import { api } from '$lib/api/endpoints.js';"
     assert needle in src, "registry.js import shape changed; update the parity stub"
-    src = src.replace(needle, stub)
-    src += (
+    src = src.replace(needle, "const api = {};") + dump
+    script = tmp_path / name
+    script.write_text(src, encoding="utf-8")
+
+    proc = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=30, check=False,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
+    return json.loads(proc.stdout)
+
+
+def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
+    dump = (
         "\nconst __rows = TOOLS.flatMap((t) => t.modes.map((m) => ({"
         " mode: m.mode,"
         " tool_id: t.id,"
@@ -92,42 +109,21 @@ def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
         "})));\n"
         "process.stdout.write(JSON.stringify(__rows));\n"
     )
-    script = tmp_path / "registry_eval.mjs"
-    script.write_text(src, encoding="utf-8")
-
-    proc = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=30,
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
-    return {row["mode"]: row for row in json.loads(proc.stdout)}
+    rows = _eval_registry(tmp_path, dump, "registry_eval.mjs")
+    return {row["mode"]: row for row in rows}
 
 
 def _frontend_tools(tmp_path: Path) -> dict[str, dict]:
     """Tool-level rows from registry.js: `{id: {"default_compression": str|None}}`."""
-    node = _find_node()
-    if node is None:
-        pytest.skip("node not available to evaluate registry.js")
-
-    src = _REGISTRY_JS.read_text(encoding="utf-8")
-    needle = "import { api } from '$lib/api/endpoints.js';"
-    assert needle in src, "registry.js import shape changed; update the parity stub"
-    src = src.replace(needle, "const api = {};")
-    src += (
+    dump = (
         "\nconst __tools = TOOLS.map((t) => ({"
         " id: t.id,"
         " default_compression: (t.defaultCompression ?? [])[0] ?? null,"
         "}));\n"
         "process.stdout.write(JSON.stringify(__tools));\n"
     )
-    script = tmp_path / "registry_tools_eval.mjs"
-    script.write_text(src, encoding="utf-8")
-    proc = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=30,
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
-    return {row["id"]: row for row in json.loads(proc.stdout)}
+    rows = _eval_registry(tmp_path, dump, "registry_tools_eval.mjs")
+    return {row["id"]: row for row in rows}
 
 
 def _backend_rows() -> dict[str, dict]:

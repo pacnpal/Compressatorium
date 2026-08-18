@@ -650,6 +650,16 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
         # matches on the hash, not on where the file sits. So a row that has
         # been hashed keeps going even when nothing is at the recorded path.
         if not sha1:
+            # Nothing is retired while a job still means to write this path. A
+            # queued conversion that has waited out a long backlog has not
+            # failed, and -- the case that made this check have to come first
+            # -- numbered parts at the destination may be the *previous* run's,
+            # with the queued retry (splitting switched off) about to replace
+            # them with a single matchable ISO. Reading those old parts as this
+            # attempt's final output retired the row for a conversion that then
+            # succeeded.
+            if await run_in_threadpool(_destination_has_pending_job, output_path):
+                return _Outcome.WAITING
             # A split build produced numbered parts and no bare output. The
             # conversion did run -- but RomM matches a ROM on one file's hash,
             # and a set of parts has no single digest to join on, so this row
@@ -665,12 +675,6 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
                 )
                 return _Outcome.ABANDONED
             if not _is_stale(created_at):
-                return _Outcome.WAITING
-            # Aged out, but only if nothing is still going to write it: a
-            # queued job that has waited out a long backlog has not failed,
-            # and retiring its row loses the metadata for a conversion that
-            # is about to happen.
-            if await run_in_threadpool(_destination_has_pending_job, output_path):
                 return _Outcome.WAITING
             await run_in_threadpool(
                 romm_repin.settle, row_id, "abandoned", "Output never appeared",
@@ -756,6 +760,14 @@ async def _hash_output(output_path: str, deadline: float | None = None) -> str |
         async with await asyncio.wait_for(
             workload_limiter.acquire("match"), timeout,
         ):
+            if deadline is not None:
+                # Charged against the same budget, not granted a second one:
+                # waiting most of the pass behind a running conversion and then
+                # hashing for the full timeout would take twice as long as the
+                # budget promises.
+                timeout = max(0.0, deadline - time.monotonic())
+                if timeout <= 0:
+                    return None
             return await asyncio.wait_for(
                 run_detached(compute_file_sha1_sync, output_path), timeout,
             )

@@ -299,6 +299,38 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **Setting only one end of a schedule window no longer runs the rule all
+  day.** Typing the start of a 22:00–04:00 window and not yet the end was read
+  as "no time restriction", so an operator narrowing a rule started unattended
+  conversions in the middle of the working day at the moment they were trying
+  to restrict them. Half a window pauses the rule and says why.
+- **A library that stops responding mid-sweep no longer wedges automation.**
+  Each ROM's checks — resolving its path, confirming it is inside a volume,
+  looking for an existing output — ran with no time limit on a shared worker,
+  so a dead NFS/SMB mount held the sweep lock indefinitely: previews, manual
+  runs and even editing the rule to switch that platform off all waited behind
+  it until a restart. The platform now stops with a clear reason.
+- **A re-match snapshot survives a retry that replaces split parts.** A
+  previous run's numbered parts sitting at the destination were read as this
+  attempt's final output, so a retry queued with splitting switched off — one
+  single, matchable file — had its metadata retired before it even started.
+  Nothing is retired while a job still means to write that path.
+- **Re-matching says when a pass failed or was already running**, instead of
+  reporting "nothing waiting to be re-matched" next to a badge still showing
+  work queued.
+- **A metadata warning no longer claims a snapshot is being taken when the
+  settings could not be read.** The notice has three states now — on, off, and
+  unknown — because promising preservation next to a button that can delete the
+  source is the one guess not worth making.
+- **The library progress figures step aside when the convert panel writes to a
+  custom output folder.** They are computed from what sits beside each ROM, so
+  with an output folder set every converted file read as still to go and the
+  savings estimate promised space already reclaimed. It now says what it does
+  not cover rather than counting wrong.
+- **Metadata re-recorded after the queue redirects a conversion is verified,
+  not assumed.** The re-plan can succeed for some files and skip others; a
+  partial answer was treated as complete, retiring the old rows and reporting
+  metadata that was never saved for the rest.
 - **A conversion that failed is remembered as failed, even after a restart.**
   Each rule records what it has produced so Overwrite and Write-alongside
   happen once per ROM, and that record asked the job queue how the job ended —

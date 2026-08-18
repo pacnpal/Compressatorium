@@ -198,6 +198,14 @@ class ToolPlugin(Protocol):
     def output_path(self, mode: str, input_path: str, output_dir: str | None = None,
                     *, treat_as_stem: bool = False) -> str: ...
 
+    # Whether deleting the source is justified for *this* job's settings, not
+    # just whether the mode offers the option (`supports_delete_on_verify`).
+    # BaseTool returns True; a tool whose verification can be weakened by a
+    # compression choice overrides it — jwud returns False for `noverify`,
+    # whose structural WUX check proves the geometry but not the bytes. Asked
+    # at both plan sites and again in `_process_job`, right before the delete.
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool: ...
+
     def convert(self, input_path: str, output_path: str, mode: str, *,
                 compression: str | None = None,
                 cancel_event: asyncio.Event | None = None) -> AsyncGenerator[dict, None]: ...
@@ -1548,11 +1556,14 @@ platform table. The sweep checks the *mode*, not `spec.tool_id`.
 Any consumer that needs to know how a job *ended* — not whether it exists —
 therefore cannot ask later; it has to be told at the time.
 
-**`job_manager.add_terminal_listener(callback)`** registers a callback fired
-once per job reaching `COMPLETED` / `FAILED` / `CANCELLED`. It fires from
+**`job_manager.add_terminal_listener(callback)`** registers a callback for every
+job reaching `COMPLETED` / `FAILED` / `CANCELLED`. Delivery is **at least once**,
+not exactly once. It fires from
 `_process_job`'s `finally` (every runner outcome), from both
 `finish_external_job*` paths, from `cancel_job`'s QUEUED branch, and from the
-two early cancel returns that precede `_process_job`'s try block. The callback
+four early returns that precede `_process_job`'s try block (two cancels, the
+output-lock failure and the split-set collision) — which is why a job cancelled
+before it starts is announced twice. The callback
 may be sync or async, exceptions are logged and swallowed (a listener must
 never fail a conversion), and the same job may be announced twice — listeners
 are required to be idempotent.

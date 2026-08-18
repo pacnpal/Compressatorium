@@ -283,6 +283,12 @@
       'its output folder is outside the configured volumes — skipped',
     unreadable: 'RomM could not list this platform',
     queue_failed: 'the conversion queue rejected this batch',
+    destination_claimed:
+      'another job took one of the output paths — nothing was queued, the next '
+      + 'run picks it up',
+    library_unresponsive:
+      'the library stopped responding while reading this platform — stopped '
+      + 'partway',
   };
 
   function sweepErrorLabel(code) {
@@ -693,6 +699,13 @@
                   </p>
                 {/if}
 
+                {#if rule.invalid_window}
+                  <p class="warn" role="alert">
+                    Only one end of the time window is set, so this rule is
+                    paused. A window needs both a start and an end — half of one
+                    would have run all day on the days selected.
+                  </p>
+                {/if}
                 {#if rule.invalid_pattern}
                   <p class="warn" role="alert">
                     A name filter could not be read as a regular expression, so it was

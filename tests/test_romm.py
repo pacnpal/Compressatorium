@@ -3024,6 +3024,122 @@ async def test_the_settle_pass_bounds_the_hash_by_its_own_budget() -> None:
     assert seen["timeout"] > romm_routes._HASH_TIMEOUT_FLOOR_S, seen
 
 
+def test_half_a_schedule_window_pauses_the_rule() -> None:
+    """One endpoint filled in must not mean "no time restriction".
+
+    An operator narrowing a rule to 22:00–04:00 types the start first. Reading
+    that as "any time on the selected days" started unattended conversions —
+    delete-on-verify included — in the middle of the working day, at the moment
+    they were trying to restrict them.
+    """
+    from datetime import datetime, timezone
+
+    from services import romm_auto
+
+    half = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "enabled": True, "window_start": "22:00",
+    })
+    assert half["invalid_window"] is True
+    assert half["enabled"] is False
+    # And the clock refuses it even if the blob is edited straight in the
+    # database, where normalization never ran.
+    forced = dict(half, enabled=True)
+    assert romm_auto._in_window(
+        forced, datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc),
+    ) is False
+
+    # A complete window is untouched, and so is a rule with no window at all.
+    whole = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "enabled": True,
+        "window_start": "22:00", "window_end": "04:00",
+    })
+    assert whole["invalid_window"] is False
+    assert whole["enabled"] is True
+    always = romm_auto.normalize_rule({"mode": "dolphin_rvz", "enabled": True})
+    assert always["invalid_window"] is False
+    assert always["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_hung_candidate_probe_stops_the_platform(
+    settings_db, tmp_path: Path, monkeypatch,
+) -> None:
+    """One unresponsive ROM must not hold `_sweep_lock` forever.
+
+    The probe resolves a path, checks containment and stats the destination —
+    all on the remote mounts this integration exists for. In the shared pool
+    with no deadline, a mount that stops answering strands a worker per
+    candidate and blocks previews, manual runs, and the rule edit that would
+    switch the platform off, until a restart.
+    """
+    import asyncio as _asyncio
+
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _never_returns(*_args, **_kwargs):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(romm_auto, "run_detached", _never_returns)
+    monkeypatch.setattr(romm_auto, "_CANDIDATE_PROBE_SECONDS", 0.05)
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ):
+        await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+        # The test's own guard: without the deadline this never returns.
+        result = await _asyncio.wait_for(
+            romm_auto.sweep(ignore_schedule=True), 10,
+        )
+
+    assert result["queued"] == 0, result
+    assert {"platform_id": 7, "error": "library_unresponsive"} in result["errors"]
+
+
+@pytest.mark.asyncio
+async def test_a_queued_retry_keeps_its_row_when_old_split_parts_remain(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Numbered parts at the destination may be the *previous* attempt's.
+
+    A makeps3iso run that split its output leaves `Game.iso.0`, `.1`, … A retry
+    with splitting switched off is queued to write a single matchable ISO over
+    them — and reading the old parts as this attempt's final output retired the
+    row before the conversion that would have settled it even started.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.iso"
+    (tmp_path / "Game.iso.0").write_bytes(b"part")
+
+    romm_repin.record(
+        {"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42}, "folder_to_iso",
+    )
+    row = romm_repin.pending_rows(10)[0]
+
+    with patch.object(romm_routes, "_destination_has_pending_job", return_value=True):
+        outcome = await romm_routes._settle_one_repin(row)
+    assert outcome is romm_routes._Outcome.WAITING
+
+    # With nothing queued for it, the parts are this conversion's output and
+    # the row is retired with that as the reason.
+    with patch.object(romm_routes, "_destination_has_pending_job", return_value=False):
+        outcome = await romm_routes._settle_one_repin(row)
+    assert outcome is romm_routes._Outcome.ABANDONED
+
+
 @pytest.mark.asyncio
 async def test_a_manual_limit_can_only_narrow_the_run(
     settings_db, tmp_path: Path,
