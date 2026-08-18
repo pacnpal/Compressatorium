@@ -22,6 +22,7 @@ from services.jwudtool import (
     split_set_parts,
     verification_enabled,
 )
+from services.subprocess_runner import run_detached
 from services.lock_manager import lock_manager
 
 from .base import BaseTool
@@ -30,6 +31,10 @@ from .spec import ModeKind, ModeSpec
 
 class JwudTool(BaseTool):
     id = "jwud"
+    platform_slugs = frozenset({"wiiu", "wii-u"})
+    # WUX has no codec; the dropdown carries JWUDTool's verification pass,
+    # and verifying is the default.
+    default_compression = "verify"
     policy_owner = "jwud"
     display_name = "Wii U"
     modes = (
@@ -80,8 +85,13 @@ class JwudTool(BaseTool):
     async def is_ready(self) -> bool:
         # JWUDTool is a .jar behind a launcher that needs a Java runtime, so it
         # can genuinely be absent outside the image. Hide the tool rather than
-        # offering jobs that can only fail. Threadpooled: it stats the disk.
-        return await run_in_threadpool(self._service.binary_available)
+        # offering jobs that can only fail.
+        #
+        # Detached rather than pooled, for the reason nsz's spells out: this
+        # stats the disk, every readiness caller fans out over the whole
+        # registry, and a stat that never returns must cost a disposable
+        # thread rather than one of the shared pool's few workers.
+        return await run_detached(self._service.binary_available)
 
     def converts_path(self, path: str) -> bool:
         # A split dump is one disc image spread over game_part1…12.wud, and

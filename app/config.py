@@ -213,6 +213,27 @@ class Settings(BaseSettings):
         default=False, alias="MAMEREDUMP_AUTO_SYNC",
         description="Auto-sync DATs from MAMERedump on startup if none loaded",
     )
+
+    # RomM catalog overlay. Compressatorium reads RomM's catalog over HTTP but
+    # touches the ROM bytes only through the filesystem: RomM's library is
+    # mounted as an ordinary Compressatorium volume (locally via the same bind
+    # mount, remotely via NFS/SMB/rclone), so no ROM ever crosses the network.
+    #
+    # None of its settings are Settings fields. They are runtime-editable in
+    # the app (URL, library root, unattended-conversion policy, per-platform
+    # rules), which makes the saved value the authority and the environment
+    # only the first-run default -- a layering `Settings` cannot express, since
+    # it is populated once at import. `services.romm.settings` owns the whole
+    # table: ROMM_URL, ROMM_LIBRARY_ROOT, ROMM_AUTO_CONVERT,
+    # ROMM_AUTO_CONVERT_INTERVAL_MINUTES, ROMM_AUTO_CONVERT_MAX_PER_RUN,
+    # ROMM_REPIN*, ROMM_VERIFY_AFTER_CONVERT, ROMM_DELETE_SOURCE_AFTER_VERIFY.
+    # Duplicating any of them here would create a second source of truth that
+    # nothing reads and that silently drifts from the one that matters.
+    #
+    # The credential is likewise not here, for the additional reason that
+    # applies to MAMEREDUMP_GITHUB_TOKEN: a secret on the settings singleton
+    # ends up in every repr()/log line that dumps config.
+
     # Process-priority and timeout policy shared by EVERY conversion tool's
     # subprocess (chdman, Dolphin, 3DS, Switch) and the shared SubprocessRunner.
     # These began life as chdman-only knobs; prefer the tool-neutral

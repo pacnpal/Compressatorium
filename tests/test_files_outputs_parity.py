@@ -26,6 +26,10 @@ FILEENTRY_KEYS = {
     "name", "path", "type", "size", "extension",
     "archive_items", "archive_has_output", "archive_truncated", "media_type",
     "convertible_by", "outputs", "verifiable_by", "split_parts",
+    # Display-only label used when a library manager knows a curated title for
+    # the file (the RomM catalog view). Always None for a directory listing --
+    # `name` stays the filename every filesystem action depends on.
+    "display_name",
 }
 # On-disk search hits mirror the file schema minus the listing-only archive
 # summary / media / split fields, plus the ``in_archive`` marker.

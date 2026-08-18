@@ -27,6 +27,7 @@ import json
 from logging_setup import get_logger
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,6 +43,7 @@ from sqlalchemy import (
     create_engine,
     event,
     select,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -53,6 +55,28 @@ logger = get_logger("db")
 # ---------------------------------------------------------------------------
 # ORM models
 # ---------------------------------------------------------------------------
+
+
+def utcnow_iso() -> str:
+    """UTC timestamp in the ``...Z`` form every string date column here uses.
+
+    Public and shared: the stores that write these columns must agree on the
+    shape, or a reader parsing one module's output against another's assumption
+    silently mis-sorts or fails to compare.
+    """
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def iso_seconds_ago(seconds: int) -> str:
+    """A timestamp *seconds* in the past, in the same shape as `utcnow_iso`.
+
+    Beside it deliberately: a comparison like ``settled_at < iso_seconds_ago(x)``
+    is string arithmetic over these columns, so the two must be formed the same
+    way or a later change to one silently breaks the other.
+    """
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat().replace("+00:00", "Z")
 
 
 class Base(DeclarativeBase):
@@ -109,6 +133,88 @@ class DATSyncState(Base):
     last_sync_tag = Column(String, nullable=True)
     last_sync_at = Column(String, nullable=True)
     last_sync_files = Column(Integer, nullable=False, default=0)
+
+
+class RommRepin(Base):
+    """One pending metadata re-pin for a converted RomM ROM.
+
+    RomM matches a CHD by the raw+meta SHA-1 embedded in its v5 header, and an
+    archive by its largest member, so those keep their Redump/No-Intro identity
+    across a conversion.  Every other format we emit (RVZ/CSO/NSZ/WUX/Z3DS) is
+    matched on the container's own hash, which conversion necessarily changes --
+    the ROM goes unidentified until something re-attaches the metadata.
+
+    A row is written *before* the conversion (the source's provider ids are only
+    readable while the source is still the file RomM knows about) and settled
+    after RomM has rescanned.  It is a queue, not a preference, which is why it
+    is a table rather than a ``preferences`` blob: the settle step may be minutes
+    or hours later, across restarts, and the read-modify-write of a JSON blob
+    would race the next conversion.
+
+    ``output_sha1`` is the join key.  RomM computes the converted file's own
+    SHA-1 on scan and ``file_hasher.compute_file_sha1`` computes the same one, so
+    ``GET /api/roms/by-hash`` identifies the new record exactly -- no filename
+    guessing, and correct even when the user renamed it in between.  It is
+    cached here because hashing a multi-GB image is the expensive half of the
+    settle pass and a row may be retried many times before RomM rescans.
+    """
+
+    __tablename__ = "romm_repin"
+    __table_args__ = (
+        Index("ix_romm_repin_state", "state"),
+        Index("ix_romm_repin_output_path", "output_path"),
+        # At most one *pending* row per output. Partial, because settled rows
+        # are history and the same path is legitimately converted again later.
+        # Enforced in the schema rather than only by a read-then-insert, so two
+        # callers recording the same output concurrently (a manual submit
+        # racing a sweep) cannot both win the check and stack two pending rows
+        # that would each try to re-pin the same file.
+        Index(
+            "ux_romm_repin_pending_output",
+            "output_path",
+            unique=True,
+            sqlite_where=text("state = 'pending'"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # RomM's id for the *source* ROM, captured before conversion.
+    source_rom_id = Column(Integer, nullable=False)
+    source_name = Column(String, nullable=True)
+    # Absolute local path of the conversion output this row is waiting on.
+    output_path = Column(String, nullable=False)
+    # ...and the local file its provider ids were read from. The row is keyed
+    # by destination, because a destination is produced once -- but that alone
+    # cannot say *which* conversion a row belongs to, and two clients can plan
+    # different sources onto one destination. Without this, a row kept because
+    # "a job is writing there" could be re-pinned onto an output some other
+    # source produced. Nullable: rows written before it existed cannot name
+    # their source, and are treated as unproven rather than as a match.
+    source_path = Column(String, nullable=True)
+    output_sha1 = Column(String, nullable=True)
+    # {"igdb_id": 123, "moby_id": ..., ...} -- only the providers that were set.
+    metadata_ids = Column(JSON, nullable=False, default=dict)
+    # What was already sitting at ``output_path`` when the row was recorded,
+    # as "size:mtime_ns" -- or "" when the path was free. Only the overwrite
+    # policy ever records a non-empty one, and it is the answer to "has the
+    # conversion actually produced its output yet". Without it, a batch that
+    # was planned but never submitted leaves a row pointing at the *previous*
+    # artifact, and the settle pass hashes that and stamps this ROM's identity
+    # onto whatever RomM knows the old file as.
+    pre_fingerprint = Column(String, nullable=True)
+    # The conversion mode this row is waiting on, so the settle pass can ask
+    # the owning tool what it actually produced. A makeps3iso `-s` build past
+    # 4 GB leaves `<name>.iso.0`, `.1`, ... and no bare `<name>.iso`, which
+    # looks identical to "the conversion never ran" from the path alone.
+    mode = Column(String, nullable=True)
+    # "pending" -> "done" | "abandoned"
+    state = Column(String, nullable=False, default="pending")
+    detail = Column(String, nullable=True)
+    # Callable default, not "": the abandonment clock reads this, and an empty
+    # string parses as "no age", so a row inserted without one could never be
+    # retired however long its output failed to appear.
+    created_at = Column(String, nullable=False, default=utcnow_iso)
+    settled_at = Column(String, nullable=True)
 
 
 class CHDMetadata(Base):

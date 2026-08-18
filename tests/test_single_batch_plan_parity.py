@@ -13,8 +13,11 @@ skips, and an accepted file resolves to an identical ``output_path`` /
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -27,6 +30,8 @@ from app.models import (
     JobCreateRequest,
 )
 from app.routes import convert as convert_routes
+from services.job_manager import OutputClaimedError
+from services.lock_manager import lock_manager
 
 
 @pytest.fixture(name="parity_env")
@@ -467,7 +472,7 @@ async def test_locked_output_overwrite_agree(parity_env, monkeypatch):
         return False, False
 
     monkeypatch.setattr(
-        convert_routes.lock_manager, "check_file_status", fake_status,
+        lock_manager, "check_file_status", fake_status,
     )
 
     kwargs = {
@@ -611,3 +616,399 @@ async def test_delete_on_verify_allows_the_verified_default(parity_env):
     assert "status" not in single, single
     assert "skipped" not in batch, batch
     assert single["output_path"] == batch["output_path"]
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_destination_is_a_conflict_not_a_server_error(
+    parity_env, monkeypatch,
+) -> None:
+    """Losing a race for a destination is a 409, on both routes.
+
+    The queue refuses the second of two submissions that resolved the same
+    output — correct, and the whole point of reserving destinations under its
+    own lock. But it surfaced as an unhandled `ValueError`, so a working
+    safety check answered 500: "the server broke" for something the caller can
+    simply retry or skip.
+    """
+    source = parity_env["tmp_path"] / "game.iso"
+    source.write_bytes(b"data")
+
+    def _claimed(*_args, **_kwargs):
+        raise OutputClaimedError(
+            "Another queued job (job-1) is already writing game.chd",
+            claimed_by="job-1",
+        )
+
+    async def _claimed_async(*args, **kwargs):
+        _claimed()
+
+    monkeypatch.setattr(convert_routes.job_manager, "create_jobs_atomic", _claimed_async)
+    monkeypatch.setattr(convert_routes.job_manager, "create_job", _claimed_async)
+
+    batch = await _run_batch(
+        parity_env, file_path=str(source), mode=ConversionMode.CREATECD,
+        duplicate_action=DuplicateAction.SKIP, delete_on_verify=False,
+    )
+    assert batch["status"] == 409, batch
+    assert "already writing" in batch["detail"]
+
+    single = await _run_single(
+        parity_env, file_path=str(source), mode=ConversionMode.CREATECD,
+        duplicate_action=DuplicateAction.SKIP, delete_on_verify=False,
+    )
+    assert single["status"] == 409, single
+
+
+def test_destination_reservation_resolves_each_path_once(monkeypatch) -> None:
+    """The check runs on the event loop while the queue lock is held.
+
+    The pairwise version re-resolved every earlier destination for every new
+    one, and re-resolved every live job's output per spec — quadratic in the
+    batch size, in blocking `realpath` calls, against exactly the remote mounts
+    this integration targets. A Select-All submit made that millions of stats.
+    """
+    from services import job_manager as jm
+
+    calls: list[str] = []
+    real = os.path.realpath
+    monkeypatch.setattr(
+        jm.os.path, "realpath", lambda p: (calls.append(p), real(p))[1],
+    )
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    specs = [
+        {"file_path": f"/vol/game{i}.iso", "output_path": f"/vol/out{i}.chd"}
+        for i in range(60)
+    ]
+    manager._reject_claimed_destinations_locked(specs, ConversionMode.CREATECD)
+
+    # One resolve per destination, not one per pair. The old shape cost
+    # 60 * 59 / 2 = 1770 comparisons, each resolving two paths.
+    assert len(calls) <= len(specs) * 2, len(calls)
+
+
+@pytest.mark.asyncio
+async def test_destination_canonicalisation_never_runs_on_the_event_loop(
+    monkeypatch,
+) -> None:
+    """Job creation must not `realpath` while it holds `_create_lock`.
+
+    The reservation resolves each destination to a canonical key, and
+    `realpath` is a stat chain: aimed at an unresponsive NFS/SMB/rclone mount
+    — the deployment this integration exists for — it blocks in
+    uninterruptible I/O. On the event loop, under the lock, that is not one
+    slow submit: it is every unrelated API request and all job creation,
+    frozen for as long as the mount stays quiet.
+
+    So the keys are pre-computed off the loop under a bound, and the locked
+    pass reads them. This asserts both halves: nothing resolves on the loop
+    thread, and a mount that never answers is *answered* -- the submit returns
+    inside the bound instead of hanging on it, while the loop keeps serving
+    everything else.
+
+    What it returns changed. Completing the batch on lexical keys looked like
+    the conservative degrade and was the opposite: the lexical seed is the
+    *spelling*, so one file named through a symlink and through its real path
+    gets two keys and both submissions pass a check whose whole purpose is to
+    reject the second. The reservation refuses now -- see
+    `DestinationUnresolvableError` -- and the property this test exists for is
+    unchanged: bounded, off the loop, and never a hang.
+    """
+    import asyncio
+    import threading
+
+    from services import job_manager as jm
+
+    loop_thread = threading.get_ident()
+    real = os.path.realpath
+    stuck = threading.Event()
+
+    def _realpath(path):
+        assert threading.get_ident() != loop_thread, (
+            f"realpath({path}) ran on the event loop"
+        )
+        if "/dead-mount/" in str(path):
+            stuck.wait(30)  # a volume that is simply not going to answer
+        return real(path)
+
+    monkeypatch.setattr(jm.os.path, "realpath", _realpath)
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.2)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        with pytest.raises(jm.DestinationUnresolvableError):
+            await asyncio.wait_for(
+                manager.create_batch_jobs(
+                    ["/dead-mount/game.iso"], ConversionMode.CREATECD,
+                ),
+                timeout=5,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    # Refused, and nothing left behind: a submit that could not be checked must
+    # not leave a job queued against the destination it could not check.
+    assert not manager.jobs, manager.jobs
+    # The loop kept running while the mount did not answer.
+    assert ticks > 0
+
+
+@pytest.mark.asyncio
+async def test_a_job_queued_during_another_preflight_still_claims_its_output(
+    tmp_path, monkeypatch,
+) -> None:
+    """The pre-flight map is older than any job queued after it was built.
+
+    Canonicalisation moved off the event loop, which means it now happens
+    *before* `_create_lock` is taken. Two submissions can both pre-resolve and
+    then queue one after the other, and the second's map cannot contain the
+    first's job — so a lexical fallback for that job would miss that a
+    symlinked spelling and the real path name the same file. With overwrite
+    plus delete-on-verify, both sources are deleted for one surviving output.
+    """
+    from services import job_manager as jm
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    mode = ConversionMode.CREATECD
+    # The first submission spells its source through the symlink, the second
+    # through the real directory. Both resolve to one `game.chd`.
+    first = [{"file_path": str(link / "game.iso")}]
+    second = [{"file_path": str(real / "game.iso")}]
+
+    # Both pre-flights complete before either takes the lock.
+    keys_first = await manager._reservation_keys(first, mode)
+    keys_second = await manager._reservation_keys(second, mode)
+
+    manager._reject_claimed_destinations_locked(first, mode, keys_first)
+    manager._queue_job_locked(
+        file_path=str(link / "game.iso"), mode=mode, reservation=keys_first,
+    )
+
+    with pytest.raises(OutputClaimedError):
+        manager._reject_claimed_destinations_locked(second, mode, keys_second)
+
+
+@pytest.mark.asyncio
+async def test_companion_enumeration_never_runs_on_the_event_loop(
+    tmp_path, monkeypatch,
+) -> None:
+    """`companion_outputs` is not pure path math for every tool.
+
+    makeps3iso probes the disk for its numbered split parts, so enumerating a
+    live job's sidecars inline blocks the event loop on exactly the mount the
+    pre-flight bound exists to survive — and it happens *before* that bound is
+    reached, while inspecting a job that is merely queued.
+
+    An expired bound refuses the reservation rather than reserving the
+    primaries alone: unclaimed sidecars let a second submission whose *primary*
+    differs but whose companions land on these through, and a cue sheet or a
+    numbered split part written by two jobs is the same lost data as the image.
+    """
+    import asyncio
+    import threading
+
+    from services import job_manager as jm
+
+    loop_thread = threading.get_ident()
+    stuck = threading.Event()
+    real = os.path.realpath
+
+    def _realpath(path):
+        assert threading.get_ident() != loop_thread, (
+            f"realpath({path}) ran on the event loop"
+        )
+        return real(path)
+
+    def _slow_companions(mode, output_path):
+        assert threading.get_ident() != loop_thread, (
+            f"companion_outputs({output_path}) ran on the event loop"
+        )
+        if "/dead-mount/" in str(output_path):
+            stuck.wait(30)
+        return []
+
+    monkeypatch.setattr(jm.os.path, "realpath", _realpath)
+    monkeypatch.setattr(jm.JobManager, "_companions", staticmethod(_slow_companions))
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.2)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        with pytest.raises(jm.DestinationUnresolvableError):
+            await asyncio.wait_for(
+                manager.create_batch_jobs(
+                    ["/dead-mount/game.iso"], ConversionMode.CREATECD,
+                ),
+                timeout=5,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    # Refused, and nothing left behind: a submit that could not be checked must
+    # not leave a job queued against the destination it could not check.
+    assert not manager.jobs, manager.jobs
+    assert ticks > 0
+
+
+@pytest.mark.asyncio
+async def test_a_reservation_refuses_rather_than_falling_back_to_lexical_keys(
+    tmp_path, monkeypatch,
+) -> None:
+    """A degraded key is not a conservative key — it is the wrong one.
+
+    The collision check is atomic only because every destination is first
+    reduced to one key, and `realpath` is what makes two spellings of one file
+    compare equal. Falling back to the lexical seed when the probe bound
+    expires hands a symlinked path and its real path *different* keys, so two
+    submissions naming one file both pass the check that exists to reject the
+    second. When the mount recovers they write the same file, and with
+    delete-on-verify both sources are removed for the one artifact that
+    survives.
+
+    Refusing costs a submit against a volume the conversion would have failed
+    on anyway; the fallback cost a file.
+    """
+    from services import job_manager as jm
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.05)
+
+    # Wedged for *this* destination only. `realpath` is used across the
+    # process -- pathlib, pytest's own tmp_path teardown -- and a blanket stub
+    # would stall those instead, which is not what is under test here.
+    real_realpath = jm.os.path.realpath
+
+    def _wedged(path: str) -> str:
+        if str(path).startswith(str(tmp_path)):
+            import time
+            time.sleep(30)
+        return real_realpath(path)
+
+    monkeypatch.setattr(jm.os.path, "realpath", _wedged)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    with pytest.raises(jm.DestinationUnresolvableError):
+        await manager._reservation_keys(
+            [{"file_path": str(link / "game.iso")}], ConversionMode.CREATECD,
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_submit_route_answers_503_when_the_volume_cannot_answer(
+    tmp_path, monkeypatch,
+) -> None:
+    """Transient and on the storage's side, so neither a 400 nor a 500.
+
+    Nothing was queued and nothing is wrong with the request: the volume did
+    not answer inside the probe bound, so the collision check could not be
+    made. 503 tells the caller to come back.
+    """
+    from services import job_manager as jm
+
+    async def _unresolvable(*_a, **_k):
+        raise jm.DestinationUnresolvableError("volume not answering")
+
+    monkeypatch.setattr(
+        convert_routes.job_manager, "create_jobs_atomic", _unresolvable,
+    )
+    monkeypatch.setattr(
+        convert_routes.job_manager, "create_batch_jobs", _unresolvable,
+    )
+    monkeypatch.setattr(convert_routes.settings, "chd_volumes", str(tmp_path))
+    source = tmp_path / "a.iso"
+    source.write_bytes(b"x" * 64)
+
+    with pytest.raises(HTTPException) as raised:
+        await convert_routes.create_batch_jobs(
+            BatchJobCreateRequest(file_paths=[str(source)], mode=ConversionMode.CREATECD),
+        )
+    assert raised.value.status_code == 503, raised.value.detail
+
+
+@pytest.mark.asyncio
+async def test_resolving_what_to_verify_cannot_hang_the_queue(monkeypatch) -> None:
+    """This probe sits ahead of every bound the verify itself carries.
+
+    Asking the tool what to check is a stat of the output plus a scan for
+    numbered split parts — on storage that has just taken a multi-gigabyte
+    write, and is therefore the likeliest thing in the process to have stopped
+    answering. It runs after the conversion and before `verify_timeout()`, with
+    the job holding its output lock and its source-directory lock, so blocking
+    here froze the queue outright at the default MAX_CONCURRENT_JOBS of 1 —
+    and the watchdog saw nothing, because `_verifying` is not populated yet.
+    """
+    from services import job_manager as jm
+
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 0.05)
+
+    def _wedged(_output_path: str, _mode: str) -> str:
+        import time
+        time.sleep(30)
+        return _output_path
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    tool = SimpleNamespace(verify_target=_wedged)
+    job = SimpleNamespace(output_path="/vol/game.iso", mode=ConversionMode.CREATECD)
+
+    with pytest.raises(RuntimeError) as raised:
+        await manager._verify_target_bounded(tool, job, None)
+    assert "stopped responding" in str(raised.value), raised.value
+
+
+@pytest.mark.asyncio
+async def test_cancelling_during_that_probe_returns_now(monkeypatch) -> None:
+    """Cancel must not wait out the probe bound on a mount that is not answering.
+
+    And it is a cancellation, not a verdict: nothing was judged, so the source
+    must not be deleted on it — the same translation the verify itself makes.
+    """
+    from services import job_manager as jm
+
+    monkeypatch.setattr(jm, "_CANONICAL_PROBE_SECONDS", 30)
+
+    def _wedged(_output_path: str, _mode: str) -> str:
+        import time
+        time.sleep(30)
+        return _output_path
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    tool = SimpleNamespace(verify_target=_wedged)
+    job = SimpleNamespace(output_path="/vol/game.iso", mode=ConversionMode.CREATECD)
+
+    cancel = asyncio.Event()
+    cancel.set()
+    with pytest.raises(jm.ConversionCancelled):
+        await asyncio.wait_for(
+            manager._verify_target_bounded(tool, job, cancel), timeout=10,
+        )

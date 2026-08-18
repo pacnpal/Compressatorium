@@ -59,7 +59,16 @@ const CSO_SOURCE_EXTS = [...CSO_COMPRESS_EXTS, ...CSO_VERIFY_EXTS];
 // Handheld ROM packer (7z). Compress takes a loose GB/GBC/GBA/NDS ROM;
 // extract takes one of the .7z/.zip archives it writes. Both directions are
 // "sources" by mode. Output names preserve the ROM extension (Game.gba.7z).
-const ROMZ_COMPRESS_EXTS = ['.gb', '.gbc', '.gba', '.nds'];
+// Mirrors ROMZ_COMPRESS_EXTENSIONS in app/services/romz.py — one entry per
+// platform RomzTool claims, checked by tests/test_frontend_parity_186.py.
+// `.bin` is deliberately absent: chdman's disc modes own it.
+const ROMZ_COMPRESS_EXTS = [
+  '.gb', '.gbc', '.gba', '.nds',
+  '.nes', '.sfc', '.smc', '.z64', '.n64', '.v64',
+  '.sms', '.md', '.gen', '.smd', '.gg',
+  '.vb', '.ws', '.wsc', '.ngp', '.ngc', '.lnx',
+  '.d64', '.t64', '.prg', '.a26', '.a78',
+];
 const ROMZ_VERIFY_EXTS = ['.7z', '.zip'];
 const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 
@@ -176,6 +185,11 @@ export const TOOLS = [
       { value: 'avhu',  label: 'avhu',  hint: 'Audio/video Huffman' },
     ],
     compressionStyle: 'multi',  // multi-codec list joined with commas
+    // chdman's `-c` takes at most four codecs. Declared on the tool, not in
+    // whichever picker happens to be on screen: the manual panel and the RomM
+    // automation editor both build codec selections, and a cap only one of
+    // them knows about is a rule the other quietly breaks.
+    maxCodecs: 4,
     modes: [
       { mode: 'createraw', kind: 'create',  label: 'Create Raw', group: 'create',
         outputExt: '.chd', inputExtensions: CHDMAN_SOURCE_EXTS,
@@ -513,7 +527,10 @@ export const TOOLS = [
       { mode: 'folder_to_iso', kind: 'create', label: 'PS3 Folder → ISO', group: 'makeps3iso',
         outputExt: '.iso', inputExtensions: [], inputKinds: ['directory'],
         supportsCompression: false, supportsCompressionLevel: false,
-        supportsDeleteOnVerify: false, allowsArchiveInput: false,
+        // Verifiable but never deletable: the build is checked by reading
+        // PARAM.SFO back out of the ISO, while removing a curated game folder
+        // on the strength of that is not something to offer.
+        supportsDeleteOnVerify: false, supportsVerify: true, allowsArchiveInput: false,
         // makeps3iso -s: split the output into ~4 GB parts for FAT32 targets.
         supportsSplit: true },
     ],
@@ -698,6 +715,9 @@ export const registry = {
 
   /** The owning tool for a wire-mode value. */
   toolForMode: (mode) => byMode.get(mode)?.tool,
+
+  /** How many codecs this mode's tool accepts at once (Infinity if unbounded). */
+  maxCodecsFor: (mode) => byMode.get(mode)?.tool?.maxCodecs ?? Infinity,
 
   /** Pick the tool whose verify_extensions match a given file path, or null.
    *  Pure extension match — use `verifyToolForPath` when an entry's backend

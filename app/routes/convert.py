@@ -22,9 +22,22 @@ from models import (
     JobStatus,
 )
 from services.archive import archive_service
-from services.job_manager import QueueBackpressureError, job_manager
+from services.job_manager import (
+    DestinationUnresolvableError,
+    OutputClaimedError,
+    QueueBackpressureError,
+    job_manager,
+)
 from services.romz import romz_service
-from services.lock_manager import lock_manager
+from services.output_conflicts import (
+    OutputPathExhausted,
+    OutputPathLocked,
+    check_output_conflicts,
+    input_priority,
+)
+from services.output_conflicts import (
+    get_unique_output_path as _get_unique_output_path,
+)
 from services.tools import InputKind, ModeKind, registry
 from sse_starlette.sse import EventSourceResponse
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -202,76 +215,25 @@ def get_disallowed_archive_paths(file_paths: list[str]) -> set[str]:
     }
 
 
-def _reject_rename_in_locked_dir(base_path: str) -> None:
-    """Bail out of unique-name probing when ``base_path`` is inside a locked
-    directory subtree (a ``folder_to_iso`` job packing a PS3 folder).
-
-    Every numbered sibling these helpers would probe shares ``base_path``'s
-    parent, so all of them fall inside the same held subtree and
-    ``check_file_status`` reports each as locked — the ``while`` loops would spin
-    with no sleep until the dir lock releases, burning a thread, then return an
-    arbitrarily numbered name. A rename whose every candidate is inside a held
-    subtree can never succeed, so reject it up front exactly like skip/overwrite
-    do (``SkipFile(OUTPUT_LOCKED)``) and let the job pipeline defer/requeue it.
-
-    Only a *directory* subtree lock triggers this; an ordinary single-file lock
-    on ``base_path`` leaves its numbered siblings free, so that case still probes
-    normally.
-    """
-    if lock_manager.is_within_locked_dir(base_path):
-        raise SkipFile(SkipReason.OUTPUT_LOCKED)
-
-
-def check_output_conflicts(mode: str, output_path: str) -> tuple:
-    """``(exists, locked)`` for an output path *and all of its companion outputs*.
-
-    Companions (extractcd's ``.bin`` data-track sidecar, a split ``folder_to_iso``
-    build's numbered ``.iso.0``/``.1``/… parts) are enumerated from the owning
-    tool's ``companion_outputs`` hook rather than re-derived here, so every
-    duplicate/lock preflight agrees on the full set of files a mode occupies.
-    Touches the disk (a directory mode's companion lookup scans), so call it off
-    the event loop for ``folder_to_iso``.
-    """
-    file_exists, is_locked = lock_manager.check_file_status(output_path)
-    exists = file_exists or is_locked
-    locked = is_locked
-    for companion in registry.for_mode(mode).companion_outputs(output_path, mode):
-        c_exists, c_locked = lock_manager.check_file_status(companion)
-        exists = exists or c_exists or c_locked
-        locked = locked or c_locked
-    return exists, locked
-
-
 def get_unique_output_path(base_path: str, mode: str | None = None) -> str:
-    """Unique output path, appending ``_N`` until the file — and, when ``mode``
-    is supplied, that mode's companion outputs — are all free.
+    """API-layer wrapper over the shared unique-output-path probe.
 
-    ``mode=None`` checks the bare path only (the plain single-file case). A mode
-    routes the probe through :func:`check_output_conflicts`, so a sibling output
-    (extractcd's ``.bin``, a split ``folder_to_iso``'s numbered parts) can't be
-    silently clobbered by a rename. This subsumes the former per-mode
-    ``get_unique_*`` helpers — one companion-aware probe for every mode.
+    The probe itself lives in ``services.output_conflicts`` so the RomM
+    automation sweep resolves duplicates exactly the way ``/api/jobs`` does.
+    Only the failure *shape* is a route concern: a rename into a locked
+    directory subtree becomes ``SkipFile(OUTPUT_LOCKED)`` here, so the job
+    pipeline defers and requeues it like any other locked output.
+
+    Why the service refuses rather than probing on: every numbered sibling it
+    would try shares ``base_path``'s parent and so falls inside the same held
+    subtree, which would spin the loop with no sleep until the dir lock
+    released. Only a *directory* lock triggers this; an ordinary single-file
+    lock leaves the numbered siblings free and still probes normally.
     """
-    def _taken(candidate: str) -> bool:
-        if mode is None:
-            file_exists, is_locked = lock_manager.check_file_status(candidate)
-            return file_exists or is_locked
-        exists, _locked = check_output_conflicts(mode, candidate)
-        return exists
-
-    if not _taken(base_path):
-        return base_path
-
-    _reject_rename_in_locked_dir(base_path)
-
-    path = Path(base_path)
-    stem, suffix, parent = path.stem, path.suffix, path.parent
-    counter = 1
-    while True:
-        candidate = str(parent / f"{stem}_{counter}{suffix}")
-        if not _taken(candidate):
-            return candidate
-        counter += 1
+    try:
+        return _get_unique_output_path(base_path, mode)
+    except (OutputPathLocked, OutputPathExhausted):
+        raise SkipFile(SkipReason.OUTPUT_LOCKED) from None
 
 
 def _input_extension(path: str) -> str:
@@ -291,16 +253,6 @@ def _declares_input(path: str, spec) -> bool:
     """
     name = path.split("::", 1)[1] if "::" in path else path
     return match_extension(name, spec.input_extensions) is not None
-
-
-def _priority(ext: str) -> int:
-    if ext in {".cue", ".gdi"}:
-        return 4
-    if ext == ".iso":
-        return 3
-    if ext == ".bin":
-        return 1
-    return 0
 
 
 @dataclass
@@ -804,7 +756,7 @@ async def plan_job(
         allow_overwrite=allow_overwrite,
         display_filename=display_filename,
         delete_snapshot=delete_snapshot,
-        priority=_priority(_input_extension(file_path)),
+        priority=input_priority(file_path),
     )
 
 
@@ -988,6 +940,19 @@ async def create_job(request: JobCreateRequest):
             split=request.split,
             delete_snapshot=plan.delete_snapshot,
         )
+    except OutputClaimedError as exc:
+        # A concurrency outcome, not a malformed request: another live job took
+        # this destination between planning and queueing. 409 so the caller can
+        # retry or skip; a 500 said "server broke" for something working
+        # exactly as designed.
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except DestinationUnresolvableError as exc:
+        # Transient and on the storage's side, not the caller's: the volume
+        # holding the destination did not answer inside the probe bound, so the
+        # collision check could not be made and nothing was queued. 503 says
+        # "come back", which is the truth -- a 500 would read as a bug and a
+        # 400 as a bad request.
+        raise HTTPException(status_code=503, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 
@@ -1119,6 +1084,19 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
             delete_on_verify=request.delete_on_verify,
             split=request.split,
         )
+    except OutputClaimedError as exc:
+        # A concurrency outcome, not a malformed request: another live job took
+        # this destination between planning and queueing. 409 so the caller can
+        # retry or skip; a 500 said "server broke" for something working
+        # exactly as designed.
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except DestinationUnresolvableError as exc:
+        # Transient and on the storage's side, not the caller's: the volume
+        # holding the destination did not answer inside the probe bound, so the
+        # collision check could not be made and nothing was queued. 503 says
+        # "come back", which is the truth -- a 500 would read as a bug and a
+        # 400 as a bad request.
+        raise HTTPException(status_code=503, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 

@@ -18,6 +18,18 @@ async def compute_file_sha1(file_path: str) -> str:
     return await run_in_threadpool(_sha1_sync, file_path)
 
 
+def compute_file_sha1_sync(file_path: str) -> str:
+    """Blocking SHA-1 for callers that bring their own offload strategy.
+
+    ``compute_file_sha1`` hands the work to the shared threadpool, which is the
+    wrong home for a whole-file read of a path on storage that may stop
+    answering (AGENTS.md: such a read must never occupy a pooled worker). A
+    caller that runs this through ``run_detached`` gets the same digest on a
+    throwaway thread instead.
+    """
+    return _sha1_sync(file_path)
+
+
 def _sha1_sync(file_path: str) -> str:
     """Synchronous SHA1 computation."""
     h = hashlib.sha1(usedforsecurity=False)  # nosec # nosemgrep: insecure-hash-algorithm-sha1  # pylint: disable=unexpected-keyword-arg

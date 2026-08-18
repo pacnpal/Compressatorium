@@ -5,6 +5,7 @@
   import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
   import Boxes from '@lucide/svelte/icons/boxes';
   import Database from '@lucide/svelte/icons/database';
+  import Library from '@lucide/svelte/icons/library';
   import HelpCircle from '@lucide/svelte/icons/circle-help';
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
@@ -33,6 +34,9 @@
     </SidebarItem>
     <SidebarItem label="Dashboard" {collapsed} active={view === 'dashboard'} onclick={() => go('dashboard')}>
       {#snippet icon()}<LayoutDashboard size={16} />{/snippet}
+    </SidebarItem>
+    <SidebarItem label="RomM" {collapsed} active={view === 'romm'} onclick={() => go('romm')}>
+      {#snippet icon()}<Library size={16} />{/snippet}
     </SidebarItem>
     <SidebarItem label="DAT Library" {collapsed} active={view === 'dat'} onclick={() => go('dat')}>
       {#snippet icon()}<Database size={16} />{/snippet}

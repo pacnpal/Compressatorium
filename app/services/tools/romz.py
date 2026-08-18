@@ -30,6 +30,22 @@ _PRIMARY_OUTPUT_EXT = ".7z"
 
 class RomzTool(BaseTool):
     id = "romz"
+    # Cartridge/handheld ROMs, where plain .zip/.7z is the archival norm.
+    # RomM's canonical slugs first (`gamegear`, `virtualboy`, `neo-geo-pocket`,
+    # …). The shorter aliases stay: matching is exact, and a slug no tool claims
+    # simply falls back to extension-only narrowing, so an extra name costs
+    # nothing while a missing canonical one is the actual bug.
+    platform_slugs = frozenset({
+        "gb", "gbc", "gba", "nds", "nes", "snes", "n64",
+        "sms", "sega-master-system",
+        "genesis", "segamd", "genesis-slash-megadrive",
+        "gamegear", "gg", "game-gear",
+        "virtualboy", "vb",
+        "wonderswan",
+        "neo-geo-pocket", "ngp",
+        "lynx", "c64", "atari2600", "atari7800",
+    })
+    default_compression = "max"
     policy_owner = "romz"
     display_name = "Handheld ROM"
     modes = (

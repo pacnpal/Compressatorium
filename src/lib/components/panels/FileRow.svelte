@@ -110,7 +110,15 @@
       title={entry?.path}
     >
       <Icon size={16} class="ftype" />
-      <span class="name-text">{entry?.name}</span>
+      <!-- A library manager's curated title when there is one (the RomM
+           catalog), with the real filename beneath it. `name` stays the
+           filename everywhere else, because rename/delete/convert act on it. -->
+      <span class="name-stack">
+        <span class="name-text">{entry?.display_name || entry?.name}</span>
+        {#if entry?.display_name}
+          <span class="file-name" title={entry.name}>{entry.name}</span>
+        {/if}
+      </span>
       {#if isArchive}
         {@const summary = archiveItemSummary(entry)}
         {#if summary}<span class="archive-summary">{summary}</span>{/if}
@@ -190,11 +198,26 @@
   }
   .dir .name-button :global(.ftype) { color: var(--accent); }
   .archive .name-button :global(.ftype) { color: var(--badge-archive); }
+  /* The row is a flex ROW, so title and filename were siblings side by side.
+     Stacking them needs their own column box. */
+  .name-stack {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .file-name {
+    color: var(--text-2);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
   .name-text {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
   }
   .archive-summary {
     color: var(--text-3);

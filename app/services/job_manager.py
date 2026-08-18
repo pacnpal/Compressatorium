@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 from logging_setup import get_logger
 import os
@@ -11,7 +12,18 @@ import uuid
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import (
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -22,6 +34,7 @@ from services.chdman import ConversionCancelled, chdman_service
 from services.disc_id import DiscIdStorageAbandoned
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
+from services.subprocess_runner import ReadCancelled, run_detached
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -62,11 +75,171 @@ def _is_active_conversion(job) -> bool:
     )
 
 
-def _paths_collide(path_a: str, path_b: str) -> bool:
+def _lexical_path(path: str) -> str:
+    """*path* as a comparable key without touching the filesystem.
+
+    The answer when the volume will not say: absolute and normalised, so two
+    spellings of the same path still collide, but symlink aliases do not.
+    """
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _canonical_path(path: str, resolved: Optional[Mapping[str, str]] = None) -> str:
+    """*path* as one comparable key: symlinks resolved, or the path as given.
+
+    Split out from :func:`_paths_collide` so a caller comparing one path
+    against many resolves each of them once instead of per comparison --
+    `realpath` is a blocking stat chain.
+
+    Pass *resolved* (from :func:`_resolve_paths_bounded`) and this never touches
+    the filesystem at all: it reads the pre-computed key, falling back to the
+    lexical one for a path the pre-flight did not see. That is the form the
+    reservation uses, because its work happens on the event loop under
+    ``_create_lock`` -- one `realpath` into a dead NFS/SMB mount there is
+    uninterruptible, and it freezes every unrelated request in the process
+    along with all job creation.
+    """
+    if resolved is not None:
+        return resolved.get(path) or _lexical_path(path)
     try:
-        return os.path.realpath(path_a) == os.path.realpath(path_b)
+        return os.path.realpath(path)
     except OSError:
-        return False
+        return path
+
+
+def _paths_collide(
+    path_a: str, path_b: str, resolved: Optional[Mapping[str, str]] = None,
+) -> bool:
+    return _canonical_path(path_a, resolved) == _canonical_path(path_b, resolved)
+
+
+# How long the whole pre-flight canonicalisation may take before the batch
+# proceeds on lexical keys. Generous, because it covers every path in one
+# submit and a healthy mount answers in microseconds; the point is only that a
+# mount which never answers cannot hold up job creation forever.
+_CANONICAL_PROBE_SECONDS = 20.0
+
+
+class _Reservation(NamedTuple):
+    """What the locked destination check needs, all of it computed off-loop.
+
+    ``resolved`` maps each path to its canonical key; ``keys`` maps each
+    destination to every key a job writing it claims -- itself plus the
+    sidecars its mode writes beside it. Both are frozen before the lock is
+    taken, so the check does no filesystem work at all: `companion_outputs` is
+    *not* pure path math for every tool (makeps3iso probes the disk for its
+    numbered split parts), so enumerating it inline would block the event loop
+    on exactly the mount the bound exists to survive.
+    """
+
+    resolved: Dict[str, str]
+    keys: Dict[str, Tuple[str, ...]]
+
+
+async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
+    """``{path: canonical key}`` for *paths*, resolved off the event loop.
+
+    Every key is present before the resolution starts, seeded lexically, and
+    upgraded in place as each `realpath` returns -- so a bound that expires
+    part-way keeps the paths that did answer instead of discarding the lot.
+
+    Detached rather than pooled for the usual reason: a `realpath` on an
+    unresponsive mount cannot be cancelled, only abandoned, and abandoning a
+    shared pool worker per submit would eventually starve every unrelated
+    offload. The thread here is disposable.
+    """
+    pending = list(dict.fromkeys(paths))
+    resolved: Dict[str, str] = {path: _lexical_path(path) for path in pending}
+    if not pending:
+        return resolved
+
+    # The worker fills its own dict, and the caller only ever sees it once the
+    # worker is done. A timed-out `run_detached` abandons the *awaiter*, not
+    # the thread: it keeps running, and if it were writing into the map the
+    # reservation is using, one destination could compare lexically against an
+    # earlier spec and canonically against a later one -- so a symlink alias
+    # would slip through a check that is otherwise atomic under the lock.
+    produced: Dict[str, str] = {}
+
+    def _resolve_all() -> None:
+        for path in pending:
+            try:
+                produced[path] = os.path.realpath(path)
+            except OSError:
+                pass  # leave the lexical seed in place
+
+    try:
+        await asyncio.wait_for(
+            run_detached(_resolve_all), _CANONICAL_PROBE_SECONDS,
+        )
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "Canonicalising %d destination(s) did not finish in %.1fs; "
+            "refusing the reservation (a volume is not answering)",
+            len(pending),
+            _CANONICAL_PROBE_SECONDS,
+        )
+        # Refused, not degraded. Falling back to the lexical seeds hands two
+        # spellings of one file two different keys, so the check that exists to
+        # reject the second submission passes both -- see
+        # `DestinationUnresolvableError`. Nor is the partial result merged: the
+        # map must be frozen before it is used, and a half-applied one compares
+        # one destination lexically against an earlier spec and canonically
+        # against a later one.
+        raise DestinationUnresolvableError(
+            "The storage holding the destination stopped responding, so the "
+            "output paths could not be checked for collisions. Nothing was "
+            "queued; try again once the volume is back."
+        ) from None
+    resolved.update(produced)
+    return resolved
+
+
+# The statuses a job never leaves. Anything else is still in flight.
+_TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+
+class DestinationUnresolvableError(RuntimeError):
+    """Raised when a destination's canonical identity could not be established.
+
+    The reservation check is only atomic because every destination is reduced
+    to one key first. `realpath` is what makes two spellings of one file --
+    a symlinked library root and the path underneath it -- compare equal; the
+    lexical seed cannot, because it is the spelling.
+
+    Degrading to that seed when the bound expires looked conservative and is
+    the opposite. Two submissions naming one file through a link and through
+    its real path get *different* lexical keys, so both pass a check whose
+    whole purpose is to reject the second. When the mount recovers they write
+    the same file -- concurrently once MAX_CONCURRENT_JOBS is above one,
+    otherwise one over the other -- and with delete-on-verify both sources are
+    removed for the single artifact that survives.
+
+    So the reservation refuses instead. A volume that cannot answer a
+    `realpath` inside the bound is a volume the conversion was going to fail
+    on anyway; being told so at submit time is strictly better than finding out
+    afterwards, with one of the two inputs already gone.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+class OutputClaimedError(ValueError):
+    """Raised when a destination another live job holds is requested again.
+
+    A ``ValueError`` subclass so the callers that already treat a rejected
+    spec as a bad request keep working, but its own type because this is a
+    *concurrency* outcome rather than a malformed request: two submissions
+    resolved the same destination, and the loser should be told to retry or
+    skip (409) rather than shown a 500.
+    """
+
+    def __init__(self, detail: str, *, claimed_by: str | None = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.claimed_by = claimed_by
 
 
 class QueueBackpressureError(RuntimeError):
@@ -100,6 +273,10 @@ class JobManager:
     def __init__(self, max_concurrent: int = 1, max_job_history: int = 500):
         self.jobs: OrderedDict[str, ConversionJob] = OrderedDict()
         self._archived_jobs: OrderedDict[str, Tuple[ConversionJob, float]] = OrderedDict()
+        # Called once per job that reaches a terminal status; see
+        # `add_terminal_listener` for why anything caring about *how* a job
+        # ended has to be told rather than ask later.
+        self._terminal_listeners: List[Callable[[ConversionJob], object]] = []
         self.max_concurrent = max(1, max_concurrent)
         self.max_job_history = max(0, max_job_history)
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
@@ -114,6 +291,16 @@ class JobManager:
         # it runs (a cancel notification or history prune silently dropped).
         self._background_tasks: Set[asyncio.Task] = set()
         self._delete_plans: Dict[str, Dict[str, object]] = {}
+        # job id -> the canonical key its output was reserved under. Recorded
+        # at queue time because the reservation's pre-flight map is built
+        # *before* `_create_lock` is taken (see `_reservation_keys`): two
+        # submissions can both pre-resolve, and the second's map cannot contain
+        # a job the first queues in between. Without the key kept here the
+        # second would fall back to the first job's lexical path, and two
+        # spellings of one file -- a symlinked directory and its target --
+        # would each be accepted. Dropped when the job leaves the queue; only
+        # live jobs are ever consulted.
+        self._output_keys: Dict[str, Tuple[str, ...]] = {}
         # Jobs currently inside the verify phase, mapped to the monotonic clock
         # reading when that phase began. Verification emits no progress and can
         # legitimately run for many minutes, so the stalled-job warning reports
@@ -204,36 +391,20 @@ class JobManager:
         filename_override: Optional[str] = None,
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
+        verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
+        reservation: Optional[_Reservation] = None,
     ) -> ConversionJob:
         """Queue a job while holding _create_lock (no backpressure check here)."""
         job_id = str(uuid.uuid4())[:8]
         filename = filename_override or os.path.basename(file_path)
 
-        # Determine output path - use explicit path if provided, otherwise calculate
-        if output_path is None:
-            output_path = registry.for_mode(mode.value).output_path(
-                mode.value, file_path, output_dir,
-            )
-            # The HTTP routes validate inputs before passing an explicit
-            # output_path; direct service callers reach this fallback. Most
-            # tools' output_path() raises for an unsupported extension, but
-            # z3ds's does not, so keep its input-extension gate -- now read from
-            # the mode's declared input_extensions instead of the per-direction
-            # Z3DS_*_FORMATS constants.
-            spec = registry.spec(mode.value)
-            if spec.tool_id == "z3ds":
-                ext = Path(file_path).suffix.lower()
-                if ext not in spec.input_extensions:
-                    raise ValueError(f"Unsupported file extension: {ext}")
-            # Generic same-path guard: a non-copy mode must never write over its
-            # own source (chdman copy is an intentional in-place .chd recompress;
-            # every other mode changes the extension so output != input).
-            if spec.kind != ModeKind.COPY and _paths_collide(output_path, file_path):
-                raise ValueError(
-                    "Output path matches input; refusing to overwrite source"
-                )
+        output_path = self._resolve_output_locked(
+            file_path, mode, output_dir=output_dir, output_path=output_path,
+            resolved=reservation.resolved if reservation else None,
+        )
+
 
         # Carry the mode's input kind end-to-end so the pipeline skips the
         # archive-extract / file-only assumptions for a directory job and the
@@ -241,12 +412,7 @@ class JobManager:
         # registry spec (every conversion mode is registered; external jobs
         # bypass this path), so FILE/DIRECTORY can't drift via a typo.
         try:
-            mode_spec = registry.spec(mode.value)
-            input_kind = (
-                InputKind.DIRECTORY
-                if InputKind.DIRECTORY in mode_spec.input_kinds
-                else InputKind.FILE
-            )
+            input_kind = registry.mode_input_kind(mode.value)
         except KeyError:
             input_kind = InputKind.FILE
 
@@ -262,11 +428,16 @@ class JobManager:
             allow_overwrite=allow_overwrite,
             compression=compression,
             delete_on_verify=delete_on_verify,
+            verify_after=verify_after,
             split=split,
             input_kind=input_kind,
         )
 
         self.jobs[job_id] = job
+        # Every key this job claims -- its destination and the sidecars the
+        # mode writes beside it -- for the reservation that runs after this
+        # one. See `_output_keys`.
+        self._output_keys[job_id] = self._reserved_keys(output_path, reservation)
         if delete_on_verify and delete_snapshot:
             self._delete_plans[job_id] = delete_snapshot
         ticket = concurrency_manager.reserve_ticket(job_id)
@@ -297,12 +468,23 @@ class JobManager:
         filename_override: Optional[str] = None,
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
+        verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
     ) -> ConversionJob:
         """Create a new conversion job."""
+        specs: List[Dict[str, object]] = [{
+            "file_path": file_path,
+            "output_dir": output_dir,
+            "output_path": output_path,
+        }]
+        # Outside the lock, and off the event loop: see `_reservation_keys`.
+        reservation = await self._reservation_keys(specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(1)
+            # Same destination reservation the batch path gets: a single
+            # submit racing a sweep is the same collision with one fewer file.
+            self._reject_claimed_destinations_locked(specs, mode, reservation)
             job = self._queue_job_locked(
                 file_path=file_path,
                 mode=mode,
@@ -312,8 +494,10 @@ class JobManager:
                 filename_override=filename_override,
                 compression=compression,
                 delete_on_verify=delete_on_verify,
+                verify_after=verify_after,
                 split=split,
                 delete_snapshot=delete_snapshot,
+                reservation=reservation,
             )
         await self._prune_jobs()
         return job
@@ -325,14 +509,18 @@ class JobManager:
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
         split: bool = False,
+        verify_after: bool = False,
     ) -> List[ConversionJob]:
         """Create multiple jobs atomically under a single backpressure check."""
         if not job_specs:
             return []
 
         jobs: List[ConversionJob] = []
+        # Outside the lock, and off the event loop: see `_reservation_keys`.
+        reservation = await self._reservation_keys(job_specs, mode)
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(len(job_specs))
+            self._reject_claimed_destinations_locked(job_specs, mode, reservation)
             for spec in job_specs:
                 file_path = str(spec["file_path"])
                 output_dir = spec.get("output_dir")
@@ -352,8 +540,10 @@ class JobManager:
                         ),
                         compression=compression,
                         delete_on_verify=delete_on_verify,
+                        verify_after=verify_after,
                         split=split,
                         delete_snapshot=spec.get("delete_snapshot"),
+                        reservation=reservation,
                     )
                 )
         await self._prune_jobs()
@@ -368,28 +558,367 @@ class JobManager:
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
         delete_snapshots: Optional[Dict[str, Dict[str, object]]] = None,
+        split: bool = False,
+        verify_after: bool = False,
+        output_paths: Optional[Dict[str, str]] = None,
+        allow_overwrite: bool = False,
     ) -> List[ConversionJob]:
-        """Create multiple conversion jobs."""
+        """Create multiple conversion jobs.
+
+        ``output_paths`` overrides the derived destination per input, and
+        ``allow_overwrite`` authorises writing over an existing one. Both exist
+        so a caller that has already resolved duplicates (the RomM sweep's
+        rename/overwrite policy) hands the decision down instead of the queue
+        re-deriving a different answer.
+        """
         job_specs: List[Dict[str, object]] = []
         for fp in file_paths:
             snapshot = delete_snapshots.get(fp) if delete_snapshots else None
-            job_specs.append(
-                {
-                    "file_path": fp,
-                    "output_dir": output_dir,
-                    "delete_snapshot": snapshot,
-                }
-            )
+            spec: Dict[str, object] = {
+                "file_path": fp,
+                "output_dir": output_dir,
+                "delete_snapshot": snapshot,
+                "allow_overwrite": allow_overwrite,
+            }
+            override = output_paths.get(fp) if output_paths else None
+            if override:
+                spec["output_path"] = override
+            job_specs.append(spec)
         return await self.create_jobs_atomic(
             job_specs,
             mode,
             compression=compression,
             delete_on_verify=delete_on_verify,
+            split=split,
+            verify_after=verify_after,
         )
+
+    @staticmethod
+    def _companions(mode: ConversionMode, output_path: str) -> List[str]:
+        """The sibling files this mode writes beside *output_path*.
+
+        Pure path math (`companion_outputs` is documented as such), which is
+        what lets the reservation claim them: extractcd writes `Game.cue` *and*
+        `Game.bin`, and `romz_extract` can restore that same `Game.bin` as its
+        primary. Reserving primaries alone accepted both jobs, and the conflict
+        probe each caller runs beforehand cannot catch it -- that runs outside
+        `_create_lock`, so two submissions both pass it before either queues.
+        """
+        try:
+            tool = registry.for_mode(mode.value)
+            return list(tool.companion_outputs(output_path, mode.value))
+        except (KeyError, ValueError, OSError):
+            return []
+
+    @staticmethod
+    def _reserved_keys(
+        output_path: str, reservation: Optional[_Reservation] = None,
+    ) -> Tuple[str, ...]:
+        """Every canonical key a job writing *output_path* claims.
+
+        Read from the pre-flight, never recomputed: enumerating companions can
+        touch the disk (see :meth:`_reservation_keys`), and this runs under
+        ``_create_lock``. Without a pre-flight entry the answer is the primary
+        alone -- the honest one, since the sidecars cannot be known here
+        without the I/O this exists to avoid.
+        """
+        if reservation is not None:
+            found = reservation.keys.get(output_path)
+            if found is not None:
+                return found
+            return (_canonical_path(output_path, reservation.resolved),)
+        return (_canonical_path(output_path),)
+
+    @staticmethod
+    def _derive_output(
+        file_path: str, mode: ConversionMode, output_dir: Optional[str],
+    ) -> str:
+        """Where *mode* would write *file_path*, as pure derivation.
+
+        Every tool's ``output_path()`` is string work over the stem and the
+        mode's suffix -- no stat, no listing. That is what lets the reservation
+        canonicalise its destinations *before* taking ``_create_lock``: the
+        paths are known without touching the filesystem, so only the
+        (bounded, off-loop) `realpath` needs the volume to answer.
+        """
+        return registry.for_mode(mode.value).output_path(
+            mode.value, file_path, output_dir,
+        )
+
+    async def _reservation_keys(
+        self, job_specs: List[Dict[str, object]], mode: ConversionMode,
+    ) -> _Reservation:
+        """Pre-resolve every path the destination reservation will compare.
+
+        Runs before ``_create_lock`` is taken, so the critical section itself
+        does no filesystem work: see :func:`_canonical_path`. Covers each
+        spec's source and derived destination plus every live job's output,
+        because the reservation compares the first set against the second --
+        and each destination's *companions*, because a mode that writes
+        `Game.cue` also writes `Game.bin`, which another mode can claim as its
+        primary.
+
+        The companion lookup happens **here**, inside the bounded detached
+        work, not under the lock: it is not pure path math for every tool --
+        makeps3iso probes the disk for its numbered split parts -- so calling
+        it inline would block the event loop on precisely the unresponsive
+        mount this bound exists to survive.
+
+        A spec whose destination cannot be derived (unknown mode, unsupported
+        extension) is skipped rather than raised on -- the locked pass runs the
+        same derivation and produces the caller-facing error there, once.
+        """
+        # (destination, mode) pairs whose sidecars have to be enumerated.
+        wanted: List[Tuple[str, ConversionMode]] = []
+        paths: List[str] = []
+        for spec in job_specs:
+            file_path = str(spec["file_path"])
+            paths.append(file_path)
+            explicit = spec.get("output_path")
+            if explicit is not None:
+                destination = str(explicit)
+            else:
+                output_dir = spec.get("output_dir")
+                try:
+                    destination = self._derive_output(
+                        file_path,
+                        mode,
+                        str(output_dir) if output_dir is not None else None,
+                    )
+                except (KeyError, ValueError):
+                    continue
+            paths.append(destination)
+            wanted.append((destination, mode))
+        for job in self.jobs.values():
+            if not job.output_path:
+                continue
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            paths.append(job.output_path)
+            wanted.append((job.output_path, job.mode))
+
+        companions: Dict[str, List[str]] = {}
+
+        def _enumerate() -> None:
+            for destination, job_mode in wanted:
+                if destination in companions:
+                    continue
+                companions[destination] = self._companions(job_mode, destination)
+
+        try:
+            await asyncio.wait_for(
+                run_detached(_enumerate), _CANONICAL_PROBE_SECONDS,
+            )
+        except (asyncio.TimeoutError, OSError):
+            logger.warning(
+                "Enumerating companion outputs did not finish in %.1fs; "
+                "refusing the reservation (a volume is not answering)",
+                _CANONICAL_PROBE_SECONDS,
+            )
+            # Same reasoning as the canonicalisation below: reserving the
+            # primaries only leaves the sidecars unclaimed, so a second
+            # submission whose *primary* differs but whose companions land on
+            # these passes a check meant to stop it. A cue sheet or a numbered
+            # split part written by two jobs is the same lost data as the image
+            # itself.
+            raise DestinationUnresolvableError(
+                "The storage holding the destination stopped responding, so "
+                "the files each job would write could not be listed. Nothing "
+                "was queued; try again once the volume is back."
+            ) from None
+        # Snapshot, for the reason `_resolve_paths_bounded` explains: the
+        # abandoned worker keeps writing into its own dict.
+        found = dict(companions)
+        for extra in found.values():
+            paths.extend(extra)
+
+        resolved = await _resolve_paths_bounded(paths)
+        keys = {
+            destination: tuple(dict.fromkeys(
+                [_canonical_path(destination, resolved)]
+                + [_canonical_path(path, resolved) for path in extra]
+            ))
+            for destination, extra in found.items()
+        }
+        return _Reservation(resolved=resolved, keys=keys)
+
+    def _resolve_output_locked(
+        self,
+        file_path: str,
+        mode: ConversionMode,
+        *,
+        output_dir: Optional[str] = None,
+        output_path: Optional[str] = None,
+        resolved: Optional[Mapping[str, str]] = None,
+    ) -> str:
+        """The destination this job will write, with the pre-creation guards.
+
+        Split out so a batch can be validated in full before a single job is
+        created: raising partway through the creation loop left the earlier
+        jobs registered and running while the caller was told the whole batch
+        had failed -- and the RomM submit path then retired the re-pin rows for
+        conversions that were, in fact, under way.
+        """
+        if output_path is not None:
+            return output_path
+        output_path = self._derive_output(file_path, mode, output_dir)
+        # The HTTP routes validate inputs before passing an explicit
+        # output_path; direct service callers reach this fallback. Most
+        # tools' output_path() raises for an unsupported extension, but
+        # z3ds's does not, so keep its input-extension gate -- now read from
+        # the mode's declared input_extensions instead of the per-direction
+        # Z3DS_*_FORMATS constants.
+        spec = registry.spec(mode.value)
+        if spec.tool_id == "z3ds":
+            ext = Path(file_path).suffix.lower()
+            if ext not in spec.input_extensions:
+                raise ValueError(f"Unsupported file extension: {ext}")
+        # Generic same-path guard: a non-copy mode must never write over its
+        # own source (chdman copy is an intentional in-place .chd recompress;
+        # every other mode changes the extension so output != input).
+        if spec.kind != ModeKind.COPY and _paths_collide(
+            output_path, file_path, resolved,
+        ):
+            raise ValueError(
+                "Output path matches input; refusing to overwrite source"
+            )
+        return output_path
+
+    def _reject_claimed_destinations_locked(
+        self,
+        job_specs: List[Dict[str, object]],
+        mode: ConversionMode,
+        reservation: Optional[_Reservation] = None,
+    ) -> None:
+        """Refuse the batch if any destination is already spoken for.
+
+        No two live jobs may write the same file. Callers resolve duplicates
+        before submitting, but that resolution is a prediction made outside
+        this lock: a manual submit and an automation sweep can each settle on
+        the same destination before either job starts and takes it, and the
+        second then overwrites the first's result -- with delete-on-verify,
+        removing both sources for one surviving output.
+
+        Every destination is checked before any job is created, so the batch
+        stays all-or-nothing. Intra-batch collisions count too: two specs of
+        one submit resolving to the same path is the same bug arriving twice
+        at once.
+        """
+        # Canonicalise once per path and compare keys. The pairwise version of
+        # this re-resolved every earlier destination for every new one, and the
+        # live-job lookup re-resolved every live job's output per spec --
+        # quadratic in the batch size, in blocking `realpath` calls, on the
+        # event loop while `_create_lock` is held. A Select-All submit of a few
+        # thousand files made that millions of stat chains against exactly the
+        # remote mounts this integration exists for.
+        #
+        # The keys themselves come pre-resolved from `_reservation_keys`, run
+        # off the loop before the lock: even one `realpath` here is a stat
+        # chain into the same remote mount, and one that never returns takes
+        # the whole process with it.
+        active = self._active_output_map(reservation)
+        planned: Dict[str, str] = {}   # canonical destination -> source
+        for spec in job_specs:
+            file_path = str(spec["file_path"])
+            output_dir = spec.get("output_dir")
+            explicit = spec.get("output_path")
+            destination = self._resolve_output_locked(
+                file_path,
+                mode,
+                output_dir=str(output_dir) if output_dir is not None else None,
+                output_path=str(explicit) if explicit is not None else None,
+                resolved=reservation.resolved if reservation else None,
+            )
+            # Destination *and* sidecars: a mode that writes `Game.cue` also
+            # writes `Game.bin`, which another mode can claim as its primary.
+            for key in self._reserved_keys(destination, reservation):
+                claimed_by = active.get(key)
+                if claimed_by is not None:
+                    raise OutputClaimedError(
+                        f"Another queued job ({claimed_by}) is already writing "
+                        f"{os.path.basename(destination)}",
+                        claimed_by=claimed_by,
+                    )
+                other = planned.get(key)
+                if other is not None:
+                    raise OutputClaimedError(
+                        "Two files in this batch would write the same output: "
+                        f"{os.path.basename(other)} and "
+                        f"{os.path.basename(file_path)}",
+                    )
+                planned[key] = file_path
+
+    def _active_output_map(
+        self, reservation: Optional[_Reservation] = None,
+    ) -> Dict[str, str]:
+        """``{canonical output path: job id}`` for every live job.
+
+        Built once per batch rather than re-derived per spec: each entry costs
+        a `realpath`, which is a blocking stat chain, and this runs under
+        ``_create_lock`` on the event loop -- so the keys come from the
+        pre-flight in *resolved*. Includes each job's companion outputs:
+        `extractcd` writes a `.bin` beside its `.cue`, and another mode can
+        name that same `.bin` as its own destination.
+        """
+        active: Dict[str, str] = {}
+        for job in self.jobs.values():
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            if job.output_path:
+                # The keys the job was queued under, when it has them: the
+                # pre-flight map in *resolved* is older than any job queued
+                # since it was built, and falling back to lexical for those
+                # would miss an alias of a path already claimed.
+                keys = self._output_keys.get(job.id)
+                if keys is None:
+                    keys = self._reserved_keys(job.output_path, reservation)
+                for key in keys:
+                    active.setdefault(key, job.id)
+        return active
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
         """Get a job by ID."""
         return self.jobs.get(job_id)
+
+    def add_terminal_listener(self, callback: Callable[[ConversionJob], object]) -> None:
+        """Call *callback* once each job reaches a terminal status.
+
+        For consumers that must remember how a job *ended* after the queue has
+        forgotten it. History is capped and lives in memory, so asking
+        ``get_job()`` later answers "unknown" for anything pruned or predating
+        a restart -- and a consumer that then guesses from the filesystem
+        cannot tell a finished conversion from a failed one that unlinked the
+        old artifact. A listener is told at the moment the answer is still
+        known, and can persist it wherever it needs it.
+
+        The callback may be sync or async (a coroutine is scheduled on the
+        loop). It runs after the status is final; exceptions are logged and
+        swallowed, because a listener must never fail a conversion.
+        """
+        self._terminal_listeners.append(callback)
+
+    def _notify_terminal(self, job: ConversionJob) -> None:
+        """Tell every listener that *job* is finished. Never raises."""
+        if not self._terminal_listeners:
+            return
+        if job.status not in _TERMINAL_STATUSES:
+            return
+        for callback in list(self._terminal_listeners):
+            try:
+                result = callback(job)
+            except Exception:  # a listener must never fail a conversion
+                logger.warning(
+                    "Terminal-job listener failed for %s", job.id, exc_info=True,
+                )
+                continue
+            if inspect.isawaitable(result):
+                try:
+                    self._spawn_background(result)
+                except RuntimeError:
+                    # No running loop (a synchronous test harness): the
+                    # coroutine is simply not awaited, and the consumer's own
+                    # fallback still applies.
+                    result.close()
 
     def _prune_archived_jobs(self) -> None:
         if not self._archived_jobs:
@@ -516,6 +1045,7 @@ class JobManager:
         # cancel_all while the external task was still running.
         self._cancel_events.pop(job_id, None)
         self._cancelled.discard(job_id)
+        self._notify_terminal(job)
         event_type = "complete" if success else "error"
         await self._notify_subscribers(
             job_id,
@@ -555,6 +1085,7 @@ class JobManager:
             job.message = message
         self._cancel_events.pop(job_id, None)
         self._cancelled.discard(job_id)
+        self._notify_terminal(job)
         await self._notify_subscribers(
             job_id,
             {
@@ -1227,6 +1758,9 @@ class JobManager:
             self._cancelled.add(job_id)
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.now(timezone.utc)
+            # A queued job cancelled before it starts never enters
+            # `_process_job`, so its listeners have to be told here.
+            self._notify_terminal(job)
             cancel_event = self._cancel_events.get(job_id)
             if cancel_event:
                 cancel_event.set()
@@ -1299,6 +1833,7 @@ class JobManager:
             self._archive_job_for_lookup(job)
             self._cancelled.discard(job_id)
             self._delete_plans.pop(job_id, None)
+            self._output_keys.pop(job_id, None)
             if job_id not in self._cancel_events:
                 concurrency_manager.release(job_id)
             if job_id not in self._cancel_events:
@@ -1955,6 +2490,48 @@ class JobManager:
         finally:
             self._semaphore.release()
 
+    async def _verify_target_bounded(self, tool, job, cancel_event) -> str | None:
+        """What to verify, resolved without letting a dead mount keep the job.
+
+        Ask the tool rather than assuming the planned path holds the artifact:
+        a split makeps3iso build writes `<iso>.0`/`.1`/… and no bare `.iso`, so
+        verifying `output_path` read a file that was never created and failed a
+        conversion that had in fact succeeded.
+
+        Bounded and detached because of *when* this runs. It sits between the
+        conversion finishing and `verify_timeout()` being resolved, so it is
+        ahead of every bound the verify itself carries — and the answer is a
+        stat of the output plus a scan for numbered parts, on storage that has
+        just taken a multi-gigabyte write and is therefore the likeliest thing
+        in the process to have stopped answering. Blocked here the job holds
+        its output lock and its source-directory lock, keeps `_verifying`
+        empty so the watchdog sees nothing to report, and with
+        MAX_CONCURRENT_JOBS at its default of 1 freezes every job behind it.
+
+        The cancel event is honoured for the same reason it is honoured by the
+        verify: a Cancel pressed while a mount is not answering must return
+        now, not after the probe bound expires. The probe thread is abandoned,
+        never the pool's — `run_detached` exists for exactly this.
+        """
+        try:
+            return await asyncio.wait_for(
+                run_detached(
+                    tool.verify_target, job.output_path, job.mode.value,
+                    cancel_event=cancel_event,
+                ),
+                timeout=_CANONICAL_PROBE_SECONDS,
+            )
+        except ReadCancelled:
+            # Cancel, not a verdict. Same translation the verify itself makes:
+            # nothing was judged, and the source must not be deleted on it.
+            raise ConversionCancelled("Conversion cancelled") from None
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                "Verification could not determine what to check "
+                f"in {_CANONICAL_PROBE_SECONDS:.0f}s "
+                "(the storage holding the output stopped responding)"
+            ) from None
+
     async def _process_job(self, job_id: str):
         """Process a single conversion job."""
         job = self.jobs.get(job_id)
@@ -1983,6 +2560,11 @@ class JobManager:
             self._cancelled.discard(job_id)
             if not job.completed_at:
                 job.completed_at = datetime.now(timezone.utc)
+            # Both early exits below return before the try/finally that
+            # notifies for every other outcome, so they announce themselves.
+            # Listeners may hear about one job twice (this path runs after
+            # `cancel_job` already fired) and must be idempotent.
+            self._notify_terminal(job)
             await self._notify_subscribers(
                 job_id,
                 {"type": "cancelled", "job_id": job_id, "status": job.status.value},
@@ -2003,6 +2585,7 @@ class JobManager:
                     job_id,
                     {"type": "cancelled", "job_id": job_id, "status": job.status.value},
                 )
+            self._notify_terminal(job)
             await self._cleanup_temp_dir(job)
             concurrency_manager.release(job_id)
             if job_id in self._cancel_events:
@@ -2041,6 +2624,11 @@ class JobManager:
                 job.error_message = "Could not acquire lock for output file"
             job.completed_at = datetime.now(timezone.utc)
 
+            # Terminal, and it returns below without reaching the try/finally
+            # that announces every other outcome -- so a listener recording how
+            # this job ended would never hear about the one case where the job
+            # failed *before* touching the output.
+            self._notify_terminal(job)
             await self._notify_subscribers(
                 job_id, {"type": "error", "job_id": job_id, "error": job.error_message}
             )
@@ -2073,6 +2661,9 @@ class JobManager:
                 job.status = JobStatus.FAILED
                 job.error_message = "Output file already exists"
                 job.completed_at = datetime.now(timezone.utc)
+                # Same as the lock failure above: an early return, so it has to
+                # announce itself.
+                self._notify_terminal(job)
                 await self._notify_subscribers(
                     job_id,
                     {"type": "error", "job_id": job_id, "error": job.error_message},
@@ -2357,11 +2948,31 @@ class JobManager:
 
                 verified = False
                 source_deleted = False
-                if job.delete_on_verify:
-                    if not registry.spec(job.mode.value).supports_delete_on_verify:
+                # Two ways to ask for the same verify: delete-on-verify needs it
+                # as a precondition, verify_after wants the check on its own and
+                # keeps the source. One block runs it either way, so a verified
+                # output means the same thing however it was requested.
+                if job.delete_on_verify or job.verify_after:
+                    # Both halves of the contract, re-asked here because this is
+                    # where the source actually gets unlinked. The plan sites
+                    # (`routes/convert.py`, `romm_auto.normalize_rule`) check the
+                    # same pair, but a job can reach this point without passing
+                    # either -- restored queue state, a hand-edited rule blob, a
+                    # future caller. `supports_delete_on_verify` says the mode
+                    # can offer it at all; `delete_on_verify_is_safe` says THIS
+                    # job can, given its compression, and that is the one that
+                    # stops a Wii U `noverify` conversion from deleting a 25 GB
+                    # source on a structural check.
+                    if job.delete_on_verify and not (
+                        registry.spec(job.mode.value).supports_delete_on_verify
+                        and registry.for_mode(job.mode.value).delete_on_verify_is_safe(
+                            job.mode.value, job.compression,
+                        )
+                    ):
                         raise RuntimeError(
-                            "Delete-on-verify is only supported for "
-                            "create/copy/Dolphin/3DS/Switch-compress modes"
+                            "Delete-on-verify is not safe for this conversion: "
+                            "the mode or its compression settings cannot prove "
+                            "the output before the source is removed"
                         )
                     if cancel_event.is_set():
                         raise ConversionCancelled("Conversion cancelled")
@@ -2390,13 +3001,25 @@ class JobManager:
                     # its own: on a mount that has stopped answering, a Cancel
                     # pressed here must not wait out the probe bound before the
                     # verify that would report it even starts.
+                    # Ask the tool what to verify rather than assuming the
+                    # planned path holds it: a split makeps3iso build writes
+                    # `<iso>.0`/`.1`/… and no bare `.iso`, so verifying
+                    # `output_path` read a file that was never created and
+                    # failed a conversion that had in fact succeeded.
+                    verify_path = await self._verify_target_bounded(
+                        tool, job, cancel_event,
+                    )
+                    if not verify_path:
+                        raise RuntimeError(
+                            "Verification could not find the converted output"
+                        )
                     verify_bound = await tool.verify_timeout(
-                        job.output_path, cancel_event=cancel_event,
+                        verify_path, cancel_event=cancel_event,
                     )
                     self._verifying[job_id] = time.monotonic()
                     try:
                         verify_result = await asyncio.wait_for(
-                            tool.verify(job.output_path, cancel_event=cancel_event),
+                            tool.verify(verify_path, cancel_event=cancel_event),
                             timeout=verify_bound or None,
                         )
                     except asyncio.TimeoutError:
@@ -2448,7 +3071,20 @@ class JobManager:
                         produced_meta=produced_meta,
                     )
 
-                    if cancel_event.is_set():
+                    if not job.delete_on_verify:
+                        # verify_after only: the source is kept by design, so
+                        # the job is finished the moment the output checks out.
+                        job.message = "Verification complete."
+                        await self._notify_subscribers(
+                            job_id,
+                            {
+                                "type": "progress",
+                                "job_id": job_id,
+                                "progress": job.progress,
+                                "message": job.message,
+                            },
+                        )
+                    elif cancel_event.is_set():
                         job.message = "Verification complete. Delete skipped (cancelled)."
                         await self._notify_subscribers(
                             job_id,
@@ -2642,6 +3278,11 @@ class JobManager:
             )
 
         finally:
+            # Before any cleanup: this is the one place every runner outcome
+            # (completed, failed, cancelled mid-run) passes through, and a
+            # listener that must record how the job ended has to hear about it
+            # while the job object still says so.
+            self._notify_terminal(job)
             # Only release lock if we acquired it
             if lock_acquired:
                 lock_manager.release_lock(job.output_path)
@@ -2652,6 +3293,7 @@ class JobManager:
             concurrency_manager.release(job_id)
 
             self._delete_plans.pop(job_id, None)
+            self._output_keys.pop(job_id, None)
             if job_id in self._cancel_events:
                 del self._cancel_events[job_id]
             self._last_progress_at.pop(job_id, None)

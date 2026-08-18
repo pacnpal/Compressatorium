@@ -499,6 +499,111 @@ export const api = {
     );
   },
 
+  // ─── RomM catalog overlay ─────────────────────────────────────────────
+  // The ROM listing comes back as a DirectoryListing of FileEntry, the same
+  // shape /files returns, so FileList/FileRow/ConvertPanel render it unchanged
+  // and conversions submit through the ordinary createBatchJobs.
+
+  getRommStatus: () =>
+    fetchJson(`${API_BASE}/romm/status`, undefined, 'Failed to get RomM status'),
+
+  getRommPlatforms: () =>
+    fetchJson(`${API_BASE}/romm/platforms`, undefined, 'Failed to list RomM platforms'),
+
+  getRommRoms: (platformId) =>
+    fetchJson(
+      buildApiUrl('/romm/roms', { platform_id: platformId }),
+      undefined,
+      'Failed to list RomM ROMs',
+    ),
+
+  // ── RomM settings, rules, and unattended conversion ──────────────────
+  getRommSettings: () =>
+    fetchJson(`${API_BASE}/romm/settings`, undefined, 'Failed to load RomM settings'),
+
+  saveRommSettings: (patch) =>
+    fetchJson(
+      `${API_BASE}/romm/settings`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      },
+      'Failed to save RomM settings',
+    ),
+
+  // Probes without saving, so the user can check a URL/token before committing.
+  testRommConnection: (patch = {}) =>
+    jsonPost(`${API_BASE}/romm/settings/test`, patch, {}, 'Connection test failed'),
+
+  getRommRules: () =>
+    fetchJson(`${API_BASE}/romm/rules`, undefined, 'Failed to load RomM rules'),
+
+  saveRommRules: (rules) =>
+    fetchJson(
+      `${API_BASE}/romm/rules`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rules }),
+      },
+      'Failed to save RomM rules',
+    ),
+
+  // Clears the "already converted by this rule" history that stops overwrite
+  // and rename rules from reconverting the same sources every interval.
+  forgetRommConverted: (platformIds = null) =>
+    jsonPost(
+      `${API_BASE}/romm/rules/forget-converted`,
+      platformIds ? { platform_ids: platformIds } : {},
+      {},
+      'Failed to clear the conversion history',
+    ),
+
+  // Shows what a sweep would queue, without queueing it.
+  previewRommAutoConvert: (body = {}) =>
+    jsonPost(`${API_BASE}/romm/auto-convert/preview`, body, {}, 'Preview failed'),
+
+  runRommAutoConvert: (body = {}) =>
+    jsonPost(`${API_BASE}/romm/auto-convert/run`, body, {}, 'Auto-convert run failed'),
+
+  // Records the metadata to carry across a conversion. MUST be called before
+  // the batch is submitted: the provider ids are read from the RomM record for
+  // the source file, which goes stale once that file is converted.
+  planRommRepin: (
+    paths, mode, outputDir = null, duplicateAction = 'skip', platformId = null,
+    outputPaths = null,
+  ) =>
+    jsonPost(
+      `${API_BASE}/romm/repin/plan`,
+      {
+        paths,
+        mode,
+        output_dir: outputDir,
+        duplicate_action: duplicateAction,
+        platform_id: platformId,
+        // {source: destination} when the queue has already decided. Planning
+        // predicts the destination; the batch can land elsewhere.
+        output_paths: outputPaths,
+      },
+      {},
+      'Failed to record RomM metadata',
+    ),
+
+  // Retires rows recorded for a batch that was then rejected. Row ids, from
+  // the plan response: a destination names whichever row holds it now, which
+  // after another client's re-plan is that client's live row.
+  cancelRommRepin: (ids) =>
+    jsonPost(
+      `${API_BASE}/romm/repin/cancel`,
+      { ids },
+      {},
+      'Failed to discard the recorded RomM metadata',
+    ),
+
+  runRommRepin: () =>
+    jsonPost(`${API_BASE}/romm/repin`, {}, {}, 'Failed to re-match RomM entries'),
+
   listDATs: () => fetchJson(`${API_BASE}/dat/list`, undefined, 'Failed to list DATs'),
 
   deleteDAT: (datId) =>

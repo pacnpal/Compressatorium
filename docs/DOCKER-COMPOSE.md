@@ -68,6 +68,75 @@ Edit `CHDMAN_MODE` in the file:
 - `createcd` for CD-ROM (Dreamcast, PS1, etc.)
 - `createdvd` for DVD-ROM (PSP, PS2, etc.)
 
+### 4. Alongside RomM (library integration)
+
+To use the **RomM** view, run Compressatorium beside your
+[RomM](https://romm.app) container and give it the **same library bind mount**.
+Compressatorium reads RomM's catalog over the API but the ROM files through the
+filesystem, so no disc image is ever streamed over HTTP.
+
+```yaml
+services:
+  romm:
+    image: rommapp/romm:latest
+    volumes:
+      - /path/to/library:/romm/library     # RomM's library
+    # ...
+
+  compressatorium:
+    image: pacnpal/compressatorium:latest
+    volumes:
+      - /path/to/library:/data/library     # the SAME host path
+    environment:
+      - ROMM_URL=http://romm:8080
+      - ROMM_TOKEN=rmm_...                 # see below
+      - ROMM_LIBRARY_ROOT=/data/library    # where RomM's library is mounted HERE
+    ports:
+      - "8080:8080"
+```
+
+> **You can skip all of this and configure RomM in the app instead.** These
+> variables only seed the first run; **RomM → Settings** in the web UI sets the
+> same values, saves them, and applies them without a restart. They are here for
+> operators who prefer a declarative compose file.
+
+**Getting a token:** in RomM, go to *Administration → Client API Tokens* and
+create one. Client API tokens (`rmm_` + 64 hex characters) are per-user, do not
+expire unless you set an expiry, and carry only the scopes you grant. Give it
+`platforms.read` and `roms.read`; add `roms.write` if you want Compressatorium to
+re-apply metadata after converting to a format RomM cannot hash-match (RVZ, CSO,
+NSZ, WUX, Z3DS).
+
+**Two things to get right:**
+
+- **`ROMM_LIBRARY_ROOT` is the path *inside the Compressatorium container*,** not
+  the path RomM sees. RomM reports each ROM's location relative to its own
+  library root, and Compressatorium joins that onto `ROMM_LIBRARY_ROOT`. It must
+  also be inside a configured Compressatorium volume, or the ROMs are skipped.
+- **Match the UID/GID** the two containers run as. If they differ, RomM cannot
+  read the files Compressatorium writes (and its cleanup tasks cannot manage
+  them).
+
+**Remote RomM:** there is no separate "remote" mode and none is needed — mount
+the remote library over NFS/SMB/rclone and point `ROMM_LIBRARY_ROOT` at the
+mount. Note RomM advises against enabling its own filesystem watcher
+(`ENABLE_RESCAN_ON_FILESYSTEM_CHANGE`) on SMB/rclone mounts; scan from RomM's UI
+instead after converting.
+
+**After converting:** RomM has to rescan before it sees the new files. On a local
+bind mount, RomM's filesystem watcher
+(`ENABLE_RESCAN_ON_FILESYSTEM_CHANGE`) picks them up on its own; on an SMB or
+rclone mount, leave the watcher off as RomM advises and run a scan from RomM's UI
+instead. Then, if you converted to
+a format RomM cannot hash-match, press **Re-match in RomM** in the RomM view to
+re-apply the saved metadata (or leave it to run automatically on page load).
+
+**Unattended conversion:** set `ROMM_AUTO_CONVERT=true` to enable the scheduler,
+then configure per-platform rules under **RomM → Automation** — target format,
+schedule, queueing limits and selection filters, all per platform. The rules
+themselves live in the app, not in environment variables: a per-platform map is
+not something an env var can express.
+
 ---
 
 ## Common Commands
@@ -180,6 +249,27 @@ Volume behavior:
 | `CHD_PROGRESS_TIMEOUT_PER_GIB` | `120` | Additional stall-timeout seconds per GiB of input size |
 | `CHD_PROGRESS_TIMEOUT_CAP` | `7200` | Upper bound for adaptive conversion stall timeout (0 disables cap) |
 | `STATIC_DIR` | `/static` | Path to static web assets |
+
+### RomM
+
+Every one of these is editable in **RomM → Settings** and **RomM → Automation**;
+the environment only supplies the first-run default, and a value saved in the app
+wins from then on. `ROMM_URL` unset *and* nothing saved in the app hides the RomM
+view entirely.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROMM_URL` | *(unset)* | Base URL of your RomM instance, e.g. `http://romm:8080`. |
+| `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. A token entered in **RomM → Settings** is stored in the `preferences` table of `compressatorium.db` (never returned to the browser) and takes precedence over this variable — so back up and permission that file accordingly. |
+| `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
+| `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. The rules themselves are configured in the app (**RomM → Automation**). |
+| `ROMM_AUTO_CONVERT_INTERVAL_MINUTES` | `60` | Interval a newly created platform rule starts with (minimum 5). |
+| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Default **Max jobs per run** for a newly created platform rule, and the ceiling one sweep may queue across all platforms. |
+| `ROMM_REPIN` | `true` | Save a ROM's metadata before converting to a format RomM cannot hash-match, so it can be restored afterwards. |
+| `ROMM_REPIN_ON_LOAD` | `true` | Re-apply saved metadata automatically when the RomM view loads. |
+| `ROMM_REPIN_ABANDON_DAYS` | `7` | Retire a saved re-pin whose output never appeared after this many days. |
+| `ROMM_VERIFY_AFTER_CONVERT` | `false` | Default for new platform rules: verify each converted file, keeping the source. |
+| `ROMM_DELETE_SOURCE_AFTER_VERIFY` | `false` | Default for new platform rules: delete the source once the new output verifies. Destructive, so off by default, and refused for modes whose verify is too weak to justify it. |
 
 ---
 

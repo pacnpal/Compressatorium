@@ -2,7 +2,784 @@
 
 ## 4.4.2 (unreleased)
 
+### Added
+
+- **RomM library integration.** A new **RomM** view lists your
+  [RomM](https://romm.app) library by platform and converts it in place — by
+  hand or on a schedule. Pick a platform and you get real game names instead of
+  filenames, in the ordinary workspace: the same file list, row actions, Verify,
+  convert panel and job queue you already use on a volume.
+
+  The real win is that RomM knows what a file *is*. A bare `.iso` could be a PS2
+  disc or a GameCube disc and the extension cannot tell you which — today you
+  resolve that by picking a tool tab. Now the platform does it: the same `.iso`
+  offers Dolphin RVZ on GameCube and CHD/CSO on PS2. Narrowing is conservative,
+  so an unrecognised platform falls back to plain extension matching rather than
+  leaving you with an unconvertible row.
+
+  **Everything is configured in the app** — connection, credentials, library
+  path, and automation. The environment variables (`ROMM_URL`, `ROMM_TOKEN`,
+  `ROMM_LIBRARY_ROOT`, …) still work as first-run defaults, but nothing needs a
+  redeploy to change. **Test connection** checks *reachable*, *token accepted*
+  and *library mounted here* separately, because they fail independently.
+
+  No ROM ever crosses the network: Compressatorium reads RomM's catalog over the
+  API but the files themselves through the filesystem. A remote RomM works by
+  mounting its library over NFS/SMB/rclone — there is no separate mode to learn.
+
+- **Per-platform automatic conversion.** Every platform gets its own rule, because
+  a library is not homogeneous: GameCube can convert to RVZ hourly while PS2
+  converts to CHD overnight, ten at a time, largest first. Each rule sets the
+  target format, its own schedule (interval, time-of-day window that may wrap
+  midnight, and a weekday mask, all evaluated in your own timezone rather than
+  UTC), conversion options (compression codec and level, split output, verify
+  each result, delete the source once it verifies), what to do when the output
+  already exists (skip, overwrite, or write alongside), queueing limits (max
+  jobs per run, priority, conversion order), an output folder, and selection
+  filters — size thresholds, name patterns, and whether to include ROMs RomM has
+  or hasn't identified.
+
+  The target list is narrowed per platform by the same registry the file browser
+  uses, so a GameCube rule offers dolphin and nkit while a PS2 rule offers chdman
+  and maxcso — a rule can never name a tool that is wrong for the system. The
+  compression controls come from the same descriptors the convert panel reads,
+  so each tool offers exactly the codecs and levels it actually supports.
+
+  A rule's defaults come from the configured settings
+  (`ROMM_AUTO_CONVERT_INTERVAL_MINUTES`, `ROMM_VERIFY_AFTER_CONVERT`,
+  `ROMM_DELETE_SOURCE_AFTER_VERIFY` and friends), so a deployment can ship a
+  house policy rather than configuring every platform by hand.
+
+  A rule that cannot be honoured is paused rather than quietly run wider than
+  asked: an output folder outside the configured volumes, or a name filter that
+  is not a valid regular expression, both stop the rule and say so in the editor
+  — the alternative was a filter silently becoming "no filter" and the next
+  sweep converting the entire platform. Only tools the deployment can actually
+  run are offered, so a Switch install without `prod.keys` cannot be scheduled
+  to fail every hour.
+
+  Selecting a platform also points the workspace at a tool that platform can
+  use, so the disambiguation holds for hand-picked conversions too — not just
+  for the badge on the row.
+
+  **Preview** shows exactly what a sweep would queue without queueing it, and
+  without moving the schedule clock, so looking never postpones a run.
+
+  Sweeps are safe to repeat: a ROM is queued only when its target output is
+  genuinely missing, judged by the same detector that badges rows in the file
+  list. Running twice, restarting mid-sweep, or racing a manual conversion all
+  converge instead of duplicating work, and a sweep that hits a full queue stops
+  and resumes where it left off. A rule writing to its own output folder is
+  judged on that folder, and a rule that fails to queue leaves no metadata
+  snapshot behind.
+
+- **Converted ROMs keep their RomM metadata.** RomM identifies a CHD by the SHA1
+  embedded in its header and an archive by its largest member, so converting to
+  CHD, ZIP or 7z keeps the Redump/No-Intro match automatically. RVZ, CSO, NSZ,
+  WUX and Z3DS are matched on the file's own hash, which conversion necessarily
+  changes — those ROMs would go unidentified and lose their artwork.
+
+  Compressatorium now saves each ROM's metadata *before* the conversion and
+  re-applies it afterwards: convert, let RomM rescan, then press **Re-match in
+  RomM** (or leave it to run automatically when the view loads). The match uses
+  the converted file's SHA1, so it is exact and survives a rename. The view says
+  up front which target formats need this, so the trade-off is visible before you
+  queue anything rather than discovered afterwards.
+
+- **The RomM view reports library health.** Per platform: how much is already
+  converted, how much is left, and an estimate of the space converting the rest
+  would reclaim, using the same size-ratio table the progress bar estimates from.
+
 ### Fixed
+
+- **A conversion can no longer be re-matched as the wrong game.** When two
+  browser tabs (or a tab and a scheduled run) aim different ROMs at the same
+  output file, only one conversion is actually queued — but the saved metadata
+  could end up belonging to the *other* one, so RomM would confidently
+  re-identify the finished file as a game it isn't. Each saved snapshot now
+  records which file it was taken from, and is only kept when the queued job is
+  converting that file.
+
+- **Changing your RomM connection is now safe against anything in flight.**
+  Saving a new URL or library path clears the records belonging to the old
+  instance. A metadata snapshot being written at that exact moment could slip
+  in behind the clean-up and survive it, holding the previous library's
+  identifiers — so it would later be applied to a game in the new one. The
+  snapshot write now happens under the same lock the clean-up takes, and a
+  submit caught by the change is asked to try again instead.
+
+- **If that clean-up doesn't finish, nothing runs on stale records.** It is
+  retried at startup and that retry can fail transiently (a briefly locked
+  database is enough), and the app deliberately starts anyway. Until it
+  succeeds, scheduled conversions, metadata snapshots and re-matching all pause
+  rather than reading the previous instance's history — and the re-match worker
+  retries the clean-up on each tick, so it recovers on its own.
+
+- **ROMZ now accepts a ROM from every platform it is offered on.** The tool
+  advertised itself for NES, SNES, N64, Master System, Genesis, Game Gear,
+  Virtual Boy, WonderSwan, Neo Geo Pocket, Lynx, C64 and Atari while actually
+  accepting only Game Boy, GBA and DS dumps. So RomM would offer "Compress ROM
+  → 7z" on an NES platform, every `.nes` row was unselectable, and an
+  automation rule for it skipped the whole platform on every run without
+  saying why. It is a `7z` wrapper with no per-format logic, so all of those
+  now work — `.nes`, `.sfc`, `.smc`, `.z64`, `.n64`, `.v64`, `.sms`, `.md`,
+  `.gen`, `.smd`, `.gg`, `.vb`, `.ws`, `.wsc`, `.ngp`, `.ngc`, `.lnx`, `.d64`,
+  `.t64`, `.prg`, `.a26` and `.a78`. (`.bin` stays with the disc tools.)
+
+- **Running or previewing automation with no platforms ticked no longer runs
+  all of them.** An explicitly empty selection was read as "no filter", which
+  means *everything* — so a client sending an empty list started every enabled
+  rule, delete-after-verify included, and Preview widened the same way so you
+  could not see it coming. **Forget history** had the identical flaw, where it
+  would clear the conversion record for every platform at once and make the
+  next sweep reconvert your whole library.
+
+- **Toggling automation or a metadata setting no longer re-scans your
+  library.** Saving anything on the RomM settings screen re-listed every
+  platform and reloaded the current catalog, which on a large remote library
+  meant waiting out a multi-minute scan to flip a checkbox — and it threw away
+  the listing you were looking at. Only a change of URL, library path or
+  credentials does that now, because only those change which files are being
+  described.
+
+- **A filter pattern that would hang the scheduler is caught in one more
+  shape.** Patterns are rejected at save time if they can backtrack
+  catastrophically, since Python's regex engine cannot be interrupted mid-match
+  and the sweep holds its lock while it runs. One shape slipped through: an
+  optional part inside a repeated group, like `(a?){30}`. Ordinary
+  non-capturing groups and lookarounds — `(?:USA|Europe)` and friends — are
+  unaffected and still accepted.
+
+- **The "Re-match in RomM" badge is right immediately after a submit.** When
+  some of the selected files did not become jobs — skipped duplicates, or two
+  rows resolving to the same output — their metadata snapshots are discarded,
+  but the badge still showed the count from before that clean-up and stayed
+  high until the next reload.
+
+- **A tool that cannot say whether it can run no longer costs you a worker.**
+  Switch (nsz) reports readiness by searching your volumes for `prod.keys`, and
+  Wii U (jwud) by checking for its runtime. On a mount that has stopped
+  answering, those checks were holding one of a small shared pool of workers
+  each time they were asked — so repeated page loads gradually starved
+  everything else that needs to touch the disk. They now run on their own
+  disposable threads.
+
+- **Your saved API token is no longer wiped by saving a metadata setting.**
+  The Metadata card's Save correctly sent only its own fields, but the shared
+  success handler still cleared the Connection card's token box and its "clear
+  token" tick. So typing a replacement token, then saving a metadata toggle
+  before pressing Save on the connection, discarded it — and RomM shows an API
+  token once, when you create it, so for most people that meant issuing a new
+  one and updating anything else that used it. The buffers are now cleared only
+  by the save that actually submits them.
+
+- **The Library and the tool sidebar no longer hang forever when a mount stops
+  responding.** Switch (nsz) reports whether it can run by searching every
+  configured volume for your `prod.keys`, and that search had no time limit: on
+  an NFS/SMB/rclone share that had gone quiet it never came back. The RomM
+  platform list and the main tool list both wait for it, so both screens sat
+  loading indefinitely, and every reload made it worse. Each check is now
+  bounded — a tool that cannot answer in time is reported unavailable, the same
+  as one whose program is missing — and the tool list asks them all at once
+  instead of one after another, so a single slow volume no longer delays the
+  tools behind it.
+
+- **A conversion whose storage disappears at the finish line now fails instead
+  of freezing the queue.** After converting, Compressatorium asks the tool which
+  file to verify — for a split PS3 build that means checking for the bare ISO
+  and then for its numbered parts. That question ran with no time limit, on
+  storage that had just taken a multi-gigabyte write, while the job still held
+  its locks; with the default of one job at a time, everything queued behind it
+  stopped too, and Cancel did nothing. It is now bounded and cancellable: the
+  job fails with a message naming the storage, and Cancel stops it immediately
+  without treating the conversion as failed verification (so your source is
+  never deleted on it).
+
+- **Two conversions can no longer be sent to the same file when a volume is
+  slow.** Before queueing, Compressatorium reduces every destination to one
+  canonical name so that the same file reached two ways — through a symlinked
+  library root and through the real path underneath it — is recognised as one
+  destination. When the volume was too slow to answer, it used to fall back to
+  comparing the paths as typed, which is exactly the comparison that cannot see
+  the two are the same: both submissions were accepted, and once the mount
+  recovered they wrote the same file. With delete-after-verify that removed both
+  sources for the single file that survived. Submitting now fails cleanly
+  instead ("the storage stopped responding, nothing was queued") — a retry costs
+  you a moment, the old behaviour cost a game.
+
+- **A scheduled RomM rule set to Overwrite or Write-alongside no longer
+  reconverts your library on every single run.** Both policies are defined by
+  what they do to an *occupied* destination — Overwrite reuses it, Write-alongside
+  takes the next free `_1`, `_2`, … — so the file on disk could never mean "this
+  one is done", and a rule left running would rewrite the same multi-gigabyte
+  images every interval, or fill the volume with numbered copies. Each rule now
+  remembers which ROMs it has converted, so both policies mean what they say and
+  happen exactly once per ROM. The memory is cleared automatically when you
+  retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
+  anything yet), and there is a **Forget history** button on each platform for
+  when you restore from a backup or move outputs aside by hand.
+- **Delete-after-verify is now re-checked where the source is actually
+  deleted.** Both places that *plan* a conversion asked whether the tool
+  considers the settings safe enough to justify deleting the original — but the
+  job runner itself only checked whether the mode supports the option at all.
+  A Wii U conversion run with verification off could pass the structural check
+  and remove the only copy. The runner now asks both questions.
+- **Two conversions can no longer be queued to write the same file.** Callers
+  resolve duplicates before submitting, but that is a prediction made outside
+  the queue's lock — a manual submit and an automation sweep could each settle
+  on the same destination before either job started, and the second would
+  overwrite the first's result. With *delete the source after verifying*, that
+  removed both sources for one surviving output. The queue itself now refuses a
+  destination another live job holds.
+- **A failed or cancelled conversion no longer counts as done.** The rule
+  history treated any change to the destination as success, so a job that died
+  after unlinking the old file — or leaving a partial one — marked that ROM
+  converted forever. It now asks the job how it ended.
+- **A filter pattern that can hang the scheduler is refused when you save it.**
+  Python's regex engine cannot be interrupted, so a pattern like `(a+)+$` would
+  run effectively forever on a long filename while holding the sweep — blocking
+  previews, manual runs, and even editing the rule to remove the pattern, with
+  a restart as the only way out. The check reads the pattern rather than running
+  it, so it costs nothing and cannot itself be slowed down by the thing it is
+  looking for.
+- **A metadata snapshot RomM never matches is now given up on** after the
+  configured period, like one whose output never appeared. Once the file had
+  been hashed it waited forever instead, sitting in the badge and re-querying
+  every pass — which contradicted what the setting says it does.
+- **Reading a RomM platform no longer risks tying up the app** when the library
+  mount stops responding: the catalog scan stats every ROM in the platform, and
+  it now runs off the shared worker pool with the same bounded probe the rest of
+  the integration uses, returning a clear error instead of hanging.
+- **Saving settings that leave RomM unreachable now clears the catalog** instead
+  of leaving the previous instance's rows on screen, still selected and still
+  wired to the Convert button.
+- **A conversion that lands on a different path than planned no longer stamps
+  its metadata onto the wrong file.** Planning predicts where the conversion
+  will write; if something else takes that path before the batch is accepted,
+  the job writes elsewhere — and the saved snapshot, still aimed at the
+  predicted path, would be applied to whatever turned up there. The snapshot
+  now follows the path the queue actually chose.
+- **Switching between two platforms that share a tool no longer keeps a target
+  format the new one cannot use.** Both PS2 and GameCube allow the two-step
+  conversions, but not the *same* one, so moving between them left the previous
+  console's format selected — the picker stopped offering it while the Convert
+  button would still have submitted it.
+- **A slow directory listing no longer starts over on every refresh.** The
+  guard that collapses a duplicate load of the same folder was being cleared
+  the moment it was set, so repeated refreshes each kicked off another full
+  backend scan and threw away the finished one.
+- **Leaving the RomM view during its first load no longer drops RomM rows into
+  the ordinary file browser.** The startup sequence kept running after the view
+  was gone.
+- **A RomM catalog refresh now honours the auto-refresh switch.** Listing a
+  platform stats every ROM in it, and the periodic refresh was skipping the
+  suppression check the directory listing gets — so turning auto-refresh off
+  during a conversion did not stop the most expensive refresh there is.
+- **A redirect that spells out the default port is no longer refused.**
+  `https://romm` and `https://romm:443` are the same origin; an HTTPS-to-HTTP
+  downgrade is still refused.
+- **In the RomM catalog the filename now sits under the game title** rather
+  than beside it, and a row missing both a title and a filename can no longer
+  break the sort for the whole listing.
+- **Saving RomM settings reads the catalog once, not twice** — even toggling a
+  metadata checkbox was costing two full remote catalog reads and two
+  filesystem scans of the library.
+- **Changing the RomM URL or library path mid-sweep could convert, and with
+  delete-after-verify destroy, the wrong files.** A running sweep resolves each
+  ROM's path from the *current* library root, so swapping that root underneath
+  it made it queue whatever unrelated files happened to sit at the same relative
+  paths in the new library. Saving those settings now waits for the sweep.
+- **PS3 game folders appear in the RomM library.** A RomM record can resolve to
+  a decrypted game directory — the input makeps3iso takes — and the listing
+  dropped it, so *Folder → ISO* was usable from automation but not by hand, for
+  exactly the same records, while the platform advertised the tool.
+- **NKit → RVZ is no longer offered for PS2, nor CSO → CHD for GameCube.** Those
+  two-step conversions belong to a tool that serves no single system, so
+  narrowing by tool kept both on every platform they touched — and a rule saved
+  against the wrong one would produce a format for the other console.
+- **The RomM library has a "Convert to" picker.** A platform usually allows
+  several tools — PS2 takes chdman and maxcso — and the only way to reach the
+  others was to leave RomM for the sidebar and come back.
+- **Queueing a RomM batch no longer scans your whole instance.** The metadata
+  lookup walked every platform's full catalog until it found the selected
+  files, which on a large library is hundreds of requests before the batch is
+  queued. It now asks the platform you are actually looking at.
+- **The re-pin snapshot can no longer capture the finished file as its "before"
+  picture.** On an idle queue a fast conversion could complete in the moment
+  between the batch being accepted and its metadata row being written, so the
+  row described the output as unchanged and was eventually abandoned — losing
+  the metadata the feature exists to protect. The snapshot now comes from when
+  the conversion was planned.
+- **CHDMAN's extract and copy modes work in automation.** A rule was validated
+  against the tool rather than the selected mode, and CHDMAN deliberately does
+  not badge a finished `.chd` as a convertible source — so `copy` rejected every
+  real source it had and accepted `.iso` files it cannot consume.
+- **You can now set how long a saved metadata snapshot waits** before it is
+  given up on (Settings → Metadata). It was configurable by environment variable
+  and honoured by the backend, but there was no field for it — so an operator
+  with a conversion or RomM scan backlog longer than a week could not raise it,
+  and snapshots were retired before their outputs were ever scanned.
+- **Two more paths that could hang the whole app on a dead network mount** are
+  now bounded like the rest: checking that the library folder sits inside a
+  configured volume, and measuring an output before hashing it. The second is
+  the stat used to *compute* the hash timeout, so the timeout could never have
+  covered it.
+- **The library progress counts what the selected format can actually convert**,
+  and counts a conversion that has started but not yet written its file as in
+  progress rather than still to do. Both made the "to go" figure and the savings
+  estimate describe work the Convert button would not take.
+- **Run now updates the re-match badge.** A sweep that queued formats needing a
+  re-pin left the header showing the old count, hiding the follow-up step from
+  exactly the run that created it.
+- **A conversion that was queued but never ran is no longer remembered as done.**
+  The rule history above recorded a ROM the moment its job was queued, so a job
+  you cancelled — or one interrupted by a restart, or one the converter failed on
+  — marked that ROM converted forever, and only **Forget history** brought it
+  back. It now records what was actually *produced*, so those ROMs are simply
+  picked up by the next run.
+- **Switching to a different RomM instance or library no longer skips your new
+  library.** The conversion history is keyed by RomM's own platform and ROM ids,
+  and a different RomM database reuses those numbers for entirely different
+  games — so an Overwrite rule could treat unrelated ROMs as already done and
+  never touch them. Changing the URL or library path now clears that history.
+  Your rules are kept.
+- **Editing a rule while a sweep is running no longer confuses the two.** The
+  save now waits for the sweep, so a retargeted rule cannot inherit the finishing
+  run's record of what it converted, or its schedule clock.
+- **A PS3 conversion split into 4 GB parts now says its metadata needs a manual
+  re-match**, instead of sitting in the pending queue for a week and then
+  reporting that its output never appeared. RomM matches a ROM on one file's
+  hash, and a set of parts has none. The same rule under 4 GB produces a single
+  ISO and re-pins normally, which is why this cannot be refused up front.
+- **Converting two catalog entries that write to the same output no longer loses
+  one of their metadata snapshots.** The batch collapses them into one job, and
+  discarding the losing entry's record took the winner's with it.
+- **The automation editor now says why a platform converted nothing** — a tool
+  that is not installed here, a saved format that is not for this system, an
+  output folder outside the configured volumes, or a platform RomM could not
+  list. Those were already refused; now they are visible.
+- **A failed platform list no longer leaves the previous library on screen.** The
+  error appeared beside a stale catalog whose rows were still selected and still
+  wired to the Convert panel, so a conversion could be submitted against a server
+  that was no longer connected.
+- **Two catalog entries for the same file no longer produce two jobs writing to
+  one output.** With Overwrite plus *delete the source after verifying*, that
+  meant two sources deleted for one surviving file. A sweep now claims each
+  destination once.
+- **Automatic conversion no longer queues jobs that were always going to fail.**
+  A saved rule outlives the install it was written against, so a rebuilt
+  container missing a tool would run the rule and fail every job at launch; and
+  RomM's catalog outlives the files it describes, so an entry whose ROM was moved
+  or deleted outside RomM was still queued. Both are now refused before queueing,
+  and the sweep says which platform and why.
+- **Converted metadata is no longer lost when a conversion is planned but never
+  runs.** The metadata snapshot has to be taken before the conversion, while the
+  source is still the file RomM knows about. If the batch was then rejected, the
+  saved row pointed at whatever was already sitting at that path — and with
+  Overwrite the re-matching pass would eventually hash that older file and stamp
+  this ROM's identity onto it. The pass can now tell the file it was going to
+  replace from the one the conversion produced, and a rejected batch discards its
+  rows immediately instead of leaving a week of phantom backlog.
+- **Metadata is no longer thrown away when you rename or move a converted file
+  before RomM rescans it.** RomM matches on the hash, not the path, so a moved
+  output was always still re-pinnable — but the pass gave up on it and eventually
+  retired the row. It now keeps going from the hash it already took. A row whose
+  conversion is still sitting in a long queue is no longer retired either.
+- **Re-matching no longer stalls the request on an unresponsive share, and two
+  browser tabs no longer hash the same files twice.** The pass has a wall-clock
+  budget and a per-file read budget that scales with the file, so a hung mount
+  costs one pass rather than an open request; a second pass while one is running
+  reports that instead of duplicating its work. Nothing is lost either way —
+  whatever was not reached is picked up next time.
+- **The RomM automation editor now enforces chdman's four-codec limit** (the
+  manual Convert panel already did), so a rule cannot be saved in a state that
+  fails every job it queues. The limit now lives on the tool itself, where both
+  pickers read it.
+- **The RomM library summary now counts the format you actually selected.**
+  dolphin-tool produces RVZ, WIA and GCZ, and a stray `.gcz` beside a GameCube
+  ISO reported it as converted while RVZ was selected — so the count and the
+  savings estimate described a different conversion than the button would run.
+- **Filter patterns are evaluated off the event loop.** A pattern like `(a+)+$`
+  can backtrack for minutes on one long filename, and it was being run against
+  every candidate on the loop the whole app shares.
+- **A Dolphin rule with a compression level but no codec now converts.** The
+  level travels with the codec, so leaving the codec on *Tool default* while
+  setting a level sent dolphin-tool an empty codec and failed every job the rule
+  queued. The tool's own default is used instead, and the picker names it, so
+  *Tool default (zstd)* says what you are going to get. nsz is unaffected: its
+  dropdown picks a layout, not a codec, and an empty one genuinely means "the
+  tool decides".
+- **A platform no installed tool can convert no longer offers the Convert
+  panel.** The panel stayed wired to whatever tool the workspace was last left
+  on, so a PS2 disc could be submitted to a GameCube format from a platform that
+  allows neither. The reason is named instead, next to the platform it applies
+  to.
+- **Submitting a very large batch no longer slows down as it grows.** The
+  check that stops two jobs writing the same file resolved every path against
+  every other one — fine for ten files, millions of filesystem probes for a
+  few thousand, all of them on the thread that serves the app.
+- **A library reached through a symlink keeps its metadata.** The queue reports
+  each job's source with symlinks resolved while the snapshot was recorded
+  under the path as typed, so the two did not match and a perfectly good
+  snapshot was retired as if the conversion had never been queued.
+- **Two selected ROMs that write the same file keep the right metadata.** The
+  batch collapses them into one conversion and keeps one source; the snapshot
+  was recorded per source in submission order, so the row ended up holding
+  whichever came last — and the conversion that actually ran could be
+  re-matched as the ROM the queue skipped. Both now use the same rule.
+- **A re-match interrupted by a restart is picked up again.** A row claimed for
+  writing by a process that then died stayed claimed: later passes fetched it
+  and failed on it, and the badge and the background pass could not see it at
+  all.
+- **Clicking into a folder in the RomM catalog works.** A record can resolve to
+  a directory (a decrypted PS3 game folder); clicking one set the path and then
+  reloaded the same platform listing, so the folder looked clickable and did
+  nothing.
+- **A RomM instance with no platforms clears the previous one's rows** instead
+  of showing "No platforms in RomM" above a live catalog whose files were still
+  wired to the Convert panel.
+- **A PS3 conversion split into parts verifies the parts.** With verification
+  now reachable for that format, the check was still being pointed at the
+  single ISO the job planned — which a `-s` build past 4 GB never writes — so a
+  conversion that had worked was marked failed, and an Overwrite rule repeated
+  it every run. The tool says where its product actually landed.
+- **A destination that cannot be read leaves the re-match row waiting.** The
+  newly bounded check turned a timeout into "the file changed", which would
+  have sent the row on to hash whatever sat at the destination — under
+  Overwrite, the file the conversion was going to replace.
+- **Two re-match passes can no longer write the same ROM's metadata twice
+  over.** Ownership of a row was read and then acted on; a conversion
+  re-planned in between superseded it, and the pass pushed the older ids to
+  RomM anyway. The row is claimed in one atomic step now, and handed back
+  unclaimed if the write does not happen.
+- **Re-typing the same RomM URL with a trailing slash no longer wipes your
+  conversion history.** The identity check compared spellings rather than what
+  the client and the path mapper actually use, so `http://romm:8080/` looked
+  like a different server and `/library/` like a different folder — both
+  clearing the history and retiring every pending snapshot for nothing.
+- **"Verify each converted file" is available for PS3 folder → ISO.** The
+  setting was gated on whether the mode could *delete* its source, and that
+  conversion deliberately never deletes a curated game folder — so the one
+  check it does offer, reading PARAM.SFO back out of the ISO it built, could
+  not be switched on. Verification and deletion are separate capabilities now.
+- **Changing the RomM instance or library path retires pending re-match rows.**
+  Each row holds provider ids read from the old instance and a path under the
+  old library, so the next pass could hand those ids to whichever ROM the *new*
+  instance matched the digest to — one library's identity written onto
+  another's game. The switch also waits for any re-match pass already running.
+- **A bookkeeping failure after a batch is queued no longer causes the whole
+  platform to be converted twice.** If saving a metadata snapshot failed once
+  the jobs were already accepted — a locked database, a full volume — the run
+  was recorded as "the queue rejected this batch" and the production record was
+  skipped, so the next scheduled run queued every one of those ROMs again while
+  the first batch was still converting them.
+- **One more unbounded stat.** Checking whether an overwrite destination has
+  changed ran without a deadline, so a mount that died mid-pass held the
+  re-match lock until a restart.
+- **Setting only one end of a schedule window no longer runs the rule all
+  day.** Typing the start of a 22:00–04:00 window and not yet the end was read
+  as "no time restriction", so an operator narrowing a rule started unattended
+  conversions in the middle of the working day at the moment they were trying
+  to restrict them. Half a window pauses the rule and says why.
+- **A library that stops responding mid-sweep no longer wedges automation.**
+  Each ROM's checks — resolving its path, confirming it is inside a volume,
+  looking for an existing output — ran with no time limit on a shared worker,
+  so a dead NFS/SMB mount held the sweep lock indefinitely: previews, manual
+  runs and even editing the rule to switch that platform off all waited behind
+  it until a restart. The platform now stops with a clear reason.
+- **A re-match snapshot survives a retry that replaces split parts.** A
+  previous run's numbered parts sitting at the destination were read as this
+  attempt's final output, so a retry queued with splitting switched off — one
+  single, matchable file — had its metadata retired before it even started.
+  Nothing is retired while a job still means to write that path.
+- **Re-matching says when a pass failed or was already running**, instead of
+  reporting "nothing waiting to be re-matched" next to a badge still showing
+  work queued.
+- **A metadata warning no longer claims a snapshot is being taken when the
+  settings could not be read.** The notice has three states now — on, off, and
+  unknown — because promising preservation next to a button that can delete the
+  source is the one guess not worth making.
+- **The library progress figures step aside when the convert panel writes to a
+  custom output folder.** They are computed from what sits beside each ROM, so
+  with an output folder set every converted file read as still to go and the
+  savings estimate promised space already reclaimed. It now says what it does
+  not cover rather than counting wrong.
+- **Metadata re-recorded after the queue redirects a conversion is verified,
+  not assumed.** The re-plan can succeed for some files and skip others; a
+  partial answer was treated as complete, retiring the old rows and reporting
+  metadata that was never saved for the rest.
+- **A conversion that failed is remembered as failed, even after a restart.**
+  Each rule records what it has produced so Overwrite and Write-alongside
+  happen once per ROM, and that record asked the job queue how the job ended —
+  which only works while the queue still remembers it. Once the job aged out of
+  the history, or the app restarted, the only evidence left was the destination
+  having changed, and a *failed* conversion changes it too (it can delete the
+  file it was replacing, or leave half of one). Those ROMs were then skipped by
+  every later run until you pressed **Forget history**. The outcome is now
+  written down the moment the job finishes.
+- **A filter pattern that repeats the same character several times over is
+  refused too.** The save-time check caught nested repetition — `(a+)+` — but
+  not `a*a*a*a*b`, which has no nesting and still takes minutes on one long
+  filename, with the scheduler blocked behind it. Patterns you would actually
+  write are unaffected: two repeats only count when they sit next to each other
+  *and* could both match the same character.
+- **Unticking every weekday now means "never on a schedule".** It was read as
+  "every day", so a rule you deliberately parked ran daily — unattended, and
+  with delete-after-verify if that was set. The editor says what an empty
+  selection does, and **Run now** still works.
+- **A manual Preview or Run now can no longer queue past the configured
+  maximum.** The optional limit those buttons accept was used verbatim, so it
+  could exceed *Max conversions per run* rather than narrow it; a non-numeric
+  value failed the request with a server error instead of a validation
+  message.
+- **Losing a race for an output path now reads as a conflict, not a crash.**
+  The queue refuses the second of two submissions that resolved the same
+  destination — that is the safety check working — but it surfaced as HTTP 500.
+  It is now a 409 the caller can retry or skip, and an automation sweep says
+  the destination was claimed rather than "could not be queued".
+- **Reading a RomM platform now has a real deadline.** The catalog scan was
+  moved off the shared worker pool so a dead mount could not starve unrelated
+  work, but nothing bounded it — so the request, and the spinner behind it,
+  waited forever. It now gives up with a clear error, on a budget that scales
+  with the size of the platform.
+- **Re-matching no longer holds a browser request open for a multi-gigabyte
+  hash.** The pass advertises a 120-second budget but checked it only between
+  files, while a single file could wait indefinitely for the disk lane and then
+  hash for five minutes or more — during which every other re-match request
+  reported busy. The budget now covers both. Large outputs still get their full
+  time: a background pass settles them with nobody waiting.
+- **Metadata that could not be re-saved after the queue redirected a
+  conversion now says so.** When the queue writes somewhere other than the
+  planned path the snapshot is re-recorded against the real one; if that second
+  call failed it was silently swallowed, leaving the conversion running with no
+  snapshot while the badge still promised a re-match.
+- **The "metadata is saved and restored" notice no longer appears when
+  metadata preservation is switched off.** With the setting off nothing is
+  saved, so the notice was reassuring you about a snapshot that did not exist —
+  while you converted, and possibly deleted, the only file carrying the match.
+- **Unsaved automation edits survive a trip to the library tab.** The editor
+  tracked "you have unsaved changes" per screen while the changes themselves
+  lived with the rules, so switching tabs and back hid the Save bar — and
+  **Preview** / **Run now**, which save first, then quietly reported on the
+  server's rules while the editor showed yours. A reload triggered by something
+  else (saving connection settings, a sweep finishing) no longer discards them
+  either.
+
+- **A PS2 or PSP catalog is offered Create DVD, not Create CD.** Narrowing the
+  library to a platform picked the right *tool* but not the right *command*:
+  every CHDMAN mode was offered on every disc system, and Create CD — the first
+  one in the list — is what an ISO submission defaulted to. `createcd` writes a
+  CD track layout, so the conversion was wrong before you touched anything. The
+  create and extract modes now each declare the media they actually serve:
+  PS2/PSP get the DVD pair, PS1/Dreamcast/Saturn and the rest get the CD pair,
+  and arcade keeps CD, HD and raw because MAME ships all three. Copy /
+  Recompress is unchanged — it is media-agnostic.
+- **Queueing a conversion no longer freezes the whole app when a mount stops
+  answering.** Before creating jobs the queue resolves each destination to a
+  canonical path so two jobs cannot write the same file, and that resolution ran
+  on the thread serving the app while it held the lock every submission passes
+  through. One unresponsive NFS/SMB/rclone volume was enough: every request, and
+  all job creation, waited on a stat that never returned. The resolution now
+  happens off that thread with a deadline, and a volume that does not answer
+  costs the batch nothing but symlink-awareness for that submit.
+- **Discarding a planned metadata snapshot can no longer discard somebody
+  else's.** A plan that was never submitted is retired by the browser, and it
+  retired whatever row pointed at that destination — which, once another tab or
+  a sweep had re-planned the same output, was that conversion's live row. Rows
+  are retired by identity now, so tidying up after a rejected batch cannot take
+  a running conversion's metadata with it.
+- **A re-match that fails while the same output was re-planned no longer errors
+  out.** Handing the row back after a failed write collided with the newer row
+  for that path and surfaced as a server error, hiding the real failure and
+  leaving the row stuck for fifteen minutes. The superseded attempt is now
+  retired, and the re-planned one carries on.
+- **Saving new RomM connection settings can no longer leave the previous
+  server's platform selected.** The reload that runs after a save did nothing
+  while the first load of the session was still in flight, so the old instance's
+  answer arrived afterwards and selected one of *its* platforms — which the
+  Convert panel then narrowed to, against a server nobody was pointed at any
+  more.
+
+- **Two submissions racing each other can no longer both claim one file
+  through different spellings of its path.** The queue resolves each
+  destination before taking its lock now (so a dead mount cannot freeze the
+  app), which left a gap: a job queued between one submission's resolution and
+  the next was compared by its literal path, so a library reached through a
+  symlink and the same library reached directly looked like two different
+  destinations. With Overwrite plus *delete the source after verifying*, that
+  deleted both sources for one surviving file. Each job now carries the key its
+  destination was claimed under.
+- **An automatic rule no longer queues a folder to a format that takes a
+  file.** A RomM record can resolve to a directory, and a directory whose name
+  ends in an accepted extension passed the format check — so an Overwrite rule
+  would authorise the job, delete the previous output, and only then fail in
+  the converter. The sweep now confirms what is on disk is the kind the format
+  actually consumes, and says the format cannot take it rather than claiming
+  the file is gone.
+- **Switching RomM instances retires a re-match row whose write was
+  interrupted.** Rows still waiting were retired, but one that a previous run
+  had claimed and never finished was left behind — and claims are deliberately
+  re-issued after fifteen minutes, so it would come back and apply the old
+  instance's identity to whatever the new one matched its digest to. Exactly
+  what retiring those rows exists to prevent.
+- **Leaving the RomM library while it is still loading no longer drops the
+  catalog into the ordinary file browser.** The platform request outlives the
+  screen, and its last step selects a platform — which re-entered RomM mode
+  after the view had already restored the normal directory listing, so the
+  workspace opened showing catalog rows under a folder heading.
+
+- **Saving a metadata setting no longer commits a half-typed connection
+  edit.** The Metadata card shared its Save button's handler with the
+  Connection card, so it submitted the URL, token and library path too — and a
+  URL or library path that differs from the saved one tells the backend you
+  have moved to a different RomM, which clears the conversion history and
+  retires every pending metadata snapshot. Ticking "re-apply on load" is not a
+  reason to lose those. Neither Save can fire before the saved settings have
+  loaded either, since the fields are empty until then and submitting them
+  reads as a move to nowhere.
+- **Turning automatic conversion on now saves your pending rule edits first**,
+  the way Preview and Run now already did. The scheduler reads the saved
+  rules, so switching the master toggle on with unsaved edits started
+  unattended runs against the *previous* configuration — including a platform
+  you had just switched off, or a delete-after-verify you had just cleared,
+  while the editor showed the safer version.
+- **The metadata promise is no longer made for split conversions.** With
+  splitting on, a PS3 image over 4 GB is written as numbered parts, and RomM
+  matches a ROM on one file's hash — so those genuinely cannot be re-matched
+  automatically, which the backend already knew and said. The warning beside
+  the format now says it too instead of promising a restore that was never
+  coming.
+- **A filter pattern longer than the 500-character limit is refused rather
+  than trimmed.** A cut-off regular expression is usually still a valid one
+  that means something else: an include that widens the selection, or an
+  exclude that stops covering the titles it was written for — running
+  unattended, possibly with delete-after-verify. Overlong patterns now pause
+  the rule and say why, like every other filter this validator refuses.
+- **Changing the RomM connection can no longer hang on the mount you are
+  replacing.** Deciding whether the library actually moved resolves both the
+  old and the new path, and the old one is frequently the share that has
+  stopped responding — which is why you are there. That resolution had no
+  deadline and ran while holding the locks that re-matching, sweeps and rule
+  edits all wait on, so the one request that would have fixed the mount
+  wedged everything else instead.
+
+- **Editing a rule while the previous save is still in flight no longer
+  discards the edit.** The reply carries the server's tidied copy of what was
+  *submitted*, and taking it replaced anything typed since — then cleared the
+  "unsaved changes" bar, so nothing said the edit had gone. The edit that
+  matters most is the one that makes a rule safer.
+- **The re-match badge no longer creeps upward on retries.** Saving a snapshot
+  for a destination *replaces* the one already waiting rather than adding to
+  it, so a retried or redirected conversion does not change the backlog — but
+  the badge counted every newly saved row, and stayed wrong until the page
+  reloaded. It now shows the figure the backend actually measured.
+- **Saving automation rules can no longer freeze the app on a dead output
+  folder.** Validating one resolves the path and checks it against every
+  configured volume, and that ran on the thread serving the app while holding
+  the lock every sweep, preview and rule edit waits on — so the request to
+  disable the rule naming the bad folder queued up behind the folder itself.
+  It now runs off that thread with a deadline, and a folder that cannot be
+  checked pauses its rule instead of being accepted unchecked. The same
+  deadline covers the sweep's own re-check of a saved folder, and a submitted
+  batch's path resolution.
+- **A completed conversion no longer costs a walk through your whole
+  conversion history.** Every finishing job — including every manual one —
+  searched every remembered ROM of every platform for its own record, on the
+  app's thread. Each job now goes straight to its record.
+
+- **Changing your RomM connection now finishes what it starts, even across a
+  crash.** Pointing at a different instance or library clears the conversion
+  history and retires the pending metadata snapshots, because both belong to
+  the instance they were recorded against. That was two separate operations,
+  and whichever one survived an interruption left the other undone — either the
+  old connection still in force with its records already destroyed, or the new
+  one running with the previous instance's metadata rows still live against it.
+  The two now commit together, and an interrupted change is completed on the
+  next start.
+- **A metadata snapshot can no longer be saved against the wrong RomM.**
+  Planning reads the catalog and then writes rows carrying that catalog's
+  identifiers. If you changed the connection in another tab in between, those
+  rows described one library's game using another library's identity. The plan
+  now notices and asks you to submit again.
+- **A conversion that finishes almost instantly is remembered correctly.** The
+  outcome is written down the moment a job ends, but for a very fast conversion
+  that could arrive before the record it belongs to existed — and the verdict
+  was dropped, leaving the rule to fall back on "the destination changed",
+  which a *failed* overwrite does just as convincingly. The answer is now held
+  until the record catches up.
+- **Opening a folder from the RomM catalog no longer strands you in it.**
+  Clicking a directory-backed entry (a decrypted PS3 game) left the RomM
+  toolbar sitting above ordinary directory contents, with no breadcrumbs and no
+  parent link — the only way back was to leave and reopen the whole view. It
+  now moves to the workspace, which is the screen that knows how to show a
+  folder.
+- **A slow answer from the RomM you just replaced no longer overwrites the new
+  one's status.** An unreachable URL is exactly the reason to change it, so
+  that request is the one most likely to still be in flight when you save — and
+  its late reply left the library reporting the new instance as unusable while
+  its catalog had already loaded.
+
+- **Naming a platform on Run now no longer starts a rule that validation
+  paused.** Running one platform by hand deliberately overrides the scheduler
+  being off — but a rule paused because its output folder was outside the
+  volumes, its filter backtracked, or its time window was half-filled has
+  already had that value replaced with the wider fallback. Running it would
+  write beside every source, or convert the whole platform, unattended and
+  possibly with delete-after-verify. Those stay paused, and the run says so.
+- **The reason a rule is paused survives a reload.** The refused value is
+  replaced by the fallback, so re-reading the saved rule found nothing wrong
+  with it and cleared the flag — leaving the editor showing a paused rule with
+  no explanation.
+- **Retargeting a rule can no longer keep the history that belonged to its old
+  target.** Changing the format or output folder clears what the rule
+  remembers producing, and those were two separate writes: if the second one
+  was lost, a retry compared the new rule with itself, saw no change, and left
+  Overwrite and Write-alongside skipping every ROM as already converted against
+  outputs of the *former* format. The history is now cleared first, so an
+  interruption costs a re-conversion rather than a silent skip.
+- **Discarding a plan no longer takes a running conversion's metadata with
+  it.** Two tabs can prepare the same output before either submits; the second
+  replaces the first's snapshot, and if the *first* tab then wins the queue the
+  second tidies up after itself — retiring the row the accepted conversion
+  depended on. A snapshot for a file a queued job is writing is now left alone,
+  whoever prepared it.
+- **Submitting `null` for the RomM URL is no longer read as moving away from
+  it.** Every other setting treats an omitted value as "leave it alone", but
+  this one path read it as an empty connection and cleared the conversion
+  history and every pending snapshot without a single setting having changed.
+- **One more way a dead mount could freeze job submission.** The queue lists
+  each job's companion files when reserving a destination, and for PS3 split
+  builds that means asking the disk which numbered parts exist. That ran on the
+  thread serving the app, before the deadline meant to cover it, while
+  inspecting a job that was merely queued.
+
+- **Copy / Recompress can no longer be set as an automatic rule.** Left running
+  it never stops: `Game.chd` becomes `Game_copy.chd`, RomM scans that, the same
+  rule converts it to `Game_copy_copy.chd`, and so on once per sweep at full
+  size until the volume fills — with nothing to notice it, since each
+  destination really is new. It stays available for conversions you start
+  yourself; only unattended rules refuse it, in the editor and in the backend
+  both, so a hand-edited configuration cannot slip it through.
+- **Retrying a failed connection change now finishes the cleanup it owed.** If
+  the new address saved but clearing the old instance's records did not,
+  pressing Save again saw nothing left to change and reported success — while
+  the previous instance's history and metadata snapshots stayed live against
+  the new one until a restart.
+- **Preview, Run now and the automation switch no longer act on a rule you have
+  since edited.** They save first, and an edit made while that save was in
+  flight is deliberately kept rather than overwritten — but the action then
+  went ahead against the older saved copy, which might still have had the
+  platform enabled or delete-after-verify set.
+- **A platform whose sources all became unreadable no longer waits out its full
+  interval.** With delete-after-verify on, a mount going quiet can drop every
+  candidate from the batch; queueing nothing then looked like a clean run and
+  advanced the schedule, postponing the lot for hours over a transient failure.
+  It now reports the platform's sources as unreadable and leaves the clock
+  alone, so the next run picks them straight back up.
+- **Checking whether a tool is usable can no longer hang a sweep.** Switch
+  conversions look for `prod.keys` by walking every configured volume, and that
+  walk had no deadline while the sweep held its lock — so one unresponsive
+  share blocked previews, manual runs, rule edits and settings saves behind it.
 
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K

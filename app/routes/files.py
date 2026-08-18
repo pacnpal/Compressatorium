@@ -108,7 +108,7 @@ def _fold_split_iso_entries(entries: list[FileEntry]) -> list[FileEntry]:
     return result
 
 
-def _detect_file_outputs(
+def detect_file_outputs(
     item_path: str,
     *,
     from_archive: bool = False,
@@ -145,12 +145,12 @@ def _detect_file_outputs(
     return convertible_by, outputs, by_tool
 
 
-def _detect_directory_outputs(
+def detect_directory_outputs(
     item_path: str,
 ) -> tuple[list[str], list[OutputStatus]]:
     """Registry-driven convertibility + output detection for a directory row.
 
-    The directory analogue of :func:`_detect_file_outputs`: ask the registry
+    The directory analogue of :func:`detect_file_outputs`: ask the registry
     which tools accept this folder as their input unit (``tools_for_directory``
     runs each tool's source-layout detector) and collect their sibling outputs
     (``<folder>.iso``). Cheap but does disk I/O (a stat for ``PS3_GAME/`` and a
@@ -199,8 +199,8 @@ def _detect_archive_member_outputs(
     synthetic_input = os.path.join(
         archive_dir, archive_service._output_name_for_member(entry["internal_path"]),
     )
-    _, outputs, by_tool = _detect_file_outputs(synthetic_input, from_archive=True)
-    # `_detect_file_outputs` derives convertibility from each tool's
+    _, outputs, by_tool = detect_file_outputs(synthetic_input, from_archive=True)
+    # `detect_file_outputs` derives convertibility from each tool's
     # `converts_path` — but a member is only convertible in *place* when a tool
     # can accept
     # it straight from an archive. Re-derive against `allows_archive_input` so a
@@ -213,7 +213,7 @@ def _detect_archive_member_outputs(
     return output_stem, convertible_by, outputs, by_tool
 
 
-def _verifiable_by(path: str) -> list[str]:
+def verifiable_tools(path: str) -> list[str]:
     """Tool ids whose Verify/Info apply to this concrete on-disk path.
 
     Registry-driven per-file refinement of ``verify_extensions``: romz inspects
@@ -253,7 +253,7 @@ def _summarize_archive(item_path: str) -> dict:
         "archive_items": len(contents),
         "archive_has_output": archive_has_output,
         "archive_truncated": bool(archive_result["truncated"]),
-        "verifiable_by": _verifiable_by(item_path),
+        "verifiable_by": verifiable_tools(item_path),
     }
 
 
@@ -360,7 +360,7 @@ async def list_files(
                         # browser can badge + select it. A plain folder gets
                         # empty lists and stays navigation-only.
                         dir_convertible_by, dir_outputs = (
-                            _detect_directory_outputs(item_path)
+                            detect_directory_outputs(item_path)
                         )
                         entries.append(
                             FileEntry(
@@ -383,7 +383,7 @@ async def list_files(
                         if is_archive:
                             convertible_by, outputs = [], []
                         else:
-                            convertible_by, outputs, _ = _detect_file_outputs(
+                            convertible_by, outputs, _ = detect_file_outputs(
                                 item_path,
                             )
 
@@ -404,7 +404,7 @@ async def list_files(
                                 archive_truncated = summary["archive_truncated"]
                                 verifiable_by = summary["verifiable_by"]
                         else:
-                            verifiable_by = _verifiable_by(item_path)
+                            verifiable_by = verifiable_tools(item_path)
 
                         entry = FileEntry(
                             name=item,
@@ -530,7 +530,7 @@ async def search_files(
                             # jobs). scan_directory alone would leave it invisible
                             # to recursive search. A plain folder still recurses.
                             dir_convertible_by, dir_outputs = (
-                                _detect_directory_outputs(item_path)
+                                detect_directory_outputs(item_path)
                             )
                             if dir_convertible_by:
                                 files.append(
@@ -553,7 +553,7 @@ async def search_files(
                             if is_archive:
                                 convertible_by, outputs = [], []
                             else:
-                                convertible_by, outputs, _ = _detect_file_outputs(
+                                convertible_by, outputs, _ = detect_file_outputs(
                                     item_path,
                                 )
                             if convertible_by:
@@ -566,7 +566,7 @@ async def search_files(
                                         "in_archive": False,
                                         "convertible_by": convertible_by,
                                         "outputs": outputs,
-                                        "verifiable_by": _verifiable_by(item_path),
+                                        "verifiable_by": verifiable_tools(item_path),
                                     },
                                 )
                             elif include_archive_scan and is_archive:
@@ -593,7 +593,7 @@ async def search_files(
                                         # Per-archive gate: romz Verify/Info only
                                         # surface on single-ROM .7z/.zip, not on
                                         # every archive container.
-                                        "verifiable_by": _verifiable_by(item_path),
+                                        "verifiable_by": verifiable_tools(item_path),
                                     },
                                 )
                                 # List archive contents. Search surfaces

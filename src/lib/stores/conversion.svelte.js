@@ -62,6 +62,14 @@ class ConversionStore {
   split = $state(false);
   customFilterMode = $state(false);
 
+  // How many re-pin rows the last submit recorded, for the caller to surface.
+  lastRepinRecorded = $state(0);
+  // The backend's own count of rows still waiting, as of the last plan. The
+  // badge is set from this rather than added to, because `record()` supersedes
+  // the row for a destination instead of stacking one — so a retry records a
+  // row without changing the total. Null when nothing was planned.
+  lastRepinPending = $state(null);
+
   duplicateCheck = $state(null);
   deletePlan = $state(null);
   converting = $state(false);
@@ -330,7 +338,11 @@ class ConversionStore {
    * then fail at runtime. Removing a codec from an existing 4-long
    * selection still works.
    */
-  CHDMAN_MAX_CODECS = 4;
+  get CHDMAN_MAX_CODECS() {
+    // The registry owns the cap (chdman declares `maxCodecs`), so the manual
+    // picker and the RomM automation editor enforce the same number.
+    return registry.maxCodecsFor(this.mode);
+  }
 
   toggleCodec(codec) {
     if (codec === 'none') {
@@ -432,10 +444,66 @@ class ConversionStore {
   }
 
   // ─── Submission ───────────────────────────────────────────────────────
-  async submit(filePaths, { duplicateAction = 'skip' } = {}) {
+  /**
+   * @param {string[]} filePaths
+   * @param {{ duplicateAction?: string, rommRepin?: boolean }} [opts]
+   *   `rommRepin` records each source's RomM metadata before the jobs are
+   *   queued, so a format RomM cannot hash-match (RVZ/CSO/NSZ/WUX/Z3DS) can be
+   *   re-identified after its rescan. It must happen BEFORE the conversion:
+   *   the provider ids are read from the RomM record for the source file, and
+   *   that record is what goes stale once the source is converted or deleted.
+   */
+  async submit(
+    filePaths,
+    { duplicateAction = 'skip', rommRepin = false, rommPlatformId = null } = {},
+  ) {
     if (!filePaths?.length) return null;
     this.converting = true;
+    this.lastRepinRecorded = 0;
+    this.lastRepinPending = null;
+    // The metadata snapshot is taken before the batch is submitted, so any
+    // path the batch does not end up queueing — a rejected submit, or one the
+    // backend filters out during per-file validation — leaves a row describing
+    // a conversion that will never run. Source path -> recorded destination.
+    let recorded = {};
+    // Source path -> the id of the row recorded for it. Retiring is keyed by
+    // id, not by destination: `record()` supersedes, so between this plan and
+    // its cancel another client can own the row that path now holds, and
+    // cancelling by path would retire its live conversion's metadata.
+    let recordedIds = {};
     try {
+      if (rommRepin) {
+        try {
+          // The duplicate policy goes with it: the plan has to record the
+          // path the batch will actually write. Under Rename the batch resolves
+          // to `Game_1.rvz`, so recording the occupied base path would re-pin
+          // the OLD file and leave the new one unidentified; under Skip the
+          // conflicting sources are never queued at all.
+          // The platform goes with it: the backend would otherwise walk every
+          // platform's full catalog looking for these paths, which on a large
+          // instance is hundreds of serialised requests before a small batch
+          // is even queued. These rows all came from one platform's listing.
+          const planned = await api.planRommRepin(
+            filePaths, this.mode, this.outputDir || null, duplicateAction,
+            rommPlatformId,
+          );
+          // Reported back to the caller rather than pushed into the RomM store
+          // from here: conversion is imported by fileBrowser, which the RomM
+          // store imports, so a static import back would be a cycle.
+          this.lastRepinRecorded = planned?.recorded ?? 0;
+          this.lastRepinPending = planned?.pending ?? null;
+          recorded = planned?.recorded_paths ?? {};
+          recordedIds = planned?.recorded_ids ?? {};
+        } catch (e) {
+          // Best-effort, like the disc-ID tagging hook: losing the metadata
+          // snapshot costs a re-match in RomM, while refusing to convert costs
+          // the user the thing they actually asked for.
+          toast.warning(
+            `Could not save RomM metadata (${e?.message ?? 'unknown error'}); `
+            + 'converted files may need re-matching in RomM',
+          );
+        }
+      }
       const result = await jobs.createBatch(filePaths, this.mode, {
         outputDir: this.outputDir || null,
         duplicateAction,
@@ -463,12 +531,175 @@ class ConversionStore {
       } else {
         toast.success(`Queued ${created} job(s)`);
       }
+      // Reconcile the planned rows against what the queue actually did.
+      //
+      // Planning resolves a destination by predicting the duplicate policy's
+      // answer, and between predicting and queueing the prediction can go
+      // stale: another job or an outside process takes the path Rename picked,
+      // so the batch writes somewhere else. A row left pointing at the
+      // predicted path would then be settled against whatever landed there —
+      // this ROM's identity stamped on an unrelated file. So compare against
+      // each job's real `output_path`, not just its source.
+      const created_jobs = (Array.isArray(result) ? result : []).filter(Boolean);
+      // The queue reports each job's source as the backend resolved it, which
+      // is the symlink-free path; the row was recorded against the path the
+      // browser submitted. For a library reached through a symlinked ancestor
+      // those differ, and matching on the submitted spelling alone would find
+      // no job for a source that was queued — retiring a row the conversion
+      // still needs. A destination that some job is writing means the row is
+      // live whatever the source is spelled like.
+      const actualBySource = new Map(
+        created_jobs.map((j) => [j.file_path, j.output_path]),
+      );
+      const queuedDestinations = new Set(
+        created_jobs.map((j) => j.output_path).filter(Boolean),
+      );
+      const misdirected = {};
+      for (const [source, planned] of Object.entries(recorded)) {
+        const actual = actualBySource.get(source);
+        if (!actual) continue;
+        if (actual !== planned) misdirected[source] = actual;
+      }
+      if (Object.keys(misdirected).length) {
+        // Re-record first, retire second. The old row is only wrong once the
+        // new one exists: if the re-record fails — RomM went away between the
+        // first plan and now — cancelling first would leave the conversion
+        // running with no snapshot at all, and the operator none the wiser.
+        // Losing this ordering is how metadata disappears silently.
+        let replanned = null;
+        try {
+          replanned = await api.planRommRepin(
+            Object.keys(misdirected), this.mode, this.outputDir || null,
+            duplicateAction, rommPlatformId, misdirected,
+          );
+        } catch (e) {
+          // Say so rather than swallow it: the conversion is already queued,
+          // so this metadata now needs the manual path. The count is corrected
+          // below so the badge does not promise a re-match that is not coming.
+          toast.warning(
+            `Metadata could not be saved for ${Object.keys(misdirected).length} `
+            + `file(s) the queue redirected: ${e?.message ?? 'the request failed'}. `
+            + 'Re-match those in RomM by hand after converting.',
+          );
+        }
+        // Truthy is not enough: the plan endpoint skips a path it cannot
+        // record (RomM no longer lists it, the destination is outside the
+        // volumes) and still answers 200, so a partial result would retire
+        // the old rows and report metadata that was never saved. Every
+        // redirected source has to come back mapped to the path the queue
+        // actually chose.
+        const replannedPaths = replanned?.recorded_paths ?? {};
+        const replannedIds = replanned?.recorded_ids ?? {};
+        const replanComplete = Object.entries(misdirected).every(
+          ([source, destination]) => replannedPaths[source] === destination,
+        );
+        if (replanned && !replanComplete) {
+          toast.warning(
+            'Metadata could not be saved for every file the queue redirected. '
+            + 'Re-match those in RomM by hand after converting.',
+          );
+        }
+        if (replanComplete) {
+          await api
+            .cancelRommRepin(
+              Object.keys(misdirected)
+                .map((k) => recordedIds[k])
+                .filter((id) => id != null),
+            )
+            .catch(() => {});
+          for (const [source, actual] of Object.entries(misdirected)) {
+            recorded[source] = actual;
+            recordedIds[source] = replannedIds[source];
+          }
+        } else {
+          // Retire the old rows anyway. They point at a path this batch is no
+          // longer writing — under Overwrite that is the file the conversion
+          // was going to replace — and a row aimed at the wrong file is worse
+          // than no row at all. The `finally` block cannot do it: these
+          // sources did become jobs, so they are filtered out of `recorded`
+          // below and would be left behind.
+          await api
+            .cancelRommRepin(
+              Object.keys(misdirected)
+                .map((k) => recordedIds[k])
+                .filter((id) => id != null),
+            )
+            .catch(() => {});
+          for (const source of Object.keys(misdirected)) {
+            delete recorded[source];
+            delete recordedIds[source];
+          }
+          // Only the ones that really were not re-recorded: a partial answer
+          // still saved metadata for the sources it mapped, and counting
+          // those as lost would under-report just as misleadingly.
+          const lost = Object.entries(misdirected).filter(
+            ([source, destination]) => replannedPaths[source] !== destination,
+          ).length;
+          this.lastRepinRecorded = Math.max(0, this.lastRepinRecorded - lost);
+        }
+      }
+      // What is left in `recorded` after this is the set the `finally` block
+      // retires: rows whose source did NOT become a job at all.
+      //
+      // Retire by destination, but decide by destination too: two sources can
+      // resolve to one output (duplicate basenames landing in a single output
+      // folder), the batch collapses them into one job, and cancelling on
+      // behalf of the source that lost would delete the row the winner needs.
+      // A destination any queued source claims is never retired.
+      const queuedSources = new Set(created_jobs.map((job) => job.file_path));
+      const claimed = new Set(
+        Object.entries(recorded)
+          .filter(([source]) => queuedSources.has(source))
+          .map(([, destination]) => destination),
+      );
+      recorded = Object.fromEntries(
+        Object.entries(recorded).filter(
+          ([source, destination]) =>
+            !queuedSources.has(source)
+            && !claimed.has(destination)
+            // ...and not a row whose destination a job is writing under a
+            // source spelled differently (a symlinked ancestor, resolved by
+            // the backend). Retiring that row loses the metadata for a
+            // conversion that is running.
+            && !queuedDestinations.has(destination),
+        ),
+      );
+      // Report only the rows that survive, or the toast would claim metadata
+      // was saved for conversions that are not happening.
+      this.lastRepinRecorded = Math.max(
+        0, this.lastRepinRecorded - Object.keys(recorded).length,
+      );
       return result;
     } catch (e) {
       toast.error(e?.message ?? 'Failed to create jobs');
       throw e;
     } finally {
       this.converting = false;
+      // Retire the rows for everything that did not become a job. They are
+      // harmless if this fails — a row whose output never changes is never
+      // settled and ages out on its own — so it must not mask a real error.
+      // By id: `recorded` decides *which* rows (its keys are the sources that
+      // did not become jobs), `recordedIds` names them.
+      const orphaned = Object.keys(recorded)
+        .map((source) => recordedIds[source])
+        .filter((id) => id != null);
+      if (orphaned.length) {
+        // Awaited for its *count*, not for its success. `lastRepinPending` was
+        // measured by the plan call, before these rows were retired, so leaving
+        // it there showed the pre-reconciliation backlog on the badge — and a
+        // fire-and-forget retirement can never correct it, so it stayed wrong
+        // until a status reload or a settle pass. The reply carries the
+        // authoritative count; a failure leaves the old one, which is the
+        // existing best-effort behaviour and still ages out on its own.
+        try {
+          const reconciled = await api.cancelRommRepin(orphaned);
+          if (typeof reconciled?.pending === 'number') {
+            this.lastRepinPending = reconciled.pending;
+          }
+        } catch (_e) {
+          // Harmless: a row whose output never changes is never settled.
+        }
+      }
     }
   }
 }

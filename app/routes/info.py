@@ -1178,11 +1178,17 @@ async def list_tools():
     prerequisites are missing — today that's Switch (nsz), which needs the
     operator's prod.keys, but the check is the plugin's, not this route's, so
     any future gated tool is covered by implementing the hook.
+
+    Asked through the registry's bounded seam. nsz's answer is a recursive walk
+    of every configured volume, so an NFS/SMB/rclone mount that stops answering
+    used to hang this route outright — and this one is the sidebar, awaited
+    once per tool in turn, so a single dead volume held up the tools that were
+    perfectly fine behind it. A probe that expires reports the tool
+    unavailable, which is what a tool whose prerequisites cannot be read is.
     """
-    available, unavailable = [], []
-    for tool in registry.all():
-        target = available if await tool.is_ready() else unavailable
-        target.append(tool.id)
+    ready = set(await registry.ready_tool_ids())
+    available = [t.id for t in registry.all() if t.id in ready]
+    unavailable = [t.id for t in registry.all() if t.id not in ready]
     return {"available": available, "unavailable": unavailable}
 
 

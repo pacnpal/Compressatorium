@@ -188,6 +188,64 @@
   wait: 1800
   javascript: *js_theme_dark
 
+# --- RomM library ---------------------------------------------------------
+# The screenshot environment has no RomM instance configured, so these capture
+# the first-run state. That is deliberate: the setup form is what a new user
+# actually meets, and the Settings tab is where the integration is configured.
+- url: http://127.0.0.1:8099/?s=romm-light#/romm
+  output: docs/screenshots/romm-light.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: *js_theme_light
+- url: http://127.0.0.1:8099/?s=romm-dark#/romm
+  output: docs/screenshots/romm-dark.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: *js_theme_dark
+
+# The Automation tab. NOT the Settings tab: with no RomM configured the view
+# opens on Settings by itself, so the base shot above already captures that
+# surface and a second one would be identical. Clicked after the theme flip, so
+# the JS is inline rather than using the shared anchors.
+- url: http://127.0.0.1:8099/?s=romm-automation-light#/romm
+  output: docs/screenshots/romm-automation-light.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: |
+    (async () => {
+      localStorage.setItem('theme-preference', 'light');
+      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'light' }));
+      await new Promise(r => setTimeout(r, 400));
+      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Automation');
+      // Throw rather than fall through: silently capturing whichever tab
+      // happened to be open would replace the Automation screenshot with a
+      // duplicate of the Settings one, and nothing downstream would notice.
+      if (!tab) throw new Error('Automation tab not found');
+      tab.click();
+      await new Promise(r => setTimeout(r, 600));
+    })()
+- url: http://127.0.0.1:8099/?s=romm-automation-dark#/romm
+  output: docs/screenshots/romm-automation-dark.png
+  width: 1280
+  height: 900
+  wait: 1800
+  javascript: |
+    (async () => {
+      localStorage.setItem('theme-preference', 'dark');
+      window.dispatchEvent(new StorageEvent('storage', { key: 'theme-preference', newValue: 'dark' }));
+      await new Promise(r => setTimeout(r, 400));
+      const tab = [...document.querySelectorAll('.tab')].find(b => b.textContent.trim() === 'Automation');
+      // Throw rather than fall through: silently capturing whichever tab
+      // happened to be open would replace the Automation screenshot with a
+      // duplicate of the Settings one, and nothing downstream would notice.
+      if (!tab) throw new Error('Automation tab not found');
+      tab.click();
+      await new Promise(r => setTimeout(r, 600));
+    })()
+
 # --- DAT Library ----------------------------------------------------------
 - url: http://127.0.0.1:8099/?s=dat-light#/dat
   output: docs/screenshots/dat-light.png
