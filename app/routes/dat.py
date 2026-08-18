@@ -653,6 +653,41 @@ async def _drain_deferred_rematch() -> None:
         )
 
 
+async def _paths_needing_rematch(before: list[str]) -> list[str]:
+    """The pre-change snapshot, plus every row that *survived* the change.
+
+    Both callers snapshot before the change, because the change is what
+    invalidates. That snapshot is not transactional with it, though, and a
+    match already in flight can persist a remote hit inside the window between
+    the two. Invalidation preserves remote hits by design, so such a row
+    survives while being absent from the snapshot -- and since a cached hit is
+    always usable, nothing would ever recompute it. The DAT just imported could
+    know that hash and would never get the chance to say so.
+
+    Reading the surviving rows *after* the change closes that without making
+    the snapshot transactional with the import. Anything still cached once the
+    new index is live either predates the change (already in *before*) or was
+    written during it, and both need recomputing. A row written after the
+    commit was decided against the new index already, so including it is
+    redundant rather than wrong -- and the window is milliseconds wide.
+
+    Sorted because ``list_match_paths`` promises no order and the resulting job
+    should not depend on one.
+    """
+    try:
+        surviving = await run_in_threadpool(dat_store.list_match_paths)
+    except Exception:
+        # Best-effort, like the caller: the DATs are committed either way, and
+        # rematching the snapshot alone is strictly better than rematching
+        # nothing.
+        logger.exception(
+            "failed to list surviving match rows; rematching the pre-change "
+            "snapshot only",
+        )
+        return sorted(set(before))
+    return sorted(set(before) | set(surviving))
+
+
 async def rematch_after_dat_change(
     paths: list[str], *, source: str,
 ) -> tuple[str, str | None]:
@@ -664,9 +699,14 @@ async def rematch_after_dat_change(
     recomputed against the new index. It had been written twice, and only the
     sync copy reported what happened when the matcher was busy.
 
+    *paths* is the caller's pre-change snapshot; the rows that survived the
+    change are added here (see :func:`_paths_needing_rematch`), which is why an
+    empty snapshot is still worth calling with.
+
     Never raises: the DAT is already committed by the time this runs, so a
     scheduling failure must not turn a good import into an error.
     """
+    paths = await _paths_needing_rematch(paths)
     if not paths:
         return "none", None
     try:

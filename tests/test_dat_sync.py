@@ -555,7 +555,12 @@ async def test_do_sync_schedules_rematch_after_success(sync_service, tmp_path):
 
 @pytest.mark.asyncio
 async def test_do_sync_skips_rematch_when_no_previous_matches(sync_service, tmp_path):
-    """Empty match cache → no schedule_match_job call."""
+    """Nothing cached before *or after* the sync → no schedule_match_job call.
+
+    The hook is now called unconditionally (a remote hit persisted during the
+    sync survives it and cannot be in the snapshot), so "skip" means the union
+    came back empty, not that the snapshot did.
+    """
     dat_file = tmp_path / "sample.dat"
     dat_file.write_text("<datafile></datafile>")
 
@@ -582,6 +587,47 @@ async def test_do_sync_skips_rematch_when_no_previous_matches(sync_service, tmp_
 
     assert result["status"] == "complete"
     mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_sync_rematches_a_hit_persisted_during_the_sync(sync_service, tmp_path):
+    """An empty snapshot must not skip the hook entirely.
+
+    A match in flight can persist a remote hit between the snapshot and the
+    persist() that invalidates; the sync preserves it, and with the old
+    `if previous_match_paths:` guard an install whose cache was empty
+    beforehand never scheduled a rematch for it at all.
+    """
+    dat_file = tmp_path / "sample.dat"
+    dat_file.write_text("<datafile></datafile>")
+
+    mock_dat_store = MagicMock()
+    mock_dat_store.list_dats = MagicMock(return_value=[])
+    mock_dat_store.delete_dats_bulk = AsyncMock(return_value=0)
+    mock_dat_store.import_dat_no_persist = AsyncMock(return_value={
+        "id": "new1", "name": "Fresh", "file_count": 1, "hashes_added": 1,
+    })
+    mock_dat_store.persist = AsyncMock()
+    # The sync's own pre-persist snapshot: empty.
+    mock_dat_store.list_match_paths = MagicMock(return_value=[])
+
+    mock_schedule = AsyncMock(return_value="rematch-job-99")
+
+    with patch.object(sync_service, "_fetch_latest_tag", return_value="0.285"), \
+         patch.object(sync_service, "_list_dat_files", side_effect=[
+             [{"name": "test.dat", "path": "MAME Redump/test.dat", "size": 100}],
+             [],
+         ]), \
+         patch.object(sync_service, "_download_dat", return_value=str(dat_file)), \
+         patch.object(sync_service, "_get_dat_store", return_value=mock_dat_store), \
+         patch("routes.dat.schedule_match_job", mock_schedule), \
+         patch("routes.dat.dat_store.list_match_paths",
+               return_value=["/data/late.chd"]):
+        result = await sync_service.sync(tag="0.285")
+
+    assert result["status"] == "complete"
+    mock_schedule.assert_awaited_once_with(["/data/late.chd"], defer_if_busy=True)
+    assert result["rematch_status"] == "scheduled"
 
 
 @pytest.mark.asyncio

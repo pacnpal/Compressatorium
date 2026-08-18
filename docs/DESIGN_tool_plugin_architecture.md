@@ -1354,7 +1354,10 @@ This is a payload field, not a schema change.
   the candidates (leaving the path uncached, so the next match resolves it
   locally). What remains is the transaction boundary itself: an import
   committing between that read and the write's commit leaves a remote hit,
-  which invalidation preserves by design.
+  which invalidation preserves by design — and which is now *scheduled for
+  rematch* unless its commit also lands after the post-change listing below,
+  so the residual window is the narrower one and sits entirely after the new
+  DATs are live.
 
   That third guard covers **every verdict the remote source took part in, over
   the whole candidate set** — not just the hit, and not just the hash that
@@ -1387,13 +1390,28 @@ This is a payload field, not a schema change.
   "complete" carrying a generic error count — exactly the misread that branch
   exists to prevent. A batch of nothing but skips still completes: nothing was
   attempted, so nothing went wrong.
-- **A DAT change re-matches through one helper.** `rematch_after_dat_change()`
-  is shared by the manual upload (`import_dat`) and the MAMERedump sync; both
-  want "recompute what already had a verdict against the new index", and it had
-  been written twice. The matcher is single-flight, so when a job is already
-  running those paths go into `_deferred_rematch_paths` and the finishing job
-  drains them — "best-effort" means *later*, not *never*, which is what dropping
-  the `None` return used to mean.
+- **A DAT change re-matches through one helper, over before *and* after.**
+  `rematch_after_dat_change()` is shared by the manual upload (`import_dat`) and
+  the MAMERedump sync; both want "recompute what already had a verdict against
+  the new index", and it had been written twice. The matcher is single-flight,
+  so when a job is already running those paths go into
+  `_deferred_rematch_paths` and the finishing job drains them — "best-effort"
+  means *later*, not *never*, which is what dropping the `None` return used to
+  mean.
+
+  The caller's snapshot is taken *before* the change, because the change is
+  what invalidates — but it is not transactional with it, and a match already
+  in flight can persist a remote hit inside that window. Invalidation preserves
+  remote hits by design, so such a row survives while being absent from the
+  snapshot, and since a cached hit is always usable nothing would ever
+  recompute it: the DAT just imported could know that hash and never get the
+  chance to say so. `_paths_needing_rematch()` therefore unions the snapshot
+  with a listing taken *after* the change — anything still cached once the new
+  index is live either predates the change or was written during it, and both
+  need recomputing. A row written after the listing is redundant to include
+  rather than wrong. This is why the sync calls the hook unconditionally now:
+  an empty snapshot is exactly the case where the surviving row is the *only*
+  thing to rematch, and the old `if previous_match_paths:` guard skipped it.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

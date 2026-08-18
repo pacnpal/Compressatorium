@@ -85,6 +85,18 @@
   removed, and nothing ever re-checked it. Whether a match came from Hasheous
   is now recorded on the row rather than guessed from a null key.
 
+- **A match recorded *while* a DAT import was running is no longer left out of
+  the follow-up re-match.** The re-match works from a snapshot taken just
+  before the import, so a file identified through Hasheous in the moments
+  between the two ended up in a gap: the import keeps remote matches (they owe
+  nothing to your DATs), but the snapshot couldn't know about that one, and a
+  match that already has an answer is never re-checked on its own. The DAT you
+  had just imported might have identified the same file and would never have
+  got the chance to. The re-match now also covers whatever is still cached once
+  the new DATs are live, and the MAMERedump sync runs it even when nothing was
+  cached beforehand — that being precisely the case where the file caught in
+  the gap is the only one that needs it.
+
 - **A DAT import landing during a scan no longer skips its re-match.** The
   matcher runs one job at a time, so an import or sync that finished while a
   match job was running had its follow-up silently dropped and those files kept

@@ -2864,3 +2864,123 @@ async def test_the_route_hands_its_candidates_to_the_write_boundary(
     hit = await dat_routes._match_single_file("/vol/game.chd")
     assert hit["matched"] is True
     assert hit[CANDIDATE_HASHES_KEY] == [header, data]
+
+
+# ---------------------------------------------------------------------------
+# Twenty-ninth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_hit_written_during_an_import_is_still_rematched(monkeypatch):
+    """The snapshot is not transactional with the invalidation it precedes.
+
+    A match already in flight can persist a remote hit between the two. The
+    import preserves it (remote hits owe nothing to the local DATs), the
+    snapshot cannot contain it, and a cached hit is always usable -- so the
+    DAT just imported would never get to say it knows that hash.
+    """
+    scheduled: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        scheduled.append(list(paths))
+        return "job-1"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+    monkeypatch.setattr(
+        dat_routes.dat_store, "list_match_paths", lambda: ["/vol/late.chd"],
+    )
+
+    status, job_id = await dat_routes.rematch_after_dat_change(
+        [], source="import_dat",
+    )
+
+    assert (status, job_id) == ("scheduled", "job-1")
+    assert scheduled == [["/vol/late.chd"]], (
+        "a row that survived the import was never scheduled for rematch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_rematch_set_is_the_union_of_before_and_after(monkeypatch):
+    """Survivors are added to the snapshot, not substituted for it.
+
+    The snapshot still carries the rows invalidation is about to *delete*,
+    which the after-listing by definition cannot.
+    """
+    scheduled: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        scheduled.append(list(paths))
+        return "job-1"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+    monkeypatch.setattr(
+        dat_routes.dat_store, "list_match_paths",
+        lambda: ["/vol/kept.chd", "/vol/late.chd"],
+    )
+
+    await dat_routes.rematch_after_dat_change(
+        ["/vol/gone.iso", "/vol/kept.chd"], source="dat_sync",
+    )
+
+    assert scheduled == [
+        ["/vol/gone.iso", "/vol/kept.chd", "/vol/late.chd"],
+    ], "the union dropped, duplicated or mis-ordered a path"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_survivor_listing_still_rematches_the_snapshot(monkeypatch):
+    """Best-effort, like the caller: the DATs are committed either way.
+
+    Rematching the snapshot alone is strictly better than rematching nothing,
+    so a broken store must not cost the part that would have worked.
+    """
+    scheduled: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        scheduled.append(list(paths))
+        return "job-1"
+
+    def _boom():
+        raise RuntimeError("db not initialised")
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+    monkeypatch.setattr(dat_routes.dat_store, "list_match_paths", _boom)
+
+    status, _job_id = await dat_routes.rematch_after_dat_change(
+        ["/vol/a.chd"], source="import_dat",
+    )
+
+    assert status == "scheduled"
+    assert scheduled == [["/vol/a.chd"]]
+
+
+@pytest.mark.asyncio
+async def test_an_import_leaves_its_surviving_hit_where_the_rematch_looks(tmp_path):
+    """The assumption the union rests on, pinned.
+
+    Invalidation preserves remote hits, so listing the match cache *after* an
+    import returns exactly the rows that need re-checking against the new
+    index -- including one written too late for the snapshot.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/late.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Remote Name",
+        "match_type": "file_sha1", "file_hash": "f" * 40, "source": "hasheous",
+    })
+    # A local miss, which invalidation is meant to drop.
+    await store.set_match("/vol/gone.iso", {
+        "path": "/vol/gone.iso", "matched": False,
+    })
+
+    await store.import_dat(SAMPLE_DAT_XML)
+
+    assert store.list_match_paths() == [path], (
+        "the surviving remote hit is not visible to the post-import listing"
+    )
