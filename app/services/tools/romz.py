@@ -45,6 +45,7 @@ class RomzTool(BaseTool):
         "neo-geo-pocket", "ngp",
         "lynx", "c64", "atari2600", "atari7800",
     })
+    default_compression = "max"
     policy_owner = "romz"
     display_name = "Handheld ROM"
     modes = (

@@ -103,6 +103,33 @@ def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
     return {row["mode"]: row for row in json.loads(proc.stdout)}
 
 
+def _frontend_tools(tmp_path: Path) -> dict[str, dict]:
+    """Tool-level rows from registry.js: `{id: {"default_compression": str|None}}`."""
+    node = _find_node()
+    if node is None:
+        pytest.skip("node not available to evaluate registry.js")
+
+    src = _REGISTRY_JS.read_text(encoding="utf-8")
+    needle = "import { api } from '$lib/api/endpoints.js';"
+    assert needle in src, "registry.js import shape changed; update the parity stub"
+    src = src.replace(needle, "const api = {};")
+    src += (
+        "\nconst __tools = TOOLS.map((t) => ({"
+        " id: t.id,"
+        " default_compression: (t.defaultCompression ?? [])[0] ?? null,"
+        "}));\n"
+        "process.stdout.write(JSON.stringify(__tools));\n"
+    )
+    script = tmp_path / "registry_tools_eval.mjs"
+    script.write_text(src, encoding="utf-8")
+    proc = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
+    return {row["id"]: row for row in json.loads(proc.stdout)}
+
+
 def _backend_rows() -> dict[str, dict]:
     rows: dict[str, dict] = {}
     for spec in registry.mode_specs():
@@ -149,4 +176,50 @@ def test_frontend_registry_mirrors_backend_mode_specs(tmp_path):
         "registry.js ↔ registry.mode_specs() field drift "
         "(update src/lib/tools/registry.js or the backend ModeSpec to match):\n"
         + "\n".join(mismatches)
+    )
+
+
+def test_default_compression_mirrors_the_frontend_seed(tmp_path):
+    """`BaseTool.default_compression` ↔ `registry.js` `defaultCompression`.
+
+    The backend resolves this codec when an automation rule sets a compression
+    *level* but leaves the codec on "tool default" — the level rides on the
+    codec string, so ``":19"`` would reach dolphin-tool as ``-c "" -l 19`` and
+    fail every job. The manual picker seeds the same choice from
+    ``defaultCompression``, so the two must name the same codec or the same
+    rule would compress differently depending on which surface queued it.
+
+    Declaring one is *required* for every tool with a mode that takes both a
+    codec and a level (there is no other way to express such a rule); optional
+    elsewhere, where an unset level makes the question moot.
+    """
+    frontend = _frontend_tools(tmp_path)
+    problems = []
+    for tool in registry.all():
+        # The chain tool has no descriptor of its own: its composite modes are
+        # grouped under the descriptors of the tools they start from
+        # (`cso_to_chd` under cso, `nkit_to_rvz` under nkit), the same
+        # exception `_TOOL_ID_EXCEPTIONS` records above. Nothing to mirror.
+        fe = frontend.get(tool.id)
+        needs_default = any(
+            m.supports_compression and m.supports_compression_level
+            for m in tool.modes
+        )
+        if needs_default and not tool.default_compression:
+            problems.append(
+                f"  {tool.id}: has a codec+level mode but declares no "
+                "default_compression, so a level with no codec cannot be sent"
+            )
+        if (
+            fe is not None
+            and tool.default_compression is not None
+            and tool.default_compression != fe["default_compression"]
+        ):
+            problems.append(
+                f"  {tool.id}.default_compression: backend="
+                f"{tool.default_compression!r} registry.js="
+                f"{fe['default_compression']!r}"
+            )
+    assert not problems, (
+        "tool-level compression-default drift:\n" + "\n".join(problems)
     )

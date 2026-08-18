@@ -287,6 +287,25 @@
 - **Filter patterns are evaluated off the event loop.** A pattern like `(a+)+$`
   can backtrack for minutes on one long filename, and it was being run against
   every candidate on the loop the whole app shares.
+- **A Dolphin rule with a compression level but no codec now converts.** The
+  level travels with the codec, so leaving the codec on *Tool default* while
+  setting a level sent dolphin-tool an empty codec and failed every job the rule
+  queued. The tool's own default is used instead, and the picker names it, so
+  *Tool default (zstd)* says what you are going to get. nsz is unaffected: its
+  dropdown picks a layout, not a codec, and an empty one genuinely means "the
+  tool decides".
+- **A platform no installed tool can convert no longer offers the Convert
+  panel.** The panel stayed wired to whatever tool the workspace was last left
+  on, so a PS2 disc could be submitted to a GameCube format from a platform that
+  allows neither. The reason is named instead, next to the platform it applies
+  to.
+- **Unsaved automation edits survive a trip to the library tab.** The editor
+  tracked "you have unsaved changes" per screen while the changes themselves
+  lived with the rules, so switching tabs and back hid the Save bar — and
+  **Preview** / **Run now**, which save first, then quietly reported on the
+  server's rules while the editor showed yours. A reload triggered by something
+  else (saving connection settings, a sweep finishing) no longer discards them
+  either.
 
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K

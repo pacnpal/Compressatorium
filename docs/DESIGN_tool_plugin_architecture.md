@@ -1531,6 +1531,34 @@ browser as each platform's `mode_ids` beside its `tool_ids`, so neither the
 automation editor nor the RomM target picker carries a second copy of the
 platform table. The sweep checks the *mode*, not `spec.tool_id`.
 
+#### A codec for "tool default" (`ToolPlugin.default_compression`)
+
+The compression *level* is not a separate argument anywhere in the pipeline: it
+rides on the compression string as `"codec:level"`, which the tool splits back
+apart. A level with no codec therefore serialises as `":19"`, and whether that
+is meaningful is a per-tool fact:
+
+- Where a mode declares `supports_compression=False` but
+  `supports_compression_level=True` — nsz, whose dropdown picks a solid/block
+  *layout* rather than a codec — the tool reads the empty part as its own
+  default and honours the level.
+- Where a mode offers codecs (`supports_compression=True`), the empty part is a
+  blank, not a default. `DolphinTool._build_convert_command` emits
+  `-c "" -l 19`, which dolphin-tool refuses.
+
+**`ToolPlugin.default_compression: str | None`** names the codec to use in the
+second case, so the resolution stays a per-tool declaration instead of an
+if-ladder on tool identity at the call site.
+`registry.default_compression(mode)` applies it *only* to codec-offering modes,
+returning `None` elsewhere so nsz's meaningful empty part survives. The RomM
+sweep (`services/romm_auto._compression_arg`) is the current consumer: with no
+declared default it drops the level and logs, rather than queue a job the tool
+will reject or invent a codec the operator did not choose.
+
+The value mirrors `defaultCompression` in `src/lib/tools/registry.js`, which
+seeds the same choice in the manual picker — `tests/test_frontend_parity_186.py`
+fails on drift, and on a codec+level mode that declares no default at all.
+
 #### Extension matching is a suffix match (`utils.path_utils.match_extension`)
 
 Every "does this tool handle this file?" decision goes through one helper:

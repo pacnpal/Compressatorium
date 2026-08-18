@@ -49,6 +49,12 @@ class RommStore {
   rulesLoading = $state(false);
   rulesSaving = $state(false);
   rulesError = $state(null);
+  // Unsaved edits live here, next to the rules they describe, not in the
+  // editor component: the automation tab unmounts every time the operator
+  // looks at the library, and a component-local flag came back false while
+  // `rules` still held the edits — so the save bar vanished and Preview / Run
+  // now silently reported on the *server's* rules while showing the new ones.
+  rulesDirty = $state(false);
   sweepResult = $state(null);
   sweeping = $state(false);
 
@@ -219,6 +225,23 @@ class RommStore {
     }
   }
 
+  /**
+   * True when the selected platform is one nothing installed can convert.
+   *
+   * `tool_ids`/`mode_ids` absent means "no opinion" (unknown slug, older
+   * server) and everything stays offered; an empty array is a decision. The
+   * distinction matters because the convert panel has no valid tool to fall
+   * back to in the second case, so the view hides it instead.
+   */
+  get selectedPlatformUnsupported() {
+    const platform = this.platforms.find((p) => p.id === this.selectedPlatformId);
+    if (!platform) return false;
+    return (
+      (Array.isArray(platform.tool_ids) && platform.tool_ids.length === 0)
+      || (Array.isArray(platform.mode_ids) && platform.mode_ids.length === 0)
+    );
+  }
+
   async selectPlatform(platformId) {
     const id = Number(platformId);
     if (!Number.isFinite(id)) return;
@@ -243,7 +266,15 @@ class RommStore {
     const allowedModes = platform?.mode_ids;
     // No opinion from the backend (unknown slug, older server) changes nothing,
     // matching narrow_to_platform's conservative contract.
-    if (!Array.isArray(allowed) || allowed.length === 0) return;
+    if (!Array.isArray(allowed)) return;
+    // An explicitly empty list is the opposite of no opinion: the backend
+    // knows this platform and no *installed* tool serves it. There is nothing
+    // to adopt, so the workspace keeps whatever it had — which is only safe
+    // because the view refuses to render the convert panel for such a
+    // platform (`selectedPlatformUnsupported`). Treating [] as "no opinion"
+    // left the panel wired to the previous tool, and a PS2 ISO could be
+    // submitted to Dolphin RVZ from a platform Dolphin does not serve.
+    if (allowed.length === 0) return;
 
     // The tool being allowed is not enough. Two platforms can both allow the
     // chain tool while allowing *different* chain modes, so moving from
@@ -279,7 +310,11 @@ class RommStore {
     this.rulesError = null;
     try {
       const data = await api.getRommRules();
-      this.rules = data?.rules ?? {};
+      // Server truth, unless the editor is holding edits nobody has saved: a
+      // reload can be triggered by something else entirely (a settings save on
+      // the next tab, a sweep finishing), and overwriting there would discard
+      // what the operator typed with no way back.
+      if (!this.rulesDirty) this.rules = data?.rules ?? {};
       this.ruleDefaults = data?.defaults ?? null;
       this.ruleOptions = data?.options ?? this.ruleOptions;
       this.ruleState = data?.state ?? {};
@@ -307,12 +342,14 @@ class RommStore {
 
   setRule(platformId, rule) {
     this.rules = { ...this.rules, [String(platformId)]: rule };
+    this.rulesDirty = true;
   }
 
   removeRule(platformId) {
     const next = { ...this.rules };
     delete next[String(platformId)];
     this.rules = next;
+    this.rulesDirty = true;
   }
 
   async saveRules() {
@@ -322,6 +359,7 @@ class RommStore {
       // Take the server's normalized copy: it clamps numbers and drops rules
       // whose mode no longer exists, so the editor shows what will actually run.
       this.rules = data?.rules ?? this.rules;
+      this.rulesDirty = false;
       return this.rules;
     } finally {
       this.rulesSaving = false;

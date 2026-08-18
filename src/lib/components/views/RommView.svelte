@@ -77,6 +77,11 @@
     conversion.setMode(mode);
   }
 
+  const selectedPlatformName = $derived(
+    romm.platforms.find((p) => p.id === romm.selectedPlatformId)?.name
+      ?? 'this platform',
+  );
+
   const platformOptions = $derived(
     romm.platforms.map((p) => ({
       value: String(p.id),
@@ -377,7 +382,21 @@
       />
 
       <article class="right">
-        <ConvertPanel />
+        {#if romm.selectedPlatformUnsupported || modeOptions.length === 0}
+          <!-- Nothing installed converts this platform. The panel would still
+               submit against whatever tool the workspace was last left on —
+               a PS2 ISO to Dolphin RVZ — so it is replaced rather than
+               disabled, and the reason is named. -->
+          <div class="notice warn">
+            <TriangleAlert size={16} />
+            <span>
+              No installed tool converts <strong>{selectedPlatformName}</strong>.
+              Install the tool for this system, or pick another platform.
+            </span>
+          </div>
+        {:else}
+          <ConvertPanel />
+        {/if}
         <div class="separator" aria-hidden="true"></div>
         <JobsPanel />
       </article>

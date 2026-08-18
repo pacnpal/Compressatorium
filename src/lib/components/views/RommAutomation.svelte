@@ -30,7 +30,11 @@
 
   // SvelteSet: mutation must be reactive so an expanded row re-renders.
   const expanded = new SvelteSet();
-  let dirty = $state(false);
+  // The store owns this: the tab unmounts whenever the operator switches to
+  // the library, and a local flag came back false while the edits themselves
+  // survived in `romm.rules` — hiding the save bar and letting Preview / Run
+  // now report on the server's rules while the editor showed the new ones.
+  const dirty = $derived(romm.rulesDirty);
 
   // The convertible targets one platform can actually use. Built from the
   // registry so a new tool or mode appears here with no change, then narrowed
@@ -87,9 +91,9 @@
         : {}),
       ...patch,
     };
+    // `setRule` / `removeRule` raise the store's dirty flag themselves.
     if (!rule.mode) romm.removeRule(platformId);
     else romm.setRule(platformId, rule);
-    dirty = true;
   }
 
   /**
@@ -119,6 +123,25 @@
 
   function toolFor(mode) {
     return mode ? registry.toolForMode(mode) : null;
+  }
+
+  /**
+   * What "leave it to the tool" actually resolves to, named where the operator
+   * picks it.
+   *
+   * A compression level rides on the same wire string as the codec, so a level
+   * with no codec serialises as ":19". For a mode that offers no codec choice
+   * (nsz's dropdown picks a solid/block layout) the tool reads that as its own
+   * default and honours the level. For a mode that does offer codecs the
+   * backend resolves the tool's default rather than send a blank one, and this
+   * says which — otherwise "Tool default" plus a level looks like it means
+   * "no compression".
+   */
+  function defaultCodecLabel(mode) {
+    const spec = specFor(mode);
+    const fallback = toolFor(mode)?.defaultCompression?.[0];
+    if (!spec?.supportsCompression || !fallback) return 'Tool default';
+    return `Tool default (${fallback})`;
   }
 
   // --- conversion options, straight off the registry descriptor ----------
@@ -180,7 +203,6 @@
   async function save() {
     try {
       await romm.saveRules();
-      dirty = false;
       toast.success('Automation rules saved');
     } catch (e) {
       toast.error(e?.message ?? 'Failed to save rules');
@@ -199,7 +221,6 @@
     if (!dirty) return true;
     try {
       await romm.saveRules();
-      dirty = false;
       return true;
     } catch (e) {
       toast.error(e?.message ?? 'Failed to save rules');
@@ -430,7 +451,7 @@
                         <Select
                           value={rule.compression ?? ''}
                           options={[
-                            { value: '', label: 'Tool default' },
+                            { value: '', label: defaultCodecLabel(rule.mode) },
                             ...codecs.map((c) => ({ value: c.value, label: c.label })),
                           ]}
                           ariaLabel="Compression codec"

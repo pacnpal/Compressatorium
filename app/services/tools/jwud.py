@@ -31,6 +31,9 @@ from .spec import ModeKind, ModeSpec
 class JwudTool(BaseTool):
     id = "jwud"
     platform_slugs = frozenset({"wiiu", "wii-u"})
+    # WUX has no codec; the dropdown carries JWUDTool's verification pass,
+    # and verifying is the default.
+    default_compression = "verify"
     policy_owner = "jwud"
     display_name = "Wii U"
     modes = (

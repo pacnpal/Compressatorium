@@ -117,6 +117,7 @@ class ChdmanTool(BaseTool):
         "segasaturn", "3do", "pcfx", "neogeocd", "turbografx-cd", "philips-cd-i",
         "arcade", "mame", "neo-geo-cd", "pc-fx",
     })
+    default_compression = "zlib"
     policy_owner = "chdman"
     display_name = "CHDMAN"
     modes = _build_modes()

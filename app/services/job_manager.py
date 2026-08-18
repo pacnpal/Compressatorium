@@ -212,45 +212,10 @@ class JobManager:
         job_id = str(uuid.uuid4())[:8]
         filename = filename_override or os.path.basename(file_path)
 
-        # Determine output path - use explicit path if provided, otherwise calculate
-        if output_path is None:
-            output_path = registry.for_mode(mode.value).output_path(
-                mode.value, file_path, output_dir,
-            )
-            # The HTTP routes validate inputs before passing an explicit
-            # output_path; direct service callers reach this fallback. Most
-            # tools' output_path() raises for an unsupported extension, but
-            # z3ds's does not, so keep its input-extension gate -- now read from
-            # the mode's declared input_extensions instead of the per-direction
-            # Z3DS_*_FORMATS constants.
-            spec = registry.spec(mode.value)
-            if spec.tool_id == "z3ds":
-                ext = Path(file_path).suffix.lower()
-                if ext not in spec.input_extensions:
-                    raise ValueError(f"Unsupported file extension: {ext}")
-            # Generic same-path guard: a non-copy mode must never write over its
-            # own source (chdman copy is an intentional in-place .chd recompress;
-            # every other mode changes the extension so output != input).
-            if spec.kind != ModeKind.COPY and _paths_collide(output_path, file_path):
-                raise ValueError(
-                    "Output path matches input; refusing to overwrite source"
-                )
+        output_path = self._resolve_output_locked(
+            file_path, mode, output_dir=output_dir, output_path=output_path,
+        )
 
-        # No two live jobs may write the same file. Callers resolve duplicates
-        # before submitting, but resolution is a prediction made outside this
-        # lock: a manual submit and an automation sweep can each decide on the
-        # same destination before either job starts and takes its lock, and the
-        # second then overwrites the first's result -- with delete-on-verify,
-        # removing both sources for one surviving output. Checked here because
-        # this is the one place that is both under `_create_lock` and past the
-        # point where the destination is finally known, so it also catches two
-        # specs of a single batch colliding (each job is registered as it is
-        # created, so the second sees the first).
-        claimed_by = self._active_job_writing(output_path)
-        if claimed_by is not None:
-            raise ValueError(
-                f"Another queued job ({claimed_by}) is already writing that output",
-            )
 
         # Carry the mode's input kind end-to-end so the pipeline skips the
         # archive-extract / file-only assumptions for a directory job and the
@@ -322,6 +287,16 @@ class JobManager:
         """Create a new conversion job."""
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(1)
+            # Same destination reservation the batch path gets: a single
+            # submit racing a sweep is the same collision with one fewer file.
+            self._reject_claimed_destinations_locked(
+                [{
+                    "file_path": file_path,
+                    "output_dir": output_dir,
+                    "output_path": output_path,
+                }],
+                mode,
+            )
             job = self._queue_job_locked(
                 file_path=file_path,
                 mode=mode,
@@ -354,6 +329,7 @@ class JobManager:
         jobs: List[ConversionJob] = []
         async with self._create_lock:
             self._enforce_queue_backpressure_locked(len(job_specs))
+            self._reject_claimed_destinations_locked(job_specs, mode)
             for spec in job_specs:
                 file_path = str(spec["file_path"])
                 output_dir = spec.get("output_dir")
@@ -424,6 +400,90 @@ class JobManager:
             split=split,
             verify_after=verify_after,
         )
+
+    def _resolve_output_locked(
+        self,
+        file_path: str,
+        mode: ConversionMode,
+        *,
+        output_dir: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> str:
+        """The destination this job will write, with the pre-creation guards.
+
+        Split out so a batch can be validated in full before a single job is
+        created: raising partway through the creation loop left the earlier
+        jobs registered and running while the caller was told the whole batch
+        had failed -- and the RomM submit path then retired the re-pin rows for
+        conversions that were, in fact, under way.
+        """
+        if output_path is not None:
+            return output_path
+        output_path = registry.for_mode(mode.value).output_path(
+            mode.value, file_path, output_dir,
+        )
+        # The HTTP routes validate inputs before passing an explicit
+        # output_path; direct service callers reach this fallback. Most
+        # tools' output_path() raises for an unsupported extension, but
+        # z3ds's does not, so keep its input-extension gate -- now read from
+        # the mode's declared input_extensions instead of the per-direction
+        # Z3DS_*_FORMATS constants.
+        spec = registry.spec(mode.value)
+        if spec.tool_id == "z3ds":
+            ext = Path(file_path).suffix.lower()
+            if ext not in spec.input_extensions:
+                raise ValueError(f"Unsupported file extension: {ext}")
+        # Generic same-path guard: a non-copy mode must never write over its
+        # own source (chdman copy is an intentional in-place .chd recompress;
+        # every other mode changes the extension so output != input).
+        if spec.kind != ModeKind.COPY and _paths_collide(output_path, file_path):
+            raise ValueError(
+                "Output path matches input; refusing to overwrite source"
+            )
+        return output_path
+
+    def _reject_claimed_destinations_locked(
+        self, job_specs: List[Dict[str, object]], mode: ConversionMode,
+    ) -> None:
+        """Refuse the batch if any destination is already spoken for.
+
+        No two live jobs may write the same file. Callers resolve duplicates
+        before submitting, but that resolution is a prediction made outside
+        this lock: a manual submit and an automation sweep can each settle on
+        the same destination before either job starts and takes it, and the
+        second then overwrites the first's result -- with delete-on-verify,
+        removing both sources for one surviving output.
+
+        Every destination is checked before any job is created, so the batch
+        stays all-or-nothing. Intra-batch collisions count too: two specs of
+        one submit resolving to the same path is the same bug arriving twice
+        at once.
+        """
+        planned: Dict[str, str] = {}
+        for spec in job_specs:
+            file_path = str(spec["file_path"])
+            output_dir = spec.get("output_dir")
+            explicit = spec.get("output_path")
+            resolved = self._resolve_output_locked(
+                file_path,
+                mode,
+                output_dir=str(output_dir) if output_dir is not None else None,
+                output_path=str(explicit) if explicit is not None else None,
+            )
+            claimed_by = self._active_job_writing(resolved)
+            if claimed_by is not None:
+                raise ValueError(
+                    f"Another queued job ({claimed_by}) is already writing "
+                    f"{os.path.basename(resolved)}",
+                )
+            for other, other_path in planned.items():
+                if _paths_collide(other_path, resolved):
+                    raise ValueError(
+                        "Two files in this batch would write the same output: "
+                        f"{os.path.basename(other)} and "
+                        f"{os.path.basename(file_path)}",
+                    )
+            planned[file_path] = resolved
 
     def _active_job_writing(self, output_path: str) -> Optional[str]:
         """Id of a queued/running job whose output is *output_path*, else None.

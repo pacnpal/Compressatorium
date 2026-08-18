@@ -58,6 +58,12 @@ class ToolPlugin(Protocol):
     # an implementation that satisfies the protocol without it would fail there
     # rather than at registration. See BaseTool.platform_slugs for the semantics.
     platform_slugs: frozenset[str]
+    # The codec this tool falls back to when a caller asks for a compression
+    # level but leaves the codec on "tool default". Part of the contract
+    # because `ToolRegistry.default_compression` reads it off every registered
+    # tool. None means "this tool names no default" -- see
+    # BaseTool.default_compression for what that costs.
+    default_compression: str | None
 
     def spec(self, mode: str) -> ModeSpec:
         """Return the ModeSpec for a mode this tool owns."""
@@ -348,6 +354,21 @@ class BaseTool:
     # slug degrades to today's extension-only behaviour rather than to an empty
     # list.
     platform_slugs: frozenset[str] = frozenset()
+    # The codec to name when the operator asks for a compression *level* but
+    # leaves the codec on "tool default".
+    #
+    # The level is not a separate argument anywhere in the pipeline: it rides
+    # on the compression string as ``"codec:level"``, so a level with no codec
+    # serialises as ``":19"``. Whether that is meaningful is a per-tool fact.
+    # For a mode that offers no codec choice at all (nsz, whose dropdown picks
+    # a solid/block *layout*) the empty part reads as "tool default" and the
+    # level is honoured. For a mode that does offer codecs it is not a default
+    # but a blank: dolphin-tool receives ``-c "" -l 19`` and refuses the job.
+    # Declaring the default here lets the automation resolve it instead, per
+    # tool, rather than an if-ladder keyed on tool identity at the call site.
+    # Mirrors `defaultCompression` in `src/lib/tools/registry.js`, which seeds
+    # the same choice in the manual picker.
+    default_compression: str | None = None
 
     def __init__(self, binary_path: str) -> None:
         self.binary_path = binary_path

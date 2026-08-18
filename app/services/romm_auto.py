@@ -301,7 +301,9 @@ def default_rule(mode: str = "") -> dict[str, Any]:
     }
 
 
-def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | None:
+def normalize_rule(
+    raw: Any, *, mode_required: bool = True, check_volumes: bool = True,
+) -> dict[str, Any] | None:
     """Coerce one submitted/stored rule into the full schema.
 
     Returns None when the rule cannot be honoured at all (no mode, or a mode no
@@ -344,7 +346,19 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
         and raw.get("compression_level") is not None
     ):
         out["compression_level"] = _clamp("compression_level", raw["compression_level"], 0)
-    if raw.get("output_dir"):
+    if raw.get("output_dir") and not check_volumes:
+        # Reading back what was already validated when it was saved. The check
+        # below resolves the candidate and stats every configured volume, and
+        # `get_rules()` is awaited by the rules API and by every sweep while it
+        # holds `_sweep_lock` -- so on an unresponsive mount that one stat would
+        # take the whole event loop down with it. A blob edited straight in the
+        # database bypasses the save-time check, which is why the sweep tests
+        # the destination again, off the loop, before it queues anything.
+        out["output_dir"] = str(raw["output_dir"])
+        if raw.get("invalid_output_dir"):
+            out["invalid_output_dir"] = raw["invalid_output_dir"]
+            out["enabled"] = False
+    elif raw.get("output_dir"):
         candidate = str(raw["output_dir"])
         # The sweep queues through the job manager directly, so it does not get
         # `/jobs/batch`'s containment check for free. An unvalidated rule could
@@ -435,7 +449,7 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
     return out
 
 
-def normalize_rules(raw: Any) -> dict[str, dict]:
+def normalize_rules(raw: Any, *, check_volumes: bool = True) -> dict[str, dict]:
     if not isinstance(raw, dict):
         return {}
     rules: dict[str, dict] = {}
@@ -444,14 +458,25 @@ def normalize_rules(raw: Any) -> dict[str, dict]:
             platform_id = int(key)
         except (TypeError, ValueError):
             continue
-        rule = normalize_rule(value)
+        rule = normalize_rule(value, check_volumes=check_volumes)
         if rule is not None:
             rules[str(platform_id)] = rule
     return rules
 
 
 async def get_rules() -> dict[str, dict]:
-    return normalize_rules(await preferences_store.get(RULES_KEY))
+    """The stored rules, normalized without touching the filesystem.
+
+    `check_volumes=False`: the output directory was validated when it was
+    saved, and re-validating on every read would put a resolve plus a stat of
+    every configured volume on the event loop -- in the rules API and in each
+    sweep, which holds `_sweep_lock` while it runs. The sweep re-checks the
+    destination off the loop before it queues anything, which is what covers a
+    blob edited straight in the database.
+    """
+    return normalize_rules(
+        await preferences_store.get(RULES_KEY), check_volumes=False,
+    )
 
 
 # The rule fields that decide *what* a conversion produces. Change any of
@@ -703,6 +728,25 @@ def _compression_arg(rule: dict) -> str | None:
     level = rule["compression_level"]
     if level is None:
         return codec or None
+    if not codec and registry.spec(rule["mode"]).supports_compression:
+        # An empty codec is only a "tool default" where the mode offers no
+        # codec choice at all: nsz reads the empty layout part of ":18" and
+        # still honours the level. Where the mode *does* have a codec picker
+        # and the operator left it on "Tool default", the empty part is a
+        # blank, not a default -- dolphin-tool receives `-c "" -l 19` and
+        # every such job fails at the tool -- so name the tool's own default.
+        codec = registry.default_compression(rule["mode"])
+        if not codec:
+            # A codec-picking mode whose tool declares no default. The level
+            # cannot be expressed without a codec, and inventing one would
+            # convert the library with settings the operator did not choose,
+            # so drop the level and say so rather than queue a failing job.
+            logger.warning(
+                "romm_auto: %s needs a codec alongside a compression level and "
+                "declares no default; ignoring the level",
+                rule["mode"],
+            )
+            return None
     # A level with no codec is meaningful: nsz reads the empty layout part as
     # "tool default" and still honours the level, so ":18" must not collapse to
     # None or the operator's level would be silently discarded.
@@ -1029,7 +1073,9 @@ async def _sweep_locked(
         # Belt and braces on the destination: `normalize_rule` refuses an
         # out-of-volume output_dir at save time, but a rules blob can also be
         # edited straight in the database.
-        if rule["output_dir"] and not is_within_configured_volumes(rule["output_dir"]):
+        if rule["output_dir"] and not await run_in_threadpool(
+            is_within_configured_volumes, rule["output_dir"],
+        ):
             logger.warning(
                 "romm_auto: skipping platform %s, output_dir outside volumes",
                 platform_id,

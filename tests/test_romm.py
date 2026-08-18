@@ -2033,6 +2033,50 @@ def test_nsz_layout_and_level_both_reach_the_job() -> None:
     assert romm_auto._compression_arg(level_only) == ":12"
 
 
+def test_a_level_without_a_codec_names_the_tools_default() -> None:
+    """"Tool default" plus a level must not reach dolphin-tool as `-c ""`.
+
+    The level rides on the codec string, so a level with no codec serialises as
+    ":19". nsz reads that empty part as its own default layout; dolphin does
+    not — `DolphinTool._build_command` splits it into an empty codec and emits
+    `-c "" -l 19`, which fails every queued job. The mode says which case it is.
+    """
+    from services import romm_auto
+    from services.tools import registry
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "compression_level": 19,
+    })
+    assert rule["compression"] is None
+    assert romm_auto._compression_arg(rule) == "zstd:19"
+    # A codec the operator did pick is never second-guessed.
+    chosen = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "compression": "lzma2", "compression_level": 9,
+    })
+    assert romm_auto._compression_arg(chosen) == "lzma2:9"
+    # And the mode that has no codec picker keeps its meaningful empty part.
+    assert registry.default_compression("nsz_compress") is None
+
+
+def test_a_codec_mode_with_no_declared_default_drops_the_level(monkeypatch) -> None:
+    """Rather than queue a job the tool will refuse.
+
+    Inventing a codec would convert the library with a setting the operator did
+    not choose; sending an empty one fails at the tool. Neither is acceptable,
+    so the level is dropped and logged.
+    """
+    from services import romm_auto
+    from services.tools import registry
+
+    monkeypatch.setattr(
+        registry.for_mode("dolphin_rvz"), "default_compression", None,
+    )
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "compression_level": 19,
+    })
+    assert romm_auto._compression_arg(rule) is None
+
+
 def test_a_mistyped_filter_pauses_the_rule_instead_of_widening_it() -> None:
     """An uncompilable regex must never come back as "no filter".
 

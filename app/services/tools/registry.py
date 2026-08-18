@@ -52,6 +52,19 @@ class ToolRegistry:
     def spec(self, mode: str) -> ModeSpec:
         return self.for_mode(mode).spec(mode)
 
+    def default_compression(self, mode: str) -> str | None:
+        """The codec to send when a level is set and the codec is "tool default".
+
+        Only for modes that offer a codec choice. Where a mode declares
+        ``supports_compression=False`` its dropdown is not a codec list at all
+        (nsz picks a solid/block layout) and the empty part of ``":18"`` is
+        meaningful to the tool -- naming a codec there would override a working
+        choice, so this answers None and the caller leaves the string as it is.
+        """
+        if not self.spec(mode).supports_compression:
+            return None
+        return self.for_mode(mode).default_compression
+
     def mode_specs(self) -> list[ModeSpec]:
         return [m for t in self._tools.values() for m in t.modes]
 
