@@ -56,7 +56,7 @@ def _call_with_watchdog(fn, *args, timeout: float = 4.0) -> dict:
 def test_rename_inside_locked_subtree_rejected_not_looped(tmp_path, mode):
     folder = tmp_path / "MyGame"
     (folder / "PS3_GAME").mkdir(parents=True)
-    lock_manager = convert_routes.lock_manager
+    from services.lock_manager import lock_manager  # noqa: PLC0415
 
     assert lock_manager.acquire_dir_lock(str(folder)) is True
     try:

@@ -25,7 +25,7 @@ A game image converter that wraps nine tools: **CHDMAN** (MAME), **dolphin-tool*
 | **3DS** | Nintendo 3DS ROMs | .cci, .cia, .3ds, .cxi, .3dsx, .zcci, .zcia, .z3ds, .zcxi, .z3dsx | .zcci, .zcia, .z3ds, .zcxi, .z3dsx, .cci, .cia, .3ds, .cxi, .3dsx | None (fixed) | None | `z3ds_compressor` |
 | **Switch** | Nintendo Switch dumps | .nsp, .xci, .nsz, .xcz | .nsz, .xcz, .nsp, .xci | Layout + level | **Yes** (`prod.keys`) | `nsz` |
 | **CSO** | PSP / PS2 game images | .iso, .cso, .zso, .dax | .cso, .zso, .dax, .iso, .chd | Effort preset (Fast/Default/Max); the `cso_to_chd` chain ignores it and uses chdman defaults | None | `maxcso` (+ chdman for `cso_to_chd`) |
-| **Handheld ROM** | Game Boy / GBC / GBA / DS ROMs | .gb, .gbc, .gba, .nds, .7z, .zip | .7z, .zip, .gb, .gbc, .gba, .nds | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
+| **Handheld ROM** | Cartridge ROMs (Nintendo, Sega, and other 8/16-bit systems) | .gb, .gbc, .gba, .nds, .nes, .sfc, .smc, .z64, .n64, .v64, .sms, .md, .gen, .smd, .gg, .vb, .ws, .wsc, .ngp, .ngc, .lnx, .d64, .t64, .prg, .a26, .a78, .7z, .zip | .7z, .zip, and the original ROM | Effort preset (Fast/Default/Max) | None | `7z` (p7zip-full) |
 | **PS3 ISO** | Decrypted PS3 disc / JB folders | a folder containing `PS3_GAME/` (plus `PS3_DISC.SFB` for disc rips) | .iso (optional 4 GB FAT32 split) | None (fixed) | None | `makeps3iso` |
 | **Wii U** | Wii U disc images | .wud, .wux | .wux, .wud | None (fixed); a verify-after-conversion toggle | None | `JWUDTool` (Java) |
 | **NKit** | NKit-shrunk GameCube / Wii discs | .nkit.iso, .nkit.gcz | .iso, .rvz (via the `nkit_to_rvz` chain) | None (fixed) | None | `nkit2iso` (+ dolphin-tool for `nkit_to_rvz`) |
@@ -359,7 +359,7 @@ When you open the Web UI, you'll see the tool options at the top:
 * **3DS** - For compressing Nintendo 3DS ROMs
 * **Switch** - For compressing/decompressing Nintendo Switch dumps (needs your own prod.keys)
 * **CSO** - For compressing/decompressing PSP/PS2 ISO images to CSO/ZSO (and a one-step CSO → CHD chain)
-* **Handheld ROM** - For compressing/extracting GB/GBC/GBA/DS ROM dumps to .7z/.zip archives
+* **Handheld ROM** - For compressing/extracting cartridge ROM dumps to .7z/.zip archives (Game Boy/GBC/GBA/DS, NES, SNES, N64, Master System, Genesis, Game Gear, Virtual Boy, WonderSwan, Neo Geo Pocket, Lynx, C64, Atari 2600/7800)
 * **PS3 ISO** - For packing a decrypted PS3 folder into a `.iso` RPCS3 can mount
 * **Wii U** - For compressing Wii U disc images to `.wux` and back
 
@@ -473,6 +473,195 @@ compression setting still matches** for both. A missing badge usually means the 
 aren't synced, the title isn't in the DAT, or the file is larger than
 `MATCH_MAX_FILE_SIZE` (which skips the expensive full-disc reconstruction) — not that
 the file is bad.
+
+### RomM integration
+
+Point Compressatorium at a [RomM](https://romm.app) instance and the **RomM** view
+becomes a second workspace: your library, by platform, with real game names instead
+of filenames — and the ability to convert all of it, by hand or on a schedule.
+
+Everything is configured in the app. Environment variables still work as first-run
+defaults, but nothing here needs a redeploy to change.
+
+#### Why the platform matters
+
+The headline feature isn't the pretty names — it's that RomM knows what a file
+**is**. A bare `.iso` could be a PS2 disc, a GameCube disc, a PSP disc or a Wii
+disc, and the extension cannot tell you which; today you resolve that yourself by
+picking a tool tab. RomM's platform resolves it:
+
+| The same `.iso`, per RomM's platform | Tools offered |
+|---|---|
+| GameCube / Wii | Dolphin (RVZ/WIA/GCZ), NKit |
+| PlayStation 2 | CHDMAN (CHD), maxcso (CSO/ZSO/DAX) |
+| PSP | CHDMAN, maxcso |
+| PlayStation 3 | PS3 ISO |
+
+Narrowing is conservative on purpose: a tool that declares no platforms is never
+filtered out, and an unrecognised RomM platform falls back to plain
+extension-matching, so a new console never leaves you with an unconvertible row.
+
+#### Setting it up
+
+1. In RomM, go to **Administration → Client API Tokens** and create one. Grant
+   `platforms.read` and `roms.read`, plus `roms.write` if you want Compressatorium
+   to restore metadata after conversion (recommended — see below).
+2. Mount RomM's library folder into the Compressatorium container, and make sure
+   it's inside a configured Compressatorium volume.
+3. Open **RomM → Settings**, paste the URL, token and library path, and press
+   **Test connection**.
+
+The test reports three things separately, because they fail independently and
+"it doesn't work" is useless when it could be any of them:
+
+- **RomM reachable** — the URL is right and the instance is up.
+- **Token accepted** — the token is valid and has the scopes it needs.
+- **Library folder mounted here** — Compressatorium can actually see the files.
+
+**The library path is the path inside *this* container**, not the one RomM sees.
+RomM reports each ROM's location relative to its own library root, and
+Compressatorium joins that onto your path. Also match the UID/GID the two
+containers run as, or RomM won't be able to read what Compressatorium writes.
+
+Remote RomM needs no special mode: mount the library over NFS/SMB/rclone and it
+behaves exactly like a local one. No ROM is ever copied over HTTP — only the
+catalog travels over the API.
+
+#### Converting
+
+Pick a platform and you get the ordinary workspace — the same file list, row
+actions, Verify, convert panel and job queue you use on a volume. Select what you
+want, choose a format, convert. The header also reports how much of the platform
+is already converted and roughly how much space converting the rest would save.
+
+#### Automatic conversion
+
+**RomM → Automation** gives every platform its own rule. A library isn't
+homogeneous, so one global setting can't describe it: GameCube can convert to RVZ
+hourly while PS2 converts to CHD overnight, ten at a time, largest first.
+
+| Setting | What it does |
+|---|---|
+| **Convert to** | Target format for this platform. Off means "leave it alone". Recompress-in-place targets (CHDMAN's Copy) are not offered here: a rule using one would convert its own output every sweep and never stop. Use it from the Convert panel instead. |
+| **Enabled** | Pause a rule without deleting it. |
+| **Run every** | Minutes between sweeps for this platform (minimum 5). |
+| **Only between** | Time-of-day window. Wraps midnight, so `22:00`–`04:00` works. |
+| **On these days** | Weekday mask — weekends only, weeknights only, whatever. |
+| **Max jobs per run** | Ceiling per sweep, so one rule can't flood the queue. |
+| **Priority** | Lower runs first when several platforms are due at once. |
+| **Convert in this order** | Name, largest first, smallest first, oldest or newest added. |
+| **Output folder** | Blank writes beside the source. |
+| **Smallest / largest ROM** | Size thresholds in MB. |
+| **Only names matching / Skip names matching** | Regex filters — convert only `(USA)`, skip `(Beta)`. |
+| **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. Mutually exclusive. |
+| **If the output already exists** | Skip it, overwrite it, or write `Game_1.rvz` alongside. Overwrite and write-alongside also remember what the rule has converted, so each ROM is done once instead of every run — see below. |
+| **Compression / level** | The codec and level for modes that take them — the same registry-driven controls the convert panel uses, so chdman offers its codec chips and Dolphin/NSZ/CSO a codec plus level. |
+| **Split into 4 GB parts** | For FAT32 targets, where the mode supports it. |
+| **Verify each converted file** | Check the output; the source is kept. |
+| **Delete source after verify** | Offered only for modes that support it. Verifies first, and is refused outright where the verify is too weak to justify it (a Wii U rule with `noverify`). |
+| **Timezone** | The window and weekday mask are evaluated here — your browser's zone by default, so `22:00` means 22:00 where you are, and DST is handled. |
+
+A rule Compressatorium cannot honour is **paused**, not quietly widened: an
+output folder outside the configured volumes, or a name filter that is not a
+valid regular expression, stops the rule and explains why in the editor.
+
+Only formats the platform can actually use are offered: a GameCube rule lists
+dolphin and nkit, a PS2 rule lists chdman and maxcso. That narrowing comes from
+the same registry the file browser uses, so a rule can never name a tool that is
+wrong for the system — and it works per *format*, not just per tool, so the
+two-step conversions (NKit → RVZ, CSO → CHD) each appear only on the console
+they belong to.
+
+**Preview** shows exactly what a sweep would queue, without queueing it — and
+without moving the schedule clock, so looking never postpones a run. **Run now**
+does it for real.
+
+Sweeps are safe to repeat. Under **Skip** — the default — a ROM is queued only
+when its target output is genuinely missing, and that comes from the same
+detector that badges rows in the file list, so the filesystem is the state.
+Running twice, restarting mid-sweep, or racing a manual conversion all converge
+instead of duplicating work. Sweeps also stop when the queue is full and resume
+where they left off.
+
+**Overwrite** and **write alongside** are the two policies the filesystem cannot
+answer for: an occupied destination is exactly what they are *for*, so a rule
+using them would otherwise rewrite the same images — or write `Game_1`, `Game_2`,
+`Game_3` — every interval, forever. Each rule therefore remembers which ROMs it
+has converted, and that memory is kept honest for you:
+
+- It records what was **produced**, not what was queued. A job you cancel, or one
+  interrupted by a restart, or one the converter fails on, leaves the ROM exactly
+  where it was — the next sweep picks it up again. Nothing to notice, nothing to
+  clear by hand.
+- Retargeting a rule clears it. A rule switched from RVZ to GCZ, or pointed at a
+  new output folder, has not produced that file for anything yet.
+- Pointing Compressatorium at a **different RomM instance or library** clears it
+  too. The history is keyed by RomM's own ids, and another RomM database reuses
+  those numbers for entirely different games. Your rules are kept; only what they
+  believe they have produced starts over.
+- A **Forget history** button on the platform clears it on demand — for when you
+  restore from a backup, or move outputs aside by hand, and want the rule to run
+  over them again.
+- Preview reads the same history, so what it shows you is what a run would do.
+
+The schedule clock and the conversion history are separate, so forgetting one
+never disturbs the other.
+
+#### Your metadata survives conversion
+
+This is the part most conversion workflows get wrong. RomM identifies a CHD by the
+SHA1 embedded in its header and an archive by its largest member, so **converting
+to CHD, ZIP or 7z keeps the Redump/No-Intro match automatically**.
+
+RVZ, CSO, NSZ, WUX and Z3DS are different: RomM matches those on the file's own
+hash, which conversion necessarily changes, so the ROM would go unidentified and
+lose its artwork and metadata. Compressatorium handles it — it saves each ROM's
+metadata **before** converting and re-applies it afterwards:
+
+1. Convert as usual. The view tells you up front which formats need this step.
+2. Let RomM rescan (its watcher, a scheduled scan, or a manual one).
+3. Press **Re-match in RomM** — or leave it to run automatically on page load.
+
+One case cannot work and says so instead of pretending: a PS3 rule that **splits
+its output into 4 GB parts** only actually splits past 4 GB, and when it does
+there is no single file for RomM to hash — that ROM is reported as needing a
+manual re-match rather than sitting in the queue for a week. Under 4 GB the same
+rule produces one ISO and re-pins normally.
+
+The match uses the converted file's SHA1, so it's exact and survives you renaming
+or moving the file in between — once the hash has been taken, where the file sits
+stops mattering. Re-matching is idempotent: already-restored ROMs are skipped, and
+anything RomM hasn't scanned yet just waits for the next attempt. A conversion
+that was planned and then never ran is recognised as such rather than re-pinned
+onto whatever it was going to overwrite, and its saved metadata is discarded
+instead of sitting in the pending count. Each pass has a time budget, so an
+unresponsive share costs one pass rather than a hung page; whatever it did not
+reach is picked up on the next one.
+
+#### Settings reference
+
+| Setting | Default | What it does |
+|---|---|---|
+| RomM URL | *(unset)* | Base URL of your instance. Unset hides the feature. |
+| API token | *(unset)* | Client API token. Saved in `compressatorium.db` and never sent back to the browser — treat that file as holding a secret. |
+| Library path | *(unset)* | Where RomM's library is mounted **in this container**. |
+| Give up on a saved snapshot after | `7` days | How long a saved metadata snapshot waits for RomM to rescan the converted file. Raise it if your conversion queue or RomM scan schedule runs longer than that — retiring one early means that ROM's metadata is gone for good. |
+| Run automatically | off | Master switch for scheduled sweeps. |
+| Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. Off silences both the manual and the automatic path. |
+| Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |
+
+`ROMM_AUTO_CONVERT_INTERVAL_MINUTES`, `ROMM_AUTO_CONVERT_MAX_PER_RUN`,
+`ROMM_VERIFY_AFTER_CONVERT` and `ROMM_DELETE_SOURCE_AFTER_VERIFY` seed the
+defaults a *new* platform rule starts from, so a deployment can ship a house
+policy without configuring each platform by hand. A rule that sets the field
+explicitly keeps its own value.
+
+Clearing the token in **Settings** clears it for good: a `ROMM_TOKEN` in the
+environment does not silently take over again.
+
+The matching environment variables — `ROMM_URL`, `ROMM_TOKEN`,
+`ROMM_LIBRARY_ROOT`, `ROMM_AUTO_CONVERT` and friends — seed these on first run.
+See [docs/DOCKER-COMPOSE.md](docs/DOCKER-COMPOSE.md) for a full compose example.
 
 ### Archives
 
@@ -626,6 +815,20 @@ An at-a-glance view of the job queue, verification cache, mounted volumes, recen
 |-------|------|
 | ![Dashboard, light](docs/screenshots/dashboard-light.png) | ![Dashboard, dark](docs/screenshots/dashboard-dark.png) |
 
+#### RomM library
+
+Connect a [RomM](https://romm.app) instance and browse your library by platform — real game names instead of filenames, and the platform tells Compressatorium what a bare `.iso` actually is. Everything is configured in the app; this is the first-run setup. See [RomM integration](#romm-integration).
+
+| Light | Dark |
+|-------|------|
+| ![RomM setup, light](docs/screenshots/romm-light.png) | ![RomM setup, dark](docs/screenshots/romm-dark.png) |
+
+Per-platform automation — target format, schedule, queueing limits and selection filters for each platform independently:
+
+| Light | Dark |
+|-------|------|
+| ![RomM automation, light](docs/screenshots/romm-automation-light.png) | ![RomM automation, dark](docs/screenshots/romm-automation-dark.png) |
+
 #### DAT Library
 
 Import or sync No-Intro / Redump / MAMERedump datasets and match converted files against known-good hashes.
@@ -677,7 +880,7 @@ On small screens the file list switches to a card layout. Controls use 44 to 48p
 - Archives extract temporarily during conversion, then clean up automatically
 - When a `.cue`/`.gdi` is present in the same archive folder, `.bin` entries are suppressed and batch jobs are deduplicated by output path to avoid stalled conversions.
 - Archive listings include safety limits (max entries/size) and expose truncation metadata when limits are hit.
-- **Browsing is global, scoped to known extensions.** When you look inside an archive, the listing shows every member whose extension is one the app understands — every tool's convertible source plus a `.chd` you can decompress — regardless of which tool is currently selected. That covers CHDMAN (`.gdi`/`.iso`/`.cue`/`.bin`), Dolphin (`.iso`/`.gcz`/`.wia`/`.rvz`/`.wbfs`), 3DS (`.cci`/`.cia`/`.3ds`/`.cxi`/`.3dsx`), Switch (`.nsp`/`.xci`), CSO (`.iso`/`.cso`/`.zso`/`.dax`), and Handheld ROM (`.gb`/`.gbc`/`.gba`/`.nds`). Archive members appear for whichever tool accepts them, exactly like on-disk files.
+- **Browsing is global, scoped to known extensions.** When you look inside an archive, the listing shows every member whose extension is one the app understands — every tool's convertible source plus a `.chd` you can decompress — regardless of which tool is currently selected. That covers CHDMAN (`.gdi`/`.iso`/`.cue`/`.bin`), Dolphin (`.iso`/`.gcz`/`.wia`/`.rvz`/`.wbfs`), 3DS (`.cci`/`.cia`/`.3ds`/`.cxi`/`.3dsx`), Switch (`.nsp`/`.xci`), CSO (`.iso`/`.cso`/`.zso`/`.dax`), and Handheld ROM (cartridge ROM dumps — `.gb`/`.gba`/`.nds`/`.nes`/`.sfc`/`.z64`/`.md`/… ). Archive members appear for whichever tool accepts them, exactly like on-disk files.
 - **Why everything else is hidden.** Unknown files (text, `.nfo`/`.sfv`, cover art, manuals), nested archives (a `.zip` inside a `.zip`), and OS/NAS clutter (`__MACOSX/…`, `.DS_Store`, `Thumbs.db`) are filtered out — they aren't convertible or verifiable, so listing them would only be noise. See [Archives → Why only certain files show inside an archive](#why-only-certain-files-show-inside-an-archive).
 - **Some shown members are view-only.** A handheld ROM this app packed (`Game.gba` inside `Game.gba.7z`) is listed for visibility/verification but not offered for re-conversion (recompressing an archived ROM would be recursive); unpack it by selecting the archive and running `romz_extract`. A `.chd` inside an archive can be decompressed in place but not recompressed (copy/recompress acts on a finished output). Such members are badged non-convertible.
 - The inputs that can't come from an archive are CHDMAN's copy/recompress mode (recompressing an already-finished `.chd` would be a pointless round trip, though the extract modes *can* decompress a `.chd` straight out of an archive), Handheld ROM compression, whose `.7z`/`.zip` are the packed product, and PS3 ISO, whose input is a folder rather than a file (a zipped `PS3_GAME` tree can't be selected from inside an archive).

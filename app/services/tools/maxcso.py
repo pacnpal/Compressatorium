@@ -33,6 +33,11 @@ _PRIMARY_OUTPUT_EXT = ".cso"
 
 class MaxcsoTool(BaseTool):
     id = "cso"
+    # CSO/ZSO/DAX are PSP and PS2 formats.
+    platform_slugs = frozenset({"psp", "ps2"})
+    # An effort preset rather than a codec; the dropdown offers
+    # default/fast/max and "max" is what the manual picker seeds.
+    default_compression = "max"
     policy_owner = "maxcso"
     display_name = "CSO"
     modes = (

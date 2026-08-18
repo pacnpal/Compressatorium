@@ -10,7 +10,7 @@ from config import settings
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from routes import convert, dat, files, info, preferences
+from routes import convert, dat, files, info, preferences, romm
 from services.job_manager import job_manager
 from services.nsz import nsz_service
 
@@ -281,6 +281,68 @@ async def lifespan(app: FastAPI):
 
     process_queue_task.add_done_callback(_log_process_queue_error)
 
+    # Prime the RomM settings cache before anything can serve a request.  The
+    # RomM client reads it synchronously from worker threads, so it must be
+    # populated first; without this the first catalog call would fall back to
+    # the environment and ignore whatever the operator saved in the app.
+    from services.romm import auto as romm_auto, settings as romm_settings
+
+    try:
+        romm_cfg = await romm_settings.load()
+    except Exception:
+        logger.exception("Failed to load RomM settings; using environment defaults")
+        romm_cfg = {}
+    if romm_cfg.get("url"):
+        logger.info("RomM integration configured (%s)", romm_cfg["url"])
+
+    # A change of RomM instance or library root clears the records that
+    # belonged to the old one. If the process died between installing the new
+    # identity and finishing that cleanup, the marker written with it says so,
+    # and the stale rows would otherwise stay live against the new instance
+    # forever. Best-effort: a failure here must not stop the app from starting,
+    # and the marker survives for the next attempt.
+    try:
+        await romm.replay_identity_cleanup()
+    except Exception:
+        logger.exception("Failed to finish a pending RomM identity cleanup")
+
+    # How a conversion *ended* is only knowable while the queue remembers the
+    # job, and its history is capped and in-memory. An automation rule needs
+    # that answer weeks later to know whether a ROM was really converted, so
+    # it listens for the outcome and writes it down as each job finishes.
+    job_manager.add_terminal_listener(romm_auto.note_job_finished)
+
+    # The unattended-conversion scheduler always runs; it checks the master
+    # switch each tick, so toggling auto-convert in the app takes effect
+    # without a restart.  It sleeps first, so startup never queues anything.
+    romm_auto_task = asyncio.create_task(romm_auto.run_forever())
+    app.state.background_tasks.add(romm_auto_task)
+    romm_auto_task.add_done_callback(app.state.background_tasks.discard)
+
+    def _log_romm_auto_error(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "RomM auto-convert scheduler exited unexpectedly",
+                exc_info=t.exception(),
+            )
+
+    romm_auto_task.add_done_callback(_log_romm_auto_error)
+
+    # The re-pin settler runs beside it: the request-driven pass skips rows it
+    # cannot finish inside a browser request, and without this nothing would
+    # ever finish a large output's hash.
+    romm_settle_task = asyncio.create_task(romm.settle_forever())
+    app.state.background_tasks.add(romm_settle_task)
+    romm_settle_task.add_done_callback(app.state.background_tasks.discard)
+
+    def _log_romm_settle_error(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "RomM re-pin settler exited unexpectedly", exc_info=t.exception(),
+            )
+
+    romm_settle_task.add_done_callback(_log_romm_settle_error)
+
     # Auto-sync MAMERedump DATs on startup.  Two independent triggers:
     #   1. MAMEREDUMP_AUTO_SYNC=true AND the store is empty  → fresh-install sync.
     #   2. Any DAT has file_count=0 (regardless of MAMEREDUMP_AUTO_SYNC) →
@@ -347,6 +409,7 @@ app.include_router(convert.router, prefix="/api", tags=["convert"])
 app.include_router(info.router, prefix="/api", tags=["info"])
 app.include_router(dat.router, prefix="/api", tags=["dat"])
 app.include_router(preferences.router, prefix="/api", tags=["preferences"])
+app.include_router(romm.router, prefix="/api", tags=["romm"])
 
 
 @app.get("/health")

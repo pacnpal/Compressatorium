@@ -136,7 +136,8 @@ class ModeSpec:
     input_extensions: frozenset[str]
     supports_compression: bool = False
     supports_compression_level: bool = False   # dolphin rvz/wia only
-    supports_delete_on_verify: bool = False
+    supports_delete_on_verify: bool = False  # may this job delete its source?
+    supports_verify: bool = False            # can its output be checked at all?
     allows_archive_input: bool = False         # opt-in; set True on every mode that can take a member straight from an archive (chdman create + extract, dolphin, z3ds). Only chdman copy (.chd recompress round-trip) leaves it False
 ```
 
@@ -197,6 +198,20 @@ class ToolPlugin(Protocol):
 
     def output_path(self, mode: str, input_path: str, output_dir: str | None = None,
                     *, treat_as_stem: bool = False) -> str: ...
+
+    # The file to verify once a job finishes, or None when the product cannot
+    # be found. Nearly always `output_path`; a split makeps3iso build writes
+    # `<iso>.0`/`.1`/… and no bare `.iso`, so verifying the planned path failed
+    # a conversion that had worked. BaseTool returns `output_path`.
+    def verify_target(self, output_path: str, mode: str) -> str | None: ...
+
+    # Whether deleting the source is justified for *this* job's settings, not
+    # just whether the mode offers the option (`supports_delete_on_verify`).
+    # BaseTool returns True; a tool whose verification can be weakened by a
+    # compression choice overrides it — jwud returns False for `noverify`,
+    # whose structural WUX check proves the geometry but not the bytes. Asked
+    # at both plan sites and again in `_process_job`, right before the delete.
+    def delete_on_verify_is_safe(self, mode: str, compression: str | None) -> bool: ...
 
     def convert(self, input_path: str, output_path: str, mode: str, *,
                 compression: str | None = None,
@@ -1673,6 +1688,314 @@ than let a badge and a list disagree — `JobsPanel` renders *"Showing the 500
 most recent of 1,153"*, and a distinct empty state for a tab whose jobs have all
 aged out.
 
+### 3.3.8 Output-conflict resolution (`services/output_conflicts.py`)
+
+"Is this mode's output already taken, and what do I do about it?" is asked by
+every path that queues a job — `/api/jobs`, `/api/jobs/batch`, and the RomM
+automation sweep. It is not an HTTP concern, so it does not live in a route:
+both helpers sit in `services/output_conflicts.py` and every caller gets the
+same answer, or `duplicate_action` would mean different things depending on how
+the job was started.
+
+- **`check_output_conflicts(mode, output_path) -> (exists, locked)`** —
+  companion-aware. An `extractcd` `.bin` sidecar or a split `folder_to_iso`
+  build's numbered parts count as occupying the destination, enumerated through
+  the owning tool's `companion_outputs` hook rather than re-derived per caller.
+- **`get_unique_output_path(base_path, mode=None)`** — probes `name_1`,
+  `name_2`, … until the file *and* that mode's companions are all free. Raises
+  **`OutputPathLocked`** when `base_path` sits inside a locked directory subtree:
+  every numbered sibling it would try shares the same held parent, so probing on
+  would spin with no sleep until the dir lock released and then return an
+  arbitrary name.
+
+The *failure shape* stays a caller concern. `routes/convert.py` keeps a thin
+`get_unique_output_path` wrapper that translates `OutputPathLocked` into
+`SkipFile(SkipReason.OUTPUT_LOCKED)`, so the job pipeline defers and requeues
+the file like any other locked output; the sweep simply drops the candidate and
+picks it up next time. Both touch the disk (a directory mode's companion lookup
+scans), so call them off the event loop.
+
+#### Destination reservation is linear, and does no I/O (`_canonical_path`)
+
+`JobManager._reject_claimed_destinations_locked` runs on the event loop while
+`_create_lock` is held, so its cost is the cost of accepting a batch. Every
+destination is canonicalised **once** (`_canonical_path`) and compared through a
+dict, and the live-job map is built once per batch (`_active_output_map`) rather
+than re-derived per spec. The pairwise form re-resolved every earlier
+destination for every new one — quadratic in the batch size, in blocking
+`realpath` stat chains, against the remote mounts this integration exists for.
+
+Linear was not enough: *one* `realpath` into an unresponsive NFS/SMB/rclone
+mount blocks in uninterruptible I/O, on the event loop, under the lock — which
+is every unrelated API request and all job creation, frozen for as long as the
+mount stays quiet. So the reservation now does **no filesystem work at all**.
+`create_job` / `create_jobs_atomic` call **`_reservation_keys(job_specs, mode)`**
+*before* taking the lock: it derives each destination with `_derive_output`
+(pure string work — every tool's `output_path()` is stem + suffix, no stat),
+collects them with the sources and every live job's output, and resolves the lot
+in one `run_detached` thread under `asyncio.wait_for(_CANONICAL_PROBE_SECONDS)`.
+The result is a `{path: canonical}` map, pre-seeded lexically
+(`normpath(abspath())`). `_canonical_path(path, resolved)` reads that map and
+never touches the disk.
+
+**An expired bound refuses the submit — it does not degrade to the seed.**
+Completing on lexical keys reads as the conservative choice and is the
+opposite. The lexical seed is the path's *spelling*, and `realpath` is the only
+thing that makes two spellings of one file compare equal; so a destination named
+through a symlinked library root and one named through the path underneath it
+get two different keys, and both submissions pass a check whose entire purpose
+is to reject the second. When the mount comes back they write the same file —
+concurrently once `MAX_CONCURRENT_JOBS` is above one, otherwise one over the
+other — and with delete-on-verify both sources are removed for the single
+artifact that survives. `_resolve_paths_bounded` therefore raises
+**`DestinationUnresolvableError`**, which the submit routes answer **503**: the
+volume is not answering, nothing was queued, come back. A volume that cannot
+complete a `realpath` inside the bound is one the conversion would have failed
+on anyway, and being told at submit time costs a retry rather than a file. The
+partial result is not merged either — a half-applied map compares one
+destination lexically against an earlier spec and canonically against a later
+one, which is the same hole with extra steps.
+
+**A new caller of the reservation must pass a map from `_reservation_keys`.**
+Calling `_canonical_path` without one is the blocking form, and it is only
+correct off the event loop.
+
+`companion_outputs` is enumerated in that same detached pass, not under the
+lock: it is **not** pure path math for every tool -- makeps3iso probes the disk
+for its numbered split parts -- so the pre-flight returns a `_Reservation`
+carrying both the canonical map and each destination's full key set, and the
+locked check reads them. That pass refuses on the same terms: reserving the
+primaries alone leaves the sidecars unclaimed, so a second submission whose
+primary differs but whose companions land on these gets through, and a cue sheet
+or a numbered split part written by two jobs is the same lost data as the image.
+
+`_derive_output` is pure string work only because **every tool's `output_path()`
+is stem + suffix arithmetic with no stat**, and three hot paths now depend on
+that: this pre-flight, `registry.mode_is_automatable`, and the status route that
+serves it. A tool whose `output_path` probed the disk would put filesystem I/O
+back under `_create_lock` and on the event loop -- so keep it pure, and put the
+probing in `detect_output` / `verify_target`, which have bounded seams.
+
+Moving the resolution ahead of the lock opens one gap the map alone cannot
+close: two submissions can both pre-resolve before either takes the lock, so
+the second's map cannot contain a job the first queues in between. Falling back
+to lexical for that job would miss that a symlinked spelling and the real path
+name one file — and with overwrite plus delete-on-verify, both sources are
+deleted for one surviving output. So `_queue_job_locked` records the key it
+claimed the destination under in **`_output_keys[job_id]`**, and
+`_active_output_map` prefers it over the (possibly stale) map. The entry is
+dropped when the job leaves the queue; only live jobs are consulted.
+
+#### One destination, one source (`output_conflicts.collapse_to_winners`)
+
+Two inputs can resolve to the same output — a `.cue` beside its `.bin`, two
+`Game.iso` files aimed at one output folder — and `/jobs/batch` collapses them
+into a single job, keeping the highest-priority source (`input_priority`; first
+wins a tie). Anything that records *per source* has to reach the same answer or
+it describes a job that was never created: the RomM metadata snapshot was
+written for whichever source came last, so the conversion that ran could be
+re-pinned with the skipped ROM's identity. Both the batch route and the re-pin
+plan call the same helper.
+
+#### A row is keyed by its destination, and owned by its source
+
+The dedupe key is `output_path`, which is right — one destination is produced
+once, so re-recording *supersedes* rather than stacking, and re-submitting a
+batch is harmless. But the key alone cannot say **which conversion** a row
+belongs to, and that is a different question with a real answer.
+
+It matters when a planned batch is not the one the queue accepts. Two clients
+can plan different sources onto one destination; the second `record()`
+supersedes the first's row, and if the *first* then wins job creation, the
+second's failed submit tidies up. Retiring its row would take the accepted
+conversion's only remaining snapshot with it — which is why the cancel route
+keeps a row a queued job is writing to. Keeping it on *those* grounds was its
+own bug: the surviving row holds the second source's provider ids while the
+queued job converts the first, so the settle pass hashes one game's output and
+stamps the other game's identity onto it, confidently, with nothing to notice.
+
+So the row records `source_path` (migration `0007`), and the test is
+`_destination_job_matches_source`: keep the row only when a queued job carries
+**both** this destination and this source — `get_active_job_candidates` reports
+a job's input and output together, so one job holding both is this row's
+conversion. `_destination_has_pending_job` remains for the weaker question,
+which still has uses ("may I treat what is on disk as settled"); the two are
+distinct and both are needed.
+
+A row with no `source_path` — written before the column existed — cannot answer
+and answers **no**. Retiring it costs a manual re-match; keeping it can cost a
+game its identity, which is the whole failure being removed. The column rides
+through the unique-index retry path too, or a row that lost that race would come
+back unable to prove ownership.
+
+### 3.3.9 Re-pin queue and conversion provenance (`services/romm/repin.py`)
+
+Two questions the filesystem cannot answer on its own, both owned here so the
+manual submit (`routes/romm.py`) and the unattended sweep (`services/romm/auto.py`)
+give the same answer.
+
+**"Has the conversion actually produced this output yet?"** A re-pin row is
+written *before* the conversion runs — the source's provider ids are only
+readable while the source is still the file RomM knows about — and under the
+`overwrite` policy the destination is occupied at that moment by definition. So
+`record()` also stores **`pre_fingerprint`** (`"size:mtime_ns"`, or `""` when the
+path was free) and the settle pass treats an unchanged destination as "not yet".
+Without it, a batch that was planned and then rejected leaves a row that hashes
+the *previous* artifact and pushes this ROM's ids onto whatever RomM identifies
+that as. `cancel(row_ids)` retires such rows immediately rather than waiting out
+`repin_abandon_days`; the fingerprint is what makes leaving them safe until then.
+
+Cancelling is keyed by **row id**, which is why `record()` returns one and
+`/romm/repin/plan` answers with `recorded_ids` beside `recorded_paths`. A
+destination names whichever row holds it *now*: `record()` supersedes, so a
+second client planning the same output between this caller's plan and its
+cancel owns that path — and cancelling by path would retire the live row its
+queued conversion needs. The same asymmetry governs `release()`: a claimed row
+is `settling`, which the partial unique index does not see, so a re-plan can
+insert a new `pending` row for the same output while the claim is out.
+Restoring the claim to `pending` then violates
+`ux_romm_repin_pending_output` — inside the failure handler that called
+`release`, replacing the real error with a 500 and stranding the claim until it
+ages out — so `release()` retires a superseded claim instead, and returns
+whether the row went back to `pending`.
+
+`retire_all_pending()` (the identity swap) covers `settling` as well as
+`pending` for the same reason `claim` re-issues a stale one: a claim whose
+holder died mid-write comes back after `_CLAIM_STALE_SECONDS`, and a row left
+behind by the swap would then apply the *old* instance's provider ids to
+whatever the new one matches its digest to.
+
+Every remaining filesystem check on these paths is bounded the same way:
+`normalize_rules_bounded` (the save-time output-directory validation, inside
+`_sweep_lock`), `_within_volumes_bounded` (the sweep's re-check of a stored
+directory), and the re-pin plan's batch resolve, which is scaled by batch size
+like the catalog scan. Each degrades toward *refuse*: an output directory
+nobody can resolve pauses its rule or skips its platform, and a submitted path
+that does not answer is skipped — the same answer a path outside the volumes
+gets, which is what an unreachable one effectively is.
+
+The change and its cleanup **commit together or not at all**. They are two
+operations and either can be the one that survives a crash: cleanup-then-save
+leaves the old identity live with its history gone and its snapshots retired,
+while save-then-cleanup leaves the retry comparing the new values with
+themselves — concluding nothing moved, and leaving the previous instance's ids
+live against the new one forever. So `romm_settings.save(patch,
+cleanup_pending=True)` writes the marker in the *same row* as the new identity,
+`_run_identity_cleanup()` clears it only once the work is done, and
+`replay_identity_cleanup()` finishes an interrupted change at startup. Both
+halves of the cleanup are idempotent, so replaying costs nothing.
+
+Startup is not the only replay point: the settings route runs the cleanup when
+`changed` **or** `romm_settings.cleanup_owed()`. Retrying the same save
+otherwise finds the new identity already cached, computes no change, and
+returns success while the marker still says the old instance's records are
+live.
+
+The re-pin **plan** reads the catalog and then writes rows carrying that
+catalog's provider ids, so it has to be sure the catalog is still the one in
+use. `romm_settings.identity_generation()` is read up front and re-checked
+before recording: a change landing in that window means the ids belong to an
+instance nobody is pointed at, and the plan answers 409 rather than recording
+them. A batch converted without a snapshot needs a manual re-match, which is
+recoverable; a row holding another library's ids is not.
+
+A re-check is not a guarantee, though — it is true at an instant, and the
+inserts come after it. A save landing in between could install the new identity
+*and finish its cleanup* while the rows were still going in, leaving them alive
+against the new library, holding the old one's ids, and invisible to the pass
+that was supposed to retire them. So the plan is split: the fingerprint probes
+run unlocked (they are bounded filesystem reads, and holding a lock the settler
+and the settings route both need across a dead mount, once per destination,
+would trade this race for a much longer stall), and **only the inserts run
+under `_settle_lock`** — the lock `_run_identity_cleanup` requires — with the
+generation re-read inside it. That is what makes "the identity has not moved"
+true *for the duration of* the writes.
+
+**And while a cleanup is owed, nothing acts on the records it has not reached
+yet.** The marker can outlive startup: `replay_identity_cleanup()` is
+best-effort, a briefly locked SQLite file is enough to fail it, and the app
+starts anyway by design. Until it lands, the conversion history and the pending
+re-pin rows still belong to the previous instance — so `sweep()` refuses
+(`identity_cleanup_pending`) rather than reading the old library's history, the
+plan route answers 409 rather than adding a row the cleanup has already passed
+over, and the settler skips its tick. The settler is also where the **retry**
+lives: it takes `_settle_lock` and the sweep pause, runs the cleanup, and only
+then proceeds. A sweep cannot retry it — it holds `_sweep_lock` and so is the
+one caller that cannot take those — which is why the refusal and the retry sit
+in different places.
+
+Deciding *whether* the identity moved is itself bounded (`_identity_moved`),
+because it resolves both library roots and the old one is the unresponsive
+mount as often as not — that is why the operator is changing it. It runs
+detached under `_IDENTITY_PROBE_SECONDS` and falls back to comparing the
+normalised spellings, while the request holds `_settle_lock` and the sweep
+pause. The fallback errs toward *moved*: two spellings of one directory then
+cost a redone conversion history, where the opposite mistake writes one
+library's provider ids onto another library's game.
+
+**"Has this rule already converted this source?"** `skip` is idempotent from the
+destination alone, but the other two policies are not: `overwrite` resolves an
+occupied destination as queueable, and `rename` always finds a free suffix. Both
+would therefore reconvert the whole library every interval.
+
+What is recorded is **production, not queueing**. `converted` on the platform's
+`romm.auto_state` entry maps each RomM id to `{path, pre}` — the destination the
+rule chose and a fingerprint of whatever occupied it at planning time — and
+`_was_produced()` answers it in three steps, strongest evidence first: the
+verdict written down when the job ended (`done`), then the job's live status if
+the queue still remembers it, then — only for a record predating either — the
+fingerprint having changed.
+
+The written-down verdict is what makes the rest trustworthy. A *failed*
+`overwrite` job changes the destination just as visibly as a successful one, by
+unlinking the old artifact or leaving a partial file, so the fingerprint alone
+cannot tell them apart and the ROM would be skipped by every later sweep until
+**Forget history**. `job_manager.add_terminal_listener` (§3.4) hands
+`note_job_finished` the outcome at the moment it is certain; the sweep also
+freezes any outcome the queue can still answer for, which covers a job that
+finished before its record existed. Neither has to be kept in sync with the
+queue: a missing verdict degrades to the older evidence rather than to a wrong
+answer.
+
+It is invalidated where it stops being true: `set_rules` drops it for any
+platform whose `OUTPUT_IDENTITY_FIELDS` changed — a rule retargeted from RVZ to
+GCZ is asking for a different file — and does so **under `_sweep_lock`**, since
+a sweep running concurrently finishes by writing its own ids and schedule stamp
+under the same key. `routes/romm.py` also clears it when `url` or `library_root`
+changes, because a different RomM database reuses the same integer ids for
+different games. `forget_converted()` (exposed as
+`POST /api/romm/rules/forget-converted`, with a per-platform button in the
+automation editor) is the operator's escape hatch after restoring a backup.
+`_record_run` merges into the entry rather than replacing it, or every run would
+forget the history it shares a key with.
+
+**"What did the tool actually produce?"** A row also stores its `mode`, so the
+settle pass can ask the owning tool through `companion_outputs`. makeps3iso's
+`-s` build only splits past 4 GB — under it, the bare `.iso` appears and the row
+settles normally; over it, only `<name>.iso.0`, `.1`, … exist, which from the
+recorded path alone is indistinguishable from a conversion that never ran. RomM
+matches a ROM on one file's hash, so a part set has no digest to join on: the
+row is retired immediately with that as its reason rather than waiting out
+`repin_abandon_days` and reporting "output never appeared".
+
+### 3.3.9 Verify without delete (`ConversionJob.verify_after`)
+
+`delete_on_verify` verifies as a *precondition* for deleting the source. A
+caller that wants the check on its own — an unattended sweep proving its output
+before it walks away — sets **`verify_after`** instead. One block in
+`_process_job` runs the verification for either flag, so a verified output means
+the same thing however it was requested, and only `delete_on_verify` reaches the
+delete half.
+
+The capability gate applies to the delete, not to the check. `verify_after`
+simply runs the tool's verification and keeps the source, so any mode whose tool
+can verify may ask for it. `delete_on_verify` must additionally satisfy
+**both** `ModeSpec.supports_delete_on_verify` ("can this mode's output be
+verified at all") and `ToolPlugin.delete_on_verify_is_safe(mode, compression)`
+("can *this* job's settings prove it") — re-asked in `_process_job` itself,
+because that is where the source is unlinked and a job can arrive there without
+having passed either plan-time check.
+
 ### 3.4 `registry.py`
 
 ```python
@@ -1706,6 +2029,298 @@ class ToolRegistry:
     def scannable_extensions(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.output_extensions()) | set(self.verify_extensions())))
 ```
+
+#### Platform narrowing (`narrow_to_platform`, `ToolPlugin.platform_slugs`)
+
+Extension matching decides *convertibility*, which is all a bare filesystem
+listing can know. A library manager knows more: RomM stamps a `platform_slug` on
+every ROM record, and that is the only thing able to tell a GameCube `.iso` from
+a PS2 one.
+
+Each tool declares the platforms it serves as `platform_slugs: frozenset[str]`
+(dolphin: `{"ngc", "gamecube", "wii"}`; maxcso: `{"psp", "ps2"}`; the default is
+an empty set, meaning "no opinion"). `narrow_to_platform(tool_ids, slug)` then
+*removes* candidates the platform contradicts — it never adds any.
+
+It is conservative by construction, because a wrong exclusion is worse than a
+missing one. With no slug, an unrecognised slug, or a slug no tool claims, the
+list is returned untouched; a tool declaring no `platform_slugs` is never
+dropped. So a platform we have never heard of degrades to plain extension-only
+behaviour rather than to an empty list. Both consumers go through it: the RomM
+catalog listing narrows each row's `convertible_by`, and `/romm/platforms`
+returns the narrowed `tool_ids` so the automation editor offers a platform only
+the modes it can actually use.
+
+#### Operator-authored filter patterns
+
+The automation rules take real regexes — "convert only `(USA)`" is the feature —
+which makes them the one place user input becomes executable. Two bounds, and
+one accepted alert.
+
+`_valid_pattern` caps the source at `_MAX_PATTERN` characters, refuses one that
+does not compile (refuses, never drops: a rule whose filter silently vanished
+would come back as *unfiltered*, and the next unattended sweep could queue the
+whole platform with delete-on-verify attached), and then refuses one that
+backtracks. `re` cannot be interrupted, so a pattern like `(a+)+$` would hold
+`_sweep_lock` indefinitely — blocking previews, manual runs, and the very rule
+edit that would remove it.
+
+**`_has_nested_quantifier` reads the pattern rather than running it.** The
+obvious implementation times the regex against an adversarial string, and that
+was the first attempt; it is wrong three ways. It has to survive the very
+blow-up it is looking for (the runtime doubles per character, so measuring at
+full length hangs the check). It is load-dependent, so a busy machine rejects
+patterns that are fine. And executing an operator-supplied regex is exactly what
+CodeQL's `py/regex-injection` flags — the query's only sanitizer is `re.escape`,
+which would turn "convert only `(USA)`" into a literal search and delete the
+feature. A structural test avoids all three: it looks for a quantified group
+whose body itself repeats (`(a+)+`, `(\w+\s?)*`) or is an alternation
+(`(a|a)+`), which are the shapes with exponentially many ways to split one
+input. Escapes and character classes are stripped first, so a literal `\+` or a
+`[+|]` class is not mistaken for a quantifier.
+
+**The two quantifier sets are not the same set.** What may follow a *group*
+is `*+{` — `(...)?` cannot blow up, because the outer level consumes at most
+once. What counts *inside* a group that is already repeated unboundedly is
+`*+{?`, because there every optional atom doubles the ways the engine can split
+the same input: `^(a?){30}a{30}b$` compiles, looks tame, and walks
+exponentially many choices against a long run of `a`. Bounded repetition is not
+a reprieve — `{30}` is thirty levels of doubling. Getting this wrong is not just
+a slow sweep: the probe thread is abandoned rather than stopped, so repeated
+scheduled retries eat into the process-wide probe capacity that unrelated
+filesystem checks share.
+
+A group's leading `?` is stripped before that test, because in `(?:…)`, `(?=…)`,
+`(?<!…)`, `(?P<name>…)` and inline-flag groups it is *syntax*. Reading it as an
+optional atom would refuse every non-capturing group — and a refused filter
+disables the rule, so an operator who cannot write `(?:USA|Europe)` writes
+something looser instead, which is the widening this validator exists to stop.
+
+It is conservative on purpose — `(USA|Europe)+` is harmless and still refused —
+because being wrong at save time costs one clear message, while being wrong the
+other way wedges the scheduler.
+
+#### Composite modes narrow per mode (`ModeSpec.platform_slugs`)
+
+Narrowing by tool cannot separate a composite tool's modes. `ChainTool` is a
+shell that belongs to no system: it owns `nkit_to_rvz` (GameCube/Wii) and
+`cso_to_chd` (PS2/PSP), so it legitimately survives `narrow_to_platform` on
+both — and offering *both* modes on *both* is how a GameCube disc gets a rule
+targeting a PS2 format.
+
+**`ModeSpec.platform_slugs`** (default empty, meaning "ask the tool") lets a
+mode name its own systems. `mode_allows_platform(mode, slug)` applies the same
+conservative rules as `narrow_to_platform` one level down, and
+`modes_for_platform(slug)` returns the whole applicable set — served to the
+browser as each platform's `mode_ids` beside its `tool_ids`, so neither the
+automation editor nor the RomM target picker carries a second copy of the
+platform table. The sweep checks the *mode*, not `spec.tool_id`.
+
+Composite tools are not the only case. A tool whose modes are *different
+commands over different media* has to declare per mode too: CHDMAN's
+`createcd` writes a CD track layout and `createdvd` a flat DVD image, and
+inheriting the tool's combined slug set offered a PS2 catalog both — with
+`createcd`, the first CREATE mode, as the default an ISO submission landed on.
+`chdman.py` therefore splits its platforms into `_CD_PLATFORMS` /
+`_DVD_PLATFORMS` / `_HD_PLATFORMS` / `_LD_PLATFORMS`, gives each create and
+extract mode the set its command actually serves, and derives the tool-level
+`platform_slugs` as their union so the two levels cannot drift. `copy` declares
+nothing and inherits: recompressing a finished `.chd` is media-agnostic.
+
+The rule for a new tool: declare `platform_slugs` on the *mode* whenever two of
+a tool's modes would be wrong for each other's platforms, and let the tool-level
+set be the union.
+
+#### What may run unattended (`registry.mode_is_automatable`)
+
+A rule fires repeatedly over a library RomM rescans, so a mode is only
+automatable if that loop **terminates**. The one that does not is CHDMAN's
+`copy`: `Game.chd` becomes `Game_copy.chd`, RomM lists it, the same rule
+accepts it as a source, and the next sweep writes `Game_copy_copy.chd` — full
+size, once per sweep, until the volume fills. Nothing downstream stops it,
+because the destination is new every round: the duplicate policy and the
+converted history both agree it is work not yet done.
+
+The test is not "does it accept its own output" but **where would it write
+it**. `dolphin_rvz` over a `.rvz` resolves to the *same* path, which the
+queue's same-path guard refuses — so it settles rather than multiplying. The
+registry therefore asks the tool: derive the output path for a synthetic source
+carrying the mode's own output extension, and refuse the mode when the answer
+differs from it. Derived, so a future tool of the same shape is excluded
+without anyone remembering.
+
+Enforced in two places, because a rules blob can be written straight into the
+database: `normalize_rule` drops such a rule, and the editor omits the mode
+(served through `/romm/status`'s `automatable_modes`, since the derivation
+needs the tool's `output_path` and cannot be mirrored in JS). Extract modes are
+a *separate*, UI-side exclusion — they terminate, and rules using them work.
+
+#### Asking a tool whether it can run (`registry.tool_is_ready`)
+
+`ToolPlugin.is_ready()` is a coroutine, which makes it look bounded and does
+not make it so. NSZ's delegates to a pooled `keys_available()` that walks every
+configured volume looking for `prod.keys`, with no deadline of its own: on an
+NFS/SMB/rclone mount that has stopped answering it blocks in uninterruptible
+I/O and holds a shared-pool worker while every caller waits behind it.
+
+The callers all fan out over the whole registry, so the cost is a whole screen.
+`GET /api/tools` — the sidebar's tool list — awaited each tool *in turn*, so one
+dead volume held up every tool that was fine behind it.
+`GET /api/romm/platforms` gathered them, leaving the Library and the automation
+editor loading forever. Retry either and each attempt stranded another worker.
+
+**Ask through `registry.tool_is_ready(tool)`, never `tool.is_ready()`
+directly.** It bounds the probe at `READY_PROBE_SECONDS` (20s — generous,
+because the honest answer for NSZ is a real walk of a possibly large share) and
+reports **not ready** when it expires: the same answer a missing binary gets,
+and the right one, since a tool whose prerequisites cannot be read cannot
+convert. `registry.ready_tool_ids()` is the fan-out form, concurrent rather
+than sequential. The RomM sweep's `_ready_bounded` is a thin alias kept for its
+local consequence: the sweep holds `_sweep_lock` throughout, so a hang there
+also blocks previews, manual runs, rule edits and settings saves.
+
+**And the other half is the plugin's.** The bound frees the *caller*, and only
+the caller — Python can abandon an awaiter, never an OS thread. Whose thread is
+abandoned is decided by the implementation, so **an `is_ready()` that touches
+the filesystem must use `run_detached`, not `run_in_threadpool`.** A pooled
+worker wedged on a dead mount is never handed back, and since every caller fans
+out over the whole registry, repeated probes retire the pool one worker at a
+time until unrelated offloads have nowhere to run — the bound turns a hang into
+a leak rather than removing it. `nsz` (a recursive walk for `prod.keys`) and
+`jwud` (a stat for the `.jar`) are the two that touch the disk today; the
+requirement is stated on `ToolPlugin.is_ready` so a new gated tool inherits it.
+
+#### Resolving what to verify (`_verify_target_bounded`)
+
+`verify_target()` answers "which file actually holds this conversion's output"
+— for makeps3iso, a stat of the bare ISO plus a scan for numbered split parts.
+Cheap, and dangerously placed: it runs after the conversion and *before*
+`verify_timeout()` is resolved, so it sits ahead of every bound the verify
+itself carries, on storage that has just taken a multi-gigabyte write and is
+therefore the likeliest thing in the process to have stopped answering.
+
+Blocked there the job holds its output lock and its source-directory lock,
+`_verifying` is still empty so the watchdog has nothing to report, and at the
+default `MAX_CONCURRENT_JOBS` of 1 the whole queue stops. So it goes through
+`run_detached` under `asyncio.wait_for` — an abandoned disposable thread rather
+than a pooled worker — and takes the job's `cancel_event`, because a Cancel
+pressed while a mount is silent must return now rather than after the probe
+bound. An expired bound fails the job with a message naming the storage; a
+cancel raises `ConversionCancelled`, the same translation the verify makes, so
+nothing is judged and the source is not deleted on it.
+
+#### A platform claim is a promise about extensions
+
+`platform_slugs` and the modes' `input_extensions` are two halves of one
+statement, and nothing enforces the join — so they can disagree, and the
+disagreement is invisible until an operator hits it. ROMZ claimed NES, SNES,
+N64, Genesis, Game Gear and a dozen more while accepting only `.gb`, `.gbc`,
+`.gba` and `.nds`. RomM offered the ROMZ modes on an NES platform, every `.nes`
+row was unselectable, and an enabled automation rule skipped the whole platform
+as unconvertible on every sweep — silently, because "nothing to do" and
+"nothing I *can* do" report the same way.
+
+**Widen the extensions rather than dropping the slugs**, whenever the tool can
+honestly serve them: ROMZ is a `7z` wrapper with no per-format logic, so a
+`.nes` packs exactly as a `.gba` does. Dropping the claim would have been the
+smaller diff and the worse answer — it removes a capability to make a doc
+string true. And keep the two lists collision-free against other tools:
+`.bin` stays chdman's, because a Genesis dump sharing an extension with a CD
+track is not a collision worth creating.
+
+The frontend mirrors these lists in `src/lib/tools/registry.js`, and
+`tests/test_frontend_parity_186.py` fails when the two drift — so widening a
+tool's inputs is a two-file change by construction.
+
+#### What counts as a source (`registry.mode_input_kind`)
+
+`ModeSpec.input_kinds` is a set, and "does this mode take a file or a
+directory" was re-derived from it at each seam. **`mode_input_kind(mode)`** is
+the one answer, used by the queue (which carries it end-to-end so the pipeline
+skips the file-only assumptions), by the sweep's declaration check, and by the
+sweep's existence check.
+
+That last one matters because existing is not the same as being the right kind.
+The declaration check is extensions and the tool's predicate, so a directory
+whose *name* carries an accepted extension passes it, and a plain
+`os.path.exists()` then let it into the queue. The manual batch route stats for
+a regular file; automation has to as well, because nothing is watching an
+unattended sweep — an `overwrite` rule authorises the job,
+`_clear_existing_output` removes the previous artifact, and only then does the
+converter fail on a directory it cannot open.
+
+#### How a job ended, after the queue forgets (`add_terminal_listener`)
+
+`JobManager.jobs` is capped (`max_job_history`) and lives in memory, so
+`get_job(id)` answers "unknown" for anything pruned or predating a restart.
+Any consumer that needs to know how a job *ended* — not whether it exists —
+therefore cannot ask later; it has to be told at the time.
+
+Ownership is registered the instant the queue accepts a batch (`_own_jobs`),
+before the first await after acceptance — the listener fires from the queue
+worker, so a fast conversion on an idle queue can end while the post-queue
+bookkeeping is still running. The *record* it writes into does not exist until
+a few awaits later, so a verdict arriving in between is stashed in
+`_late_verdicts` and applied by `_mark_converted`. Dropping it instead left the
+row with no verdict at all, after which the only evidence is the destination
+having changed — which a *failed* overwrite produces just as convincingly.
+
+**`job_manager.add_terminal_listener(callback)`** registers a callback for every
+job reaching `COMPLETED` / `FAILED` / `CANCELLED`. Delivery is **at least once**,
+not exactly once. It fires from
+`_process_job`'s `finally` (every runner outcome), from both
+`finish_external_job*` paths, from `cancel_job`'s QUEUED branch, and from the
+four early returns that precede `_process_job`'s try block (two cancels, the
+output-lock failure and the split-set collision) — which is why a job cancelled
+before it starts is announced twice. The callback
+may be sync or async, exceptions are logged and swallowed (a listener must
+never fail a conversion), and the same job may be announced twice — listeners
+are required to be idempotent.
+
+The RomM automation is the first consumer: `romm.auto.note_job_finished` writes
+the verdict into the rule's converted-history record (`done: true|false`), and
+`_was_produced` reads that first. Without it, provenance fell back to "the
+destination changed since planning", which a *failed* overwrite produces just
+as well as a success — by unlinking the old artifact or leaving a partial one
+— and the ROM would be skipped by every later sweep until **Forget history**.
+The sweep also freezes any outcome the queue can still answer for
+(`_persist_known_outcomes`), covering the window before a record exists.
+
+The listener fires for **every** job in the app, most of them manual, so it
+cannot afford to search: `_mark_converted` files the `job id -> (platform,
+rom)` pairing in `_job_owners` as it queues, and `note_job_finished` pops that
+one entry. A miss means the job is not the automation's — a record can only
+name a job this process queued, since the queue is in memory — so there is
+nothing to write and nothing to scan. The alternative walked every remembered
+ROM of every platform per completion, on the event loop under `_sweep_lock`.
+
+#### A codec for "tool default" (`ToolPlugin.default_compression`)
+
+The compression *level* is not a separate argument anywhere in the pipeline: it
+rides on the compression string as `"codec:level"`, which the tool splits back
+apart. A level with no codec therefore serialises as `":19"`, and whether that
+is meaningful is a per-tool fact:
+
+- Where a mode declares `supports_compression=False` but
+  `supports_compression_level=True` — nsz, whose dropdown picks a solid/block
+  *layout* rather than a codec — the tool reads the empty part as its own
+  default and honours the level.
+- Where a mode offers codecs (`supports_compression=True`), the empty part is a
+  blank, not a default. `DolphinTool._build_convert_command` emits
+  `-c "" -l 19`, which dolphin-tool refuses.
+
+**`ToolPlugin.default_compression: str | None`** names the codec to use in the
+second case, so the resolution stays a per-tool declaration instead of an
+if-ladder on tool identity at the call site.
+`registry.default_compression(mode)` applies it *only* to codec-offering modes,
+returning `None` elsewhere so nsz's meaningful empty part survives. The RomM
+sweep (`services/romm/auto._compression_arg`) is the current consumer: with no
+declared default it drops the level and logs, rather than queue a job the tool
+will reject or invent a codec the operator did not choose.
+
+The value mirrors `defaultCompression` in `src/lib/tools/registry.js`, which
+seeds the same choice in the manual picker — `tests/test_frontend_parity_186.py`
+fails on drift, and on a codec+level mode that declares no default at all.
 
 #### Extension matching is a suffix match (`utils.path_utils.match_extension`)
 

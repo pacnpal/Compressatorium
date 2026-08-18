@@ -7,6 +7,7 @@
   import TopBar from '$lib/components/layout/TopBar.svelte';
   import Dashboard from '$lib/components/views/Dashboard.svelte';
   import WorkArea from '$lib/components/views/WorkArea.svelte';
+  import RommView from '$lib/components/views/RommView.svelte';
   import DATView from '$lib/components/views/DATView.svelte';
   import HelpView from '$lib/components/views/HelpView.svelte';
   import EmptyState from '$lib/components/ui/EmptyState.svelte';
@@ -180,6 +181,7 @@
       <svelte:boundary onerror={onBoundaryError}>
         {#if ui.activeView === 'dashboard'}<Dashboard />
         {:else if ui.activeView === 'workspace'}<WorkArea />
+        {:else if ui.activeView === 'romm'}<RommView />
         {:else if ui.activeView === 'dat'}<DATView />
         {:else if ui.activeView === 'help'}<HelpView />
         {/if}

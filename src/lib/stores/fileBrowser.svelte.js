@@ -6,6 +6,7 @@ import { api } from '$lib/api/endpoints.js';
 import { STORAGE_KEYS, readString, writeString } from '$lib/util/localStorage.js';
 import { jobs } from './jobs.svelte.js';
 import { conversion } from './conversion.svelte.js';
+import { ui } from './ui.svelte.js';
 
 const DEFAULT_PAGE_SIZE = 50;
 // Rows-per-page choices offered in the file list footer.
@@ -36,6 +37,12 @@ class FileBrowserStore {
   // Navigation
   currentPath = $state(null);
   currentArchivePath = $state(null);
+  // RomM catalog mode: the id of the RomM platform whose ROMs are listed, or
+  // null for ordinary filesystem browsing. RomM is a third listing *source*
+  // alongside search and archive-member views rather than a parallel UI — the
+  // backend returns the same DirectoryListing/FileEntry shape, so FileList,
+  // FileRow, RowActionsMenu and ConvertPanel all work unchanged.
+  rommPlatformId = $state(null);
 
   // Entries
   entries = $state([]);
@@ -155,8 +162,12 @@ class FileBrowserStore {
           bv = b.type;
           break;
         default:
-          av = a.name.toLowerCase();
-          bv = b.name.toLowerCase();
+          // Sort on the text the row actually shows. RomM catalog rows lead
+          // with the curated `display_name` (and the backend already orders
+          // them that way); filesystem rows have none, so this is the plain
+          // filename there and ordinary listings are unchanged.
+          av = (a.display_name || a.name || '').toLowerCase();
+          bv = (b.display_name || b.name || '').toLowerCase();
       }
       if (av < bv) return -1 * order;
       if (av > bv) return 1 * order;
@@ -275,6 +286,25 @@ class FileBrowserStore {
     // stuck on the old search results under the new currentPath if we
     // didn't drop search state first.
     this.exitSearch();
+    // RomM mode short-circuits refresh() the same way, and a catalog row can
+    // be a directory — a decrypted PS3 game folder. Clicking one set
+    // `currentPath` and then reloaded the platform catalog instead, so the
+    // folder looked clickable and did nothing. Asking to go somewhere is
+    // asking to leave the catalog; `exitRomm` clears its rows but must not
+    // also refresh the old path, since this call is about to set a new one.
+    if (this.rommPlatformId !== null) {
+      this.rommPlatformId = null;
+      this.entries = [];
+      this.entriesError = null;
+      this._loadedPath = null;
+      // ...and leave the RomM screen with it. Dropping catalog mode while the
+      // view stays on `romm` left the platform toolbar sitting above unrelated
+      // directory entries, and that shell renders no breadcrumbs and no parent
+      // link — so a decrypted PS3 folder was a one-way trip, with no way back
+      // to the catalog short of leaving and reopening the whole view. The
+      // workspace is the screen that knows how to show a directory.
+      ui.navigate('workspace');
+    }
     this.currentPath = path;
     this.currentArchivePath = null;
     this.clearSelection();
@@ -344,6 +374,22 @@ class FileBrowserStore {
    *   always updates the listing.
    */
   async refresh({ force = false } = {}) {
+    // RomM mode lists a platform's catalog, not a directory. Checked first for
+    // the same reason the archive branch exists: a vanilla refresh against
+    // currentPath would swap the catalog for a directory listing while the mode
+    // flag stayed set, so selections and conversions would silently act on
+    // different rows than the ones on screen. Selection is deliberately NOT
+    // cleared here, so a background/auto refresh keeps the user's picks.
+    if (this.rommPlatformId !== null) {
+      // Same auto-refresh suppression the directory path gets below. Listing a
+      // platform stats every ROM in it, so a periodic refresh while a
+      // conversion runs is the most expensive thing this store does — exactly
+      // what turning auto-refresh off is asking it not to do. A forced refresh
+      // (navigation, a mutation) still goes through.
+      if (!force && jobs.hasActive && !this.autoRefresh) return;
+      await this._loadRommEntries(this.rommPlatformId);
+      return;
+    }
     // Search mode keeps the recursive result set, not the current
     // directory. A vanilla refresh against currentPath would clobber
     // the user's search view. But modals (rename/delete) DO call
@@ -610,6 +656,78 @@ class FileBrowserStore {
   exitSearch() {
     this.searchMode = false;
     this.searchResults = null;
+  }
+
+  // ─── RomM catalog mode ────────────────────────────────────────────────
+  /**
+   * List a RomM platform's ROMs instead of a directory.
+   *
+   * The other listing modes are left behind explicitly: search results and an
+   * open archive both describe the filesystem view, and leaving either set
+   * would make `refresh()` ambiguous about which source wins.
+   *
+   * @param {number} platformId - RomM platform id.
+   */
+  async enterRomm(platformId) {
+    if (platformId === null || platformId === undefined) return;
+    this.exitSearch();
+    this.currentArchivePath = null;
+    // Rows from another platform are gone; keeping them selected would let a
+    // convert act on files that are no longer on screen.
+    this.clearSelection();
+    this.rommPlatformId = platformId;
+    this.page = 1;
+    await this._loadRommEntries(platformId);
+  }
+
+  /** Return to ordinary filesystem browsing.
+   *
+   * Re-loads the directory the user was in rather than only clearing the
+   * catalog rows: `WorkArea` does not refresh on mount and `VolumeList` only
+   * fetches when it has no volumes, so leaving the entries empty would show a
+   * blank file list until something else happened to trigger a reload.
+   */
+  exitRomm() {
+    if (this.rommPlatformId === null) return;
+    this.rommPlatformId = null;
+    this.clearSelection();
+    this.entries = [];
+    this.entriesError = null;
+    // Drop the memo of the last loaded directory so the refresh is not
+    // collapsed as a duplicate of the listing we just discarded.
+    this._loadedPath = null;
+    if (this.currentPath) {
+      this.refresh({ force: true });
+    }
+  }
+
+  async _loadRommEntries(platformId) {
+    // Same monotonic-token guard the directory loader uses: switching platforms
+    // quickly must not let an older response overwrite a newer one, and the two
+    // loaders share the counter so a mode switch is covered too.
+    this._listingRequestSeq += 1;
+    const myReq = this._listingRequestSeq;
+    // Release the directory loader's in-flight memo: the request that set it
+    // has just been superseded, so its `finally` will not clear it (its token
+    // is stale). Left set, a later forced refresh of that same path — the one
+    // exitRomm issues — is dropped as a duplicate and the file list stays
+    // blank with no spinner and no error.
+    this._inflightListingPath = null;
+    this.loading = true;
+    this.entriesError = null;
+    try {
+      const data = await api.getRommRoms(platformId);
+      if (this._listingRequestSeq !== myReq || this.rommPlatformId !== platformId) return;
+      this.entries = data?.entries ?? [];
+      this._listingGeneration += 1;
+    } catch (e) {
+      if (this._listingRequestSeq !== myReq || this.rommPlatformId !== platformId) return;
+      this.entriesError = e?.message ?? 'Failed to load RomM ROMs';
+      this.entries = [];
+    } finally {
+      if (this._listingRequestSeq === myReq) this.loading = false;
+      this._clampPage();
+    }
   }
 
   // ─── Selection ────────────────────────────────────────────────────────

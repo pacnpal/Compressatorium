@@ -86,6 +86,12 @@ class OutputStatus(BaseModel):
 
 class FileEntry(BaseModel):
     name: str
+    # Human-facing label when it differs from the filename: a library manager's
+    # curated game title ("Super Mario Bros." for smb_u_rev1.sfc). Display only
+    # -- `name` remains the real filename that rename/delete/convert act on, so
+    # nothing that touches the filesystem may read this. None for ordinary
+    # directory listings.
+    display_name: str | None = None
     path: str
     type: str  # "file", "directory", or "archive"
     size: int | None = None
@@ -139,6 +145,11 @@ class ConversionJob(BaseModel):
     allow_overwrite: bool = False
     compression: str | None = None
     delete_on_verify: bool = False
+    # Verify the output and keep the source. Independent of delete_on_verify,
+    # which verifies as a precondition for deleting; this asks for the check on
+    # its own, so an unattended conversion can prove its result without the
+    # destructive half.
+    verify_after: bool = False
     # Split the output into ~4 GB parts for FAT32 targets (makeps3iso -s).
     # Only meaningful for the folder->iso directory mode; ignored elsewhere.
     split: bool = False

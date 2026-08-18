@@ -53,6 +53,9 @@ CSO_TO_CHD = ChainSpec(
     group="chain",
     output_ext=".chd",
     input_extensions=frozenset({".cso", ".zso", ".dax"}),
+    # The chain tool serves no single system, so each mode names its own --
+    # these match maxcso's, the tool that owns step 1.
+    platform_slugs=frozenset({"psp", "ps2"}),
     steps=(
         # weights reflect that chd compression is far slower than cso decompress.
         ChainStep(tool_id="cso", mode="cso_decompress", weight=0.20, output_ratio=2.0),
@@ -85,6 +88,8 @@ NKIT_TO_RVZ = ChainSpec(
     group="chain",
     output_ext=".rvz",
     input_extensions=frozenset({".nkit.iso", ".nkit.gcz"}),
+    # nkit2iso's platforms: NKit is a GameCube/Wii shrink format.
+    platform_slugs=frozenset({"ngc", "gamecube", "wii"}),
     steps=(
         # RVZ compression dominates: the NKit restore is a linear rebuild, while
         # dolphin-tool re-compresses the whole disc.

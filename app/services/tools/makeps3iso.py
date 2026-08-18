@@ -25,6 +25,7 @@ from .spec import InputKind, ModeKind, ModeSpec
 
 class MakePs3IsoTool(BaseTool):
     id = "makeps3iso"
+    platform_slugs = frozenset({"ps3"})
     policy_owner = "makeps3iso"
     display_name = "PS3 ISO"
     modes = (
@@ -39,10 +40,13 @@ class MakePs3IsoTool(BaseTool):
             # empty and selection runs through accepts_directory() instead.
             input_extensions=frozenset(),
             supports_compression=False,
-            # No delete-on-verify: deleting a user-curated decrypted folder is
-            # destructive and makeps3iso has no native verify (only the light
-            # PARAM.SFO TITLE_ID readback).
+            # makeps3iso has no verify subcommand: the check is a PARAM.SFO
+            # readback out of the ISO just built. Enough to say the build is
+            # structurally sound, not enough to justify deleting the curated
+            # game folder it came from -- so the mode is verifiable but never
+            # deletable.
             supports_delete_on_verify=False,
+            supports_verify=True,
             allows_archive_input=False,
             input_kinds=frozenset({InputKind.DIRECTORY}),
         ),
@@ -128,6 +132,21 @@ class MakePs3IsoTool(BaseTool):
             part for part in self._service.split_parts(output_path)
             if part != output_path
         ]
+
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """The bare ISO, or the first numbered part when the build split.
+
+        A ``-s`` build past 4 GB writes ``<iso>.0``/``.1``/… and never the bare
+        path the job planned, so verifying `output_path` reads a file that is
+        not there and fails a conversion that actually worked -- and under an
+        overwrite rule the next sweep repeats it. The service's own readback
+        already targets the first part; this is the same answer, given to the
+        job runner.
+        """
+        if os.path.exists(output_path):
+            return output_path
+        parts = self._service.split_parts(output_path)
+        return parts[0] if parts else None
 
     def overwrite_targets(
         self, output_path: str, mode: str,  # noqa: ARG002 - single-mode tool

@@ -52,6 +52,18 @@ class ToolPlugin(Protocol):
     # Dolphin's recompressed RVZ/WIA/GCZ. False (default) for formats whose own
     # file SHA1 may legitimately be indexed (e.g. a CHD-container DAT).
     embedded_hash_is_exhaustive: bool
+    # Library-manager platform slugs whose media this tool handles, empty for
+    # "no opinion". Part of the contract, not just BaseTool's default:
+    # `ToolRegistry.narrow_to_platform` reads it off every registered tool, so
+    # an implementation that satisfies the protocol without it would fail there
+    # rather than at registration. See BaseTool.platform_slugs for the semantics.
+    platform_slugs: frozenset[str]
+    # The codec this tool falls back to when a caller asks for a compression
+    # level but leaves the codec on "tool default". Part of the contract
+    # because `ToolRegistry.default_compression` reads it off every registered
+    # tool. None means "this tool names no default" -- see
+    # BaseTool.default_compression for what that costs.
+    default_compression: str | None
 
     def spec(self, mode: str) -> ModeSpec:
         """Return the ModeSpec for a mode this tool owns."""
@@ -260,6 +272,16 @@ class ToolPlugin(Protocol):
         Async because a readiness probe may touch the disk (nsz searches the
         configured volumes for ``prod.keys``); implementations that block
         should hop to a threadpool rather than stall the event loop.
+        
+        **Filesystem work here goes through ``run_detached``, never
+        ``run_in_threadpool``.** Callers all fan out over the whole registry
+        (``GET /api/tools``, the RomM platform list, every sweep) and bound the
+        wait through :meth:`ToolRegistry.tool_is_ready` -- but a bound can only
+        abandon the awaiter, never the OS thread. A probe wedged on an
+        unresponsive mount therefore keeps whatever thread it was given, and
+        one taken from the shared pool is never handed back, so repeated probes
+        retire the pool a worker at a time until unrelated offloads have
+        nowhere to run. A detached thread is disposable and costs nothing.
         """
 
     def active_pids(self) -> list[int]:
@@ -299,6 +321,17 @@ class ToolPlugin(Protocol):
         error. Blocking (a small header read) — call it off the event loop.
         """
 
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """The file to verify for a finished job, or None when there is none.
+
+        Usually ``output_path`` itself. It differs where a mode's real product
+        is not at the path the job planned: a split makeps3iso build writes
+        ``<iso>.0``/``.1``/… and no bare ``.iso``, so verifying the planned path
+        checks a file that does not exist and fails a conversion that worked.
+        Asking the tool keeps that per-format knowledge in the plugin instead of
+        the job runner.
+        """
+
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         """Sibling output paths this mode writes beside ``output_path``.
 
@@ -329,6 +362,34 @@ class BaseTool:
     # Default False: a tool whose container file SHA1 might be DAT-indexed
     # still falls back to a file-level hash after an embedded-hash miss.
     embedded_hash_is_exhaustive: bool = False
+    # Library-manager platform slugs (RomM's vocabulary, which is IGDB's) whose
+    # media this tool handles. Purely *narrowing*: an extension match still
+    # decides convertibility, but when a library manager tells us the platform,
+    # this disambiguates what the extension cannot. A bare ``.iso`` is accepted
+    # by chdman, dolphin and maxcso alike; only the platform says whether it is
+    # a GameCube disc (RVZ) or a PS2 disc (CHD/CSO).
+    #
+    # Declared per tool, so adding a tool stays a one-module change and the
+    # mapping never becomes an if-ladder in a route. Empty means "no platform
+    # opinion" — such a tool is never filtered out, so an unknown or new RomM
+    # slug degrades to today's extension-only behaviour rather than to an empty
+    # list.
+    platform_slugs: frozenset[str] = frozenset()
+    # The codec to name when the operator asks for a compression *level* but
+    # leaves the codec on "tool default".
+    #
+    # The level is not a separate argument anywhere in the pipeline: it rides
+    # on the compression string as ``"codec:level"``, so a level with no codec
+    # serialises as ``":19"``. Whether that is meaningful is a per-tool fact.
+    # For a mode that offers no codec choice at all (nsz, whose dropdown picks
+    # a solid/block *layout*) the empty part reads as "tool default" and the
+    # level is honoured. For a mode that does offer codecs it is not a default
+    # but a blank: dolphin-tool receives ``-c "" -l 19`` and refuses the job.
+    # Declaring the default here lets the automation resolve it instead, per
+    # tool, rather than an if-ladder keyed on tool identity at the call site.
+    # Mirrors `defaultCompression` in `src/lib/tools/registry.js`, which seeds
+    # the same choice in the manual picker.
+    default_compression: str | None = None
 
     def __init__(self, binary_path: str) -> None:
         self.binary_path = binary_path
@@ -438,6 +499,11 @@ class BaseTool:
         self, input_path: str, output_path: str, mode: str,
     ) -> None:
         return None
+
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """Default: the job's own output path, which is what nearly every mode
+        produces. Overridden where the product can live elsewhere."""
+        return output_path
 
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         # Default: derive the sibling paths from the mode's ``companion_exts``

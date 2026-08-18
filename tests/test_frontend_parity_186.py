@@ -42,6 +42,7 @@ _COMPARED_FIELDS = (
     "supports_compression",
     "supports_compression_level",
     "supports_delete_on_verify",
+    "supports_verify",
     "allows_archive_input",
 )
 
@@ -64,20 +65,37 @@ def _find_node() -> str | None:
     return None
 
 
-def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
+def _eval_registry(tmp_path: Path, dump: str, name: str) -> list[dict]:
+    """Evaluate ``registry.js`` under Node with *dump* appended, as JSON.
+
+    One helper for both parity views (per mode and per tool): the Node lookup,
+    the `$lib` stub, the temporary module and the subprocess are identical, and
+    only the trailing snippet that shapes the output differs.
+    """
     node = _find_node()
     if node is None:
         pytest.skip("node not available to evaluate registry.js")
 
     src = _REGISTRY_JS.read_text(encoding="utf-8")
     # registry.js imports the SvelteKit `$lib` alias only for the getInfo/verify
-    # bindings, which this dump never calls — stub it so plain Node can evaluate
-    # the module as-is (preserving every ext constant and spread).
-    stub = "const api = {};"
+    # bindings, which these dumps never call — stub it so plain Node can
+    # evaluate the module as-is (preserving every ext constant and spread).
     needle = "import { api } from '$lib/api/endpoints.js';"
     assert needle in src, "registry.js import shape changed; update the parity stub"
-    src = src.replace(needle, stub)
-    src += (
+    src = src.replace(needle, "const api = {};") + dump
+    script = tmp_path / name
+    script.write_text(src, encoding="utf-8")
+
+    proc = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=30, check=False,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
+    return json.loads(proc.stdout)
+
+
+def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
+    dump = (
         "\nconst __rows = TOOLS.flatMap((t) => t.modes.map((m) => ({"
         " mode: m.mode,"
         " tool_id: t.id,"
@@ -88,19 +106,26 @@ def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
         " supports_compression: !!m.supportsCompression,"
         " supports_compression_level: !!m.supportsCompressionLevel,"
         " supports_delete_on_verify: !!m.supportsDeleteOnVerify,"
+        " supports_verify: !!m.supportsVerify,"
         " allows_archive_input: !!m.allowsArchiveInput,"
         "})));\n"
         "process.stdout.write(JSON.stringify(__rows));\n"
     )
-    script = tmp_path / "registry_eval.mjs"
-    script.write_text(src, encoding="utf-8")
+    rows = _eval_registry(tmp_path, dump, "registry_eval.mjs")
+    return {row["mode"]: row for row in rows}
 
-    proc = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=30,
+
+def _frontend_tools(tmp_path: Path) -> dict[str, dict]:
+    """Tool-level rows from registry.js: `{id: {"default_compression": str|None}}`."""
+    dump = (
+        "\nconst __tools = TOOLS.map((t) => ({"
+        " id: t.id,"
+        " default_compression: (t.defaultCompression ?? [])[0] ?? null,"
+        "}));\n"
+        "process.stdout.write(JSON.stringify(__tools));\n"
     )
-    if proc.returncode != 0:
-        pytest.fail(f"Could not evaluate registry.js via node:\n{proc.stderr}")
-    return {row["mode"]: row for row in json.loads(proc.stdout)}
+    rows = _eval_registry(tmp_path, dump, "registry_tools_eval.mjs")
+    return {row["id"]: row for row in rows}
 
 
 def _backend_rows() -> dict[str, dict]:
@@ -116,6 +141,7 @@ def _backend_rows() -> dict[str, dict]:
             "supports_compression": spec.supports_compression,
             "supports_compression_level": spec.supports_compression_level,
             "supports_delete_on_verify": spec.supports_delete_on_verify,
+            "supports_verify": spec.supports_verify,
             "allows_archive_input": spec.allows_archive_input,
         }
     return rows
@@ -149,4 +175,59 @@ def test_frontend_registry_mirrors_backend_mode_specs(tmp_path):
         "registry.js ↔ registry.mode_specs() field drift "
         "(update src/lib/tools/registry.js or the backend ModeSpec to match):\n"
         + "\n".join(mismatches)
+    )
+
+
+def test_default_compression_mirrors_the_frontend_seed(tmp_path):
+    """`BaseTool.default_compression` ↔ `registry.js` `defaultCompression`.
+
+    The backend resolves this codec when an automation rule sets a compression
+    *level* but leaves the codec on "tool default" — the level rides on the
+    codec string, so ``":19"`` would reach dolphin-tool as ``-c "" -l 19`` and
+    fail every job. The manual picker seeds the same choice from
+    ``defaultCompression``, so the two must name the same codec or the same
+    rule would compress differently depending on which surface queued it.
+
+    Declaring one is *required* for every tool with a mode that takes both a
+    codec and a level (there is no other way to express such a rule); optional
+    elsewhere, where an unset level makes the question moot.
+    """
+    frontend = _frontend_tools(tmp_path)
+    problems = []
+    for tool in registry.all():
+        # The chain tool has no descriptor of its own: its composite modes are
+        # grouped under the descriptors of the tools they start from
+        # (`cso_to_chd` under cso, `nkit_to_rvz` under nkit), the same
+        # exception `_TOOL_ID_EXCEPTIONS` records above. Nothing to mirror --
+        # but only a tool that declares no default may be missing, or a
+        # renamed descriptor would silently stop being compared.
+        fe = frontend.get(tool.id)
+        if fe is None and tool.default_compression is not None:
+            problems.append(
+                f"  {tool.id}: declares default_compression="
+                f"{tool.default_compression!r} but registry.js has no descriptor "
+                "with that id"
+            )
+            continue
+        needs_default = any(
+            m.supports_compression and m.supports_compression_level
+            for m in tool.modes
+        )
+        if needs_default and not tool.default_compression:
+            problems.append(
+                f"  {tool.id}: has a codec+level mode but declares no "
+                "default_compression, so a level with no codec cannot be sent"
+            )
+        if (
+            fe is not None
+            and tool.default_compression is not None
+            and tool.default_compression != fe["default_compression"]
+        ):
+            problems.append(
+                f"  {tool.id}.default_compression: backend="
+                f"{tool.default_compression!r} registry.js="
+                f"{fe['default_compression']!r}"
+            )
+    assert not problems, (
+        "tool-level compression-default drift:\n" + "\n".join(problems)
     )

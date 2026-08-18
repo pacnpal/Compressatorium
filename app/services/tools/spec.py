@@ -36,6 +36,14 @@ class ModeSpec:
     supports_compression: bool = False
     supports_compression_level: bool = False  # dolphin rvz/wia only
     supports_delete_on_verify: bool = False
+    # Whether the tool can verify this mode's product *without* the question of
+    # deleting anything. Implied by `supports_delete_on_verify` (deleting needs
+    # a verify first), so only a mode that can be checked but must never delete
+    # its source declares it: makeps3iso's folder->iso reads PARAM.SFO back out
+    # of the ISO it built, while deleting a curated game folder on the strength
+    # of that is not something to offer. Gating "verify each result" on the
+    # delete flag made that check unreachable for exactly those modes.
+    supports_verify: bool = False
     allows_archive_input: bool = False         # chdman create modes only
     # Sibling outputs this mode writes beside its primary output_path, expressed
     # as suffix swaps off the primary (e.g. extractcd's ``.cue`` -> ``.bin``
@@ -48,6 +56,15 @@ class ModeSpec:
     # Default keeps every existing mode FILE-based (zero behavior change). A
     # directory mode (folder->iso) overrides to {InputKind.DIRECTORY}.
     input_kinds: frozenset[InputKind] = frozenset({InputKind.FILE})
+    # Platforms this MODE serves, when they differ from its tool's. Empty means
+    # "ask the tool", which is right for every single-system tool: chdman's
+    # modes are all as PS2/PSX/Dreamcast as chdman is. It exists for composite
+    # modes, where the tool is a shell and each mode belongs to a different
+    # system -- the chain tool declares no platforms of its own, so without
+    # this its GameCube NKit->RVZ mode was offered on PS2 and its PS2 CSO->CHD
+    # mode on GameCube, and a saved rule would convert a disc to a format for
+    # the wrong console.
+    platform_slugs: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -85,6 +102,10 @@ class ChainSpec:
     supports_compression: bool = False
     supports_compression_level: bool = False
     supports_delete_on_verify: bool = True   # of the ORIGINAL source, gated on final verify
+    # Structural parity with ModeSpec: a chain's final step verifies the
+    # output, and its delete flag already implies that, so this stays False and
+    # `registry.mode_supports_verify` reads them together.
+    supports_verify: bool = False
     allows_archive_input: bool = True        # == step 1's
     input_kinds: frozenset[InputKind] = field(
         default_factory=lambda: frozenset({InputKind.FILE})
@@ -92,3 +113,8 @@ class ChainSpec:
     # Structural parity with ModeSpec.companion_exts so BaseTool.companion_outputs
     # works for chain modes too (cso_to_chd's single .chd has no companion).
     companion_exts: tuple[str, ...] = ()
+    # Structural parity with ModeSpec.platform_slugs -- and the reason that
+    # field exists. The chain tool is a shell with no platform of its own, so
+    # each composite mode has to name its own system or it is offered on every
+    # one of them.
+    platform_slugs: frozenset[str] = frozenset()
