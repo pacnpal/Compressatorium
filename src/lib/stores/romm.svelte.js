@@ -338,6 +338,11 @@ class RommStore {
       this.sweepResult = await api.runRommAutoConvert(
         platformIds ? { platform_ids: platformIds } : {},
       );
+      // A sweep that queued formats RomM cannot hash-match has just written
+      // pending rows. Without this the header badge keeps its old count and
+      // the Re-match action stays hidden until the page is reloaded, which
+      // hides the follow-up step from exactly the run that created the need.
+      this.notePendingRepins(this.sweepResult?.repins_recorded ?? 0);
       // The sweep already succeeded; a failing state refresh must not be
       // reported as a failed run. `rulesError` carries that failure instead.
       await this.loadRules().catch(() => {});

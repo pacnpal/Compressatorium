@@ -430,6 +430,7 @@ reach is picked up on the next one.
 | RomM URL | *(unset)* | Base URL of your instance. Unset hides the feature. |
 | API token | *(unset)* | Client API token. Saved in `compressatorium.db` and never sent back to the browser — treat that file as holding a secret. |
 | Library path | *(unset)* | Where RomM's library is mounted **in this container**. |
+| Give up on a saved snapshot after | `7` days | How long a saved metadata snapshot waits for RomM to rescan the converted file. Raise it if your conversion queue or RomM scan schedule runs longer than that — retiring one early means that ROM's metadata is gone for good. |
 | Run automatically | off | Master switch for scheduled sweeps. |
 | Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. Off silences both the manual and the automatic path. |
 | Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |

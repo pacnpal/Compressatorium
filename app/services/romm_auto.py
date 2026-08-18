@@ -52,7 +52,7 @@ from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
 from services.tools import InputKind, registry
 from utils.delete_plan import build_delete_snapshot
-from utils.path_utils import is_within_configured_volumes
+from utils.path_utils import is_within_configured_volumes, match_extension
 
 logger = get_logger("romm_auto")
 
@@ -598,16 +598,32 @@ def _compression_arg(rule: dict) -> str | None:
 
 
 def _accepts_source(tool, spec, path: str) -> bool:
-    """Whether this tool takes *path* as an input unit for its mode.
+    """Whether this *mode* takes *path* as an input unit.
+
+    The mode, not the tool. `converts_path` answers a tool-wide,
+    direction-agnostic question, and for a tool whose directions have
+    different inputs it answers backwards: chdman deliberately drops `.chd`
+    from its tool-level extensions so a finished CHD is not badged as a
+    convertible source, yet `.chd` is exactly what its extract and copy modes
+    take. Gating the sweep on it rejected every real `copy` source and
+    accepted `.iso` files that mode cannot consume.
 
     Directory modes (makeps3iso's decrypted PS3 folder) declare no input
-    extensions at all, so the extension-based `converts_path` rejects every
-    one of them and the sweep called an advertised mode "unconvertible" for
-    every single candidate. The registry says which predicate applies.
+    extensions at all, so the extension match rejects every one of them; the
+    registry says which predicate applies.
+
+    Where the tool *does* claim the extension, its own predicate still gets
+    the final word: that is where the per-file refinements live (jwud leaves
+    the secondary members of a split Wii U dump visible but non-convertible,
+    since only `game_part1.wud` drives the set).
     """
     if InputKind.DIRECTORY in spec.input_kinds:
         return tool.accepts_directory(path)
-    return tool.converts_path(path)
+    if spec.input_extensions and match_extension(path, spec.input_extensions) is None:
+        return False
+    if match_extension(path, tool.input_extensions) is not None:
+        return tool.converts_path(path)
+    return bool(spec.input_extensions)
 
 
 async def _converted_map(platform_id: str) -> dict:
@@ -1049,9 +1065,17 @@ async def _sweep_locked(
                         ids = romm_repin.metadata_ids(rom) if rom else {}
                         if not ids:
                             continue
+                        # The fingerprint comes from candidate inspection, not
+                        # from now: on an idle queue a fast conversion can
+                        # finish between `create_batch_jobs` returning and this
+                        # call, and stating the destination here would record
+                        # the *finished* output as the pre-conversion state --
+                        # after which the settler sees nothing change and
+                        # abandons the row, losing exactly the metadata this
+                        # exists to protect.
                         if await run_in_threadpool(
                             romm_repin.record, rom, destinations[path], ids,
-                            rule["mode"],
+                            rule["mode"], pre_by_path[path],
                         ):
                             repin_count += 1
                 summary["repins_recorded"] = repin_count

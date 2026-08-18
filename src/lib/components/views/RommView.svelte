@@ -54,6 +54,13 @@
    * would shrink the pending total while the work is still queued, so only a
    * `ready` output counts.
    *
+   * "To go" is what the panel could actually submit, asked through the same
+   * `allowsInputEntry` gate that decides whether a row is selectable. The
+   * row's `convertible_by` is a tool-level, mode-agnostic annotation and the
+   * two disagree by design — a PS2 ISO is annotated convertible by CHDMAN, but
+   * CHDMAN's extract modes take a `.chd` and cannot consume it — so counting
+   * from the annotation promised savings on files the button would refuse.
+   *
    * The savings figure uses the mode's expected output/input ratio — the same
    * SIZE_RATIOS table the progress bar estimates from — and is labelled as an
    * estimate, because real ratios vary per title.
@@ -84,11 +91,16 @@
     for (const e of entries) {
       const outs = (e.outputs ?? []).filter(forActiveTool);
       const done = outs.some((o) => o.ready);
-      const working = outs.some((o) => o.exists && !o.ready);
+      // Any non-ready status means work is under way. A detector returns None
+      // — and so contributes no status at all — when there is nothing there,
+      // so the only way to see one is for a job to hold the destination. It
+      // reports exists=false until the tool creates the file, and requiring
+      // `exists` counted that whole window as still to do.
+      const working = outs.some((o) => !o.ready);
       if (done) {
         converted += 1;
         convertedBytes += e.size ?? 0;
-      } else if (!working && (e.convertible_by ?? []).length) {
+      } else if (!working && conversion.allowsInputEntry(e)) {
         pending += 1;
         pendingBytes += e.size ?? 0;
       }

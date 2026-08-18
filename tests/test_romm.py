@@ -2309,6 +2309,55 @@ async def test_retargeting_a_rule_cannot_race_a_running_sweep(
 
 
 @pytest.mark.asyncio
+async def test_automation_repin_records_the_pre_conversion_fingerprint(
+    settings_db, repin_db, tmp_path: Path,
+) -> None:
+    """The snapshot must describe the destination *before* the job ran.
+
+    The sweep records after the queue accepts the batch, and on an idle queue
+    a fast conversion can land in between. Stating the destination at that
+    point would save the finished output as the "before" picture, after which
+    the settler sees nothing change and abandons the row.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    (lib / "Game.rvz").write_bytes(b"old")  # overwrite target, pre-existing
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    before = romm_repin.path_fingerprint(str(lib / "Game.rvz"))
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc", "igdb_id": 42,
+    }]
+
+    async def _fast_batch(paths, mode, **kwargs):
+        # The conversion completes before `record()` gets its turn.
+        (lib / "Game.rvz").write_bytes(b"brand new output")
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fast_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["repins_recorded"] == 1, result
+    row = romm_repin.pending_rows(10)[0]
+    assert row[6] == before, "recorded the post-conversion state as the pre-image"
+    assert row[6] != romm_repin.path_fingerprint(str(lib / "Game.rvz"))
+
+
+@pytest.mark.asyncio
 async def test_sweep_skips_a_platform_whose_tool_is_not_installed(
     settings_db, tmp_path: Path,
 ) -> None:
@@ -2418,6 +2467,28 @@ async def test_sweep_never_sends_two_sources_to_one_destination(
 
     assert result["queued"] == 1, result
     assert queued == [[str(lib / "Game.iso")]]
+
+
+def test_modes_validate_sources_against_their_own_inputs() -> None:
+    """The mode's inputs, not the tool's.
+
+    chdman drops `.chd` from its tool-level extensions so a finished CHD is
+    not badged as a convertible source -- but `.chd` is exactly what its
+    extract and copy modes take. Asking the tool rejected every real `copy`
+    source and accepted `.iso` files that mode cannot consume.
+    """
+    from services import romm_auto
+
+    tool = registry.for_mode("copy")
+    spec = registry.spec("copy")
+    assert tool.converts_path("/vol/Game.chd") is False  # the old, wrong gate
+    assert romm_auto._accepts_source(tool, spec, "/vol/Game.chd") is True
+    assert romm_auto._accepts_source(tool, spec, "/vol/Game.iso") is False
+
+    # The create direction is unaffected: it takes the disc images.
+    create, create_spec = registry.for_mode("createcd"), registry.spec("createcd")
+    assert romm_auto._accepts_source(create, create_spec, "/vol/Game.cue") is True
+    assert romm_auto._accepts_source(create, create_spec, "/vol/Game.chd") is False
 
 
 def test_directory_modes_use_the_directory_predicate(tmp_path: Path) -> None:

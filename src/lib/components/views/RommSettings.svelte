@@ -29,6 +29,7 @@
   let clearToken = $state(false);
   let repinEnabled = $state(true);
   let repinOnLoad = $state(true);
+  let repinAbandonDays = $state(7);
   let loaded = $state(false);
 
   $effect(() => {
@@ -37,6 +38,7 @@
       libraryRoot = s.library_root ?? '';
       repinEnabled = s.repin_enabled !== false;
       repinOnLoad = s.repin_on_load !== false;
+      repinAbandonDays = s.repin_abandon_days ?? 7;
       loaded = true;
     }
   });
@@ -50,6 +52,7 @@
       library_root: libraryRoot.trim(),
       repin_enabled: repinEnabled,
       repin_on_load: repinOnLoad,
+      repin_abandon_days: Number(repinAbandonDays) || undefined,
     };
     if (clearToken) out.clear_token = true;
     else if (token.trim()) out.token = token.trim();
@@ -206,6 +209,18 @@
       bind:checked={repinOnLoad}
       label="Re-apply metadata automatically when this page loads"
     />
+    <label class="field">
+      <span>Give up on a saved snapshot after</span>
+      <div class="days">
+        <input type="number" min="1" max="365" bind:value={repinAbandonDays} />
+        <span class="unit">days</span>
+      </div>
+      <span class="hint">
+        A snapshot waits for RomM to rescan the converted file. Raise this if
+        your conversion queue or your RomM scan schedule runs longer than that
+        — retiring a snapshot early means that ROM's metadata is gone for good.
+      </span>
+    </label>
     <div class="actions">
       <Button onclick={handleSave} loading={romm.settingsSaving} icon={saveIcon}>
         Save
@@ -218,6 +233,21 @@
 {#snippet saveIcon()}<Save size={14} />{/snippet}
 
 <style>
+  .days {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .days input {
+    width: 6rem;
+  }
+
+  .unit {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.9rem;
+  }
+
   .settings {
     display: grid;
     gap: var(--space-4);

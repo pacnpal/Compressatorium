@@ -106,6 +106,18 @@ def _require_configured() -> None:
         )
 
 
+def _library_root_usable(path: str) -> bool:
+    """Is *path* a directory AND inside a configured volume?
+
+    One predicate, so the whole answer goes through a single bounded probe.
+    ``is_within_configured_volumes`` resolves the candidate *and* stats every
+    configured volume, so on an unresponsive network mount it blocks exactly
+    like the ``isdir`` beside it -- bounding only the first half left the event
+    loop just as exposed.
+    """
+    return os.path.isdir(path) and is_within_configured_volumes(path)
+
+
 def _safe_error(exc: RommError) -> str:
     """A message describing *exc* without echoing the exception text.
 
@@ -178,7 +190,9 @@ async def romm_status() -> dict:
             # `is_within_configured_volumes`, so a library root outside all of
             # them yields a connection that looks healthy and a catalog where
             # every single row is silently dropped. Report it here instead.
-            inside = is_dir and is_within_configured_volumes(library_root)
+            inside = is_dir and bool(
+                await bounded_path_check(_library_root_usable, library_root),
+            )
             result["library_root_mounted"] = inside
             if is_dir and not inside:
                 result["error"] = (
@@ -600,9 +614,13 @@ async def _hash_output(output_path: str) -> str | None:
     50 GB hash or lets a hung mount hold the pass for hours; assuming a floor
     throughput does neither.
     """
+    # Bounded, like every other stat that touches this path: on a mount that
+    # has stopped answering, `getsize` blocks the event loop indefinitely --
+    # and it runs *before* the timeout it is being used to compute, so the
+    # timeout could never have protected this half.
     try:
-        size = os.path.getsize(output_path)
-    except OSError:
+        size = await bounded_path_check(os.path.getsize, output_path) or 0
+    except (asyncio.TimeoutError, OSError):
         size = 0
     timeout = max(_HASH_TIMEOUT_FLOOR_S, size / _HASH_MIN_BYTES_PER_S)
     try:
@@ -910,8 +928,8 @@ async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
     if library_root:
         try:
             is_dir = bool(await bounded_path_check(os.path.isdir, library_root))
-            result["library_root_mounted"] = (
-                is_dir and is_within_configured_volumes(library_root)
+            result["library_root_mounted"] = is_dir and bool(
+                await bounded_path_check(_library_root_usable, library_root),
             )
             outside_volumes = is_dir and not result["library_root_mounted"]
         except (asyncio.TimeoutError, OSError):

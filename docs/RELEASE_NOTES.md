@@ -103,6 +103,33 @@
   retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
   anything yet), and there is a **Forget history** button on each platform for
   when you restore from a backup or move outputs aside by hand.
+- **The re-pin snapshot can no longer capture the finished file as its "before"
+  picture.** On an idle queue a fast conversion could complete in the moment
+  between the batch being accepted and its metadata row being written, so the
+  row described the output as unchanged and was eventually abandoned — losing
+  the metadata the feature exists to protect. The snapshot now comes from when
+  the conversion was planned.
+- **CHDMAN's extract and copy modes work in automation.** A rule was validated
+  against the tool rather than the selected mode, and CHDMAN deliberately does
+  not badge a finished `.chd` as a convertible source — so `copy` rejected every
+  real source it had and accepted `.iso` files it cannot consume.
+- **You can now set how long a saved metadata snapshot waits** before it is
+  given up on (Settings → Metadata). It was configurable by environment variable
+  and honoured by the backend, but there was no field for it — so an operator
+  with a conversion or RomM scan backlog longer than a week could not raise it,
+  and snapshots were retired before their outputs were ever scanned.
+- **Two more paths that could hang the whole app on a dead network mount** are
+  now bounded like the rest: checking that the library folder sits inside a
+  configured volume, and measuring an output before hashing it. The second is
+  the stat used to *compute* the hash timeout, so the timeout could never have
+  covered it.
+- **The library progress counts what the selected format can actually convert**,
+  and counts a conversion that has started but not yet written its file as in
+  progress rather than still to do. Both made the "to go" figure and the savings
+  estimate describe work the Convert button would not take.
+- **Run now updates the re-match badge.** A sweep that queued formats needing a
+  re-pin left the header showing the old count, hiding the follow-up step from
+  exactly the run that created it.
 - **A conversion that was queued but never ran is no longer remembered as done.**
   The rule history above recorded a ROM the moment its job was queued, so a job
   you cancelled — or one interrupted by a restart, or one the converter failed on

@@ -129,13 +129,17 @@ def path_fingerprint(path: str) -> str:
 
 def _insert_pending(
     session, rom: dict, output_path: str, ids: dict, mode: str | None,
+    pre_fingerprint: str | None,
 ) -> None:
     session.add(
         _db.RommRepin(
             source_rom_id=rom.get("id"),
             source_name=rom.get("name") or rom.get("fs_name"),
             output_path=output_path,
-            pre_fingerprint=path_fingerprint(output_path),
+            pre_fingerprint=(
+                path_fingerprint(output_path)
+                if pre_fingerprint is None else pre_fingerprint
+            ),
             mode=mode,
             metadata_ids=ids,
             state="pending",
@@ -144,7 +148,10 @@ def _insert_pending(
     )
 
 
-def record(rom: dict, output_path: str, ids: dict, mode: str | None = None) -> bool:
+def record(
+    rom: dict, output_path: str, ids: dict, mode: str | None = None,
+    pre_fingerprint: str | None = None,
+) -> bool:
     """Insert a pending row unless one already covers this output.
 
     The dedupe on ``output_path`` is what makes re-submitting the same batch
@@ -156,6 +163,13 @@ def record(rom: dict, output_path: str, ids: dict, mode: str | None = None) -> b
     (which is what makes re-submitting a batch harmless) while a settle pass
     already in flight cannot settle the new attempt on the old one's behalf.
 
+    *pre_fingerprint* lets a caller supply the destination's state as of when
+    it planned the conversion. The automation path must: it records after the
+    queue accepts the batch, by which point a fast job on an idle queue may
+    already have written the output, and stating it here would save the
+    finished file as the "before" picture. Omitted, it is taken now, which is
+    correct for the manual path -- that records before the batch is submitted.
+
     A partial unique index (``ux_romm_repin_pending_output``) is the actual
     guarantee that only one pending row exists, so a manual submit racing an
     automation sweep cannot stack two. Losing that race is not an error: retry
@@ -163,13 +177,13 @@ def record(rom: dict, output_path: str, ids: dict, mode: str | None = None) -> b
     """
     with _session() as session:
         _supersede_pending(session, output_path)
-        _insert_pending(session, rom, output_path, ids, mode)
+        _insert_pending(session, rom, output_path, ids, mode, pre_fingerprint)
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             _supersede_pending(session, output_path)
-            _insert_pending(session, rom, output_path, ids, mode)
+            _insert_pending(session, rom, output_path, ids, mode, pre_fingerprint)
             session.commit()
         return True
 
