@@ -2067,3 +2067,59 @@ async def test_a_local_miss_cannot_overwrite_a_remote_hit(tmp_path):
     assert store.get_match(path)["matched"] is False, (
         "a genuine remote miss failed to supersede the stale hit"
     )
+
+
+# ---------------------------------------------------------------------------
+# Twentieth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_manual_dat_import_schedules_a_rematch(tmp_path, isolated_store, monkeypatch):
+    """Preserving remote hits requires re-running them against the new DAT.
+
+    Rounds 18-19 stopped a DAT import from destroying remote hits. That alone
+    inverts local-first: if the imported DAT *does* know the hash, the
+    preserved remote row would be served forever. The MAMERedump sync path
+    already snapshots and reschedules; the manual-import path did not.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML, _make_upload_file
+
+    cached_path = "/vol/remote.chd"
+    await isolated_store.set_match(cached_path, {
+        "path": cached_path, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    scheduled: list[list[str]] = []
+
+    async def _capture(paths, **_kw):
+        scheduled.append(list(paths))
+        return "job-1"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _capture)
+
+    await dat_routes.import_dat(file=_make_upload_file(SAMPLE_DAT_XML))
+
+    assert scheduled, "the import did not schedule a rematch"
+    assert cached_path in scheduled[0], (
+        "the preserved remote hit was not re-checked against the new DAT"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rematch_schedule_does_not_fail_the_import(
+    tmp_path, isolated_store, monkeypatch
+):
+    """The DAT is already committed by then; scheduling is best-effort."""
+    from tests.test_dat_routes import SAMPLE_DAT_XML, _make_upload_file
+
+    await isolated_store.set_match("/vol/x.chd", {"path": "/vol/x.chd", "matched": True})
+
+    async def _boom(_paths, **_kw):
+        raise RuntimeError("job queue full")
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _boom)
+
+    result = await dat_routes.import_dat(file=_make_upload_file(SAMPLE_DAT_XML))
+    assert result["name"] == "Test Redump DAT"

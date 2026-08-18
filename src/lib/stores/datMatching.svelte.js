@@ -51,9 +51,11 @@ class DATMatchingStore {
   // The path set the last match job was started for, so a re-run of the same
   // visible page doesn't count as a new hydration and refill the retry budget.
   _lastJobPaths = null;
-  // Bumped per /dat/stats request so a slower earlier one can't land last and
-  // overwrite newer, authoritative state.
-  _statsGeneration = 0;
+  // Bumped whenever the provider state changes or a /dat/stats request starts.
+  // One counter, not two: both the availability refresh and the cache
+  // hydration have to discard responses that were in flight across a change,
+  // and giving them separate counters was how the second case got missed.
+  _generation = 0;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
@@ -65,10 +67,10 @@ class DATMatchingStore {
     // otherwise arrive last and overwrite the authoritative state the PUT
     // just applied -- the panel snaps back to "off" and matchingAvailable
     // stays false, so browsing schedules nothing until some later refresh.
-    const generation = ++this._statsGeneration;
+    const generation = ++this._generation;
     try {
       const stats = await api.getDATStats();
-      if (generation !== this._statsGeneration) return this.matchingAvailable;
+      if (generation !== this._generation) return this.matchingAvailable;
       const wasEnabled = this.stats?.hasheous_enabled;
       this.stats = stats;
       // Another tab (or an API client) can flip the provider under us. The
@@ -77,6 +79,9 @@ class DATMatchingStore {
       // paths would sit in `matches` as known-unmatched and never be
       // scheduled. Same reset setHasheousEnabled() does for a local toggle.
       if (wasEnabled !== undefined && wasEnabled !== stats?.hasheous_enabled) {
+        // Bump first: a hydrate already in flight answered under the old
+        // policy and must not repopulate what this clear is dropping.
+        this._generation += 1;
         this.matches.clear();
         this._resetAttempts();
       }
@@ -91,7 +96,7 @@ class DATMatchingStore {
         (stats?.total_dats ?? 0) > 0 || Boolean(stats?.hasheous_enabled);
       return this.matchingAvailable;
     } catch (_e) {
-      if (generation !== this._statsGeneration) return this.matchingAvailable;
+      if (generation !== this._generation) return this.matchingAvailable;
       this.matchingAvailable = false;
       return false;
     }
@@ -113,6 +118,9 @@ class DATMatchingStore {
     // still showed the old state and matchingAvailable stayed stale -- with
     // the backend already switched over.
     this._applyHasheousState(state);
+    // Bump first: a hydrate already in flight answered under the old
+    // policy and must not repopulate what this clear is dropping.
+    this._generation += 1;
     this.matches.clear();
     this._resetAttempts();
     await this.refreshMatchingAvailability();
@@ -164,8 +172,16 @@ class DATMatchingStore {
   /** Fetch cached matches (never hashes) for a batch of paths. */
   async hydrate(paths) {
     if (!paths?.length) return;
+    // A lookup that started before a provider change answers with the OLD
+    // policy. Landing after matches.clear() it would put a stale local-only
+    // miss back in the map, and hydrateAndMatch() treats any key in the map as
+    // known -- so with local DATs present (matchingAvailable never flips, the
+    // effect need not re-run) the newly enabled fallback stayed dead until a
+    // reload.
+    const generation = this._generation;
     try {
       const data = await api.getMatchCache(paths);
+      if (generation !== this._generation) return;
       const results = data?.results ?? {};
       for (const [path, result] of Object.entries(results)) {
         this.matches.set(path, result);
@@ -350,6 +366,9 @@ class DATMatchingStore {
     // AND the session-scoped attempt set so the next FileList hydration
     // re-runs against the now-smaller DAT library and re-establishes
     // truth.
+    // Bump first: a hydrate already in flight answered under the old
+    // policy and must not repopulate what this clear is dropping.
+    this._generation += 1;
     this.matches.clear();
     this._resetAttempts();
     await this.loadDATs();
@@ -367,6 +386,9 @@ class DATMatchingStore {
       // it never removes absent ones. Reset attempted paths too so
       // files previously deemed "uncached" against the old DAT get
       // re-considered against the new one.
+      // Bump first: a hydrate already in flight answered under the old
+      // policy and must not repopulate what this clear is dropping.
+      this._generation += 1;
       this.matches.clear();
       this._resetAttempts();
       await this.loadDATs();
@@ -414,6 +436,9 @@ class DATMatchingStore {
         // Reset attempts so previously-uncached paths get tried
         // against the new DAT set. loadDATs() refreshes availability
         // internally.
+        // Bump first: a hydrate already in flight answered under the old
+        // policy and must not repopulate what this clear is dropping.
+        this._generation += 1;
         this.matches.clear();
         this._resetAttempts();
         await this.loadDATs();

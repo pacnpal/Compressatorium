@@ -153,6 +153,7 @@ async def import_dat(file: UploadFile = File(...)):
     max_size = 100 * 1024 * 1024  # 100MB
     total = 0
     tmp_path = None
+    previous_match_paths: list[str] = []
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as tmp:
             tmp_path = tmp.name
@@ -168,6 +169,13 @@ async def import_dat(file: UploadFile = File(...)):
                 await run_in_threadpool(tmp.write, chunk)
 
         try:
+            # Snapshot BEFORE the import: it is the import that invalidates the
+            # cache, and remote hits deliberately survive it (they owe nothing
+            # to the local DATs). Without a rematch those preserved rows would
+            # be served forever even when the DAT just imported *does* know the
+            # hash -- local-first inverted. The MAMERedump sync path already
+            # does exactly this; the manual-import path did not.
+            previous_match_paths = await run_in_threadpool(dat_store.list_match_paths)
             # Pass the temp file path (not its contents) so parse_dat() can
             # iterparse directly from disk without a second in-memory copy.
             result = await dat_store.import_dat(tmp_path)
@@ -179,6 +187,20 @@ async def import_dat(file: UploadFile = File(...)):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    if previous_match_paths:
+        # Best-effort, exactly as in dat_sync: the DAT is already committed, so
+        # a scheduling failure must not fail the import. A preserved remote hit
+        # is only replaced if the local recompute actually matches -- set_match
+        # refuses to downgrade one to an unmatched result.
+        try:
+            await schedule_match_job(previous_match_paths)
+        except Exception:
+            logger.exception(
+                "import_dat: failed to schedule post-import rematch for %d file(s); "
+                "the DAT imported fine, matching can be re-run manually",
+                len(previous_match_paths),
+            )
 
     return result
 
