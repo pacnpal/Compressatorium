@@ -25,6 +25,7 @@ from services.archive import archive_service
 from services.job_manager import QueueBackpressureError, job_manager
 from services.romz import romz_service
 from services.output_conflicts import (
+    OutputPathExhausted,
     OutputPathLocked,
     check_output_conflicts,
 )
@@ -225,7 +226,7 @@ def get_unique_output_path(base_path: str, mode: str | None = None) -> str:
     """
     try:
         return _get_unique_output_path(base_path, mode)
-    except OutputPathLocked:
+    except (OutputPathLocked, OutputPathExhausted):
         raise SkipFile(SkipReason.OUTPUT_LOCKED) from None
 
 

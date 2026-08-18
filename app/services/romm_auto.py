@@ -29,7 +29,6 @@ operator's disk and CPU for a week on the strength of one checkbox.
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -43,13 +42,14 @@ from models import ConversionMode
 from services import romm_repin, romm_settings
 from services.job_manager import QueueBackpressureError, job_manager
 from services.output_conflicts import (
-    OutputPathLocked,
-    check_output_conflicts,
-    get_unique_output_path,
+    QUEUE,
+    SKIP_EXISTING,
+    SKIP_LOCKED,
+    resolve_destination,
 )
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
-from services.tools import ModeKind, registry
+from services.tools import registry
 from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes
 
@@ -80,6 +80,13 @@ _BOUNDS = {
 # Cap on a user-supplied filter pattern. A pathological regex is the operator's
 # own doing, but length is a cheap first guard against the obvious ones.
 _MAX_PATTERN = 500
+
+# One sweep at a time, process-wide. The active-source snapshot is taken before
+# anything is queued, so the minute scheduler and a manual "Run now" could each
+# read the same "nothing in flight" and queue the same ROM twice -- the job
+# manager's creation lock serialises the inserts but does not deduplicate
+# across two independently planned batches.
+_sweep_lock = asyncio.Lock()
 
 
 def _clamp(field: str, value: Any, default: int) -> int:
@@ -120,16 +127,23 @@ def _valid_timezone(value: Any) -> str:
     return name
 
 
-def _valid_pattern(value: Any) -> str | None:
+def _valid_pattern(value: Any) -> tuple[str | None, bool]:
+    """``(pattern, invalid)``. A mistyped regex is refused, never dropped.
+
+    Dropping it silently was the dangerous option: the filter is what keeps a
+    rule to a subset, so a rule whose `(USA` never compiled would come back as
+    *unfiltered* and the next unattended sweep could queue the whole platform —
+    with delete-on-verify attached. The caller disables the rule instead.
+    """
     if not isinstance(value, str) or not value.strip():
-        return None
+        return None, False
     pattern = value.strip()[:_MAX_PATTERN]
     try:
         re.compile(pattern)
     except re.error:
-        logger.warning("romm_auto: ignoring invalid filter pattern %r", pattern)
-        return None
-    return pattern
+        logger.warning("romm_auto: refusing invalid filter pattern %r", pattern)
+        return None, True
+    return pattern, False
 
 
 def default_rule(mode: str = "") -> dict[str, Any]:
@@ -184,6 +198,9 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         # Set when delete-on-verify was refused because this mode + compression
         # cannot verify strongly enough to justify removing the source.
         "unsafe_delete_on_verify": False,
+        # Set when a submitted include/exclude regex would not compile, so the
+        # editor can say why the rule is paused instead of silently widening it.
+        "invalid_pattern": False,
     }
 
 
@@ -215,7 +232,14 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
     out["enabled"] = bool(raw.get("enabled", False))
     # Compression is only meaningful where the mode supports it; storing it
     # otherwise would be silently dropped at submit time anyway.
-    if spec is not None and spec.supports_compression and raw.get("compression"):
+    # `supports_compression or supports_compression_level`, matching the shared
+    # CompressionPicker gate. nsz declares only the latter but still offers a
+    # solid/block layout through `compressionCodecs`, so the stricter test
+    # dropped the layout AND, because the level rides on the same string, the
+    # level with it.
+    if spec is not None and (
+        spec.supports_compression or spec.supports_compression_level
+    ) and raw.get("compression"):
         out["compression"] = str(raw["compression"])
     if (
         spec is not None
@@ -239,6 +263,10 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
             )
             out["output_dir"] = None
             out["invalid_output_dir"] = candidate
+            # Pausing matters: with output_dir cleared the sweep would happily
+            # write beside each source instead, filling a filesystem the
+            # operator did not choose. The editor surfaces the rejected path.
+            out["enabled"] = False
     if raw.get("duplicate_action") in DUPLICATE_ACTIONS:
         out["duplicate_action"] = raw["duplicate_action"]
     # Both gated on what the mode actually allows, mirroring the manual path.
@@ -288,8 +316,12 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
 
     out["min_size_mb"] = _clamp("min_size_mb", raw.get("min_size_mb"), 0)
     out["max_size_mb"] = _clamp("max_size_mb", raw.get("max_size_mb"), 0)
-    out["include_pattern"] = _valid_pattern(raw.get("include_pattern"))
-    out["exclude_pattern"] = _valid_pattern(raw.get("exclude_pattern"))
+    out["include_pattern"], bad_include = _valid_pattern(raw.get("include_pattern"))
+    out["exclude_pattern"], bad_exclude = _valid_pattern(raw.get("exclude_pattern"))
+    if bad_include or bad_exclude:
+        # Pause rather than run wider than asked. The editor shows why.
+        out["invalid_pattern"] = True
+        out["enabled"] = False
     out["only_unmatched"] = bool(raw.get("only_unmatched", False))
     out["only_matched"] = bool(raw.get("only_matched", False))
     # Mutually exclusive; "both" is the same as neither, and silently meaning
@@ -443,80 +475,6 @@ def _passes_filters(rom: dict, rule: dict) -> bool:
     return not (rule["only_unmatched"] and identified)
 
 
-# What the duplicate policy decided for one candidate. Returned rather than
-# branched on at the call site so the sweep reads as one table lookup.
-QUEUE = "queue"
-SKIP_EXISTING = "skip_existing"
-SKIP_LOCKED = "skip_locked"
-
-
-def _same_file(path_a: str, path_b: str) -> bool:
-    """Whether two paths name the same file once symlinks are resolved."""
-    try:
-        return os.path.realpath(path_a) == os.path.realpath(path_b)
-    except OSError:
-        # Unreadable either way: treat as "same" so the caller refuses rather
-        # than authorises an overwrite it could not rule out.
-        return True
-
-
-def _resolve_destination(
-    tool, path: str, mode: str, output_dir: str | None, duplicate_action: str,
-) -> tuple[str | None, str]:
-    """Where this rule's conversion of *path* should write, and whether to queue.
-
-    Returns ``(destination, decision)``. ``detect_output()`` was the wrong tool
-    for this: it only ever looks *beside the source* -- it takes no output
-    directory -- so a rule with ``output_dir`` set never found its own output,
-    re-queued the ROM on every sweep, and failed each job on a collision.
-    ``tool.output_path()`` derives the real destination instead, the same SSOT
-    the manual path uses.
-
-    The duplicate policy is then applied through the *same* helpers
-    ``/api/jobs`` uses, so ``overwrite`` and ``rename`` mean here exactly what
-    they mean there rather than silently degrading to ``skip``:
-
-    * ``skip`` -- an occupied destination drops the candidate;
-    * ``overwrite`` -- reuses it, unless a job holds it right now;
-    * ``rename`` -- probes ``name_1``, ``name_2``, ... for a free one.
-
-    A locked destination is never queued: the next sweep picks it up once the
-    lock clears, because the filesystem still reports the ROM unconverted.
-    """
-    # *tool* is the one the sweep already resolved for this rule's mode. No
-    # None check: `registry.for_mode` raises KeyError on an unknown mode and
-    # never returns None, and the sweep has already caught that before any
-    # candidate reaches here -- so a guard would be dead code that turned a
-    # misconfigured rule into a silent "already converted".
-    try:
-        destination = tool.output_path(mode, path, output_dir)
-    except (KeyError, ValueError, OSError):
-        return None, SKIP_EXISTING
-
-    # A conversion must never be authorised to write over its own input. RomM
-    # rescans what we produce, so a persistent `dolphin_rvz` rule eventually
-    # sees the .rvz it made: dolphin accepts .rvz as input, output_path maps it
-    # straight back onto itself, and an `overwrite` rule would then unlink the
-    # file before reading it -- destroying the only copy when the source ISO
-    # was already deleted. The manual planner refuses this
-    # (SkipReason.DOLPHIN_SAME_PATH); the sweep must refuse it identically.
-    # Only a COPY mode (chdman .chd -> .chd) rewrites in place on purpose.
-    if registry.spec(mode).kind is not ModeKind.COPY and _same_file(destination, path):
-        return None, SKIP_EXISTING
-
-    exists, locked = check_output_conflicts(mode, destination)
-    if not exists:
-        return destination, QUEUE
-    if duplicate_action == "overwrite":
-        return (None, SKIP_LOCKED) if locked else (destination, QUEUE)
-    if duplicate_action == "rename":
-        try:
-            return get_unique_output_path(destination, mode), QUEUE
-        except OutputPathLocked:
-            return None, SKIP_LOCKED
-    return None, SKIP_EXISTING
-
-
 def _resolve_source(path: str) -> str | None:
     """Absolute, symlink-free source path, or None when it cannot be resolved.
 
@@ -539,9 +497,12 @@ def _compression_arg(rule: dict) -> str | None:
     """
     codec = rule["compression"]
     level = rule["compression_level"]
-    if not codec:
-        return None
-    return f"{codec}:{level}" if level is not None else codec
+    if level is None:
+        return codec or None
+    # A level with no codec is meaningful: nsz reads the empty layout part as
+    # "tool default" and still honours the level, so ":18" must not collapse to
+    # None or the operator's level would be silently discarded.
+    return f"{codec or ''}:{level}"
 
 
 def _inspect_candidate(path: str, rule: dict, tool) -> dict:
@@ -561,7 +522,7 @@ def _inspect_candidate(path: str, rule: dict, tool) -> dict:
     resolved = _resolve_source(path)
     if resolved is None:
         return {"skip": "unresolvable", "resolved": None, "destination": None}
-    destination, decision = _resolve_destination(
+    destination, decision = resolve_destination(
         tool, path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
     )
     return {
@@ -599,7 +560,29 @@ async def sweep(
 
     Returns a summary rather than raising on a partial failure: one unreachable
     platform must not abort the sweep for the others.
+
+    Serialised process-wide, so a scheduled tick and a manual run cannot both
+    plan against the same "nothing is in flight" snapshot. A preview is a real
+    sweep in every respect but the queueing, so it takes the lock too rather
+    than reporting candidates a concurrent run is already claiming.
     """
+    async with _sweep_lock:
+        return await _sweep_locked(
+            platform_ids=platform_ids,
+            ignore_schedule=ignore_schedule,
+            dry_run=dry_run,
+            overall_limit=overall_limit,
+        )
+
+
+async def _sweep_locked(
+    *,
+    platform_ids: list[int] | None,
+    ignore_schedule: bool,
+    dry_run: bool,
+    overall_limit: int | None,
+) -> dict:
+    """The sweep body. Always called with ``_sweep_lock`` held."""
     cfg = romm_settings.effective()
     rules = await get_rules()
     state = await get_state()
@@ -840,6 +823,7 @@ async def sweep(
                 result["errors"].append(
                     {"platform_id": int(platform_id), "error": "queue_failed"},
                 )
+                summary["queue_failed"] = True
         elif batch:
             summary["queued"] = len(batch)
             result["queued"] += len(batch)
@@ -847,8 +831,10 @@ async def sweep(
         summary["candidates"] = [Path(p).name for p in batch[:25]]
         result["platforms"].append(summary)
         # A real run updates the schedule clock; a preview must not, or looking
-        # at what *would* happen would postpone the run that should.
-        if not dry_run:
+        # at what *would* happen would postpone the run that should. Nor does a
+        # run that failed to queue anything: advancing the clock there would
+        # make the platform sit out a full interval over a transient error.
+        if not dry_run and not summary.get("queue_failed"):
             await _record_run(platform_id, summary)
 
     return result

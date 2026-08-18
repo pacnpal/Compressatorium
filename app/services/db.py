@@ -57,8 +57,13 @@ logger = get_logger("db")
 # ---------------------------------------------------------------------------
 
 
-def _utcnow_iso() -> str:
-    """UTC timestamp in the ``...Z`` form every string date column here uses."""
+def utcnow_iso() -> str:
+    """UTC timestamp in the ``...Z`` form every string date column here uses.
+
+    Public and shared: the stores that write these columns must agree on the
+    shape, or a reader parsing one module's output against another's assumption
+    silently mis-sorts or fails to compare.
+    """
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -175,7 +180,7 @@ class RommRepin(Base):
     # Callable default, not "": the abandonment clock reads this, and an empty
     # string parses as "no age", so a row inserted without one could never be
     # retired however long its output failed to appear.
-    created_at = Column(String, nullable=False, default=_utcnow_iso)
+    created_at = Column(String, nullable=False, default=utcnow_iso)
     settled_at = Column(String, nullable=True)
 
 

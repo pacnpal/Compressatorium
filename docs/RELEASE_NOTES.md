@@ -50,6 +50,12 @@
   `ROMM_DELETE_SOURCE_AFTER_VERIFY` and friends), so a deployment can ship a
   house policy rather than configuring every platform by hand.
 
+  A rule that cannot be honoured is paused rather than quietly run wider than
+  asked: an output folder outside the configured volumes, or a name filter that
+  is not a valid regular expression, both stop the rule and say so in the editor
+  — the alternative was a filter silently becoming "no filter" and the next
+  sweep converting the entire platform.
+
   **Preview** shows exactly what a sweep would queue without queueing it, and
   without moving the schedule clock, so looking never postpones a run.
 

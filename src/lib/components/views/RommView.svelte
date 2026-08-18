@@ -155,16 +155,29 @@
     </div>
   </header>
 
-  <nav class="tabs" aria-label="RomM sections">
+  <!-- A real tab set, not a nav: `aria-current="page"` marks the current item
+       among navigation links, which does not tell a screen-reader user that
+       these three form one group with one selected. Keyboard access already
+       works (they are buttons), so this is semantics only. -->
+  <div class="tabs" role="tablist" aria-label="RomM sections">
     {#each [['library', 'Library'], ['automation', 'Automation'], ['settings', 'Settings']] as [id, label] (id)}
       <button
         type="button" class="tab" class:active={tab === id}
+        role="tab"
+        id={`romm-tab-${id}`}
+        aria-selected={tab === id}
+        aria-controls={`romm-panel-${id}`}
         onclick={() => (tab = id)}
-        aria-current={tab === id ? 'page' : undefined}
       >{label}</button>
     {/each}
-  </nav>
+  </div>
 
+  <div
+    role="tabpanel"
+    id={`romm-panel-${tab}`}
+    aria-labelledby={`romm-tab-${tab}`}
+    class="panel"
+  >
   {#if tab === 'settings'}
     <RommSettings onsaved={() => { if (romm.usable) { reloadAfterSave(); } }} />
   {:else if tab === 'automation'}
@@ -276,11 +289,18 @@
       </article>
     </div>
   {/if}
+  </div>
 </section>
 
 {#snippet refreshIcon()}<RefreshCw size={14} />{/snippet}
 
 <style>
+  /* The tab panel is a passthrough wrapper: it exists for the ARIA
+     relationship, so it must not introduce a layout box of its own. */
+  .panel {
+    display: contents;
+  }
+
   .view {
     display: flex;
     flex-direction: column;

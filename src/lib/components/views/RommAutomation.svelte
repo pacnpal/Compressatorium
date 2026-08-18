@@ -63,7 +63,17 @@
 
   function update(platformId, patch) {
     const current = romm.ruleFor(platformId);
-    const rule = { ...current, timezone: current.timezone || browserZone, ...patch };
+    // A platform with no stored rule is being created right now, so it adopts
+    // the browser's zone. `ruleFor` falls back to the backend default, whose
+    // timezone is the truthy string "UTC" — testing `current.timezone ||`
+    // therefore always kept UTC and a 22:00–04:00 window written in Berlin ran
+    // at 22:00 UTC. A rule the operator has already saved keeps its own zone.
+    const isNew = !romm.rules[String(platformId)];
+    const rule = {
+      ...current,
+      timezone: isNew ? browserZone : (current.timezone || browserZone),
+      ...patch,
+    };
     if (!rule.mode) romm.removeRule(platformId);
     else romm.setRule(platformId, rule);
     dirty = true;
@@ -243,10 +253,10 @@
     {@const r = romm.sweepResult}
     <section class="sweep">
       <strong>{r.dry_run ? 'Preview' : 'Last run'}:</strong>
-      {r.queued} queued
+      {r.queued ?? 0} queued
       <span class="muted">
-        · {r.skipped_existing} already converted
-        · {r.skipped_filtered} filtered out
+        · {r.skipped_existing ?? 0} already converted
+        · {r.skipped_filtered ?? 0} filtered out
         {#if r.skipped_active}· {r.skipped_active} already in the queue{/if}
         {#if r.stopped_reason === 'limit'}· stopped at the per-run limit{/if}
         {#if r.stopped_reason === 'queue_full'}· stopped, queue full{/if}
@@ -256,7 +266,10 @@
         {#if p.candidates?.length}
           <details class="candidates">
             <summary>{romm.platformName(p.platform_id)}: {p.queued}</summary>
-            <ul>{#each p.candidates as c (c)}<li>{c}</li>{/each}</ul>
+            <!-- Keyed by index: the backend reduces candidates to basenames, so
+                 two ROMs in different folders can both be "Game.iso" and a
+                 value key would throw mid-render. -->
+            <ul>{#each p.candidates as c, i (i)}<li>{c}</li>{/each}</ul>
           </details>
         {/if}
       {/each}
@@ -323,7 +336,7 @@
                 {@const chosen = selectedCodecs(rule)}
 
                 <div class="grid">
-                  {#if spec?.supportsCompression && codecs.length > 0}
+                  {#if (spec?.supportsCompression || spec?.supportsCompressionLevel) && codecs.length > 0}
                     {#if style === 'multi'}
                       <div class="field wide">
                         <span>Compression</span>
@@ -454,6 +467,7 @@
                           type="button"
                           class="day"
                           class:on={(rule.days ?? []).includes(day)}
+                          aria-pressed={(rule.days ?? []).includes(day)}
                           onclick={() => toggleDay(platform.id, day)}
                         >{label}</button>
                       {/each}
@@ -572,6 +586,30 @@
                     />
                   {/if}
                 </div>
+
+                {#if rule.invalid_output_dir}
+                  <p class="warn" role="alert">
+                    <strong>{rule.invalid_output_dir}</strong> is outside the configured
+                    volumes, so it was not saved and this rule is paused. Pick a folder
+                    inside a mounted volume, or clear the field to write beside each source.
+                  </p>
+                {/if}
+
+                {#if rule.invalid_pattern}
+                  <p class="warn" role="alert">
+                    A name filter could not be read as a regular expression, so it was
+                    not saved and this rule is paused — running it unfiltered would
+                    convert the whole platform.
+                  </p>
+                {/if}
+
+                {#if rule.unsafe_delete_on_verify}
+                  <p class="warn" role="alert">
+                    Deleting the source was switched off: with this compression setting
+                    the verification is only structural, which is not enough to justify
+                    removing the original.
+                  </p>
+                {/if}
 
                 {#if romm.losesDatMatch(spec)}
                   <p class="warn">

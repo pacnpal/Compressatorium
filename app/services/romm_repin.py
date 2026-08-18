@@ -20,7 +20,6 @@ opt out of the guarantee the manual path makes.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 
 from logging_setup import get_logger
 from services import db as _db
@@ -30,8 +29,10 @@ from sqlalchemy.exc import IntegrityError
 logger = get_logger("romm_repin")
 
 
-def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+# One UTC timestamp shape for every persisted date, owned by the module that
+# owns the columns. Re-exported here because this module writes `created_at`
+# and `settled_at` and its callers read them back.
+utcnow_iso = _db.utcnow_iso
 
 
 def _session():
@@ -60,7 +61,10 @@ def roms_by_local_path(paths: list[str]) -> dict[str, dict]:
     Reads the whole catalog for each platform involved rather than one lookup
     per file: a batch is normally a single platform, making this one request.
     """
-    wanted = {os.path.abspath(p) for p in paths}
+    # realpath, to match what `local_path()` returns. Comparing an abspath key
+    # against a realpath value made a symlinked library silently miss every
+    # lookup, so those ROMs lost their metadata without a word.
+    wanted = {os.path.realpath(p) for p in paths}
     index: dict[str, dict] = {}
     for platform in romm_client.platforms():
         pid = platform.get("id")
@@ -193,19 +197,42 @@ def store_sha1(row_id: int, sha1: str) -> None:
 
 def settle(
     row_id: int, state: str, detail: str | None = None, new_id: int | None = None,
-) -> None:
-    """Close out one re-pin row. Keyed by primary key, for the reason above."""
+) -> bool:
+    """Close out one re-pin row. Keyed by primary key, for the reason above.
+
+    Returns whether a row was actually closed, so a caller cannot count a
+    settle that hit a superseded row as a success.
+    """
     with _session() as session:
         values: dict = {"state": state, "settled_at": utcnow_iso()}
         if detail:
             values["detail"] = detail
         elif new_id is not None:
             values["detail"] = f"Re-pinned to RomM rom {new_id}"
-        session.query(_db.RommRepin).filter(
+        updated = session.query(_db.RommRepin).filter(
             _db.RommRepin.id == row_id,
             _db.RommRepin.state == "pending",
         ).update(values)
         session.commit()
+        return bool(updated)
+
+
+def is_pending(row_id: int) -> bool:
+    """Whether this re-pin attempt is still the live one for its output.
+
+    Checked immediately before the outbound metadata write. A settle pass holds
+    a detached row for as long as hashing a multi-GB output takes; if the same
+    output is re-planned in that window the row is superseded, and pushing its
+    provider ids to RomM afterwards would overwrite the *new* conversion's
+    identity with the previous generation's.
+    """
+    with _session() as session:
+        return (
+            session.query(_db.RommRepin)
+            .filter(_db.RommRepin.id == row_id, _db.RommRepin.state == "pending")
+            .count()
+            > 0
+        )
 
 
 def count_pending() -> int:

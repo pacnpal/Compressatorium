@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,7 +47,7 @@ def _client() -> RommClient:
 
 
 def test_bearer_token_is_sent(client: RommClient) -> None:
-    with patch("urllib.request.urlopen", return_value=_response([])) as urlopen:
+    with patch("services.romm._urlopen", return_value=_response([])) as urlopen:
         client.platforms()
     request = urlopen.call_args[0][0]
     assert request.get_header("Authorization") == "Bearer rmm_test"
@@ -58,7 +60,7 @@ def test_heartbeat_is_unauthenticated(client: RommClient) -> None:
     credentials it does not need would defeat the diagnostic.
     """
     with patch(
-        "urllib.request.urlopen", return_value=_response({"VERSION": "4.9.0"}),
+        "services.romm._urlopen", return_value=_response({"VERSION": "4.9.0"}),
     ) as urlopen:
         assert client.heartbeat() == {"VERSION": "4.9.0"}
     assert urlopen.call_args[0][0].get_header("Authorization") is None
@@ -74,7 +76,7 @@ def test_non_http_scheme_is_refused(url: str) -> None:
 
 def test_plain_http_is_allowed(client: RommClient) -> None:
     """RomM is normally reached over http on a container network."""
-    with patch("urllib.request.urlopen", return_value=_response([])):
+    with patch("services.romm._urlopen", return_value=_response([])):
         assert client.platforms() == []
 
 
@@ -83,7 +85,7 @@ def test_http_error_becomes_romm_error(client: RommClient) -> None:
         "http://romm:8080/api/platforms", 401, "Unauthorized", {},
         io.BytesIO(b"bad token"),
     )
-    with patch("urllib.request.urlopen", side_effect=err), \
+    with patch("services.romm._urlopen", side_effect=err), \
             pytest.raises(RommError, match="HTTP 401"):
         client.platforms()
 
@@ -93,7 +95,7 @@ def test_rom_by_sha1_treats_404_as_no_match(client: RommClient) -> None:
     err = urllib.error.HTTPError(
         "http://romm:8080/api/roms/by-hash", 404, "Not Found", {}, io.BytesIO(b""),
     )
-    with patch("urllib.request.urlopen", side_effect=err):
+    with patch("services.romm._urlopen", side_effect=err):
         assert client.rom_by_sha1("abc") is None
 
 
@@ -285,8 +287,8 @@ async def test_status_reports_unreachable_romm_as_data() -> None:
 # ----------------------------------------------------------------------
 
 
-@pytest.fixture(name="repin_db")
-def _repin_db(tmp_path: Path):
+@pytest.fixture(name="sqlite_db")
+def _sqlite_db(tmp_path: Path):
     """A real SQLite DB wired into the module-level session factory."""
     if _db.engine is not None:
         _db.engine.dispose()
@@ -296,6 +298,12 @@ def _repin_db(tmp_path: Path):
         _db.engine.dispose()
     _db.engine = None
     _db.SessionLocal = None
+
+
+@pytest.fixture(name="repin_db")
+def _repin_db(sqlite_db):
+    """The bare database, for the re-pin queue tests."""
+    yield sqlite_db
 
 
 def test_record_repin_is_idempotent_per_output(repin_db) -> None:
@@ -426,7 +434,7 @@ def test_update_rom_metadata_sends_only_set_provider_ids(client: RommClient) -> 
     Sending a provider the source had no id for would overwrite whatever RomM
     worked out for the converted file with an empty value.
     """
-    with patch("urllib.request.urlopen", return_value=_response({"id": 500})) as urlopen:
+    with patch("services.romm._urlopen", return_value=_response({"id": 500})) as urlopen:
         client.update_rom_metadata(500, {"igdb_id": 1122, "ra_id": 44, "moby_id": None})
     request = urlopen.call_args[0][0]
     body = request.data.decode()
@@ -440,14 +448,14 @@ def test_update_rom_metadata_sends_only_set_provider_ids(client: RommClient) -> 
 def test_update_rom_metadata_skips_the_request_when_nothing_to_send(
     client: RommClient,
 ) -> None:
-    with patch("urllib.request.urlopen") as urlopen:
+    with patch("services.romm._urlopen") as urlopen:
         client.update_rom_metadata(500, {"moby_id": None})
     urlopen.assert_not_called()
 
 
 def test_update_rom_metadata_ignores_unknown_fields(client: RommClient) -> None:
     """Only the known provider ids are forwarded, never arbitrary keys."""
-    with patch("urllib.request.urlopen", return_value=_response({})) as urlopen:
+    with patch("services.romm._urlopen", return_value=_response({})) as urlopen:
         client.update_rom_metadata(1, {"igdb_id": 5, "fs_name": "evil.iso"})
     body = urlopen.call_args[0][0].data.decode()
     assert "igdb_id" in body
@@ -516,19 +524,13 @@ def test_tool_without_platform_opinion_is_never_dropped() -> None:
 
 
 @pytest.fixture(name="settings_db")
-def _settings_db(tmp_path: Path):
+def _settings_db(sqlite_db):
+    """The same database, plus a settings cache reset around the test."""
     from services import romm_settings
 
-    if _db.engine is not None:
-        _db.engine.dispose()
-    _db.init_engine(str(tmp_path / "compressatorium.db"), create_schema=True)
     romm_settings.reset_for_tests()
     yield romm_settings
     romm_settings.reset_for_tests()
-    if _db.engine is not None:
-        _db.engine.dispose()
-    _db.engine = None
-    _db.SessionLocal = None
 
 
 @pytest.mark.asyncio
@@ -1601,3 +1603,217 @@ def test_re_recording_supersedes_rather_than_mutating(repin_db) -> None:
     still_pending = romm_repin.pending_rows(10)
     assert len(still_pending) == 1
     assert still_pending[0][5] == second
+
+
+# ----------------------------------------------------------------------
+# fourth review pass
+# ----------------------------------------------------------------------
+
+
+def test_cross_origin_redirect_is_refused_before_the_token_travels() -> None:
+    """urllib copies Authorization onto a redirected GET.
+
+    A RomM that 302s elsewhere — misconfigured, compromised, or behind a hostile
+    proxy — would otherwise hand the `rmm_` token to that host.
+    """
+    from email.message import Message
+
+    from services.romm import _SameOriginRedirectHandler
+
+    handler = _SameOriginRedirectHandler("http://romm:8080/api/roms")
+    request = urllib.request.Request(
+        "http://romm:8080/api/roms", headers={"Authorization": "Bearer rmm_secret"},
+    )
+
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(
+            request, None, 302, "Found", Message(), "http://attacker.example/collect",
+        )
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(
+            request, None, 302, "Found", Message(), "file:///etc/passwd",
+        )
+
+    # Same origin still follows, or ordinary RomM redirects would break.
+    same = handler.redirect_request(
+        request, None, 302, "Found", Message(), "http://romm:8080/api/roms/",
+    )
+    assert same is not None
+    assert same.get_header("Authorization") == "Bearer rmm_secret"
+
+
+def test_nsz_layout_and_level_both_reach_the_job() -> None:
+    """nsz declares only `supports_compression_level`, but offers a layout too.
+
+    Gating the codec on `supports_compression` alone dropped the solid/block
+    choice and — because the level rides on the same string — the level with it.
+    """
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "nsz_compress", "compression": "block", "compression_level": 12,
+    })
+    assert rule["compression"] == "block"
+    assert romm_auto._compression_arg(rule) == "block:12"
+
+    # A level with no layout is still expressible: nsz reads the empty layout
+    # part as "tool default" and honours the level.
+    level_only = romm_auto.normalize_rule({
+        "mode": "nsz_compress", "compression_level": 12,
+    })
+    assert romm_auto._compression_arg(level_only) == ":12"
+
+
+def test_a_mistyped_filter_pauses_the_rule_instead_of_widening_it() -> None:
+    """An uncompilable regex must never come back as "no filter".
+
+    The filter is what keeps a rule to a subset; dropping it silently would let
+    the next unattended sweep queue the whole platform, delete-on-verify and all.
+    """
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "enabled": True, "include_pattern": "(USA",
+    })
+    assert rule["enabled"] is False
+    assert rule["invalid_pattern"] is True
+    assert rule["include_pattern"] is None
+
+
+def test_a_rejected_output_dir_pauses_the_rule() -> None:
+    """Clearing output_dir without pausing would silently relocate the writes.
+
+    The rule would then fill whichever filesystem holds the sources, rather
+    than the one the operator chose.
+    """
+    from services import romm_auto
+
+    with patch.object(romm_auto, "is_within_configured_volumes", return_value=False):
+        rule = romm_auto.normalize_rule({
+            "mode": "dolphin_rvz", "enabled": True, "output_dir": "/somewhere/else",
+        })
+    assert rule["enabled"] is False
+    assert rule["output_dir"] is None
+    assert rule["invalid_output_dir"] == "/somewhere/else"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_queue_does_not_advance_the_schedule(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A transient queue error must not cost the platform a whole interval."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(
+                romm_auto.job_manager, "create_batch_jobs",
+                AsyncMock(side_effect=RuntimeError("queue exploded")),
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+        await romm_auto.sweep(ignore_schedule=True)
+
+    # No run recorded, so the next scheduled tick retries immediately.
+    assert await romm_auto.get_state() == {}
+
+
+def test_rename_probe_is_bounded(tmp_path: Path) -> None:
+    """An unbounded probe is quadratic on a directory full of numbered outputs."""
+    from services.output_conflicts import (
+        MAX_RENAME_ATTEMPTS,
+        OutputPathExhausted,
+        get_unique_output_path,
+    )
+
+    base = tmp_path / "Game.chd"
+    base.write_bytes(b"x")
+    with patch(
+        "services.output_conflicts.lock_manager.check_file_status",
+        return_value=(True, False),
+    ), pytest.raises(OutputPathExhausted):
+        get_unique_output_path(str(base))
+    assert MAX_RENAME_ATTEMPTS == 1000
+
+
+def test_repin_index_and_lookup_share_one_canonical_key(tmp_path: Path) -> None:
+    """`local_path()` returns a realpath, so the index must be keyed the same.
+
+    An abspath key against a realpath value made a symlinked library miss every
+    lookup, losing that ROM's metadata without a word.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "Game.iso").write_bytes(b"\0" * 8)
+    link = tmp_path / "library"
+    link.symlink_to(real)
+
+    rom = {"id": 1, "name": "Game", "full_path": "Game.iso", "fs_name": "Game.iso"}
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(link)), \
+            patch.object(
+                romm_repin.romm_client, "platforms", return_value=[{"id": 7}],
+            ), \
+            patch.object(romm_repin.romm_client, "roms", return_value=[rom]):
+        index = romm_repin.roms_by_local_path([str(link / "Game.iso")])
+
+    assert index, "the symlinked library path must still resolve to its ROM"
+    assert str(real / "Game.iso") in index
+
+
+@pytest.mark.asyncio
+async def test_repin_plan_records_the_path_the_batch_will_write(
+    settings_db, repin_db, tmp_path: Path,
+) -> None:
+    """The row must name the destination, not the one the batch renames away from.
+
+    Under Rename the batch writes `Game_1.rvz`; recording the occupied base path
+    would re-pin the file already sitting there and leave the new one
+    unidentified. Under Skip the source is never queued at all, so a row would
+    wait for a conversion that never runs.
+    """
+    lib = tmp_path / "roms"
+    lib.mkdir()
+    source = lib / "Game.iso"
+    source.write_bytes(b"\0" * 32)
+    (lib / "Game.rvz").write_bytes(b"\0" * 8)  # the base output is taken
+
+    await settings_db.save({"url": "http://romm:8080", "library_root": str(tmp_path)})
+    rom = {"id": 7, "name": "Game", "fs_name": "Game.iso", "igdb_id": 42}
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_repin, "roms_by_local_path",
+                return_value={os.path.realpath(str(source)): rom},
+            ), \
+            patch.object(romm_routes, "is_within_configured_volumes", return_value=True):
+        skipped = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(source)], mode="dolphin_rvz", duplicate_action="skip",
+            ),
+        )
+        assert skipped["recorded"] == 0, skipped
+        assert romm_repin.count_pending() == 0
+
+        renamed = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(source)], mode="dolphin_rvz", duplicate_action="rename",
+            ),
+        )
+    assert renamed["recorded"] == 1, renamed
+    rows = romm_repin.pending_rows(10)
+    assert rows[0][0] == str(lib / "Game_1.rvz"), rows

@@ -560,10 +560,10 @@ export const api = {
   runRommAutoConvert: (body = {}) =>
     jsonPost(`${API_BASE}/romm/auto-convert/run`, body, {}, 'Auto-convert run failed'),
 
-  planRommRepin: (paths, mode, outputDir = null) =>
+  planRommRepin: (paths, mode, outputDir = null, duplicateAction = 'skip') =>
     jsonPost(
       `${API_BASE}/romm/repin/plan`,
-      { paths, mode, output_dir: outputDir },
+      { paths, mode, output_dir: outputDir, duplicate_action: duplicateAction },
       {},
       'Failed to record RomM metadata',
     ),

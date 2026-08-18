@@ -105,6 +105,46 @@ def _token() -> str | None:
     return romm_settings.token()
 
 
+def _urlopen(req: urllib.request.Request, origin_url: str):
+    """Open *req*, following redirects only within *origin_url*'s origin.
+
+    The one seam every RomM HTTP call goes through, so the redirect policy
+    cannot be bypassed by a caller reaching for ``urlopen`` directly.
+    """
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler(origin_url))
+    return opener.open(req, timeout=_HTTP_TIMEOUT)  # nosec B310
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect that leaves the origin the request started on.
+
+    The default handler re-sends ``Authorization`` to whatever ``Location``
+    names, so a redirect off-origin leaks the RomM API token. Rather than strip
+    the header and follow (which turns an authenticated read into a confusing
+    401 from a stranger), this refuses outright: a RomM that redirects its API
+    to another host is not a RomM we should be talking to.
+    """
+
+    def __init__(self, origin_url: str) -> None:
+        super().__init__()
+        parsed = urllib.parse.urlsplit(origin_url)
+        self._origin = (parsed.scheme.lower(), parsed.netloc.lower())
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlsplit(newurl)
+        target = (parsed.scheme.lower(), parsed.netloc.lower())
+        if parsed.scheme.lower() not in ("http", "https") or target != self._origin:
+            logger.warning(
+                "romm: refusing cross-origin redirect to %r", parsed.netloc or newurl,
+            )
+            raise urllib.error.HTTPError(
+                newurl, code,
+                "Refusing to follow a redirect off the configured RomM origin",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class RommClient:
     """Thin synchronous client over RomM's REST API."""
 
@@ -190,7 +230,7 @@ class RommClient:
 
         req = urllib.request.Request(url, headers=headers, data=data, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # nosec B310
+            with _urlopen(req, url) as resp:
                 raw = resp.read(_MAX_RESPONSE_SIZE + 1)
         except urllib.error.HTTPError as exc:
             detail = ""

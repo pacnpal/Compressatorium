@@ -348,6 +348,10 @@ hourly while PS2 converts to CHD overnight, ten at a time, largest first.
 | **Delete source after verify** | Offered only for modes that support it. Verifies first, and is refused outright where the verify is too weak to justify it (a Wii U rule with `noverify`). |
 | **Timezone** | The window and weekday mask are evaluated here — your browser's zone by default, so `22:00` means 22:00 where you are, and DST is handled. |
 
+A rule Compressatorium cannot honour is **paused**, not quietly widened: an
+output folder outside the configured volumes, or a name filter that is not a
+valid regular expression, stops the rule and explains why in the editor.
+
 Only formats the platform can actually use are offered: a GameCube rule lists
 dolphin and nkit, a PS2 rule lists chdman and maxcso. That narrowing comes from
 the same registry the file browser uses, so a rule can never name a tool that is

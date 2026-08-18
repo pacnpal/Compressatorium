@@ -16,10 +16,20 @@ off the event loop.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from services.lock_manager import lock_manager
-from services.tools import registry
+from services.tools import ModeKind, registry
+
+# Upper bound on the `name_1`, `name_2`, ... search. Each probe stats the disk
+# (a directory mode's companion lookup scans), so an unbounded walk over a
+# directory already full of numbered outputs is quadratic on a sweep's hot path.
+MAX_RENAME_ATTEMPTS = 1000
+
+
+class OutputPathExhausted(RuntimeError):
+    """No free ``name_N`` within :data:`MAX_RENAME_ATTEMPTS`."""
 
 
 class OutputPathLocked(RuntimeError):
@@ -55,7 +65,8 @@ def get_unique_output_path(base_path: str, mode: str | None = None) -> str:
 
     Raises :class:`OutputPathLocked` when the base path sits inside a locked
     directory tree: incrementing a counter there would loop forever over paths
-    the caller must not write to.
+    the caller must not write to. Raises :class:`OutputPathExhausted` when the
+    bounded search finds no free name.
     """
     def _taken(candidate: str) -> bool:
         if mode is None:
@@ -72,9 +83,81 @@ def get_unique_output_path(base_path: str, mode: str | None = None) -> str:
 
     path = Path(base_path)
     stem, suffix, parent = path.stem, path.suffix, path.parent
-    counter = 1
-    while True:
+    for counter in range(1, MAX_RENAME_ATTEMPTS + 1):
         candidate = str(parent / f"{stem}_{counter}{suffix}")
         if not _taken(candidate):
             return candidate
-        counter += 1
+    raise OutputPathExhausted(
+        f"No free output path after {MAX_RENAME_ATTEMPTS} attempts: {base_path}",
+    )
+
+
+# What the duplicate policy decided for one candidate. Returned rather than
+# branched on at the call site so a caller reads as one table lookup.
+QUEUE = "queue"
+SKIP_EXISTING = "skip_existing"
+SKIP_LOCKED = "skip_locked"
+
+
+def _same_file(path_a: str, path_b: str) -> bool:
+    """Whether two paths name the same file once symlinks are resolved."""
+    try:
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
+    except OSError:
+        # Unreadable either way: treat as "same" so the caller refuses rather
+        # than authorises an overwrite it could not rule out.
+        return True
+
+
+def resolve_destination(
+    tool, path: str, mode: str, output_dir: str | None, duplicate_action: str,
+) -> tuple[str | None, str]:
+    """Where a conversion of *path* should write, and whether to queue it.
+
+    Returns ``(destination, decision)``. Shared by the RomM automation sweep and
+    the re-pin planner so both agree on the path a conversion will actually
+    produce — recording metadata against a destination the batch then renames
+    would re-pin the wrong file.
+
+    ``detect_output()`` is the wrong tool for this: it only ever looks *beside
+    the source* and takes no output directory, so a rule with ``output_dir`` set
+    never found its own output. ``tool.output_path()`` derives the real
+    destination instead, the same SSOT the manual path uses.
+
+    The duplicate policy is then applied through the helpers ``/api/jobs`` uses,
+    so ``overwrite`` and ``rename`` mean here exactly what they mean there
+    rather than silently degrading to ``skip``:
+
+    * ``skip`` -- an occupied destination drops the candidate;
+    * ``overwrite`` -- reuses it, unless a job holds it right now;
+    * ``rename`` -- probes ``name_1``, ``name_2``, ... for a free one.
+
+    A locked destination is never queued: the next pass picks it up once the
+    lock clears, because the filesystem still reports the source unconverted.
+    """
+    try:
+        destination = tool.output_path(mode, path, output_dir)
+    except (KeyError, ValueError, OSError):
+        return None, SKIP_EXISTING
+
+    # A conversion must never be authorised to write over its own input. A
+    # library manager rescans what we produce, so a standing "convert to RVZ"
+    # rule eventually sees the .rvz it made: dolphin accepts .rvz as input,
+    # output_path maps it straight back onto itself, and an `overwrite` policy
+    # would then unlink the file before reading it -- destroying the only copy
+    # when the source was already deleted. Only a COPY mode (chdman .chd ->
+    # .chd) rewrites in place on purpose.
+    if registry.spec(mode).kind is not ModeKind.COPY and _same_file(destination, path):
+        return None, SKIP_EXISTING
+
+    exists, locked = check_output_conflicts(mode, destination)
+    if not exists:
+        return destination, QUEUE
+    if duplicate_action == "overwrite":
+        return (None, SKIP_LOCKED) if locked else (destination, QUEUE)
+    if duplicate_action == "rename":
+        try:
+            return get_unique_output_path(destination, mode), QUEUE
+        except (OutputPathLocked, OutputPathExhausted):
+            return None, SKIP_LOCKED
+    return None, SKIP_EXISTING

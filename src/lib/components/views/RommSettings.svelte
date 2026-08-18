@@ -127,10 +127,13 @@
         <code>roms.write</code> to let Compressatorium restore metadata after
         converting. The token is never shown again once saved.
       </span>
-      {#if s?.token_set}
-        <Checkbox bind:checked={clearToken} label="Remove the saved token" />
-      {/if}
     </label>
+    <!-- Outside the <label>: a label may own exactly one control, and with the
+         checkbox inside it a click on the checkbox row could focus the password
+         input instead, while assistive tech read one ambiguous name for both. -->
+    {#if s?.token_set}
+      <Checkbox bind:checked={clearToken} label="Remove the saved token" />
+    {/if}
 
     <label class="field">
       <span class="label">

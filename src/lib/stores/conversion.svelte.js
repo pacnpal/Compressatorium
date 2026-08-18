@@ -451,8 +451,13 @@ class ConversionStore {
     try {
       if (rommRepin) {
         try {
+          // The duplicate policy goes with it: the plan has to record the
+          // path the batch will actually write. Under Rename the batch resolves
+          // to `Game_1.rvz`, so recording the occupied base path would re-pin
+          // the OLD file and leave the new one unidentified; under Skip the
+          // conflicting sources are never queued at all.
           const planned = await api.planRommRepin(
-            filePaths, this.mode, this.outputDir || null,
+            filePaths, this.mode, this.outputDir || null, duplicateAction,
           );
           // Reported back to the caller rather than pushed into the RomM store
           // from here: conversion is imported by fileBrowser, which the RomM

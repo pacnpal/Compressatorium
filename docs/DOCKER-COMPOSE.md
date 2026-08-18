@@ -264,7 +264,7 @@ view entirely.
 | `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
 | `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. The rules themselves are configured in the app (**RomM → Automation**). |
 | `ROMM_AUTO_CONVERT_INTERVAL_MINUTES` | `60` | Interval a newly created platform rule starts with (minimum 5). |
-| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Ceiling on jobs queued by one sweep, across all platforms. |
+| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Default **Max jobs per run** for a newly created platform rule, and the ceiling one sweep may queue across all platforms. |
 | `ROMM_REPIN` | `true` | Save a ROM's metadata before converting to a format RomM cannot hash-match, so it can be restored afterwards. |
 | `ROMM_REPIN_ON_LOAD` | `true` | Re-apply saved metadata automatically when the RomM view loads. |
 | `ROMM_REPIN_ABANDON_DAYS` | `7` | Retire a saved re-pin whose output never appeared after this many days. |

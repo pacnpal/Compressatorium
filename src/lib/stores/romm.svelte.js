@@ -278,7 +278,9 @@ class RommStore {
       this.sweepResult = await api.runRommAutoConvert(
         platformIds ? { platform_ids: platformIds } : {},
       );
-      await this.loadRules();
+      // The sweep already succeeded; a failing state refresh must not be
+      // reported as a failed run. `rulesError` carries that failure instead.
+      await this.loadRules().catch(() => {});
       return this.sweepResult;
     } finally {
       this.sweeping = false;
