@@ -518,18 +518,49 @@ class ConversionStore {
       } else {
         toast.success(`Queued ${created} job(s)`);
       }
-      // Narrow `recorded` down to the rows whose source did NOT become a job;
-      // the `finally` block retires exactly those. Anything that did get
-      // queued keeps its row, which is the whole point of having written it.
+      // Reconcile the planned rows against what the queue actually did.
+      //
+      // Planning resolves a destination by predicting the duplicate policy's
+      // answer, and between predicting and queueing the prediction can go
+      // stale: another job or an outside process takes the path Rename picked,
+      // so the batch writes somewhere else. A row left pointing at the
+      // predicted path would then be settled against whatever landed there —
+      // this ROM's identity stamped on an unrelated file. So compare against
+      // each job's real `output_path`, not just its source.
+      const created_jobs = (Array.isArray(result) ? result : []).filter(Boolean);
+      const actualBySource = new Map(
+        created_jobs.map((j) => [j.file_path, j.output_path]),
+      );
+      const misdirected = {};
+      for (const [source, planned] of Object.entries(recorded)) {
+        const actual = actualBySource.get(source);
+        if (actual && actual !== planned) misdirected[source] = actual;
+      }
+      if (Object.keys(misdirected).length) {
+        // Retire the rows aimed at the wrong path, then re-record against the
+        // paths the queue chose. Two calls, and only on a real mismatch.
+        await api
+          .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
+          .catch(() => {});
+        await api
+          .planRommRepin(
+            Object.keys(misdirected), this.mode, this.outputDir || null,
+            duplicateAction, rommPlatformId, misdirected,
+          )
+          .catch(() => {});
+        for (const [source, actual] of Object.entries(misdirected)) {
+          recorded[source] = actual;
+        }
+      }
+      // What is left in `recorded` after this is the set the `finally` block
+      // retires: rows whose source did NOT become a job at all.
       //
       // Retire by destination, but decide by destination too: two sources can
       // resolve to one output (duplicate basenames landing in a single output
       // folder), the batch collapses them into one job, and cancelling on
       // behalf of the source that lost would delete the row the winner needs.
       // A destination any queued source claims is never retired.
-      const queuedSources = new Set(
-        (Array.isArray(result) ? result : []).map((job) => job?.file_path),
-      );
+      const queuedSources = new Set(created_jobs.map((job) => job.file_path));
       const claimed = new Set(
         Object.entries(recorded)
           .filter(([source]) => queuedSources.has(source))

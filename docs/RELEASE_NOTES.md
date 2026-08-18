@@ -103,6 +103,27 @@
   retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
   anything yet), and there is a **Forget history** button on each platform for
   when you restore from a backup or move outputs aside by hand.
+- **A conversion that lands on a different path than planned no longer stamps
+  its metadata onto the wrong file.** Planning predicts where the conversion
+  will write; if something else takes that path before the batch is accepted,
+  the job writes elsewhere — and the saved snapshot, still aimed at the
+  predicted path, would be applied to whatever turned up there. The snapshot
+  now follows the path the queue actually chose.
+- **Switching between two platforms that share a tool no longer keeps a target
+  format the new one cannot use.** Both PS2 and GameCube allow the two-step
+  conversions, but not the *same* one, so moving between them left the previous
+  console's format selected — the picker stopped offering it while the Convert
+  button would still have submitted it.
+- **A slow directory listing no longer starts over on every refresh.** The
+  guard that collapses a duplicate load of the same folder was being cleared
+  the moment it was set, so repeated refreshes each kicked off another full
+  backend scan and threw away the finished one.
+- **Leaving the RomM view during its first load no longer drops RomM rows into
+  the ordinary file browser.** The startup sequence kept running after the view
+  was gone.
+- **Saving RomM settings reads the catalog once, not twice** — even toggling a
+  metadata checkbox was costing two full remote catalog reads and two
+  filesystem scans of the library.
 - **Changing the RomM URL or library path mid-sweep could convert, and with
   delete-after-verify destroy, the wrong files.** A running sweep resolves each
   ROM's path from the *current* library root, so swapping that root underneath

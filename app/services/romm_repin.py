@@ -84,9 +84,13 @@ def roms_by_local_path(
                 index[local] = rom
 
     if platform_id is not None:
+        # Unconditionally, found everything or not. A path the caller listed
+        # that this platform does not have is a stale selection, and falling
+        # through to the scan on its account is the expensive case this
+        # parameter exists to avoid -- one dead row would send a small batch
+        # through every platform's paginated catalog.
         _absorb(int(platform_id))
-        if len(index) == len(wanted):
-            return index
+        return index
 
     for platform in romm_client.platforms():
         pid = platform.get("id")

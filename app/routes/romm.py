@@ -375,6 +375,11 @@ class RepinPlanRequest(BaseModel):
     # The platform the browser is showing. Turns the catalog lookup into one
     # request instead of a scan across every platform in the instance.
     platform_id: int | None = None
+    # {source: destination} when the caller already knows where each job is
+    # writing -- used to re-record after a batch resolved a different path
+    # than planning did. Given, it replaces the duplicate-policy resolution
+    # below, since the queue has already had the final say.
+    output_paths: dict[str, str] | None = None
     output_dir: str | None = None
     # The policy the batch will apply, so the row is recorded against the path
     # the conversion actually writes rather than the one it would have.
@@ -446,12 +451,24 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         # base path and leave the new one unidentified; under Skip the source is
         # never queued at all, leaving a pending row for a conversion that never
         # runs. Same helper, same answer.
-        destination, decision = await run_in_threadpool(
-            resolve_destination,
-            tool, path, payload.mode, payload.output_dir,
-            payload.duplicate_action,
-        )
+        #
+        # Unless the caller states the destination. Resolution is a prediction,
+        # and between predicting and queueing another job can take the path the
+        # rename policy picked -- the batch then writes somewhere else and the
+        # row would point at whatever landed on the predicted path. A caller
+        # that has the queue's answer passes it here instead.
+        if payload.output_paths and path in payload.output_paths:
+            destination, decision = payload.output_paths[path], QUEUE
+        else:
+            destination, decision = await run_in_threadpool(
+                resolve_destination,
+                tool, path, payload.mode, payload.output_dir,
+                payload.duplicate_action,
+            )
         if decision != QUEUE or not destination:
+            skipped += 1
+            continue
+        if not is_within_configured_volumes(destination):
             skipped += 1
             continue
         if await run_in_threadpool(

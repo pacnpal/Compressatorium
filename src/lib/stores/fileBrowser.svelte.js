@@ -429,12 +429,6 @@ class FileBrowserStore {
     // — can't let the stale older A apply results or clear the spinner.
     this._listingRequestSeq += 1;
     const myReq = this._listingRequestSeq;
-    // Release the directory loader's in-flight memo: the request that set it
-    // has just been superseded, so its `finally` will not clear it (its token
-    // is stale). Left set, a later forced refresh of that same path — the one
-    // exitRomm issues — is dropped as a duplicate and the file list stays
-    // blank with no spinner and no error.
-    this._inflightListingPath = null;
     this.loading = true;
     this.entriesError = null;
     try {

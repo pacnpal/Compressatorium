@@ -155,8 +155,13 @@
   });
 
   onMount(() => {
+    // The async init below outlives a fast navigation away, and its tail
+    // calls enterRomm() — which would replace the ordinary workspace's
+    // listing with RomM rows after this view is gone.
+    let alive = true;
     (async () => {
       await Promise.all([romm.loadStatus(), romm.loadSettings()]);
+      if (!alive) return;
       if (!romm.configured) {
         tab = 'settings';
         return;
@@ -167,7 +172,9 @@
       if (!romm.usable) return;
       // allSettled: each store records its own error, and one failing must
       // not skip the other load or the re-pin pass below.
+      if (!alive) return;
       await Promise.allSettled([romm.loadPlatforms(), romm.loadRules()]);
+      if (!alive) return;
       if (romm.pendingRepins > 0 && romm.settings?.repin_on_load !== false) {
         try {
           await romm.runRepin();
@@ -178,15 +185,22 @@
     })();
     // Leaving the view returns the browser to ordinary filesystem listing, or
     // the workspace would open showing RomM rows under a directory heading.
-    return () => fileBrowser.exitRomm();
+    return () => {
+      alive = false;
+      fileBrowser.exitRomm();
+    };
   });
 
-  /** Refresh what the new connection settings changed. Errors land in the store. */
+  /** Refresh what the new connection settings changed. Errors land in the store.
+   *
+   * Rules only: `saveSettings` already force-reloads the platforms and
+   * re-enters the selected one, which fetches its whole catalog and stats
+   * every file in it. Reloading here as well meant even a metadata toggle
+   * cost two remote catalog reads and two filesystem scans of a large
+   * library. The store owns the platform reload; this owns what it does not.
+   */
   async function reloadAfterSave() {
-    await Promise.allSettled([
-      romm.loadPlatforms({ force: true }),
-      romm.loadRules(),
-    ]);
+    await romm.loadRules().catch(() => {});
   }
 
   async function handleRepin() {

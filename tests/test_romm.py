@@ -466,6 +466,89 @@ async def test_repin_plan_reads_only_the_platform_it_was_given(
 
 
 @pytest.mark.asyncio
+async def test_repin_plan_does_not_scan_when_a_path_is_stale(
+    repin_db, tmp_path: Path,
+) -> None:
+    """One dead selection must not send the lookup across every platform.
+
+    That is the expensive case the platform hint exists to prevent, and
+    falling through on a partial match reintroduced it exactly there.
+    """
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    rom = {"id": 7, "name": "Game", "igdb_id": 42,
+           "full_path": "roms/gc/Game.iso", "fs_name": "Game.iso"}
+
+    asked: list = []
+
+    def _roms(pid):
+        asked.append(pid)
+        return [rom] if pid == 9 else []
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(romm_routes.romm_client, "roms", _roms), \
+            patch.object(
+                romm_routes.romm_client, "platforms",
+                lambda: [{"id": i} for i in range(1, 40)],
+            ), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ):
+        result = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                # The second path is not in this platform (or any).
+                paths=[str(lib / "Game.iso"), str(lib / "Gone.iso")],
+                mode="dolphin_rvz", platform_id=9,
+            ),
+        )
+
+    assert result["recorded"] == 1, result
+    assert result["skipped"] == 1
+    assert asked == [9], "one stale path sent the lookup across every platform"
+
+
+@pytest.mark.asyncio
+async def test_repin_plan_records_the_destination_the_caller_states(
+    repin_db, tmp_path: Path,
+) -> None:
+    """The queue's answer beats planning's prediction.
+
+    Between resolving a destination and the batch being accepted, another job
+    can take the path Rename picked -- the batch then writes elsewhere, and a
+    row left on the predicted path would be settled against whatever landed
+    there.
+    """
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    rom = {"id": 7, "name": "Game", "igdb_id": 42,
+           "full_path": "roms/gc/Game.iso", "fs_name": "Game.iso"}
+    actual = str(lib / "Game_2.rvz")
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.romm_repin, "roms_by_local_path",
+                return_value={os.path.realpath(lib / "Game.iso"): rom},
+            ), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ):
+        result = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(lib / "Game.iso")], mode="dolphin_rvz",
+                output_paths={str(lib / "Game.iso"): actual},
+            ),
+        )
+
+    assert result["recorded"] == 1, result
+    assert result["recorded_paths"] == {str(lib / "Game.iso"): actual}
+    assert romm_repin.pending_rows(10)[0][0] == actual
+
+
+@pytest.mark.asyncio
 async def test_repin_names_a_split_output_instead_of_waiting_it_out(
     repin_db, tmp_path: Path,
 ) -> None:

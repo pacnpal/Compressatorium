@@ -227,15 +227,37 @@ class RommStore {
    * Switching the active tool is the enforcement point the picker respects.
    */
   #adoptPlatformTool(platformId) {
-    const allowed = this.platforms.find((p) => p.id === platformId)?.tool_ids;
+    const platform = this.platforms.find((p) => p.id === platformId);
+    const allowed = platform?.tool_ids;
+    const allowedModes = platform?.mode_ids;
     // No opinion from the backend (unknown slug, older server) changes nothing,
     // matching narrow_to_platform's conservative contract.
     if (!Array.isArray(allowed) || allowed.length === 0) return;
-    if (allowed.includes(conversion.primaryTool)) return;
-    const next = registry.all().find((t) => allowed.includes(t.id));
-    if (next) {
-      conversion.setPrimaryTool(next.id);
-      ui.workspaceTool = next.id;
+
+    // The tool being allowed is not enough. Two platforms can both allow the
+    // chain tool while allowing *different* chain modes, so moving from
+    // GameCube to PS2 would keep `nkit_to_rvz` selected: the picker stops
+    // offering it, but the Convert panel would still submit it, and a catalog
+    // row with a matching extension would be converted to the other console's
+    // format. The mode has to be re-checked, not just its tool.
+    const modeAllowed = !Array.isArray(allowedModes)
+      || allowedModes.includes(conversion.mode);
+    if (allowed.includes(conversion.primaryTool) && modeAllowed) return;
+
+    if (!allowed.includes(conversion.primaryTool)) {
+      const next = registry.all().find((t) => allowed.includes(t.id));
+      if (next) {
+        conversion.setPrimaryTool(next.id);
+        ui.workspaceTool = next.id;
+      }
+    }
+    // setPrimaryTool resets to the tool's default mode, which may itself be
+    // one this platform disallows; and when the tool did not change, nothing
+    // has moved off the stale mode yet. Either way, land on an allowed one.
+    if (Array.isArray(allowedModes) && !allowedModes.includes(conversion.mode)) {
+      const tool = registry.forTool(conversion.primaryTool);
+      const fallback = (tool?.modes ?? []).find((m) => allowedModes.includes(m.mode));
+      if (fallback) conversion.setMode(fallback.mode);
     }
   }
 
