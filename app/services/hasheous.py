@@ -150,7 +150,7 @@ def _probe(url: str) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
         with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
-            resp.read(1024)
+            resp.read1(1024)
     except urllib.error.HTTPError as exc:
         raise HasheousUnavailable(f"HTTP {exc.code}") from exc
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
@@ -282,11 +282,18 @@ def _read_bounded(resp) -> bytes:
     """Read the body under a *total* deadline, not just a per-socket one.
 
     urllib's ``timeout`` applies to each socket operation and is reset by every
-    successful read, so a server dripping a byte at a time keeps a single
-    ``read()`` alive indefinitely -- pinning a match request, or a whole
-    DAT-match/metadata-scan job, without ever tripping the timeout or opening
-    the cooldown. Reading in chunks lets the elapsed total be checked between
-    them.
+    successful read, so a server dripping a byte at a time keeps a single read
+    alive indefinitely -- pinning a match request, or a whole DAT-match /
+    metadata-scan job, without ever tripping the timeout or opening the
+    cooldown.
+
+    ``read1()`` rather than ``read()`` is what makes the deadline enforceable:
+    ``read(n)`` blocks until it has all *n* bytes (measured: a 200-byte body
+    dripped over 10s kept one ``read(65536)`` blocked the whole 10s), so the
+    check below is never reached mid-read. ``read1(n)`` returns as soon as any
+    bytes arrive, so control comes back on every dribble and the elapsed total
+    is actually checked. It reads a whole body and terminates at EOF for both
+    identity and chunked responses.
     """
     deadline = time.monotonic() + _timeout()
     chunks: list[bytes] = []
@@ -294,7 +301,7 @@ def _read_bounded(resp) -> bytes:
     while total <= _MAX_RESPONSE_BYTES:
         if time.monotonic() > deadline:
             raise HasheousUnavailable("response exceeded the overall timeout")
-        chunk = resp.read(_READ_CHUNK_BYTES)
+        chunk = resp.read1(_READ_CHUNK_BYTES)
         if not chunk:
             break
         chunks.append(chunk)

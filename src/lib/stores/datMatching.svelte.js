@@ -92,6 +92,13 @@ class DATMatchingStore {
     this.matches.clear();
     this._resetAttempts();
     await this.refreshMatchingAvailability();
+    // ...and re-apply it afterwards. refreshMatchingAvailability() swallows a
+    // failed /dat/stats and falls back to `matchingAvailable = false`, which
+    // would bury the state the PUT just established -- reporting success while
+    // the panel shows off and browsing stays gated, with the backend already
+    // switched over. The merge is idempotent, so this is a no-op when the
+    // refresh succeeded.
+    this._applyHasheousState(state);
     return state;
   }
 

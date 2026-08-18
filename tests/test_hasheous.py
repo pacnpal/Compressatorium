@@ -7,6 +7,8 @@ No HTTP mocking library is used (the suite has none): the seam is
 
 import http.client
 import json
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -205,11 +207,20 @@ def test_url_error_raises_unavailable(hasheous_on):
 
 
 class _Resp:
+    """A minimal stand-in for ``http.client.HTTPResponse``.
+
+    ``read1`` drains and then returns b"" the way a real response does. An
+    earlier version returned the whole payload on every call, which never hit
+    EOF -- so tests naming the JSON-parse path actually passed via the
+    size-limit path instead.
+    """
+
     def __init__(self, payload: bytes):
         self._payload = payload
 
-    def read(self, _n=None):
-        return self._payload
+    def read1(self, n=None):
+        take, self._payload = self._payload[:n], self._payload[n:]
+        return take
 
     def __enter__(self):
         return self
@@ -1349,7 +1360,7 @@ async def test_a_file_level_failure_still_drops_its_stale_row(
 class _TruncatedResp:
     """A chunked response the server cuts short."""
 
-    def read(self, _n=None):
+    def read1(self, _n=None):
         raise http.client.IncompleteRead(b"partial", 500)
 
     def __enter__(self):
@@ -1378,54 +1389,90 @@ def test_a_malformed_status_line_is_a_service_failure(hasheous_on):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
+def _serve_once(handler) -> int:
+    """Run a one-shot HTTP server on a loopback port and return the port.
+
+    These two tests use a real socket rather than a fake response object on
+    purpose. The bug they pin lives in ``http.client``'s read semantics, so a
+    hand-rolled fake with a ``read``/``read1`` method cannot exhibit it: an
+    earlier fake returned promptly on every call and passed against code that
+    hung for real against a live drip server.
+    """
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _run():
+        try:
+            conn, _ = sock.accept()
+            conn.recv(4096)
+            handler(conn)
+            conn.close()
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return sock.getsockname()[1]
+
+
 def test_a_slow_drip_server_cannot_pin_a_lookup(hasheous_on, monkeypatch):
     """urllib's timeout is per socket operation and resets on every read.
 
-    A server delivering a byte at a time therefore keeps one read() alive
-    forever, pinning a match request -- or an entire scan job -- without ever
-    tripping the timeout or opening the cooldown.
+    A server delivering a byte at a time therefore keeps one read alive far
+    past the configured bound, pinning a match request -- or an entire scan
+    job -- without ever tripping the timeout or opening the cooldown. Reading
+    with ``read1`` is what lets the deadline below actually be enforced:
+    ``read(n)`` blocks until it has all n bytes, so the check between chunks is
+    never reached mid-read.
     """
     monkeypatch.setattr(settings, "hasheous_timeout", 1)
 
-    class _Drip:
-        def read(self, _n=None):
-            time.sleep(0.01)
-            return b"x"  # never EOF
+    def _drip(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+        for _ in range(100000):
+            conn.sendall(b"x")
+            time.sleep(0.005)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
+    port = _serve_once(_drip)
+    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)  # noqa: S310
 
     started = time.monotonic()
-    with patch.object(hasheous._opener, "open", return_value=_Drip()):
-        with pytest.raises(hasheous.HasheousUnavailable, match="overall timeout"):
-            hasheous._fetch_json("https://hasheous.example/x")
+    with pytest.raises(hasheous.HasheousUnavailable, match="overall timeout"):
+        hasheous._read_bounded(resp)
+    elapsed = time.monotonic() - started
 
-    # Bounded by the configured timeout, not by the (never-reached) size cap.
-    assert time.monotonic() - started < 5
+    # Bounded by the configured 1s timeout. The body would take ~500s to
+    # deliver in full, so a read that only checked the deadline between whole
+    # 64 KiB chunks would still be blocked here.
+    assert elapsed < 15, f"read was not interrupted at the deadline ({elapsed:.1f}s)"
 
 
-def test_a_normal_body_still_reads_whole(hasheous_on):
-    """The chunked reader must not truncate a legitimate response."""
+@pytest.mark.parametrize("chunked", [False, True])
+def test_a_normal_body_still_reads_whole(hasheous_on, chunked):
+    """The bounded reader must not truncate a legitimate response.
+
+    Both framings, because ``read1`` terminates at EOF differently for a
+    Content-Length body than for a chunked one.
+    """
     payload = json.dumps(SAMPLE_RESPONSE).encode()
 
-    class _Chunked:
-        def __init__(self):
-            self._left = payload
+    def _respond(conn):
+        if chunked:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            for i in range(0, len(payload), 64):
+                part = payload[i : i + 64]
+                conn.sendall(b"%x\r\n" % len(part) + part + b"\r\n")
+            conn.sendall(b"0\r\n\r\n")
+        else:
+            head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(payload)
+            conn.sendall(head + payload)
 
-        def read(self, n=None):
-            take, self._left = self._left[:n], self._left[n:]
-            return take
+    port = _serve_once(_respond)
+    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)  # noqa: S310
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
-    with patch.object(hasheous._opener, "open", return_value=_Chunked()):
-        data = hasheous._fetch_json("https://hasheous.example/x")
-
-    assert data["name"] == "Jumpman Junior"
+    body = hasheous._read_bounded(resp)
+    assert body == payload
+    assert json.loads(body)["name"] == "Jumpman Junior"
