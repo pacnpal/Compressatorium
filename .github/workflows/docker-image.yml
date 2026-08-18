@@ -108,7 +108,12 @@ jobs:
             # password), not a Bearer token.
             ENCODED_AUTH="$(printf 'x-access-token:%s' "${VERSION_SYNC_TOKEN}" | base64 -w0)"
             echo "::add-mask::${ENCODED_AUTH}"
-            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${ENCODED_AUTH}" \
+            AUTH_HEADER="http.https://github.com/.extraheader=AUTHORIZATION: basic ${ENCODED_AUTH}"
+            # Rebase onto the target branch in case it moved since the release
+            # tag was created (e.g. a PR merged between tagging and this job).
+            git -c "${AUTH_HEADER}" fetch origin "${TARGET_COMMITISH}"
+            git rebase "origin/${TARGET_COMMITISH}"
+            git -c "${AUTH_HEADER}" \
               push origin "HEAD:${TARGET_COMMITISH}"
           fi
 
