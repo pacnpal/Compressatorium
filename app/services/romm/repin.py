@@ -12,7 +12,7 @@ re-applied once RomM has rescanned.
 
 It lives in ``services`` rather than in the route because **both** conversion
 paths need it: the manual submit in ``routes.romm`` and the unattended sweep in
-``services.romm_auto``. A service importing from a route would be backwards, and
+``services.romm.auto``. A service importing from a route would be backwards, and
 duplicating the recording logic is exactly what let the automation path silently
 opt out of the guarantee the manual path makes.
 """
@@ -397,6 +397,19 @@ SETTLING = "settling"
 _CLAIM_STALE_SECONDS = 900
 
 
+def _has_newer_pending(session, row) -> bool:
+    """Is another pending row already covering this row's output?"""
+    return bool(
+        session.query(_db.RommRepin.id)
+        .filter(
+            _db.RommRepin.output_path == row.output_path,
+            _db.RommRepin.state == "pending",
+            _db.RommRepin.id != row.id,
+        )
+        .first()
+    )
+
+
 def claim(row_id: int) -> bool:
     """Take ownership of a pending row for the outbound write. Atomic.
 
@@ -409,6 +422,25 @@ def claim(row_id: int) -> bool:
     replacing one that is already being applied.
     """
     with _session() as session:
+        row = session.get(_db.RommRepin, row_id)
+        if row is None:
+            return False
+        stale_claim = (
+            row.state == SETTLING
+            and (row.settled_at or "") < _iso_seconds_ago(_CLAIM_STALE_SECONDS)
+        )
+        if stale_claim and _has_newer_pending(session, row):
+            # A claim whose holder died, *and* a later conversion has since
+            # planned the same output. Re-issuing the old row would let this
+            # pass hash the newer conversion's product and stamp the abandoned
+            # attempt's provider ids onto it -- the misidentification the whole
+            # claim mechanism exists to prevent. The newer row is the one that
+            # describes what is actually going to be written.
+            row.state = "abandoned"
+            row.detail = "Superseded by a re-planned conversion"
+            row.settled_at = utcnow_iso()
+            session.commit()
+            return False
         updated = session.query(_db.RommRepin).filter(
             _db.RommRepin.id == row_id,
             or_(
@@ -453,15 +485,7 @@ def release(row_id: int) -> bool:
         row = session.get(_db.RommRepin, row_id)
         if row is None or row.state != SETTLING:
             return False
-        superseded = bool(
-            session.query(_db.RommRepin.id)
-            .filter(
-                _db.RommRepin.output_path == row.output_path,
-                _db.RommRepin.state == "pending",
-                _db.RommRepin.id != row_id,
-            )
-            .first()
-        )
+        superseded = _has_newer_pending(session, row)
         if not superseded:
             row.state = "pending"
             row.settled_at = None

@@ -42,7 +42,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from models import ConversionMode, JobStatus
-from services import romm_repin, romm_settings
 from services.job_manager import (
     OutputClaimedError,
     QueueBackpressureError,
@@ -56,7 +55,9 @@ from services.output_conflicts import (
 )
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
-from services.subprocess_runner import run_detached
+from services.romm import repin as romm_repin
+from services.romm import settings as romm_settings
+from services.subprocess_runner import bounded_path_check, run_detached
 from services.tools import InputKind, registry
 from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes, match_extension
@@ -694,6 +695,29 @@ async def paused():
     """
     async with _sweep_lock:
         yield
+
+
+async def _probe(func, *args, default):
+    """One blocking filesystem answer, bounded, with the safe answer on timeout.
+
+    Every stat and resolve in the sweep goes through here rather than
+    `run_in_threadpool`: the pool is shared and has no deadline, and the sweep
+    holds `_sweep_lock` throughout -- so one unresponsive mount would block
+    previews, manual runs, rule edits and settings saves behind it, having
+    stranded a pooled worker on the way.
+
+    *default* is what "the volume did not answer" means at that call site, and
+    it is always the conservative reading.
+    """
+    try:
+        return await bounded_path_check(func, *args)
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm_auto: %s did not answer in time; treating it as %r "
+            "(a volume is not answering)",
+            getattr(func, "__name__", func), default,
+        )
+        return default
 
 
 async def _within_volumes_bounded(path: str) -> bool:
@@ -1394,7 +1418,15 @@ async def _sweep_locked(
     # Priority first (lower runs earlier), then id, so the order is total and
     # a capped sweep resumes where the last one stopped.
     ordered = sorted(rules, key=lambda pid: (rules[pid]["priority"], int(pid)))
-    active_paths = await run_in_threadpool(_active_source_paths)
+    # Bounded: this resolves every queued job's source, and one of them on a
+    # dead mount would hang the sweep with `_sweep_lock` held. An unreadable
+    # answer is `None`, which stops the run rather than proceeding blind --
+    # without this set the sweep cannot tell a source already converting from
+    # one to queue, and under `overwrite` would queue it a second time.
+    active_paths = await _probe(_active_source_paths, default=None)
+    if active_paths is None:
+        result["stopped_reason"] = "library_unresponsive"
+        return result
     # Destinations already claimed this sweep. Two sources can resolve to the
     # same output -- a PS3 folder and its sibling ISO, or two entries RomM
     # lists for one file -- and under `overwrite` both resolve as queueable,
@@ -1605,11 +1637,26 @@ async def _sweep_locked(
                 # missing") and fails every job after doing the full
                 # conversion. Same helper the manual path uses.
                 snapshots = None
+                unreadable: list[str] = []
                 if rule["delete_on_verify"]:
                     snapshots = {}
                     for path in batch:
-                        snapshots[path] = await run_in_threadpool(
-                            build_delete_snapshot, path,
+                        # Bounded, and a missing snapshot is not silently
+                        # accepted: `_process_job` refuses to delete without
+                        # one, so an unreadable source must drop out of the
+                        # batch rather than reach the runner and fail there.
+                        snapshot = await _probe(
+                            build_delete_snapshot, path, default=None,
+                        )
+                        if snapshot is None:
+                            unreadable.append(path)
+                            continue
+                        snapshots[path] = snapshot
+                    if unreadable:
+                        batch = [p for p in batch if p not in set(unreadable)]
+                        logger.warning(
+                            "romm_auto: dropping %d source(s) whose delete "
+                            "snapshot could not be read", len(unreadable),
                         )
 
                 jobs = await job_manager.create_batch_jobs(
@@ -1692,11 +1739,28 @@ async def _sweep_locked(
                     # only meaningful if it names the job whose outcome decides
                     # whether this ROM was really converted.
                     job_by_path = {j.file_path: j.id for j in jobs}
-                    await _mark_converted(platform_id, [
-                        (rom_by_path[path].get("id"), destinations[path],
-                         pre_by_path[path], job_by_path.get(path))
-                        for path in batch
-                    ])
+                    try:
+                        await _mark_converted(platform_id, [
+                            (rom_by_path[path].get("id"), destinations[path],
+                             pre_by_path[path], job_by_path.get(path))
+                            for path in batch
+                        ])
+                    except Exception:
+                        # Isolated for the same reason as the re-pin write
+                        # above, and this one is worse: the batch is already
+                        # running, and reaching the handler below would report
+                        # it as `queue_failed` -- which skips this very record
+                        # and leaves `overwrite`/`rename` with no memory of the
+                        # accepted jobs, so the next sweep converts them all
+                        # again. A failed write costs this run its provenance
+                        # and nothing else; the terminal-job listener still
+                        # writes each outcome as it lands.
+                        logger.warning(
+                            "romm_auto: could not record what platform %s "
+                            "produced; this run is not remembered",
+                            platform_id, exc_info=True,
+                        )
+                        summary["provenance_failed"] = True
 
                 # Claim them immediately so a later platform in the same sweep
                 # cannot queue the same source twice. Already resolved during

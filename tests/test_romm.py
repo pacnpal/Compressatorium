@@ -25,8 +25,8 @@ import pytest
 from models import JobStatus
 from routes import romm as romm_routes
 from services import db as _db
-from services import romm as romm_service
-from services import romm_repin
+from services.romm import client as romm_service
+from services.romm import repin as romm_repin
 from services.tools import registry
 from services.romm import DAT_SAFE_OUTPUT_EXTS, RommClient, RommError
 
@@ -51,7 +51,7 @@ def _client() -> RommClient:
 
 
 def test_bearer_token_is_sent(client: RommClient) -> None:
-    with patch("services.romm._urlopen", return_value=_response([])) as urlopen:
+    with patch("services.romm.client._urlopen", return_value=_response([])) as urlopen:
         client.platforms()
     request = urlopen.call_args[0][0]
     assert request.get_header("Authorization") == "Bearer rmm_test"
@@ -64,7 +64,7 @@ def test_heartbeat_is_unauthenticated(client: RommClient) -> None:
     credentials it does not need would defeat the diagnostic.
     """
     with patch(
-        "services.romm._urlopen", return_value=_response({"VERSION": "4.9.0"}),
+        "services.romm.client._urlopen", return_value=_response({"VERSION": "4.9.0"}),
     ) as urlopen:
         assert client.heartbeat() == {"VERSION": "4.9.0"}
     assert urlopen.call_args[0][0].get_header("Authorization") is None
@@ -80,7 +80,7 @@ def test_non_http_scheme_is_refused(url: str) -> None:
 
 def test_plain_http_is_allowed(client: RommClient) -> None:
     """RomM is normally reached over http on a container network."""
-    with patch("services.romm._urlopen", return_value=_response([])):
+    with patch("services.romm.client._urlopen", return_value=_response([])):
         assert client.platforms() == []
 
 
@@ -89,7 +89,7 @@ def test_http_error_becomes_romm_error(client: RommClient) -> None:
         "http://romm:8080/api/platforms", 401, "Unauthorized", {},
         io.BytesIO(b"bad token"),
     )
-    with patch("services.romm._urlopen", side_effect=err), \
+    with patch("services.romm.client._urlopen", side_effect=err), \
             pytest.raises(RommError, match="HTTP 401"):
         client.platforms()
 
@@ -99,7 +99,7 @@ def test_rom_by_sha1_treats_404_as_no_match(client: RommClient) -> None:
     err = urllib.error.HTTPError(
         "http://romm:8080/api/roms/by-hash", 404, "Not Found", {}, io.BytesIO(b""),
     )
-    with patch("services.romm._urlopen", side_effect=err):
+    with patch("services.romm.client._urlopen", side_effect=err):
         assert client.rom_by_sha1("abc") is None
 
 
@@ -787,7 +787,7 @@ def test_update_rom_metadata_sends_only_set_provider_ids(client: RommClient) -> 
     Sending a provider the source had no id for would overwrite whatever RomM
     worked out for the converted file with an empty value.
     """
-    with patch("services.romm._urlopen", return_value=_response({"id": 500})) as urlopen:
+    with patch("services.romm.client._urlopen", return_value=_response({"id": 500})) as urlopen:
         client.update_rom_metadata(500, {"igdb_id": 1122, "ra_id": 44, "moby_id": None})
     request = urlopen.call_args[0][0]
     body = request.data.decode()
@@ -801,14 +801,14 @@ def test_update_rom_metadata_sends_only_set_provider_ids(client: RommClient) -> 
 def test_update_rom_metadata_skips_the_request_when_nothing_to_send(
     client: RommClient,
 ) -> None:
-    with patch("services.romm._urlopen") as urlopen:
+    with patch("services.romm.client._urlopen") as urlopen:
         client.update_rom_metadata(500, {"moby_id": None})
     urlopen.assert_not_called()
 
 
 def test_update_rom_metadata_ignores_unknown_fields(client: RommClient) -> None:
     """Only the known provider ids are forwarded, never arbitrary keys."""
-    with patch("services.romm._urlopen", return_value=_response({})) as urlopen:
+    with patch("services.romm.client._urlopen", return_value=_response({})) as urlopen:
         client.update_rom_metadata(1, {"igdb_id": 5, "fs_name": "evil.iso"})
     body = urlopen.call_args[0][0].data.decode()
     assert "igdb_id" in body
@@ -897,7 +897,7 @@ def _fake_jobs(paths):
 @pytest.fixture(name="settings_db")
 def _settings_db(sqlite_db):
     """The same database, plus a settings cache reset around the test."""
-    from services import romm_settings
+    from services.romm import settings as romm_settings
 
     romm_settings.reset_for_tests()
     yield romm_settings
@@ -957,7 +957,7 @@ async def test_numeric_settings_are_bounded(settings_db) -> None:
 
 
 def test_rule_normalizes_to_full_schema() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({"mode": "dolphin_rvz", "enabled": True})
     assert rule is not None
@@ -968,14 +968,14 @@ def test_rule_normalizes_to_full_schema() -> None:
 
 
 def test_rule_with_unknown_mode_is_dropped() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     assert romm_auto.normalize_rule({"mode": "not_a_real_mode"}) is None
     assert romm_auto.normalize_rules({"7": {"mode": "nope"}}) == {}
 
 
 def test_rule_numeric_fields_are_bounded() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "interval_minutes": 1, "max_per_run": 99999,
@@ -985,14 +985,14 @@ def test_rule_numeric_fields_are_bounded() -> None:
 
 
 def test_invalid_filter_pattern_is_ignored_not_fatal() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({"mode": "dolphin_rvz", "include_pattern": "([a"})
     assert rule["include_pattern"] is None
 
 
 def test_compression_only_kept_where_the_mode_supports_it() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     # dolphin_gcz takes no compression setting; storing one would be dropped
     # at submit time anyway, so it must not be persisted as if it applied.
@@ -1001,7 +1001,7 @@ def test_compression_only_kept_where_the_mode_supports_it() -> None:
 
 
 def test_contradictory_match_filters_cancel_out() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "only_matched": True, "only_unmatched": True,
@@ -1012,7 +1012,7 @@ def test_contradictory_match_filters_cancel_out() -> None:
 
 def test_overnight_window_wraps_midnight() -> None:
     from datetime import datetime, timezone
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["window_start"], rule["window_end"] = "22:00", "04:00"
@@ -1026,7 +1026,7 @@ def test_overnight_window_wraps_midnight() -> None:
 
 def test_day_mask_excludes_other_days() -> None:
     from datetime import datetime, timezone
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["days"] = [5, 6]  # weekends only
@@ -1038,7 +1038,7 @@ def test_day_mask_excludes_other_days() -> None:
 
 def test_disabled_rule_is_never_due() -> None:
     from datetime import datetime, timezone
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["enabled"] = False
@@ -1047,7 +1047,7 @@ def test_disabled_rule_is_never_due() -> None:
 
 def test_interval_gates_a_second_run() -> None:
     from datetime import datetime, timedelta, timezone
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["enabled"] = True
@@ -1061,7 +1061,7 @@ def test_interval_gates_a_second_run() -> None:
 
 
 def test_size_and_name_filters() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["min_size_mb"] = 100
@@ -1077,7 +1077,7 @@ def test_size_and_name_filters() -> None:
 
 
 def test_rom_ordering_is_deterministic() -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     # Sizes chosen so every order produces a *different* sequence. With sizes
     # that happen to descend in name order, a size assertion passes even if the
@@ -1112,7 +1112,7 @@ async def test_sweep_is_idempotent_against_the_filesystem(
     a table, so a sweep that runs twice — or after a restart, or racing a
     manual conversion — converges instead of duplicating work.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1160,7 +1160,7 @@ async def test_sweep_preview_queues_nothing_and_does_not_move_the_clock(
     settings_db, tmp_path: Path,
 ) -> None:
     """Looking at what *would* run must not postpone the run that should."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1193,7 +1193,7 @@ async def test_sweep_preview_queues_nothing_and_does_not_move_the_clock(
 
 @pytest.mark.asyncio
 async def test_sweep_respects_the_overall_cap(settings_db, tmp_path: Path) -> None:
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1225,7 +1225,7 @@ async def test_sweep_skips_sources_already_being_converted(
     settings_db, tmp_path: Path,
 ) -> None:
     """A job already working on a source must not get a second one queued."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1264,7 +1264,7 @@ async def test_sweep_with_output_dir_is_idempotent(settings_db, tmp_path: Path) 
     `detect_output()` only looks beside the source, so an `output_dir` rule used
     to re-queue the same ROM on every sweep and fail each job on a collision.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1307,7 +1307,7 @@ async def test_sweep_records_repin_rows_for_unsafe_formats(
     settings_db, tmp_path: Path,
 ) -> None:
     """Automatic RVZ conversion must preserve metadata like the manual path."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1344,7 +1344,7 @@ async def test_sweep_records_nothing_for_dat_safe_formats(
     settings_db, tmp_path: Path,
 ) -> None:
     """CHD keeps its own DAT identity, so a row would be pure noise."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "ps2"
     lib.mkdir(parents=True)
@@ -1378,7 +1378,7 @@ async def test_sweep_records_nothing_for_dat_safe_formats(
 @pytest.mark.asyncio
 async def test_sweep_supplies_delete_snapshots(settings_db, tmp_path: Path) -> None:
     """delete_on_verify without a snapshot fails every job after converting."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "ps2"
     lib.mkdir(parents=True)
@@ -1417,7 +1417,7 @@ async def test_disabled_rule_is_paused_even_for_run_now(
     settings_db, tmp_path: Path,
 ) -> None:
     """Run now must not convert a platform the operator explicitly paused."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1476,7 +1476,7 @@ async def test_library_root_outside_volumes_is_not_usable(tmp_path: Path) -> Non
 def test_schedule_window_uses_the_rules_timezone() -> None:
     """A 22:00-04:00 window means the operator's evening, not UTC's."""
     from datetime import datetime, timezone as dt_timezone
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.default_rule("dolphin_rvz")
     rule["window_start"], rule["window_end"] = "22:00", "04:00"
@@ -1495,7 +1495,7 @@ def test_schedule_window_uses_the_rules_timezone() -> None:
 
 def test_unknown_timezone_falls_back_to_utc() -> None:
     """A zone the container has no data for must not break the schedule."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "timezone": "Mars/Olympus_Mons",
@@ -1579,7 +1579,7 @@ async def test_connection_test_with_a_cleared_token_does_not_reuse_the_saved_one
 
 def test_multipart_refuses_control_characters_in_a_value() -> None:
     """A remote-supplied value must not be able to forge a part header."""
-    from services.romm import RommError, _encode_multipart
+    from services.romm.client import RommError, _encode_multipart
 
     body, content_type = _encode_multipart({"igdb_id": "42"})
     assert b'name="igdb_id"' in body
@@ -1610,7 +1610,7 @@ def test_naive_last_run_does_not_abort_the_schedule_check() -> None:
     """A hand-edited state row must not TypeError the whole sweep."""
     from datetime import datetime, timezone
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "enabled": True, "interval_minutes": 60,
@@ -1633,7 +1633,7 @@ async def test_rename_policy_queues_a_free_path_instead_of_skipping(
     look for an existing output, so `overwrite` and `rename` both silently
     behaved like `skip` once one existed.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1687,7 +1687,7 @@ async def test_failed_queueing_leaves_no_pending_repin_rows(
     Recorded before the queue call, a row survives a failed submit and then
     re-pins whatever later lands on that path.
     """
-    from services import romm_auto, romm_repin
+    from services.romm import auto as romm_auto, repin as romm_repin
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1768,7 +1768,7 @@ async def test_rule_settings_reach_the_queue(settings_db, tmp_path: Path) -> Non
     then dropped on the way to `create_batch_jobs`, so toggling them in the UI
     changed nothing about the conversion that ran.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1808,7 +1808,7 @@ async def test_rule_settings_reach_the_queue(settings_db, tmp_path: Path) -> Non
 
 def test_verify_after_is_refused_on_a_mode_that_cannot_verify() -> None:
     """The switch is registry-gated, exactly like delete-on-verify."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     # dolphin_rvz supports the verify step; chdman's extract direction does not.
     rvz = romm_auto.normalize_rule({"mode": "dolphin_rvz", "verify_after": True})
@@ -1832,7 +1832,7 @@ def test_delete_on_verify_refused_when_the_verify_is_only_structural() -> None:
     that combination; an unattended rule must too, or it deletes a 25 GB source
     on the strength of a geometry check.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     unsafe = romm_auto.normalize_rule({
         "mode": "jwud_compress", "compression": "noverify", "delete_on_verify": True,
@@ -1858,7 +1858,7 @@ async def test_overwrite_never_targets_the_rule_s_own_source(
     it straight back onto itself. An `overwrite` rule would then unlink the file
     before reading it, destroying the only copy once the source ISO was gone.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -1897,7 +1897,7 @@ async def test_rule_defaults_come_from_the_configured_settings(
         "verify_after_convert": True,
         "delete_source_after_verify": True,
     })
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     fresh = romm_auto.default_rule("dolphin_rvz")
     assert fresh["interval_minutes"] == 240
@@ -1989,7 +1989,7 @@ def test_cross_origin_redirect_is_refused_before_the_token_travels() -> None:
     """
     from email.message import Message
 
-    from services.romm import _SameOriginRedirectHandler
+    from services.romm.client import _SameOriginRedirectHandler
 
     handler = _SameOriginRedirectHandler("http://romm:8080/api/roms")
     request = urllib.request.Request(
@@ -2019,7 +2019,7 @@ def test_nsz_layout_and_level_both_reach_the_job() -> None:
     Gating the codec on `supports_compression` alone dropped the solid/block
     choice and — because the level rides on the same string — the level with it.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "nsz_compress", "compression": "block", "compression_level": 12,
@@ -2043,7 +2043,7 @@ def test_a_level_without_a_codec_names_the_tools_default() -> None:
     not — `DolphinTool._build_command` splits it into an empty codec and emits
     `-c "" -l 19`, which fails every queued job. The mode says which case it is.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
     from services.tools import registry
 
     rule = romm_auto.normalize_rule({
@@ -2067,7 +2067,7 @@ def test_a_codec_mode_with_no_declared_default_drops_the_level(monkeypatch) -> N
     not choose; sending an empty one fails at the tool. Neither is acceptable,
     so the level is dropped and logged.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
     from services.tools import registry
 
     monkeypatch.setattr(
@@ -2087,7 +2087,7 @@ def test_a_polynomial_filter_pattern_is_refused_too() -> None:
     that run between six stars, and `re` cannot be interrupted while
     `_sweep_lock` is held. Adjacency plus an overlapping atom is the tell.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     assert romm_auto._valid_pattern("a*a*a*a*a*a*b") == (None, True)
     assert romm_auto._valid_pattern(r"\w*\d*x") == (None, True)
@@ -2111,7 +2111,7 @@ def test_deselecting_every_weekday_is_honoured_not_widened() -> None:
     """
     from datetime import datetime, timezone
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "enabled": True, "days": [],
@@ -2133,7 +2133,7 @@ def test_a_mistyped_filter_pauses_the_rule_instead_of_widening_it() -> None:
     The filter is what keeps a rule to a subset; dropping it silently would let
     the next unattended sweep queue the whole platform, delete-on-verify and all.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     rule = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "enabled": True, "include_pattern": "(USA",
@@ -2149,7 +2149,7 @@ def test_a_rejected_output_dir_pauses_the_rule() -> None:
     The rule would then fill whichever filesystem holds the sources, rather
     than the one the operator chose.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     with patch.object(romm_auto, "is_within_configured_volumes", return_value=False):
         rule = romm_auto.normalize_rule({
@@ -2165,7 +2165,7 @@ async def test_a_failed_queue_does_not_advance_the_schedule(
     settings_db, tmp_path: Path,
 ) -> None:
     """A transient queue error must not cost the platform a whole interval."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2299,7 +2299,7 @@ async def test_rename_rule_converts_each_source_exactly_once(
     this on its own -- `rename` means "write alongside", so a free suffix is
     always available -- which is why the rule records what it has converted.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2355,7 +2355,7 @@ async def test_overwrite_rule_converts_each_source_exactly_once(
     without the recorded history a scheduled rule rewrites the same
     multi-gigabyte image every interval, forever.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2404,7 +2404,7 @@ async def test_forget_converted_lets_a_rule_run_again(
     settings_db, tmp_path: Path,
 ) -> None:
     """The operator's escape hatch: restoring a backup must be recoverable."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2475,7 +2475,7 @@ async def test_a_queued_conversion_that_never_ran_is_retried(
     skip it on every later sweep, and only clearing the history by hand would
     bring it back.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2571,7 +2571,7 @@ def test_catastrophic_filter_patterns_are_refused_at_save_time() -> None:
     operator-supplied regex to time it is the thing CodeQL flags, and a timing
     test would also have to survive the very blow-up it is looking for.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     good = (
         r"\(USA\)", ".*Beta.*", "^Super", r"^.*\(USA\).*(Rev [0-9])?$",
@@ -2663,7 +2663,7 @@ async def test_sweep_refuses_a_composite_mode_for_the_wrong_platform(
     settings_db, tmp_path: Path,
 ) -> None:
     """The saved rule is checked against the mode, not its tool."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2702,7 +2702,7 @@ async def test_changing_the_romm_instance_forgets_the_conversion_history(
     -- they are the operator's configuration -- but what they believe they
     produced does not.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     await settings_db.save({
         "url": "http://romm:8080", "library_root": str(tmp_path),
@@ -2729,7 +2729,7 @@ async def test_retargeting_a_rule_cannot_race_a_running_sweep(
     settings_db, tmp_path: Path,
 ) -> None:
     """`set_rules` clears history a sweep may still be about to write back."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     await settings_db.save({
         "url": "http://romm:8080", "library_root": str(tmp_path),
@@ -2758,7 +2758,7 @@ async def test_automation_repin_records_the_pre_conversion_fingerprint(
     point would save the finished output as the "before" picture, after which
     the settler sees nothing change and abandons the row.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2807,7 +2807,7 @@ async def test_a_failed_job_does_not_count_as_converted(
     output — and the ROM would then be skipped forever. The job's own outcome
     decides.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2872,7 +2872,7 @@ async def test_a_pruned_failed_job_still_does_not_count_as_converted(
     conversion from a failed overwrite that unlinked the old artifact. The
     verdict is written down when the job ends, and that record wins.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2926,7 +2926,7 @@ async def test_a_completed_job_is_remembered_after_the_queue_forgets_it(
     changed, so an operator who moved the output aside got the whole platform
     reconverted.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -2977,7 +2977,7 @@ async def test_the_sweep_writes_down_an_outcome_the_queue_can_still_answer_for(
     idle queue — is not covered by the completion listener, so the sweep asks
     the queue for anything it does not yet know and freezes the answer.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     record = {"path": "/x/Game.rvz", "pre": "1:2", "job_id": "job-9"}
     await romm_auto.preferences_store.put(romm_auto.STATE_KEY, {
@@ -3084,7 +3084,7 @@ async def test_two_sources_for_one_output_record_the_source_the_queue_keeps(
     left the row holding whichever came *last*, so the conversion that actually
     ran could be re-pinned with the identity of the ROM the queue skipped.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
     from services.output_conflicts import collapse_to_winners, input_priority
 
     # The shared rule the batch route uses: the disc description outranks the
@@ -3139,7 +3139,7 @@ def test_a_claim_its_holder_never_released_is_taken_back(sqlite_db, tmp_path: Pa
     `count_pending` hid it from the badge and from the background settler, so
     nothing ever restored its metadata.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.rvz"
     romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
@@ -3166,7 +3166,7 @@ def test_claiming_a_row_is_atomic(sqlite_db, tmp_path: Path) -> None:
     superseded, and the pass — already past its check — pushes the previous
     generation's provider ids anyway.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.rvz"
     romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
@@ -3209,7 +3209,7 @@ def test_cancelling_a_plan_cannot_retire_the_row_that_superseded_it(
     row by then — and its conversion, already queued, would run with no
     snapshot at all because the first client tidied up after itself by path.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.rvz"
     mine = romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
@@ -3303,7 +3303,7 @@ async def test_saving_rules_never_validates_volumes_on_the_event_loop(
     """
     import threading
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     stuck = threading.Event()
     loop_thread = threading.get_ident()
@@ -3438,7 +3438,7 @@ async def test_a_dead_output_dir_stops_one_platform_not_the_whole_sweep(
     """
     import threading
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -3513,7 +3513,7 @@ async def test_a_finished_job_updates_one_record_not_the_whole_history(
     ran that scan on the event loop while holding `_sweep_lock` — so a batch of
     completions against a large history delayed every unrelated request.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     class _Job:
         def __init__(self, job_id, status):
@@ -3567,7 +3567,7 @@ def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:
     attached. Refusing pauses the rule and says so, which is the whole contract
     of this validator.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     # A bare alternation of literals: every prefix of it is still a valid
     # regex, which is exactly what makes trimming dangerous rather than noisy.
@@ -3612,7 +3612,7 @@ def test_an_identity_swap_retires_a_claim_its_holder_never_released(
     whatever the new one matches its digest to. Which is the one outcome this
     cleanup exists to prevent.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     kept = romm_repin.record(
         {"id": 5, "igdb_id": 42}, str(tmp_path / "A.rvz"), {"igdb_id": 42},
@@ -3646,7 +3646,7 @@ def test_releasing_a_superseded_claim_retires_it_instead_of_restoring_it(
     failure handler that called release, replacing the real error with a 500
     and parking the claim as `settling` until it aged out.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.rvz"
     mine = romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
@@ -3710,7 +3710,7 @@ async def test_an_unreadable_destination_leaves_an_overwrite_row_waiting(
     destination — under `overwrite` that is the artifact the conversion was
     going to replace — and stamps this ROM's ids onto it.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.rvz"
     out.write_bytes(b"the previous artifact")
@@ -3742,7 +3742,7 @@ def test_verify_is_offered_where_deleting_is_refused() -> None:
     converted file" on the delete flag therefore made the only check that mode
     offers unreachable — for the one conversion whose source is irreplaceable.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
     from services.tools import registry
 
     assert registry.mode_supports_verify("folder_to_iso") is True
@@ -3778,7 +3778,7 @@ async def test_a_failed_repin_write_still_records_what_was_queued(
     sweep queued every one of those ROMs a second time — with `overwrite`,
     rewriting the files the first batch was still producing.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -3843,7 +3843,7 @@ def test_half_a_schedule_window_pauses_the_rule() -> None:
     """
     from datetime import datetime, timezone
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     half = romm_auto.normalize_rule({
         "mode": "dolphin_rvz", "enabled": True, "window_start": "22:00",
@@ -3883,7 +3883,7 @@ async def test_a_hung_candidate_probe_stops_the_platform(
     """
     import asyncio as _asyncio
 
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -3928,7 +3928,7 @@ async def test_a_queued_retry_keeps_its_row_when_old_split_parts_remain(
     them — and reading the old parts as this attempt's final output retired the
     row before the conversion that would have settled it even started.
     """
-    from services import romm_repin
+    from services.romm import repin as romm_repin
 
     out = tmp_path / "Game.iso"
     (tmp_path / "Game.iso.0").write_bytes(b"part")
@@ -3959,7 +3959,7 @@ async def test_a_manual_limit_can_only_narrow_the_run(
     work one sweep may queue. A caller-supplied limit was taken verbatim, so a
     button could queue far past it.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -3999,7 +3999,7 @@ async def test_sweep_skips_a_platform_whose_tool_is_not_installed(
     settings_db, tmp_path: Path,
 ) -> None:
     """A saved rule outlives its install; queueing would fail every job."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -4032,7 +4032,7 @@ async def test_sweep_refuses_a_catalog_entry_whose_file_is_gone(
     settings_db, tmp_path: Path,
 ) -> None:
     """RomM's catalog outlives the files it describes."""
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -4071,7 +4071,7 @@ async def test_sweep_refuses_a_directory_where_the_mode_takes_a_file(
     `_clear_existing_output` removes the previous artifact, and only then does
     the converter fail on a directory it cannot open.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -4124,7 +4124,7 @@ async def test_sweep_never_sends_two_sources_to_one_destination(
     the same output -- and with delete_on_verify both sources are deleted for
     one surviving file.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     lib = tmp_path / "library" / "roms" / "gc"
     lib.mkdir(parents=True)
@@ -4170,7 +4170,7 @@ def test_modes_validate_sources_against_their_own_inputs() -> None:
     extract and copy modes take. Asking the tool rejected every real `copy`
     source and accepted `.iso` files that mode cannot consume.
     """
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     tool = registry.for_mode("copy")
     spec = registry.spec("copy")
@@ -4191,7 +4191,7 @@ def test_directory_modes_use_the_directory_predicate(tmp_path: Path) -> None:
     folder "unconvertible" and queue nothing, ever.
     """
     from services import ps3
-    from services import romm_auto
+    from services.romm import auto as romm_auto
 
     folder = tmp_path / "MyGame"
     (folder / "PS3_GAME" / "USRDIR").mkdir(parents=True)

@@ -95,12 +95,12 @@ class RommNotConfigured(RommError):
 def _token() -> str | None:
     """The RomM client API token in force, or None.
 
-    Resolved through :mod:`services.romm_settings`, so a token saved in the app
+    Resolved through :mod:`services.romm.settings`, so a token saved in the app
     wins over the ``ROMM_TOKEN`` environment default and takes effect without a
     restart. Deliberately not a field on the global ``Settings`` object: a
     secret there leaks into every ``repr()`` and config dump.
     """
-    from services import romm_settings
+    from services.romm import settings as romm_settings
 
     return romm_settings.token()
 
@@ -181,13 +181,13 @@ class RommClient:
     def base_url(self) -> str:
         if self._explicit_base is not None:
             return self._explicit_base.rstrip("/")
-        from services import romm_settings
+        from services.romm import settings as romm_settings
 
         return str(romm_settings.effective().get("url") or "").rstrip("/")
 
     @property
     def library_root(self) -> str:
-        from services import romm_settings
+        from services.romm import settings as romm_settings
 
         return str(romm_settings.effective().get("library_root") or "")
 

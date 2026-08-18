@@ -285,7 +285,7 @@ async def lifespan(app: FastAPI):
     # RomM client reads it synchronously from worker threads, so it must be
     # populated first; without this the first catalog call would fall back to
     # the environment and ignore whatever the operator saved in the app.
-    from services import romm_auto, romm_settings
+    from services.romm import auto as romm_auto, settings as romm_settings
 
     try:
         romm_cfg = await romm_settings.load()

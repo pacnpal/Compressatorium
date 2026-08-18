@@ -1424,10 +1424,10 @@ written for whichever source came last, so the conversion that ran could be
 re-pinned with the skipped ROM's identity. Both the batch route and the re-pin
 plan call the same helper.
 
-### 3.3.9 Re-pin queue and conversion provenance (`services/romm_repin.py`)
+### 3.3.9 Re-pin queue and conversion provenance (`services/romm/repin.py`)
 
 Two questions the filesystem cannot answer on its own, both owned here so the
-manual submit (`routes/romm.py`) and the unattended sweep (`services/romm_auto.py`)
+manual submit (`routes/romm.py`) and the unattended sweep (`services/romm/auto.py`)
 give the same answer.
 
 **"Has the conversion actually produced this output yet?"** A re-pin row is
@@ -1696,7 +1696,7 @@ may be sync or async, exceptions are logged and swallowed (a listener must
 never fail a conversion), and the same job may be announced twice — listeners
 are required to be idempotent.
 
-The RomM automation is the first consumer: `romm_auto.note_job_finished` writes
+The RomM automation is the first consumer: `romm.auto.note_job_finished` writes
 the verdict into the rule's converted-history record (`done: true|false`), and
 `_was_produced` reads that first. Without it, provenance fell back to "the
 destination changed since planning", which a *failed* overwrite produces just
@@ -1733,7 +1733,7 @@ second case, so the resolution stays a per-tool declaration instead of an
 if-ladder on tool identity at the call site.
 `registry.default_compression(mode)` applies it *only* to codec-offering modes,
 returning `None` elsewhere so nsz's meaningful empty part survives. The RomM
-sweep (`services/romm_auto._compression_arg`) is the current consumer: with no
+sweep (`services/romm/auto._compression_arg`) is the current consumer: with no
 declared default it drops the level and logs, rather than queue a job the tool
 will reject or invent a codec the operator did not choose.
 

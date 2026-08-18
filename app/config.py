@@ -223,7 +223,7 @@ class Settings(BaseSettings):
     # the app (URL, library root, unattended-conversion policy, per-platform
     # rules), which makes the saved value the authority and the environment
     # only the first-run default -- a layering `Settings` cannot express, since
-    # it is populated once at import. `services.romm_settings` owns the whole
+    # it is populated once at import. `services.romm.settings` owns the whole
     # table: ROMM_URL, ROMM_LIBRARY_ROOT, ROMM_AUTO_CONVERT,
     # ROMM_AUTO_CONVERT_INTERVAL_MINUTES, ROMM_AUTO_CONVERT_MAX_PER_RUN,
     # ROMM_REPIN*, ROMM_VERIFY_AFTER_CONVERT, ROMM_DELETE_SOURCE_AFTER_VERIFY.

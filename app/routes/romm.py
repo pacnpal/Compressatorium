@@ -32,7 +32,6 @@ from routes.files import (
     detect_file_outputs,
     verifiable_tools,
 )
-from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
 from services.job_manager import job_manager
 from services.lock_manager import lock_manager
@@ -48,6 +47,15 @@ from services.romm import (
     RommError,
     RommNotConfigured,
     romm_client,
+)
+from services.romm import (
+    auto as romm_auto,
+)
+from services.romm import (
+    repin as romm_repin,
+)
+from services.romm import (
+    settings as romm_settings,
 )
 from services.subprocess_runner import (
     SIZE_RATIOS,
@@ -110,6 +118,32 @@ _IDENTITY_PROBE_SECONDS = 20
 _PLAN_BASE_S = 20
 _PLAN_PER_PATH_S = 0.5
 _PLAN_CEILING_S = 300
+
+
+async def _probe(func, *args, default):
+    """One blocking filesystem answer, bounded, with the safe answer on timeout.
+
+    Every stat, resolve and containment check in this module goes through here
+    rather than `run_in_threadpool`. The pool is shared and has no deadline, so
+    one unresponsive NFS/SMB/rclone mount both hangs the request and writes off
+    a worker per retry -- and several of these run while `_settle_lock` or the
+    sweep pause is held, which puts every other RomM operation behind them.
+    `bounded_path_check` gives each call its own disposable thread and a hard
+    bound.
+
+    *default* is what "the volume did not answer" means at that call site, and
+    it is always the conservative reading: not inside the volumes, still
+    locked, still queued -- never "go ahead".
+    """
+    try:
+        return await bounded_path_check(func, *args)
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm: %s did not answer in time; treating it as %r "
+            "(a volume is not answering)",
+            getattr(func, "__name__", func), default,
+        )
+        return default
 
 
 def _plan_deadline(paths: int) -> float:
@@ -568,8 +602,11 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if decision != QUEUE or not destination:
             skipped += 1
             continue
-        # Off the loop for the same reason as the batch resolve above.
-        if not await run_in_threadpool(is_within_configured_volumes, destination):
+        # Off the loop and bounded, for the same reason as the batch resolve
+        # above. Unreachable reads as "outside", which skips the row.
+        if not await _probe(
+            is_within_configured_volumes, destination, default=False,
+        ):
             skipped += 1
             continue
         # A live job already writing here owns the pending row for it, and
@@ -581,8 +618,8 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         # Not when the caller passed `output_paths`: that is the re-record after
         # a batch was accepted, so the job holding this destination is the very
         # one being recorded for.
-        if not payload.output_paths and await run_in_threadpool(
-            _destination_has_pending_job, destination,
+        if not payload.output_paths and await _probe(
+            _destination_has_pending_job, destination, default=True,
         ):
             skipped += 1
             continue
@@ -603,6 +640,14 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         rom, ids = roms_by_path[path]
         row_id = await run_in_threadpool(
             romm_repin.record, rom, destination, ids, payload.mode,
+            # A re-record for a path the queue chose runs AFTER the jobs were
+            # accepted, and on an idle queue a fast conversion can finish in
+            # between -- fingerprinting then saves the *finished* output as the
+            # "before" picture, the settler sees nothing change, and the row is
+            # abandoned. The caller only supplies `output_paths` for the
+            # redirect case, where the queue picked a free name, so the state
+            # before this conversion is "nothing there": "".
+            "" if payload.output_paths else None,
         )
         if row_id:
             recorded += 1
@@ -744,15 +789,19 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
             # them with a single matchable ISO. Reading those old parts as this
             # attempt's final output retired the row for a conversion that then
             # succeeded.
-            if await run_in_threadpool(_destination_has_pending_job, output_path):
+            # Unreachable reads as "a job still means to write here", which
+            # waits. Retiring a row on a guess is the irreversible direction.
+            if await _probe(
+                _destination_has_pending_job, output_path, default=True,
+            ):
                 return _Outcome.WAITING
             # A split build produced numbered parts and no bare output. The
             # conversion did run -- but RomM matches a ROM on one file's hash,
             # and a set of parts has no single digest to join on, so this row
             # can never settle. Say that now rather than waiting out the
             # abandon period and then reporting "output never appeared".
-            if await run_in_threadpool(
-                romm_repin.produced_companions, output_path, mode,
+            if await _probe(
+                romm_repin.produced_companions, output_path, mode, default=[],
             ):
                 await run_in_threadpool(
                     romm_repin.settle, row_id, "abandoned",
@@ -776,12 +825,11 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
     # cached, every later attempt would reuse that wrong digest and the ROM
     # could never be matched again. A locked source means the job is still
     # running, which is simply "not yet".
-    try:
-        _, locked = await run_in_threadpool(
-            lock_manager.check_file_status, output_path,
-        )
-    except OSError:
-        locked = False
+    # Unreachable reads as "still being written", which waits rather than
+    # hashing something that may be partial.
+    _, locked = await _probe(
+        lock_manager.check_file_status, output_path, default=(False, True),
+    )
     if locked:
         return _Outcome.WAITING
 
@@ -789,7 +837,7 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
     # sitting at this destination is still the OLD artifact. Hashing it now
     # would cache the wrong digest -- and because the hash is cached, the ROM
     # could never be matched once the real output replaced it.
-    if await run_in_threadpool(_destination_has_pending_job, output_path):
+    if await _probe(_destination_has_pending_job, output_path, default=True):
         return _Outcome.WAITING
 
     try:
@@ -1160,8 +1208,17 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
     # already read the old configuration and is about to ask *some* RomM to
     # match a digest, so the identity must not change underneath it.
     async with _settle_lock, romm_auto.paused():
+        submitted = patch.model_dump(exclude_unset=True)
         before = romm_settings.effective()
-        values = await romm_settings.save(patch.model_dump(exclude_unset=True))
+        # Decided, and acted on, BEFORE the new identity is persisted. The
+        # other order looked natural and was not recoverable: the save lands,
+        # the cleanup then fails (a locked database, a full volume), the
+        # request returns an error -- and a retry now compares the new values
+        # with themselves, concludes nothing moved, and leaves the previous
+        # instance's history and provider-id rows live against the new one,
+        # permanently. This way a failed cleanup persists nothing, so the retry
+        # sees the same move and does the same work.
+        #
         # Compare what the client and the path mapper actually use, not the
         # spelling: `RommClient` strips a trailing slash from the URL and the
         # library root is resolved with `realpath`, so saving
@@ -1169,7 +1226,11 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
         # via a symlink -- pointed at the identical instance while looking like
         # a move, and threw away the conversion history and every pending
         # metadata snapshot for nothing.
-        changed = await _identity_moved(before, values)
+        proposed = {
+            **before,
+            **{k: v for k, v in submitted.items() if k in _IDENTITY_FIELDS},
+        }
+        changed = await _identity_moved(before, proposed)
         cleared = await romm_auto.forget_converted_locked() if changed else 0
         if cleared:
             logger.info(
@@ -1194,7 +1255,16 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
                     "romm: retired %s pending re-pin row(s) belonging to the "
                     "previous RomM instance", retired,
                 )
+        # Last, so that everything above having succeeded is the precondition
+        # for the new identity being in force.
+        values = await romm_settings.save(submitted)
     return romm_settings.public(values)
+
+
+# The settings that decide *which* RomM and *which* library these records
+# belong to. A change to either invalidates the conversion history and every
+# pending re-pin row; nothing else does.
+_IDENTITY_FIELDS = ("url", "library_root")
 
 
 def _identity_changed(before: dict, after: dict, *, resolve: bool = True) -> bool:

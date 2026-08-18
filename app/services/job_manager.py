@@ -126,12 +126,20 @@ async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
     if not pending:
         return resolved
 
+    # The worker fills its own dict, and the caller only ever sees it once the
+    # worker is done. A timed-out `run_detached` abandons the *awaiter*, not
+    # the thread: it keeps running, and if it were writing into the map the
+    # reservation is using, one destination could compare lexically against an
+    # earlier spec and canonically against a later one -- so a symlink alias
+    # would slip through a check that is otherwise atomic under the lock.
+    produced: Dict[str, str] = {}
+
     def _resolve_all() -> None:
         for path in pending:
             try:
-                resolved[path] = os.path.realpath(path)
+                produced[path] = os.path.realpath(path)
             except OSError:
-                pass  # keep the lexical seed
+                pass  # leave the lexical seed in place
 
     try:
         await asyncio.wait_for(
@@ -144,6 +152,11 @@ async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
             len(pending),
             _CANONICAL_PROBE_SECONDS,
         )
+        # Deliberately NOT merging what the abandoned worker managed: the map
+        # must be frozen before it is used, and a half-applied one is exactly
+        # the mixture described above.
+        return resolved
+    resolved.update(produced)
     return resolved
 
 
@@ -225,7 +238,7 @@ class JobManager:
         # spellings of one file -- a symlinked directory and its target --
         # would each be accepted. Dropped when the job leaves the queue; only
         # live jobs are ever consulted.
-        self._output_keys: Dict[str, str] = {}
+        self._output_keys: Dict[str, Tuple[str, ...]] = {}
         # Jobs currently inside the verify phase, mapped to the monotonic clock
         # reading when that phase began. Verification emits no progress and can
         # legitimately run for many minutes, so the stalled-job warning reports
@@ -359,9 +372,10 @@ class JobManager:
         )
 
         self.jobs[job_id] = job
-        # The key this destination is claimed under, for the reservation that
-        # runs after this one. See `_output_keys`.
-        self._output_keys[job_id] = _canonical_path(output_path, resolved)
+        # Every key this job claims -- its destination and the sidecars the
+        # mode writes beside it -- for the reservation that runs after this
+        # one. See `_output_keys`.
+        self._output_keys[job_id] = self._reserved_keys(mode, output_path, resolved)
         if delete_on_verify and delete_snapshot:
             self._delete_plans[job_id] = delete_snapshot
         ticket = concurrency_manager.reserve_ticket(job_id)
@@ -518,6 +532,37 @@ class JobManager:
         )
 
     @staticmethod
+    def _companions(mode: ConversionMode, output_path: str) -> List[str]:
+        """The sibling files this mode writes beside *output_path*.
+
+        Pure path math (`companion_outputs` is documented as such), which is
+        what lets the reservation claim them: extractcd writes `Game.cue` *and*
+        `Game.bin`, and `romz_extract` can restore that same `Game.bin` as its
+        primary. Reserving primaries alone accepted both jobs, and the conflict
+        probe each caller runs beforehand cannot catch it -- that runs outside
+        `_create_lock`, so two submissions both pass it before either queues.
+        """
+        try:
+            tool = registry.for_mode(mode.value)
+            return list(tool.companion_outputs(output_path, mode.value))
+        except (KeyError, ValueError, OSError):
+            return []
+
+    def _reserved_keys(
+        self,
+        mode: ConversionMode,
+        output_path: str,
+        resolved: Optional[Mapping[str, str]] = None,
+    ) -> Tuple[str, ...]:
+        """Every canonical key a job writing *output_path* claims."""
+        keys = [_canonical_path(output_path, resolved)]
+        keys.extend(
+            _canonical_path(path, resolved)
+            for path in self._companions(mode, output_path)
+        )
+        return tuple(dict.fromkeys(keys))
+
+    @staticmethod
     def _derive_output(
         file_path: str, mode: ConversionMode, output_dir: Optional[str],
     ) -> str:
@@ -553,23 +598,27 @@ class JobManager:
             paths.append(file_path)
             explicit = spec.get("output_path")
             if explicit is not None:
-                paths.append(str(explicit))
+                destination = str(explicit)
+            else:
+                output_dir = spec.get("output_dir")
+                try:
+                    destination = self._derive_output(
+                        file_path,
+                        mode,
+                        str(output_dir) if output_dir is not None else None,
+                    )
+                except (KeyError, ValueError):
+                    continue
+            paths.append(destination)
+            # The sidecars count as claimed too, so they need keys as well.
+            paths.extend(self._companions(mode, destination))
+        for job in self.jobs.values():
+            if not job.output_path:
                 continue
-            output_dir = spec.get("output_dir")
-            try:
-                paths.append(self._derive_output(
-                    file_path,
-                    mode,
-                    str(output_dir) if output_dir is not None else None,
-                ))
-            except (KeyError, ValueError):
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 continue
-        paths.extend(
-            job.output_path
-            for job in self.jobs.values()
-            if job.output_path
-            and job.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
-        )
+            paths.append(job.output_path)
+            paths.extend(self._companions(job.mode, job.output_path))
         return await _resolve_paths_bounded(paths)
 
     def _resolve_output_locked(
@@ -659,22 +708,24 @@ class JobManager:
                 output_path=str(explicit) if explicit is not None else None,
                 resolved=resolved,
             )
-            key = _canonical_path(destination, resolved)
-            claimed_by = active.get(key)
-            if claimed_by is not None:
-                raise OutputClaimedError(
-                    f"Another queued job ({claimed_by}) is already writing "
-                    f"{os.path.basename(destination)}",
-                    claimed_by=claimed_by,
-                )
-            other = planned.get(key)
-            if other is not None:
-                raise OutputClaimedError(
-                    "Two files in this batch would write the same output: "
-                    f"{os.path.basename(other)} and "
-                    f"{os.path.basename(file_path)}",
-                )
-            planned[key] = file_path
+            # Destination *and* sidecars: a mode that writes `Game.cue` also
+            # writes `Game.bin`, which another mode can claim as its primary.
+            for key in self._reserved_keys(mode, destination, resolved):
+                claimed_by = active.get(key)
+                if claimed_by is not None:
+                    raise OutputClaimedError(
+                        f"Another queued job ({claimed_by}) is already writing "
+                        f"{os.path.basename(destination)}",
+                        claimed_by=claimed_by,
+                    )
+                other = planned.get(key)
+                if other is not None:
+                    raise OutputClaimedError(
+                        "Two files in this batch would write the same output: "
+                        f"{os.path.basename(other)} and "
+                        f"{os.path.basename(file_path)}",
+                    )
+                planned[key] = file_path
 
     def _active_output_map(
         self, resolved: Optional[Mapping[str, str]] = None,
@@ -684,22 +735,24 @@ class JobManager:
         Built once per batch rather than re-derived per spec: each entry costs
         a `realpath`, which is a blocking stat chain, and this runs under
         ``_create_lock`` on the event loop -- so the keys come from the
-        pre-flight in *resolved*. Primary outputs only -- companions are
-        covered by the conflict probe callers already run.
+        pre-flight in *resolved*. Includes each job's companion outputs:
+        `extractcd` writes a `.bin` beside its `.cue`, and another mode can
+        name that same `.bin` as its own destination.
         """
         active: Dict[str, str] = {}
         for job in self.jobs.values():
             if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 continue
             if job.output_path:
-                # The key the job was queued under, when it has one: the
+                # The keys the job was queued under, when it has them: the
                 # pre-flight map in *resolved* is older than any job queued
                 # since it was built, and falling back to lexical for those
                 # would miss an alias of a path already claimed.
-                key = self._output_keys.get(job.id)
-                if key is None:
-                    key = _canonical_path(job.output_path, resolved)
-                active.setdefault(key, job.id)
+                keys = self._output_keys.get(job.id)
+                if keys is None:
+                    keys = self._reserved_keys(job.mode, job.output_path, resolved)
+                for key in keys:
+                    active.setdefault(key, job.id)
         return active
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
