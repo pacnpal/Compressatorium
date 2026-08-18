@@ -233,6 +233,13 @@
         .map((e) => e.path);
       if (filePaths.length > 0) {
         datMatching.hydrateAndMatch(filePaths).catch(() => {});
+      } else {
+        // Entries on screen, but none the DAT matcher can identify -- a folder
+        // of subdirectories, archives, manifests or folded split sets. The
+        // zero-entry guard above doesn't fire and hydrateAndMatch() is never
+        // reached, so this is the third way the visible set can change without
+        // retiring a timer armed for the previous folder.
+        datMatching.cancelRetry();
       }
     }
   });

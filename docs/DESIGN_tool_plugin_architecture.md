@@ -1360,6 +1360,13 @@ This is a payload field, not a schema change.
   hash the newly-imported DAT could have identified has already gone out. A CHD
   sends up to three, so that is up to two avoidable disclosures per file. Each
   check is over the whole candidate set, and each is one indexed lookup.
+
+  That recheck is itself an await, so the stop conditions
+  (`_remote_pass_stopped`: the toggle, and the job's cancel event) are tested on
+  **both** sides of it — before, to stop a halted pass doing further work, and
+  again immediately before the request, which is the load-bearing half. A guard
+  that only preceded the recheck reintroduced, one await later, exactly the
+  window the recheck existed to close.
 - **Concurrent DAT imports have a boundary, and it is the transaction.** A match
   runs local-first, but the decision and the write are separate operations, so
   three windows exist between them: the file hash (seconds), the remote request
@@ -1477,7 +1484,11 @@ This is a payload field, not a schema change.
 
   Both non-cacheable exits carry it too — a size-capped result never read the
   container, but the embedded hashes it *did* recompute are exactly what proves
-  a swap to the scan's pruner.
+  a swap to the scan's pruner. Which is also why the scan stopped *deleting*
+  those rows outright: a cap is not evidence a file changed, and with a
+  recomputed hash in hand the capped case goes through the same same-domain
+  comparison as the outage case rather than dropping a valid identity for a
+  file nobody touched.
 
   It carries the **whole typed candidate set**, not just `file_sha1`, and the
   comparison keys on the *stored row's own* `match_type` rather than demanding

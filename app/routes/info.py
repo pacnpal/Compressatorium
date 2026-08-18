@@ -176,7 +176,7 @@ async def _scan_phase_dat_match(
         drop_if_content_changed,
         matching_available,
     )
-    from services.dat_store import dat_store
+    from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
 
     if not all_paths:
         return 0, 0
@@ -285,11 +285,21 @@ async def _scan_phase_dat_match(
                     # embedded-only) we cannot prove staleness, so the row
                     # stays: an unprovable suspicion is not worth the data loss.
                     await drop_if_content_changed(path, result)
+                elif result.get(CANDIDATE_HASHES_KEY) or result.get("file_hash"):
+                    # A size-capped recompute is non-cacheable, but it is no
+                    # longer evidence-free: a large CHD's embedded hashes are
+                    # read even when its container is not. Deleting on that
+                    # unconditionally threw away a valid remote identity for a
+                    # file nobody had touched, purely because the container was
+                    # over the cap -- so it goes through the same same-domain
+                    # comparison as the outage case and drops the row only when
+                    # a recomputed hash actually contradicts it.
+                    await drop_if_content_changed(path, result)
                 else:
                     # Non-cacheable recompute where the *file* is the problem
-                    # (size cap, hash unavailable): drop any stale prior row so
-                    # /dat/matches/lookup doesn't keep showing an outdated
-                    # match after a (forced) rescan.
+                    # and nothing was recomputed at all (hash unavailable):
+                    # drop any stale prior row so /dat/matches/lookup doesn't
+                    # keep showing an outdated match after a (forced) rescan.
                     await dat_store.delete_match(path)
                 if result.get("matched"):
                     matched += 1

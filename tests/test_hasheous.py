@@ -3523,3 +3523,146 @@ async def test_a_capped_file_still_carries_the_hashes_it_did_recompute(
     assert result[CANDIDATE_HASHES_KEY] == [(header, "chd_sha1")], (
         "the capped result dropped the embedded hashes it did recompute"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thirty-fourth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_switching_off_during_the_local_recheck_still_stops_the_pass(
+    hasheous_on, monkeypatch,
+):
+    """The recheck added in round 32 is an await, and opened a new window.
+
+    A guard that only preceded it let the operator switch the fallback off
+    while the local pass was running and still have the next hash go out --
+    one await later, the same gap the recheck itself was added to close.
+    """
+    header, data = "a" * 40, "b" * 40
+    sent = []
+
+    async def _remote(sha1):
+        sent.append(sha1)
+        return None
+
+    async def _local_recheck(_file_path, _candidates):
+        # The operator flips the toggle while this await is in flight.
+        monkeypatch.setattr(settings, "hasheous_enabled", False)
+        hasheous.set_enabled_override(None)
+        return None
+
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+    monkeypatch.setattr(dat_routes, "_local_lookup_match", _local_recheck)
+
+    match, consulted = await dat_routes._remote_lookup_match(
+        "/vol/game.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+    )
+
+    assert sent == [header], "a hash went out after the fallback was switched off"
+    assert match is None
+    assert consulted is None, "a pass stopped part-way must not be stamped complete"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_during_the_local_recheck_still_stops_the_pass(
+    hasheous_on, monkeypatch,
+):
+    """Cancellation gets the same treatment, for the same reason."""
+    header, data = "a" * 40, "b" * 40
+    sent = []
+    cancel = asyncio.Event()
+
+    async def _remote(sha1):
+        sent.append(sha1)
+        return None
+
+    async def _local_recheck(_file_path, _candidates):
+        cancel.set()
+        return None
+
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+    monkeypatch.setattr(dat_routes, "_local_lookup_match", _local_recheck)
+
+    match, consulted = await dat_routes._remote_lookup_match(
+        "/vol/game.chd",
+        [(header, "chd_sha1"), (data, "chd_data_sha1")],
+        cancel_event=cancel,
+    )
+
+    assert sent == [header]
+    assert match is None and consulted is None
+
+
+@pytest.mark.asyncio
+async def test_a_capped_rescan_keeps_a_hit_it_cannot_disprove(
+    scan_phase_stubs, monkeypatch,
+):
+    """A size cap is not evidence that the file changed.
+
+    With Hasheous off, a large CHD carrying a HASH badge produces a
+    non-cacheable size-cap result -- and that branch used to delete the row
+    outright, throwing away a valid identity for a file nobody had touched
+    just because the container was over the cap.
+    """
+    import routes.dat as dat_internal
+    from services.dat_store import CANDIDATE_HASHES_KEY, dat_store as global_dat_store
+
+    monkeypatch.setattr(global_dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(
+        global_dat_store, "get_matches_batch", lambda paths: {p: None for p in paths},
+    )
+
+    async def _capped(path, *, cancel_event=None):
+        return {
+            "path": path, "matched": False, "reason": "file too large",
+            CANDIDATE_HASHES_KEY: [("a" * 40, "chd_sha1")],
+        }
+
+    monkeypatch.setattr(dat_internal, "_match_single_file", _capped)
+    deleted = AsyncMock()
+    monkeypatch.setattr(global_dat_store, "delete_match", deleted)
+    # The row it must not lose: same embedded hash, so nothing is disproved.
+    monkeypatch.setattr(
+        global_dat_store, "get_match",
+        lambda _p: {"matched": True, "game_name": "Kept Game",
+                    "match_type": "chd_sha1", "file_hash": "a" * 40},
+    )
+
+    await scan_phase_stubs._scan_phase_dat_match("job-1", ["/vol/big.chd"], force=True)
+
+    deleted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_capped_rescan_still_drops_a_hit_it_can_disprove(
+    scan_phase_stubs, monkeypatch,
+):
+    """...and a capped file whose embedded hash *did* change still loses it."""
+    import routes.dat as dat_internal
+    from services.dat_store import CANDIDATE_HASHES_KEY, dat_store as global_dat_store
+
+    monkeypatch.setattr(global_dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(
+        global_dat_store, "get_matches_batch", lambda paths: {p: None for p in paths},
+    )
+
+    async def _capped(path, *, cancel_event=None):
+        return {
+            "path": path, "matched": False, "reason": "file too large",
+            CANDIDATE_HASHES_KEY: [("b" * 40, "chd_sha1")],
+        }
+
+    monkeypatch.setattr(dat_internal, "_match_single_file", _capped)
+    deleted = AsyncMock()
+    monkeypatch.setattr(global_dat_store, "delete_match", deleted)
+    monkeypatch.setattr(
+        global_dat_store, "get_match",
+        lambda _p: {"matched": True, "game_name": "Old Game",
+                    "match_type": "chd_sha1", "file_hash": "a" * 40},
+    )
+
+    await scan_phase_stubs._scan_phase_dat_match("job-1", ["/vol/big.chd"], force=True)
+
+    deleted.assert_awaited_once_with("/vol/big.chd")

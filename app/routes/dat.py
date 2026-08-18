@@ -1352,6 +1352,21 @@ async def _local_lookup_match(
     return None
 
 
+def _remote_pass_stopped(cancel_event: asyncio.Event | None) -> bool:
+    """True when the operator has asked the remote pass to stop.
+
+    Never asked, or stopped part-way: either way it was not a complete remote
+    check, so the caller must return without stamping one.
+
+    Cancellation counts for the same reason the toggle does. The outer job only
+    notices once ``_match_single_file`` returns, so without this a cancelled
+    scan kept sending a CHD's remaining candidate hashes -- disclosing them
+    after the operator asked it to stop, and paying a full timeout each on the
+    way out.
+    """
+    return not hasheous.enabled() or bool(cancel_event and cancel_event.is_set())
+
+
 async def _remote_lookup_match(
     file_path: str,
     candidates: list[tuple[str, str]],
@@ -1380,15 +1395,14 @@ async def _remote_lookup_match(
         # switches the fallback off mid-lookup would otherwise still have the
         # remaining candidates go out -- "off means nothing is sent" has to
         # hold for the request after the click, not just the next file.
-        if not hasheous.enabled() or (cancel_event and cancel_event.is_set()):
-            # Never asked, or stopped part-way: either way this was not a
-            # complete remote check, so it must not be stamped as one.
-            #
-            # Cancellation counts for the same reason the toggle does. The
-            # outer job only notices once _match_single_file returns, so
-            # without this a cancelled scan kept sending a CHD's remaining
-            # candidate hashes -- disclosing them after the operator asked it
-            # to stop, and paying a full timeout each on the way out.
+        # Two checks, one before this iteration's await and one after it.
+        # The early one keeps a stopped pass from doing further work at all;
+        # the later one is the load-bearing half, because the local recheck
+        # below is itself an await and a guard that only preceded it left a
+        # window where the operator could switch the fallback off (or cancel
+        # the job) and still have this hash go out -- reintroducing, one await
+        # later, the very gap the recheck was added to close.
+        if _remote_pass_stopped(cancel_event):
             return None, None
         if consulted:
             # Between requests, not only after the last one. Each lookup is an
@@ -1404,6 +1418,8 @@ async def _remote_lookup_match(
             local = await _local_lookup_match(file_path, candidates)
             if local is not None:
                 return local, hasheous.base_url()
+        if _remote_pass_stopped(cancel_event):
+            return None, None
         consulted = True
         # ponytail: unbounded concurrency. Each call is bounded by
         # hasheous_timeout, the bulk match job is already single-flight, and

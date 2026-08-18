@@ -74,6 +74,9 @@ class DATMatchingStore {
   // genuinely stale.
   _hydrateSeq = 0;
   _appliedSeq = 0;
+  // Orders /dat/stats responses against each other without claiming the
+  // matching policy changed. See refreshMatchingAvailability().
+  _statsSeq = 0;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
@@ -126,10 +129,23 @@ class DATMatchingStore {
     // otherwise arrive last and overwrite the authoritative state the PUT
     // just applied -- the panel snaps back to "off" and matchingAvailable
     // stays false, so browsing schedules nothing until some later refresh.
-    const generation = ++this._generation;
+    // Two counters, and deliberately not one. `_statsSeq` orders *these*
+    // requests against each other; `_generation` means "the matching policy
+    // changed, discard work decided under the old one". Bumping the generation
+    // on every call conflated them, which was harmless while this ran once at
+    // mount and stopped being harmless the moment it became a poll: a tick
+    // landing mid-`startMatchJob()` invalidated that job's results even though
+    // nothing about the provider had changed, and with no terminal job event
+    // coming, the badge stayed blank until unrelated work re-hydrated it.
+    const seq = ++this._statsSeq;
+    const generation = this._generation;
     try {
       const stats = await api.getDATStats();
-      if (generation !== this._generation) return this.matchingAvailable;
+      // Still discarded across a real policy change -- a toggle PUT applying
+      // while this was in flight is what the generation check was for.
+      if (seq !== this._statsSeq || generation !== this._generation) {
+        return this.matchingAvailable;
+      }
       const wasEnabled = this.stats?.hasheous_enabled;
       this.stats = stats;
       // Another tab (or an API client) can flip the provider under us. The
@@ -155,7 +171,9 @@ class DATMatchingStore {
         (stats?.total_dats ?? 0) > 0 || Boolean(stats?.hasheous_enabled);
       return this.matchingAvailable;
     } catch (_e) {
-      if (generation !== this._generation) return this.matchingAvailable;
+      if (seq !== this._statsSeq || generation !== this._generation) {
+        return this.matchingAvailable;
+      }
       this.matchingAvailable = false;
       return false;
     }
