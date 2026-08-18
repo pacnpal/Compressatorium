@@ -429,10 +429,74 @@
             <span>{fileBrowser.entriesError}</span>
           </div>
         {:else if !fileBrowser.loading && entries.length === 0 && romm.selectedPlatformId !== null}
-          <EmptyState
-            title="No matching ROMs on this volume"
-            description="RomM lists ROMs for this platform, but none of them resolve to a file inside a configured Compressatorium volume."
-          />
+          {@const diag = fileBrowser.rommDiagnostics}
+          {#if diag && diag.total > 0}
+            <div class="diag-empty">
+              <span class="diag-glyph" aria-hidden="true">∅</span>
+              <h3>No matching ROMs on this volume</h3>
+              <p>
+                RomM lists {diag.total} ROM{diag.total === 1 ? '' : 's'} for this platform,
+                but none resolved to a file on disk.
+              </p>
+              <dl class="diag-breakdown">
+                {#if diag.not_found > 0}
+                  <div class="diag-row">
+                    <dt>{diag.not_found}</dt>
+                    <dd>file not found on disk</dd>
+                  </div>
+                {/if}
+                {#if diag.outside_volumes > 0}
+                  <div class="diag-row">
+                    <dt>{diag.outside_volumes}</dt>
+                    <dd>path outside configured volumes</dd>
+                  </div>
+                {/if}
+                {#if diag.no_path > 0}
+                  <div class="diag-row">
+                    <dt>{diag.no_path}</dt>
+                    <dd>no usable path in ROM record</dd>
+                  </div>
+                {/if}
+                {#if diag.not_regular > 0}
+                  <div class="diag-row">
+                    <dt>{diag.not_regular}</dt>
+                    <dd>not a regular file or directory</dd>
+                  </div>
+                {/if}
+              </dl>
+              {#if diag.library_root || diag.volumes.length > 0}
+                <dl class="diag-config">
+                  {#if diag.library_root}
+                    <div class="diag-row">
+                      <dt>Library root</dt>
+                      <dd><code>{diag.library_root}</code></dd>
+                    </div>
+                  {/if}
+                  {#if diag.volumes.length > 0}
+                    <div class="diag-row">
+                      <dt>Volumes</dt>
+                      <dd><code>{diag.volumes.join(', ')}</code></dd>
+                    </div>
+                  {/if}
+                </dl>
+              {/if}
+              {#if diag.sample_paths.length > 0}
+                <details class="diag-samples">
+                  <summary>Sample paths attempted</summary>
+                  <ul>
+                    {#each diag.sample_paths as p (p)}
+                      <li><code>{p}</code></li>
+                    {/each}
+                  </ul>
+                </details>
+              {/if}
+            </div>
+          {:else}
+            <EmptyState
+              title="No matching ROMs on this volume"
+              description="RomM lists ROMs for this platform, but none of them resolve to a file inside a configured Compressatorium volume."
+            />
+          {/if}
         {:else}
           <FileList />
         {/if}
@@ -599,5 +663,96 @@
     height: 1px;
     background: var(--border-subtle);
     margin: var(--space-2) 0;
+  }
+
+  .diag-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-7) var(--space-4);
+    text-align: center;
+    color: var(--text-2);
+  }
+  .diag-glyph {
+    font-size: 36px;
+    color: var(--text-3);
+  }
+  .diag-empty h3 {
+    margin: 0;
+    font-size: var(--text-lg);
+    font-weight: var(--weight-semibold);
+    color: var(--text-1);
+  }
+  .diag-empty p {
+    margin: 0;
+    max-width: 44ch;
+    color: var(--text-2);
+  }
+  .diag-breakdown, .diag-config {
+    margin: var(--space-3) 0 0;
+    padding: var(--space-3);
+    border-radius: var(--radius-md);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    text-align: left;
+    width: 100%;
+    max-width: 400px;
+  }
+  .diag-breakdown .diag-row {
+    display: flex;
+    gap: var(--space-2);
+    padding: var(--space-1) 0;
+  }
+  .diag-breakdown dt {
+    font-weight: var(--weight-semibold);
+    color: var(--text-1);
+    min-width: 3ch;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .diag-breakdown dd { margin: 0; }
+  .diag-config { margin-top: var(--space-2); }
+  .diag-config .diag-row {
+    display: flex;
+    gap: var(--space-2);
+    padding: var(--space-1) 0;
+    flex-wrap: wrap;
+  }
+  .diag-config dt {
+    font-weight: var(--weight-medium);
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .diag-config dd { margin: 0; }
+  .diag-config code, .diag-samples code {
+    font-size: var(--text-xs);
+    background: var(--surface-3, var(--surface-2));
+    padding: 1px 4px;
+    border-radius: var(--radius-sm);
+    word-break: break-all;
+  }
+  .diag-samples {
+    margin-top: var(--space-2);
+    text-align: left;
+    width: 100%;
+    max-width: 400px;
+  }
+  .diag-samples summary {
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: var(--text-sm);
+  }
+  .diag-samples ul {
+    list-style: none;
+    padding: var(--space-2) 0 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .diag-samples li {
+    font-size: var(--text-xs);
+    color: var(--text-2);
   }
 </style>

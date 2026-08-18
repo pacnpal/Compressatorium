@@ -43,6 +43,7 @@ class FileBrowserStore {
   // backend returns the same DirectoryListing/FileEntry shape, so FileList,
   // FileRow, RowActionsMenu and ConvertPanel all work unchanged.
   rommPlatformId = $state(null);
+  rommDiagnostics = $state(null);
 
   // Entries
   entries = $state([]);
@@ -296,6 +297,7 @@ class FileBrowserStore {
       this.rommPlatformId = null;
       this.entries = [];
       this.entriesError = null;
+      this.rommDiagnostics = null;
       this._loadedPath = null;
       // ...and leave the RomM screen with it. Dropping catalog mode while the
       // view stays on `romm` left the platform toolbar sitting above unrelated
@@ -693,6 +695,7 @@ class FileBrowserStore {
     this.clearSelection();
     this.entries = [];
     this.entriesError = null;
+    this.rommDiagnostics = null;
     // Drop the memo of the last loaded directory so the refresh is not
     // collapsed as a duplicate of the listing we just discarded.
     this._loadedPath = null;
@@ -715,15 +718,18 @@ class FileBrowserStore {
     this._inflightListingPath = null;
     this.loading = true;
     this.entriesError = null;
+    this.rommDiagnostics = null;
     try {
       const data = await api.getRommRoms(platformId);
       if (this._listingRequestSeq !== myReq || this.rommPlatformId !== platformId) return;
       this.entries = data?.entries ?? [];
+      this.rommDiagnostics = data?.diagnostics ?? null;
       this._listingGeneration += 1;
     } catch (e) {
       if (this._listingRequestSeq !== myReq || this.rommPlatformId !== platformId) return;
       this.entriesError = e?.message ?? 'Failed to load RomM ROMs';
       this.entries = [];
+      this.rommDiagnostics = null;
     } finally {
       if (this._listingRequestSeq === myReq) this.loading = false;
       this._clampPage();
