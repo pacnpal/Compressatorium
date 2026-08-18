@@ -112,6 +112,20 @@
   queued re-match and says so in the log; those files keep their current
   verdicts until you browse them or run a rescan.
 
+- **Enabling Hasheous in one browser tab now reaches the others.** On a setup
+  with no DATs imported, a tab already sitting on the workspace had decided
+  nothing could identify files and never asked again — so turning the fallback
+  on elsewhere (or through the API) left that tab matching nothing until it was
+  reloaded or you opened the DAT Library in it. It re-checks on its own now,
+  and only while it has nothing to match with, so a configured install does no
+  extra work.
+
+- **A replaced Dolphin RVZ/WIA/GCZ no longer keeps the old game's badge.** The
+  fix below covered files identified by their own SHA1, but those formats are
+  matched on the disc hash the tool reports and the whole file is deliberately
+  never read — so there was no hash to compare and the stale badge survived. The
+  comparison now happens in whatever hash a match was recorded against.
+
 - **A file replaced after it was identified no longer keeps the old game's
   badge through a DAT import.** The re-match an import triggers recomputes the
   file's hash, but wasn't passing it on — and that hash is the only way the

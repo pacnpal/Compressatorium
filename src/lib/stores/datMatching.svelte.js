@@ -17,6 +17,13 @@ const ATTEMPT_RETRY_MS = 90_000;
 // otherwise re-spawn a no-op job every interval for as long as the tab is open.
 const MAX_AUTO_RETRIES = 2;
 
+// How often the workspace re-asks whether anything can answer a hash lookup,
+// while the answer is still "no". Only that state polls (see
+// watchMatchingAvailability), so this is the interval of an install that is
+// not matching anything anyway -- long enough to be free, short enough that
+// enabling Hasheous from another tab takes effect on its own.
+const AVAILABILITY_POLL_MS = 60_000;
+
 class DATMatchingStore {
   matches = new SvelteMap();
   matchingAvailable = $state(false);
@@ -67,6 +74,42 @@ class DATMatchingStore {
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
+  }
+
+  /**
+   * Keep re-checking availability for as long as nothing can answer a lookup.
+   *
+   * `refreshMatchingAvailability()` already knows how to absorb a provider
+   * flip made elsewhere -- another tab, an API client -- but on the workspace
+   * nothing was driving it after mount. A DAT-less install whose operator
+   * enabled Hasheous in a second tab sat at `matchingAvailable === false`, so
+   * every hydration returned before starting a job, until this tab happened to
+   * visit the DAT view or was reloaded.
+   *
+   * Polled only while unavailable, and stopped the moment something can
+   * answer: that is the sole state a stale reading changes behaviour in, so a
+   * configured install pays nothing. Returns a teardown for the caller's
+   * unmount.
+   */
+  watchMatchingAvailability(intervalMs = AVAILABILITY_POLL_MS) {
+    let timer = null;
+    const stop = () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    };
+    const tick = async () => {
+      if (this.matchingAvailable) {
+        stop();
+        return;
+      }
+      // Swallowed: a transient /dat/stats failure leaves matchingAvailable
+      // false, which is exactly the state that keeps this polling.
+      await this.refreshMatchingAvailability().catch(() => {});
+      if (this.matchingAvailable) stop();
+    };
+    timer = setInterval(tick, intervalMs);
+    tick();
+    return stop;
   }
 
   async refreshMatchingAvailability() {

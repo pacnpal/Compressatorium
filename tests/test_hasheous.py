@@ -2758,7 +2758,7 @@ async def test_a_stamped_miss_is_not_written_over_a_dat_that_just_landed(tmp_pat
     path = "/vol/late.chd"
     miss = {
         "path": path, "matched": False, "checked_remote": "https://hasheous.org",
-        CANDIDATE_HASHES_KEY: [known_sha1],
+        CANDIDATE_HASHES_KEY: [(known_sha1, "file_sha1")],
     }
     await store.set_match(path, dict(miss))
     assert store.get_match(path) is None, (
@@ -2794,7 +2794,8 @@ async def test_a_remote_hit_yields_to_a_dat_covering_another_candidate(tmp_path)
         "match_type": "chd_sha1", "file_hash": unknown_sha1, "source": "hasheous",
         # The header hash matched remotely; the DAT that landed knows the data
         # hash instead.
-        CANDIDATE_HASHES_KEY: [unknown_sha1, known_sha1],
+        CANDIDATE_HASHES_KEY: [(unknown_sha1, "chd_sha1"),
+                               (known_sha1, "chd_data_sha1")],
     }
     await store.set_match(path, dict(hit))
     assert store.get_match(path) is None, (
@@ -2818,7 +2819,7 @@ async def test_the_candidate_list_is_a_check_input_not_a_cached_field(tmp_path):
     path = "/vol/game.chd"
     await store.set_match(path, {
         "path": path, "matched": False, "checked_remote": "https://hasheous.org",
-        CANDIDATE_HASHES_KEY: ["a" * 40, "b" * 40],
+        CANDIDATE_HASHES_KEY: [("a" * 40, "chd_sha1"), ("b" * 40, "chd_data_sha1")],
     })
 
     cached = store.get_match(path)
@@ -2854,7 +2855,7 @@ async def test_the_route_hands_its_candidates_to_the_write_boundary(
     monkeypatch.setattr(hasheous, "lookup", AsyncMock(return_value=None))
     miss = await dat_routes._match_single_file("/vol/game.chd")
     assert miss["matched"] is False
-    assert miss[CANDIDATE_HASHES_KEY] == [header, data]
+    assert miss[CANDIDATE_HASHES_KEY] == [(header, "chd_sha1"), (data, "chd_data_sha1")]
 
     # The first candidate hits: the remote-hit exit still carries both.
     async def _hit(sha1):
@@ -2863,7 +2864,7 @@ async def test_the_route_hands_its_candidates_to_the_write_boundary(
     monkeypatch.setattr(hasheous, "lookup", _hit)
     hit = await dat_routes._match_single_file("/vol/game.chd")
     assert hit["matched"] is True
-    assert hit[CANDIDATE_HASHES_KEY] == [header, data]
+    assert hit[CANDIDATE_HASHES_KEY] == [(header, "chd_sha1"), (data, "chd_data_sha1")]
 
 
 # ---------------------------------------------------------------------------
@@ -3293,3 +3294,116 @@ async def test_an_outage_miss_still_carries_its_hash_through_the_shared_helper(
 
     assert result["error"] == dat_routes.HASHEOUS_ERROR
     assert result["file_hash"] == container
+
+
+# ---------------------------------------------------------------------------
+# Thirty-second review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_exhaustive_format_carries_its_own_typed_hash(
+    hasheous_on, monkeypatch,
+):
+    """Round 31 kept only ``file_sha1``, which an exhaustive tool never has.
+
+    Dolphin RVZ/WIA/GCZ report one disc SHA1 and the matcher deliberately
+    never reads the container, so the "carry the proof" fix skipped exactly
+    the formats whose embedded hash *is* the identity.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY
+
+    disc = "d" * 40
+
+    class _Dolphin:
+        embedded_hash_is_exhaustive = True
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(disc, "dolphin_disc_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Dolphin())
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    # Nothing may read the container for an exhaustive format.
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1",
+        AsyncMock(side_effect=AssertionError("read the whole file")),
+    )
+
+    result = await dat_routes._match_single_file("/vol/game.rvz", local_only=True)
+
+    assert result["matched"] is False
+    assert result[CANDIDATE_HASHES_KEY] == [(disc, "dolphin_disc_sha1")]
+    assert "file_hash" not in result, "an exhaustive format has no file-level hash"
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_rvz_loses_the_badge_its_disc_hash_no_longer_earns(tmp_path):
+    """...and the store can now act on it, because the domains agree.
+
+    The guard demanded ``match_type == "file_sha1"``, which is right for a CHD
+    (embedded hash stored, container hash recomputed -- different domains) and
+    wrong for an exhaustive tool, which recomputes the very hash it matched on.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY, DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.rvz"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Old Game",
+        "match_type": "dolphin_disc_sha1", "file_hash": "a" * 40,
+        "source": "hasheous",
+    })
+
+    # A local-only rematch of the replaced file: same domain, different hash.
+    await store.set_match(path, {
+        "path": path, "matched": False, "checked_remote": None,
+        CANDIDATE_HASHES_KEY: [("b" * 40, "dolphin_disc_sha1")],
+    })
+    assert store.get_match(path)["matched"] is False, (
+        "a replaced RVZ kept the previous game's badge"
+    )
+
+    # The unchanged file keeps its badge -- the guard must not become "always
+    # downgrade" now that it accepts more domains.
+    other = "/vol/kept.rvz"
+    await store.set_match(other, {
+        "path": other, "matched": True, "game_name": "Kept Game",
+        "match_type": "dolphin_disc_sha1", "file_hash": "c" * 40,
+        "source": "hasheous",
+    })
+    await store.set_match(other, {
+        "path": other, "matched": False, "checked_remote": None,
+        CANDIDATE_HASHES_KEY: [("c" * 40, "dolphin_disc_sha1")],
+    })
+    assert store.get_match(other)["game_name"] == "Kept Game"
+
+
+@pytest.mark.asyncio
+async def test_a_chd_container_hash_still_cannot_disprove_an_embedded_hit(tmp_path):
+    """The cross-domain refusal this widening must not lose.
+
+    A CHD hit is stored against its embedded ``chd_sha1``; a rescan recomputes
+    the *container* ``file_sha1``. Those differ for a file nobody touched, so
+    comparing them would delete valid badges -- which is the bug the original
+    ``match_type == "file_sha1"`` restriction was added to fix.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY, DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Kept Game",
+        "match_type": "chd_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    # The recompute offers only a container hash -- a different domain.
+    await store.set_match(path, {
+        "path": path, "matched": False, "checked_remote": None,
+        "file_hash": "f" * 40,
+        CANDIDATE_HASHES_KEY: [("f" * 40, "file_sha1")],
+    })
+
+    assert store.get_match(path)["game_name"] == "Kept Game", (
+        "a container hash was compared against an embedded one"
+    )

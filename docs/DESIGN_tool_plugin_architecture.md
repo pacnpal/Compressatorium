@@ -1449,15 +1449,39 @@ This is a payload field, not a schema change.
   an invalidation, which would serve a stale negative for any file the new DAT
   does cover — the trade the invalidation exists to avoid.
 
-  The unstamped miss must still **carry the recomputed file-level SHA1**
+  The unstamped miss must still **carry the recomputed hashes**
   (`_carrying_file_hash()`). "The DATs still don't know it" and "this is a
-  different file now" both reach the store as an unmatched result, and the hash
-  is the only thing that separates them: `_proves_content_changed()` compares it
-  against the stored one, and without it the row-two guard protects the badge of
-  a file that has been *replaced*, permanently — the job path never calls
-  `drop_if_content_changed()`, that is the scan's. The outage exit had carried
-  the hash for this exact reason since round 7; the local-only exit was written
-  without it, so one helper now serves both.
+  different file now" both reach the store as an unmatched result, and a
+  recomputed hash is the only thing that separates them:
+  `_proves_content_changed()` compares against the stored one, and without it
+  the row-two guard protects the badge of a file that has been *replaced*,
+  permanently — the job path never calls `drop_if_content_changed()`, that is
+  the scan's. The outage exit had carried the file-level hash for this reason
+  since round 7; the local-only exit was written without it, so one helper now
+  serves both.
+
+  It carries the **whole typed candidate set**, not just `file_sha1`, and the
+  comparison keys on the *stored row's own* `match_type` rather than demanding
+  `file_sha1`. That restriction existed for a real reason — a CHD hit is stored
+  against its embedded `chd_sha1` while a rescan recomputes the container's
+  `file_sha1`, and those differ for a file nobody touched, so comparing them
+  deleted valid badges. But it was too blunt: an *exhaustive* tool (Dolphin
+  RVZ/WIA/GCZ) recomputes the very hash it matched on, so the domains agree and
+  the comparison is sound — and such a format never computes a `file_sha1` at
+  all, so under the old rule a replaced RVZ could never be proven changed and
+  kept its previous game's badge for good. Keying on the stored domain admits
+  that case and still refuses the cross-domain one.
+- **The workspace re-checks matchability only while it has none.**
+  `refreshMatchingAvailability()` already absorbs a provider flip made
+  elsewhere (another tab, an API client) — it resets the match cache and the
+  attempt guard when `hasheous_enabled` changed under it — but nothing drove it
+  after mount, so a DAT-less install whose operator enabled Hasheous in a
+  second tab sat at `matchingAvailable === false` and started no jobs until
+  this tab visited the DAT view or reloaded.
+  `watchMatchingAvailability()` polls it, and *stops itself* the moment
+  something can answer a lookup: that is the only state where a stale reading
+  changes behaviour, so a configured install makes no request at all. The
+  workspace owns the teardown.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

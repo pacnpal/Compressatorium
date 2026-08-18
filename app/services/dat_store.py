@@ -26,11 +26,16 @@ from services.dat_parser import parse_dat
 
 logger = get_logger("dat_store")
 
-#: Transient key on a match dict: the candidate SHA1s the verdict was reached
-#: against. The route attaches it whenever the remote source took part, the
-#: write boundary revalidates the local index against it (see
-#: ``DATStore._local_index_now_covers``), and it is stripped before the row is
-#: persisted -- it is a check input, not part of the cached record.
+#: Transient key on a match dict: the candidate ``(sha1, match_type)`` pairs
+#: the verdict was reached from. Two guards at the write boundary read it --
+#: ``DATStore._local_index_now_covers`` (did a DAT import land mid-lookup?) and
+#: ``DATStore._proves_content_changed`` (is this a different file now?) -- and
+#: it is stripped before the row is persisted, being a check input rather than
+#: part of the cached record.
+#:
+#: Typed rather than a bare hash list because the second guard has to compare
+#: within the stored row's own hash domain, and a bare hash cannot say which
+#: domain it belongs to.
 CANDIDATE_HASHES_KEY = "candidate_hashes"
 
 
@@ -433,12 +438,45 @@ class DATStore:
         return not DATStore._proves_content_changed(existing, match)
 
     @staticmethod
+    def _recomputed_hash_in(match: dict, match_type: str) -> str | None:
+        """The recomputed hash in *match_type*'s domain, or None if there is none.
+
+        The typed candidates the route attached (``CANDIDATE_HASHES_KEY``) are
+        the general answer. The fallback covers the shape a result has when no
+        candidates rode along -- an unmatched result carrying only the
+        file-level hash, which is what the scan's ``drop_if_content_changed()``
+        hands over.
+        """
+        for sha1, kind in match.get(CANDIDATE_HASHES_KEY) or ():
+            if kind == match_type:
+                return sha1
+        if match_type == "file_sha1":
+            return match.get("file_hash")
+        return None
+
+    @staticmethod
     def _proves_content_changed(existing, match: dict) -> bool:
-        """True only when the recomputed hash demonstrably contradicts the row."""
-        new_hash = match.get("file_hash")
-        if not new_hash or existing.match_type != "file_sha1":
+        """True only when a recomputed hash in the row's OWN domain contradicts it.
+
+        Comparing across domains is meaningless: a CHD hit is stored against
+        its embedded ``chd_sha1`` while a rescan recomputes the container's
+        ``file_sha1``, and those differ for a file nobody has touched. That is
+        why this used to demand ``existing.match_type == "file_sha1"`` and
+        refuse everything else.
+
+        Refusing everything else was too blunt, though. An exhaustive tool
+        recomputes the *same* typed hash it matched on -- Dolphin's
+        ``dolphin_disc_sha1`` -- so the domains do agree and the comparison is
+        sound. Keying on the stored row's own ``match_type`` keeps the
+        cross-domain case out while letting that one in, which matters because
+        an exhaustive format has no ``file_sha1`` to fall back on: a replaced
+        RVZ could never be proven changed, and kept its previous game's badge
+        for good.
+        """
+        if not existing.file_hash or not existing.match_type:
             return False
-        return bool(existing.file_hash) and existing.file_hash != new_hash
+        recomputed = DATStore._recomputed_hash_in(match, existing.match_type)
+        return bool(recomputed) and recomputed != existing.file_hash
 
     # A row is a *remote* hit only if it says so. This is the one place the
     # question is answered, and it is answered from the payload the writer
@@ -491,8 +529,10 @@ class DATStore:
           exists and the remote answer would outrank it.
 
         ``candidate_hashes`` is the transient key the route attaches for
-        exactly this re-check (see :data:`CANDIDATE_HASHES_KEY`); ``file_hash``
-        is folded in so a hit stays covered even if that list is absent.
+        exactly this re-check (see :data:`CANDIDATE_HASHES_KEY`) -- typed
+        ``(sha1, match_type)`` pairs, of which only the hashes matter here;
+        ``file_hash`` is folded in so a hit stays covered even if that list is
+        absent.
 
         Skipping the write (rather than rewriting the payload) keeps DAT-record
         shape out of the store: the path is simply left uncached, and the next
@@ -504,7 +544,7 @@ class DATStore:
         """
         if not (match.get("checked_remote") or match.get("source") == "hasheous"):
             return False
-        hashes = list(match.get(CANDIDATE_HASHES_KEY) or ())
+        hashes = [sha1 for sha1, _kind in (match.get(CANDIDATE_HASHES_KEY) or ())]
         file_hash = match.get("file_hash")
         if file_hash and file_hash not in hashes:
             hashes.append(file_hash)

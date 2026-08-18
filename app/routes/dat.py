@@ -1290,37 +1290,50 @@ def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> d
     }
 
 
-def _carrying_file_hash(result: dict, candidates: list[tuple[str, str]]) -> dict:
-    """Attach the file-level SHA1, when one was computed, to an unmatched result.
+def _carrying_candidates(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """Tag a verdict with the typed hashes it was reached from.
 
-    It is the only evidence a later writer has that the file *changed*.
+    Two guards in the store read this, which is why it stays *typed*
+    ``(sha1, match_type)`` rather than a bare hash list:
+
+    * ``_local_index_now_covers()`` re-validates the local index against every
+      candidate inside the writing transaction. The local-first decision and
+      the cache write are separate operations and a DAT import can commit
+      between them, so a verdict the remote source took part in would otherwise
+      outrank a local identity that landed while the lookup was in flight.
+    * ``_proves_content_changed()`` needs to compare like with like. A hit is
+      stored against whichever hash matched -- ``file_sha1``, ``chd_sha1``,
+      ``dolphin_disc_sha1`` -- and comparing across domains is meaningless, so
+      it looks up the recomputed hash in the *stored* row's domain. A bare list
+      cannot answer that question.
+    """
+    return {**result, CANDIDATE_HASHES_KEY: list(candidates)}
+
+
+def _carrying_file_hash(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """An unmatched result that still carries the evidence of what the file *is*.
+
     ``dat_store._would_downgrade_remote_hit()`` refuses to overwrite a remote
-    hit with an unmatched result unless ``_proves_content_changed()`` can
-    compare the recomputed ``file_sha1`` against the stored one -- so a miss
-    that drops the hash leaves a replaced file wearing the previous game's
-    badge, with nothing left to ever correct it.
+    hit with an unmatched result unless ``_proves_content_changed()`` can find
+    a recomputed hash contradicting the stored one -- so a miss that drops its
+    hashes leaves a *replaced* file wearing the previous game's badge, with
+    nothing left to ever correct it.
+
+    Carries the whole typed set, not only the file-level SHA1: an exhaustive
+    tool (Dolphin RVZ/WIA/GCZ) never computes a ``file_sha1`` at all, so
+    keeping just that one left precisely the formats whose embedded hash *is*
+    the identity with no evidence at all. ``file_hash`` is still set from the
+    file-level candidate when there is one, because ``drop_if_content_changed()``
+    on the scan path reads that field directly.
 
     Shared by the two exits that return an unmatched result after computing
-    hashes: a remote outage, and a local-only rematch. Both had the same
-    hazard; only the first had the fix.
+    hashes: a remote outage, and a local-only rematch.
     """
+    result = _carrying_candidates(result, candidates)
     file_level = next((h for h, kind in candidates if kind == "file_sha1"), None)
-    if not file_level:
-        return result
-    return {**result, "file_hash": file_level}
-
-
-def _carrying_candidates(result: dict, candidates: list[tuple[str, str]]) -> dict:
-    """Tag a verdict with the hashes the cache write must re-validate it against.
-
-    The local-first decision and the cache write are separate operations, and a
-    DAT import can commit between them (see
-    ``dat_store.DATStore._local_index_now_covers``, which reads this inside the
-    writing transaction). Attached to *both* remote exits -- the hit and the
-    stamped miss -- because both are cacheable and both would otherwise outrank
-    a local identity that landed while the lookup was in flight.
-    """
-    return {**result, CANDIDATE_HASHES_KEY: [sha1 for sha1, _kind in candidates]}
+    if file_level:
+        result["file_hash"] = file_level
+    return result
 
 
 async def _local_lookup_match(
