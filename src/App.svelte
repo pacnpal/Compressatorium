@@ -127,11 +127,11 @@
     // as something can -- so a provider enabled from another tab or by an API
     // client reaches this one without a reload, and a configured install never
     // makes the request at all.
-    const stopAvailability = datMatching.watchMatchingAvailability();
+    datMatching.watchMatchingAvailability();
     jobs.connect();
     const stopRouter = startRouter();
     return () => {
-      stopAvailability();
+      datMatching.stopWatchingAvailability();
       stopRouter();
       jobs.dispose();
       jobToasts.dispose();

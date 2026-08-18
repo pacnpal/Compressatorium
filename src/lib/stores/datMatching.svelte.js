@@ -54,6 +54,8 @@ class DATMatchingStore {
   _attemptedPaths = Object.create(null);
   _retryTimer = null;
   _retryPaths = null;
+  // Runs only while nothing can answer a lookup (see watchMatchingAvailability).
+  _availabilityTimer = null;
   _autoRetries = 0;
   // The path set the last match job was started for, so a re-run of the same
   // visible page doesn't count as a new hydration and refill the retry budget.
@@ -88,28 +90,33 @@ class DATMatchingStore {
    *
    * Polled only while unavailable, and stopped the moment something can
    * answer: that is the sole state a stale reading changes behaviour in, so a
-   * configured install pays nothing. Returns a teardown for the caller's
-   * unmount.
+   * configured install pays nothing.
+   *
+   * A field plus methods rather than a closure returning its own teardown --
+   * the same shape `_retryTimer` already uses, so both of this store's timers
+   * are torn down the same way.
    */
   watchMatchingAvailability(intervalMs = AVAILABILITY_POLL_MS) {
-    let timer = null;
-    const stop = () => {
-      if (timer) clearInterval(timer);
-      timer = null;
-    };
-    const tick = async () => {
-      if (this.matchingAvailable) {
-        stop();
-        return;
-      }
-      // Swallowed: a transient /dat/stats failure leaves matchingAvailable
-      // false, which is exactly the state that keeps this polling.
-      await this.refreshMatchingAvailability().catch(() => {});
-      if (this.matchingAvailable) stop();
-    };
-    timer = setInterval(tick, intervalMs);
-    tick();
-    return stop;
+    this.stopWatchingAvailability();
+    this._availabilityTimer = setInterval(() => this._recheckAvailability(), intervalMs);
+    this._recheckAvailability();
+  }
+
+  /** Stop the availability watch. Idempotent; the workspace calls it on unmount. */
+  stopWatchingAvailability() {
+    if (this._availabilityTimer) clearInterval(this._availabilityTimer);
+    this._availabilityTimer = null;
+  }
+
+  async _recheckAvailability() {
+    if (this.matchingAvailable) {
+      this.stopWatchingAvailability();
+      return;
+    }
+    // Swallowed: a transient /dat/stats failure leaves matchingAvailable
+    // false, which is exactly the state that keeps this polling.
+    await this.refreshMatchingAvailability().catch(() => {});
+    if (this.matchingAvailable) this.stopWatchingAvailability();
   }
 
   async refreshMatchingAvailability() {
