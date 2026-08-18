@@ -4648,3 +4648,59 @@ async def test_platform_tool_ids_exclude_unavailable_tools() -> None:
         rows = await romm_routes.romm_platforms()
 
     assert "nsz" not in rows[0]["tool_ids"], rows
+
+
+@pytest.mark.asyncio
+async def test_a_readiness_probe_that_never_answers_does_not_hang_the_catalog() -> None:
+    """`is_ready()` is a coroutine, which is not the same as being bounded.
+
+    NSZ's answer is a recursive walk of every configured volume looking for
+    `prod.keys`, in a pooled worker with no deadline of its own. On an
+    NFS/SMB/rclone mount that has stopped answering it blocks in
+    uninterruptible I/O, so `/romm/platforms` never returns: the Library and
+    the automation editor sit loading forever, and every retry strands another
+    shared-pool worker. Expiring reports the tool unavailable — the same answer
+    a missing binary gets, and the right one for a tool whose prerequisites
+    cannot be read.
+    """
+    platforms = [{"id": 9, "name": "Switch", "slug": "switch"}]
+    nsz = registry.for_mode("nsz_compress")
+
+    async def _never(self) -> bool:
+        await asyncio.sleep(3600)
+        return True
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", "/data/library"), \
+            patch.object(romm_routes.romm_client, "platforms", return_value=platforms), \
+            patch("services.tools.registry.READY_PROBE_SECONDS", 0.05), \
+            patch.object(type(nsz), "is_ready", _never):
+        rows = await asyncio.wait_for(romm_routes.romm_platforms(), timeout=10)
+
+    assert rows, rows
+    assert "nsz" not in rows[0]["tool_ids"], rows
+
+
+@pytest.mark.asyncio
+async def test_the_sidebar_tool_list_is_bounded_too() -> None:
+    """`GET /api/tools` awaited each tool in turn, so one dead volume hung it.
+
+    The worse of the two, because it is the main app's tool list rather than a
+    RomM screen, and sequential: a single unresponsive mount held up every tool
+    that was perfectly fine behind it.
+    """
+    from routes import info as info_routes
+
+    nsz = registry.for_mode("nsz_compress")
+
+    async def _never(self) -> bool:
+        await asyncio.sleep(3600)
+        return True
+
+    with patch("services.tools.registry.READY_PROBE_SECONDS", 0.05), \
+            patch.object(type(nsz), "is_ready", _never):
+        result = await asyncio.wait_for(info_routes.list_tools(), timeout=10)
+
+    assert "nsz" in result["unavailable"], result
+    # ...and the tools behind it are still reported, rather than lost with it.
+    assert result["available"], result

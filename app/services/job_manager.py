@@ -34,7 +34,7 @@ from services.chdman import ConversionCancelled, chdman_service
 from services.disc_id import DiscIdStorageAbandoned
 from services.concurrency_manager import concurrency_manager
 from services.lock_manager import lock_manager
-from services.subprocess_runner import run_detached
+from services.subprocess_runner import ReadCancelled, run_detached
 from services.tools import ModeKind, registry
 from services.verification_store import verification_store
 from utils.delete_plan import build_delete_plan, build_delete_snapshot
@@ -175,20 +175,55 @@ async def _resolve_paths_bounded(paths: Iterable[str]) -> Dict[str, str]:
     except (asyncio.TimeoutError, OSError):
         logger.warning(
             "Canonicalising %d destination(s) did not finish in %.1fs; "
-            "reserving on lexical paths (a volume is not answering)",
+            "refusing the reservation (a volume is not answering)",
             len(pending),
             _CANONICAL_PROBE_SECONDS,
         )
-        # Deliberately NOT merging what the abandoned worker managed: the map
-        # must be frozen before it is used, and a half-applied one is exactly
-        # the mixture described above.
-        return resolved
+        # Refused, not degraded. Falling back to the lexical seeds hands two
+        # spellings of one file two different keys, so the check that exists to
+        # reject the second submission passes both -- see
+        # `DestinationUnresolvableError`. Nor is the partial result merged: the
+        # map must be frozen before it is used, and a half-applied one compares
+        # one destination lexically against an earlier spec and canonically
+        # against a later one.
+        raise DestinationUnresolvableError(
+            "The storage holding the destination stopped responding, so the "
+            "output paths could not be checked for collisions. Nothing was "
+            "queued; try again once the volume is back."
+        ) from None
     resolved.update(produced)
     return resolved
 
 
 # The statuses a job never leaves. Anything else is still in flight.
 _TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+
+class DestinationUnresolvableError(RuntimeError):
+    """Raised when a destination's canonical identity could not be established.
+
+    The reservation check is only atomic because every destination is reduced
+    to one key first. `realpath` is what makes two spellings of one file --
+    a symlinked library root and the path underneath it -- compare equal; the
+    lexical seed cannot, because it is the spelling.
+
+    Degrading to that seed when the bound expires looked conservative and is
+    the opposite. Two submissions naming one file through a link and through
+    its real path get *different* lexical keys, so both pass a check whose
+    whole purpose is to reject the second. When the mount recovers they write
+    the same file -- concurrently once MAX_CONCURRENT_JOBS is above one,
+    otherwise one over the other -- and with delete-on-verify both sources are
+    removed for the single artifact that survives.
+
+    So the reservation refuses instead. A volume that cannot answer a
+    `realpath` inside the bound is a volume the conversion was going to fail
+    on anyway; being told so at submit time is strictly better than finding out
+    afterwards, with one of the two inputs already gone.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
 
 
 class OutputClaimedError(ValueError):
@@ -677,9 +712,20 @@ class JobManager:
         except (asyncio.TimeoutError, OSError):
             logger.warning(
                 "Enumerating companion outputs did not finish in %.1fs; "
-                "reserving primaries only (a volume is not answering)",
+                "refusing the reservation (a volume is not answering)",
                 _CANONICAL_PROBE_SECONDS,
             )
+            # Same reasoning as the canonicalisation below: reserving the
+            # primaries only leaves the sidecars unclaimed, so a second
+            # submission whose *primary* differs but whose companions land on
+            # these passes a check meant to stop it. A cue sheet or a numbered
+            # split part written by two jobs is the same lost data as the image
+            # itself.
+            raise DestinationUnresolvableError(
+                "The storage holding the destination stopped responding, so "
+                "the files each job would write could not be listed. Nothing "
+                "was queued; try again once the volume is back."
+            ) from None
         # Snapshot, for the reason `_resolve_paths_bounded` explains: the
         # abandoned worker keeps writing into its own dict.
         found = dict(companions)
@@ -2444,6 +2490,48 @@ class JobManager:
         finally:
             self._semaphore.release()
 
+    async def _verify_target_bounded(self, tool, job, cancel_event) -> str | None:
+        """What to verify, resolved without letting a dead mount keep the job.
+
+        Ask the tool rather than assuming the planned path holds the artifact:
+        a split makeps3iso build writes `<iso>.0`/`.1`/… and no bare `.iso`, so
+        verifying `output_path` read a file that was never created and failed a
+        conversion that had in fact succeeded.
+
+        Bounded and detached because of *when* this runs. It sits between the
+        conversion finishing and `verify_timeout()` being resolved, so it is
+        ahead of every bound the verify itself carries — and the answer is a
+        stat of the output plus a scan for numbered parts, on storage that has
+        just taken a multi-gigabyte write and is therefore the likeliest thing
+        in the process to have stopped answering. Blocked here the job holds
+        its output lock and its source-directory lock, keeps `_verifying`
+        empty so the watchdog sees nothing to report, and with
+        MAX_CONCURRENT_JOBS at its default of 1 freezes every job behind it.
+
+        The cancel event is honoured for the same reason it is honoured by the
+        verify: a Cancel pressed while a mount is not answering must return
+        now, not after the probe bound expires. The probe thread is abandoned,
+        never the pool's — `run_detached` exists for exactly this.
+        """
+        try:
+            return await asyncio.wait_for(
+                run_detached(
+                    tool.verify_target, job.output_path, job.mode.value,
+                    cancel_event=cancel_event,
+                ),
+                timeout=_CANONICAL_PROBE_SECONDS,
+            )
+        except ReadCancelled:
+            # Cancel, not a verdict. Same translation the verify itself makes:
+            # nothing was judged, and the source must not be deleted on it.
+            raise ConversionCancelled("Conversion cancelled") from None
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                "Verification could not determine what to check "
+                f"in {_CANONICAL_PROBE_SECONDS:.0f}s "
+                "(the storage holding the output stopped responding)"
+            ) from None
+
     async def _process_job(self, job_id: str):
         """Process a single conversion job."""
         job = self.jobs.get(job_id)
@@ -2918,8 +3006,8 @@ class JobManager:
                     # `<iso>.0`/`.1`/… and no bare `.iso`, so verifying
                     # `output_path` read a file that was never created and
                     # failed a conversion that had in fact succeeded.
-                    verify_path = await run_in_threadpool(
-                        tool.verify_target, job.output_path, job.mode.value,
+                    verify_path = await self._verify_target_bounded(
+                        tool, job, cancel_event,
                     )
                     if not verify_path:
                         raise RuntimeError(

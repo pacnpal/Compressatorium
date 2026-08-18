@@ -23,6 +23,7 @@ from models import (
 )
 from services.archive import archive_service
 from services.job_manager import (
+    DestinationUnresolvableError,
     OutputClaimedError,
     QueueBackpressureError,
     job_manager,
@@ -945,6 +946,13 @@ async def create_job(request: JobCreateRequest):
         # retry or skip; a 500 said "server broke" for something working
         # exactly as designed.
         raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except DestinationUnresolvableError as exc:
+        # Transient and on the storage's side, not the caller's: the volume
+        # holding the destination did not answer inside the probe bound, so the
+        # collision check could not be made and nothing was queued. 503 says
+        # "come back", which is the truth -- a 500 would read as a bug and a
+        # 400 as a bad request.
+        raise HTTPException(status_code=503, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 
@@ -1082,6 +1090,13 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
         # retry or skip; a 500 said "server broke" for something working
         # exactly as designed.
         raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except DestinationUnresolvableError as exc:
+        # Transient and on the storage's side, not the caller's: the volume
+        # holding the destination did not answer inside the probe bound, so the
+        # collision check could not be made and nothing was queued. 503 says
+        # "come back", which is the truth -- a 500 would read as a bug and a
+        # 400 as a bad request.
+        raise HTTPException(status_code=503, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 

@@ -1393,11 +1393,26 @@ mount stays quiet. So the reservation now does **no filesystem work at all**.
 collects them with the sources and every live job's output, and resolves the lot
 in one `run_detached` thread under `asyncio.wait_for(_CANONICAL_PROBE_SECONDS)`.
 The result is a `{path: canonical}` map, pre-seeded lexically
-(`normpath(abspath())`) so a bound that expires part-way keeps whatever did
-answer. `_canonical_path(path, resolved)` reads that map and never touches the
-disk; a submit against a dead mount is reserved on lexical keys (exact-path
-collisions still caught, symlink aliases not) and the job then fails on its own
-bound, instead of taking the process with it.
+(`normpath(abspath())`). `_canonical_path(path, resolved)` reads that map and
+never touches the disk.
+
+**An expired bound refuses the submit — it does not degrade to the seed.**
+Completing on lexical keys reads as the conservative choice and is the
+opposite. The lexical seed is the path's *spelling*, and `realpath` is the only
+thing that makes two spellings of one file compare equal; so a destination named
+through a symlinked library root and one named through the path underneath it
+get two different keys, and both submissions pass a check whose entire purpose
+is to reject the second. When the mount comes back they write the same file —
+concurrently once `MAX_CONCURRENT_JOBS` is above one, otherwise one over the
+other — and with delete-on-verify both sources are removed for the single
+artifact that survives. `_resolve_paths_bounded` therefore raises
+**`DestinationUnresolvableError`**, which the submit routes answer **503**: the
+volume is not answering, nothing was queued, come back. A volume that cannot
+complete a `realpath` inside the bound is one the conversion would have failed
+on anyway, and being told at submit time costs a retry rather than a file. The
+partial result is not merged either — a half-applied map compares one
+destination lexically against an earlier spec and canonically against a later
+one, which is the same hole with extra steps.
 
 **A new caller of the reservation must pass a map from `_reservation_keys`.**
 Calling `_canonical_path` without one is the blocking form, and it is only
@@ -1407,7 +1422,17 @@ correct off the event loop.
 lock: it is **not** pure path math for every tool -- makeps3iso probes the disk
 for its numbered split parts -- so the pre-flight returns a `_Reservation`
 carrying both the canonical map and each destination's full key set, and the
-locked check reads them.
+locked check reads them. That pass refuses on the same terms: reserving the
+primaries alone leaves the sidecars unclaimed, so a second submission whose
+primary differs but whose companions land on these gets through, and a cue sheet
+or a numbered split part written by two jobs is the same lost data as the image.
+
+`_derive_output` is pure string work only because **every tool's `output_path()`
+is stem + suffix arithmetic with no stat**, and three hot paths now depend on
+that: this pre-flight, `registry.mode_is_automatable`, and the status route that
+serves it. A tool whose `output_path` probed the disk would put filesystem I/O
+back under `_create_lock` and on the event loop -- so keep it pure, and put the
+probing in `detect_output` / `verify_target`, which have bounded seams.
 
 Moving the resolution ahead of the lock opens one gap the map alone cannot
 close: two submissions can both pre-resolve before either takes the lock, so
@@ -1714,6 +1739,51 @@ database: `normalize_rule` drops such a rule, and the editor omits the mode
 (served through `/romm/status`'s `automatable_modes`, since the derivation
 needs the tool's `output_path` and cannot be mirrored in JS). Extract modes are
 a *separate*, UI-side exclusion — they terminate, and rules using them work.
+
+#### Asking a tool whether it can run (`registry.tool_is_ready`)
+
+`ToolPlugin.is_ready()` is a coroutine, which makes it look bounded and does
+not make it so. NSZ's delegates to a pooled `keys_available()` that walks every
+configured volume looking for `prod.keys`, with no deadline of its own: on an
+NFS/SMB/rclone mount that has stopped answering it blocks in uninterruptible
+I/O and holds a shared-pool worker while every caller waits behind it.
+
+The callers all fan out over the whole registry, so the cost is a whole screen.
+`GET /api/tools` — the sidebar's tool list — awaited each tool *in turn*, so one
+dead volume held up every tool that was fine behind it.
+`GET /api/romm/platforms` gathered them, leaving the Library and the automation
+editor loading forever. Retry either and each attempt stranded another worker.
+
+**Ask through `registry.tool_is_ready(tool)`, never `tool.is_ready()`
+directly.** It bounds the probe at `READY_PROBE_SECONDS` (20s — generous,
+because the honest answer for NSZ is a real walk of a possibly large share) and
+reports **not ready** when it expires: the same answer a missing binary gets,
+and the right one, since a tool whose prerequisites cannot be read cannot
+convert. `registry.ready_tool_ids()` is the fan-out form, concurrent rather
+than sequential. The blocked thread is not freed — Python can abandon the
+awaiter, never the OS thread — but the caller is, which is what a person is
+waiting on. The RomM sweep's `_ready_bounded` is a thin alias kept for its
+local consequence: the sweep holds `_sweep_lock` throughout, so a hang there
+also blocks previews, manual runs, rule edits and settings saves.
+
+#### Resolving what to verify (`_verify_target_bounded`)
+
+`verify_target()` answers "which file actually holds this conversion's output"
+— for makeps3iso, a stat of the bare ISO plus a scan for numbered split parts.
+Cheap, and dangerously placed: it runs after the conversion and *before*
+`verify_timeout()` is resolved, so it sits ahead of every bound the verify
+itself carries, on storage that has just taken a multi-gigabyte write and is
+therefore the likeliest thing in the process to have stopped answering.
+
+Blocked there the job holds its output lock and its source-directory lock,
+`_verifying` is still empty so the watchdog has nothing to report, and at the
+default `MAX_CONCURRENT_JOBS` of 1 the whole queue stops. So it goes through
+`run_detached` under `asyncio.wait_for` — an abandoned disposable thread rather
+than a pooled worker — and takes the job's `cancel_event`, because a Cancel
+pressed while a mount is silent must return now rather than after the probe
+bound. An expired bound fails the job with a message naming the storage; a
+cancel raises `ConversionCancelled`, the same translation the verify makes, so
+nothing is judged and the source is not deleted on it.
 
 #### What counts as a source (`registry.mode_input_kind`)
 

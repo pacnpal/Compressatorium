@@ -747,25 +747,15 @@ async def _probe(func, *args, default):
 async def _ready_bounded(tool) -> bool:
     """Is this tool usable here, without risking the sweep on a dead volume?
 
-    `is_ready()` is async but not therefore safe: NSZ's delegates to a pooled
-    `keys_available()` that walks every configured volume looking for
-    `prod.keys`, and that walk has no deadline. The sweep holds `_sweep_lock`
-    throughout, so an unresponsive mount blocks previews, manual runs, rule
-    edits and settings saves behind it while stranding a shared worker.
-
-    A bound that expires answers *not ready*, which skips the platform with a
-    reason the editor shows -- the same answer a genuinely missing binary gets,
-    and the right one, since a tool whose keys cannot be read cannot convert.
+    Delegates to :meth:`ToolRegistry.tool_is_ready`, which is where the bound
+    and the reasoning live now that the two routes that fan out over the whole
+    registry need the same thing. Kept as a name here because the *consequence*
+    is local: the sweep holds `_sweep_lock` throughout, so an unresponsive
+    mount would block previews, manual runs, rule edits and settings saves
+    behind it — and not-ready skips the platform with a reason the editor
+    shows.
     """
-    try:
-        return bool(await asyncio.wait_for(tool.is_ready(), _VOLUME_PROBE_SECONDS))
-    except (asyncio.TimeoutError, OSError):
-        logger.warning(
-            "romm_auto: readiness check for %s did not finish in %ss; treating "
-            "it as not ready (a volume is not answering)",
-            getattr(tool, "id", tool), _VOLUME_PROBE_SECONDS,
-        )
-        return False
+    return await registry.tool_is_ready(tool)
 
 
 async def _within_volumes_bounded(path: str) -> bool:

@@ -92,6 +92,49 @@
 
 ### Fixed
 
+- **Your saved API token is no longer wiped by saving a metadata setting.**
+  The Metadata card's Save correctly sent only its own fields, but the shared
+  success handler still cleared the Connection card's token box and its "clear
+  token" tick. So typing a replacement token, then saving a metadata toggle
+  before pressing Save on the connection, discarded it — and RomM shows an API
+  token once, when you create it, so for most people that meant issuing a new
+  one and updating anything else that used it. The buffers are now cleared only
+  by the save that actually submits them.
+
+- **The Library and the tool sidebar no longer hang forever when a mount stops
+  responding.** Switch (nsz) reports whether it can run by searching every
+  configured volume for your `prod.keys`, and that search had no time limit: on
+  an NFS/SMB/rclone share that had gone quiet it never came back. The RomM
+  platform list and the main tool list both wait for it, so both screens sat
+  loading indefinitely, and every reload made it worse. Each check is now
+  bounded — a tool that cannot answer in time is reported unavailable, the same
+  as one whose program is missing — and the tool list asks them all at once
+  instead of one after another, so a single slow volume no longer delays the
+  tools behind it.
+
+- **A conversion whose storage disappears at the finish line now fails instead
+  of freezing the queue.** After converting, Compressatorium asks the tool which
+  file to verify — for a split PS3 build that means checking for the bare ISO
+  and then for its numbered parts. That question ran with no time limit, on
+  storage that had just taken a multi-gigabyte write, while the job still held
+  its locks; with the default of one job at a time, everything queued behind it
+  stopped too, and Cancel did nothing. It is now bounded and cancellable: the
+  job fails with a message naming the storage, and Cancel stops it immediately
+  without treating the conversion as failed verification (so your source is
+  never deleted on it).
+
+- **Two conversions can no longer be sent to the same file when a volume is
+  slow.** Before queueing, Compressatorium reduces every destination to one
+  canonical name so that the same file reached two ways — through a symlinked
+  library root and through the real path underneath it — is recognised as one
+  destination. When the volume was too slow to answer, it used to fall back to
+  comparing the paths as typed, which is exactly the comparison that cannot see
+  the two are the same: both submissions were accepted, and once the mount
+  recovered they wrote the same file. With delete-after-verify that removed both
+  sources for the single file that survived. Submitting now fails cleanly
+  instead ("the storage stopped responding, nothing was queued") — a retry costs
+  you a moment, the old behaviour cost a game.
+
 - **A scheduled RomM rule set to Overwrite or Write-alongside no longer
   reconverts your library on every single run.** Both policies are defined by
   what they do to an *occupied* destination — Overwrite reuses it, Write-alongside

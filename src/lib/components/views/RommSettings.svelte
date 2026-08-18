@@ -77,8 +77,18 @@
   async function save(body, message) {
     try {
       await romm.saveSettings(body);
-      token = '';
-      clearToken = false;
+      // Reset the credential buffers only when the request actually carried
+      // them. They belong to the Connection card, and the Metadata card's Save
+      // deliberately submits neither -- so clearing them here discarded a
+      // replacement token the operator had typed and not yet saved. RomM shows
+      // an API token once, at creation, so that is frequently a token nobody
+      // can get back: the operator has to generate another one and update
+      // anything else using it. The body is the authority on what was sent,
+      // rather than a flag each call site has to remember to pass.
+      if ('token' in body || 'clear_token' in body) {
+        token = '';
+        clearToken = false;
+      }
       toast.success(message);
       onsaved?.();
     } catch (e) {

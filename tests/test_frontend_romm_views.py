@@ -136,6 +136,27 @@ process.stdout.write(JSON.stringify({
   // What the Connection card would send is unchanged — this is about which
   // button sends which fields, not about forbidding connection edits.
   connection_keys: Object.keys(patch()).sort(),
+  // ...and the buffers the save did not carry are still there to be saved.
+  token_after: token,
+  clear_after: clearToken,
+}));
+"""
+
+
+_CONNECTION_SAVE = """
+token = 'rmm_new_credential';
+await handleSave();
+process.stdout.write(JSON.stringify({
+  submitted: __saved, token_after: token, clear_after: clearToken,
+}));
+"""
+
+
+_CLEAR_TOKEN_SAVE = """
+clearToken = true;
+await handleSave();
+process.stdout.write(JSON.stringify({
+  submitted: __saved, token_after: token, clear_after: clearToken,
 }));
 """
 
@@ -159,6 +180,39 @@ def test_saving_metadata_does_not_submit_the_connection_buffers(tmp_path):
     # The Connection card still owns those fields.
     assert "url" in data["connection_keys"], data
     assert "library_root" in data["connection_keys"], data
+
+
+def test_a_metadata_save_does_not_discard_the_typed_token(tmp_path):
+    """The credential buffers belong to the card that submits them.
+
+    Splitting the patch fixed *what is sent*; the shared success handler still
+    cleared the token buffer and the "clear token" tick on every save. So
+    saving a metadata toggle wiped a replacement token typed next door and not
+    yet submitted — and RomM shows an API token once, at creation, so it is
+    usually not recoverable: the operator has to issue a new one and update
+    whatever else was using it.
+    """
+    data = _run(tmp_path, _SETTINGS, _METADATA_SAVE)
+
+    sent = data["submitted"][0]
+    assert "token" not in sent and "clear_token" not in sent, sent
+    assert data["token_after"] == "rmm_half_typed", data
+    assert data["clear_after"] is False, data
+
+
+def test_a_connection_save_still_clears_the_credential_buffers(tmp_path):
+    """Once submitted, the token must not linger in the component.
+
+    The reset is what stops a saved credential sitting in a field for the rest
+    of the session and being re-submitted by the next save.
+    """
+    saved = _run(tmp_path, _SETTINGS, _CONNECTION_SAVE)
+    assert saved["submitted"][0]["token"] == "rmm_new_credential", saved
+    assert saved["token_after"] == "", saved
+
+    cleared = _run(tmp_path, _SETTINGS, _CLEAR_TOKEN_SAVE)
+    assert cleared["submitted"][0]["clear_token"] is True, cleared
+    assert cleared["clear_after"] is False, cleared
 
 
 def test_both_save_buttons_wait_for_the_settings_to_load(tmp_path):

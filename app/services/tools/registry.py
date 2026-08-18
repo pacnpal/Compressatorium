@@ -7,14 +7,25 @@ explicitly in ``__init__.py``.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
+from logging_setup import get_logger
 from models import InputKind
 from utils.path_utils import match_extension
 
 if TYPE_CHECKING:
     from .base import ToolPlugin
     from .spec import ModeSpec
+
+
+logger = get_logger("tools.registry")
+
+# How long a tool gets to answer "can I run here?" before it is treated as
+# unavailable. Generous, because the honest answer for NSZ is a recursive walk
+# of every configured volume looking for `prod.keys`, which on a healthy but
+# large SMB share is not instant. Still a bound: see `tool_is_ready`.
+READY_PROBE_SECONDS = 20.0
 
 
 class ToolRegistry:
@@ -52,6 +63,54 @@ class ToolRegistry:
 
     def spec(self, mode: str) -> ModeSpec:
         return self.for_mode(mode).spec(mode)
+
+    async def tool_is_ready(self, tool: ToolPlugin) -> bool:
+        """Can this tool run here — without hanging the caller if a mount cannot say?
+
+        ``is_ready()`` is a coroutine, which makes it look safe, and it is not.
+        NSZ's delegates to a pooled ``keys_available()`` that walks every
+        configured volume looking for ``prod.keys``, and that walk has no
+        deadline of its own: on an NFS/SMB/rclone mount that has stopped
+        answering it blocks in uninterruptible I/O, holding a shared-pool
+        worker, and every caller waits behind it forever.
+
+        The callers are all user-facing and all fan out over the whole
+        registry, so the cost is the whole screen: ``GET /api/tools`` (the
+        sidebar's tool list) awaits each tool in turn, and
+        ``GET /api/romm/platforms`` gathers them, so the Library and the
+        automation editor never finish loading. Repeat the request and each
+        attempt strands another worker.
+
+        Expiring answers **not ready**, which is the same answer a missing
+        binary gets and the right one here: a tool whose prerequisites cannot
+        be read cannot convert. The blocked thread is not freed — Python can
+        abandon the awaiter, never the OS thread — but the caller is, which is
+        the part a person is waiting on.
+
+        One seam rather than a bound per call site, so a future caller of
+        ``is_ready()`` is covered by using the registry the way every other
+        dispatch already does.
+        """
+        try:
+            return bool(await asyncio.wait_for(tool.is_ready(), READY_PROBE_SECONDS))
+        except (asyncio.TimeoutError, OSError):
+            logger.warning(
+                "readiness check for %s did not finish in %ss; treating it as "
+                "not ready (a volume is not answering)",
+                getattr(tool, "id", tool), READY_PROBE_SECONDS,
+            )
+            return False
+
+    async def ready_tool_ids(self) -> list[str]:
+        """The ids of every registered tool that can actually run here.
+
+        Concurrent rather than sequential: these are independent probes, and
+        run in turn they add up — one slow volume delayed every tool behind it
+        even when nothing was wrong with them.
+        """
+        tools = self.all()
+        ready = await asyncio.gather(*(self.tool_is_ready(t) for t in tools))
+        return [tool.id for tool, ok in zip(tools, ready, strict=True) if ok]
 
     def mode_supports_verify(self, mode: str) -> bool:
         """Whether this mode's output can be verified after conversion.

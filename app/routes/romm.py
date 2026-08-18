@@ -312,10 +312,11 @@ async def romm_platforms() -> list[dict]:
     # prod.keys reports NSZ unavailable everywhere else (GET /api/tools hides
     # it in the sidebar), so offering an NSZ rule in the automation editor
     # would queue jobs that fail at runtime, on a schedule.
-    ready = await asyncio.gather(*(t.is_ready() for t in registry.all()))
-    all_tool_ids = [
-        tool.id for tool, ok in zip(registry.all(), ready, strict=True) if ok
-    ]
+    # Through the registry's bounded seam, not `is_ready()` directly: NSZ's
+    # walks every configured volume for `prod.keys` with no deadline, so one
+    # unresponsive mount left the Library and the automation editor loading
+    # forever and stranded a shared-pool worker per attempt.
+    all_tool_ids = await registry.ready_tool_ids()
     out = [
         {
             "id": p.get("id"),
