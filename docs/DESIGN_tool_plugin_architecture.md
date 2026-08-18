@@ -1290,6 +1290,16 @@ This is a payload field, not a schema change.
   hostile or broken server can drip just as easily. `_opener` must therefore
   keep its `HTTPSHandler(context=_ssl_context())` — rebuilding it without that
   removes the protection silently, so a test pins the wiring.
+
+  Two things sit outside the deadline, both deliberately. A peer that drips
+  one TLS *handshake record* at a time inside the remaining budget is not
+  bounded, and **DNS is not bounded by `hasheous_timeout` at all** —
+  `getaddrinfo` runs before the socket exists and ignores socket timeouts. The
+  resolver bounds itself (`/etc/resolv.conf`: glibc defaults to 5s x 2
+  attempts per nameserver) and, unlike a drip, it *raises* — so it opens the
+  cooldown and the rest of a bulk job short-circuits instead of stalling one
+  file at a time. Closing either gap means leaving urllib or resolving on an
+  abandonable thread; neither is worth a fifth deadline mechanism here.
 - **The toggle persists before it applies.** `PUT /api/dat/hasheous` writes the
   preference first and only then flips the in-process override. The other order
   meant a failed write (locked SQLite, full disk) left the process sending

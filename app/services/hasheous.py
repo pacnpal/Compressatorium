@@ -216,6 +216,15 @@ class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
     means leaving urllib. It is called out in the design doc rather than
     silently implied.
 
+    What the deadline does NOT cover is DNS: ``urllib`` resolves the hostname
+    before this socket exists, and ``getaddrinfo`` ignores socket timeouts. A
+    stalled resolver is still bounded -- by ``/etc/resolv.conf`` (glibc default
+    5s x 2 attempts per nameserver), not by ``hasheous_timeout`` -- and it
+    *raises*, so it opens the cooldown and the rest of a scan short-circuits.
+    That is the difference from a dripping server, which never raises at all.
+    Bounding it properly would mean resolving on an abandonable thread; the
+    trade is documented rather than taken.
+
     ``dup()`` is abstract on ``ssl.SSLSocket`` upstream (CPython raises
     ``NotImplementedError``), hence the pylint waiver: nothing here duplicates
     the socket, and overriding it would only re-raise the same error.

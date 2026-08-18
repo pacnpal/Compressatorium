@@ -369,8 +369,12 @@ def _resolve_and_group_paths(
 @router.post("/dat/match-batch")
 async def match_batch(request: MatchBatchRequest):
     """Match multiple files against imported DATs."""
-    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
-        return {"results": {p: {"path": p, "matched": False} for p in request.paths}}
+    # NOT an early return. Cached hits stay valid when the provider that
+    # produced them is switched off -- cached_result_usable() says so, and
+    # /dat/matches/lookup returns them -- so answering "unmatched" before
+    # consulting the cache erased every persisted badge for a DAT-less library
+    # that turned Hasheous off. The gate belongs on new computation only.
+    can_match = matching_available(await run_in_threadpool(dat_store.has_dats))
 
     # Resolve all paths and check volume membership in a single thread-pool
     # call to avoid blocking the async event loop with filesystem I/O.
@@ -395,8 +399,13 @@ async def match_batch(request: MatchBatchRequest):
         if cached_result_usable(cached_result):
             for original_path in original_paths:
                 results[original_path] = cached_result
-        else:
+        elif can_match:
             to_compute.append(normalized_path)
+        else:
+            # Nothing can answer a new lookup, but that is not a fact about
+            # this file, so it is reported unmatched and not cached.
+            for original_path in original_paths:
+                results[original_path] = {"path": original_path, "matched": False}
 
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
@@ -521,11 +530,9 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
     if not request.paths:
         return {"status": "idle", "results": {}}
 
-    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
-        return {
-            "status": "idle",
-            "results": {p: {"path": p, "matched": False} for p in request.paths},
-        }
+    # Same reasoning as /dat/match-batch: read the cache first, gate only the
+    # work. Returning early here hid valid persisted hits from the client.
+    can_match = matching_available(await run_in_threadpool(dat_store.has_dats))
 
     normalized_to_originals, denied_normalized = await run_in_threadpool(
         _resolve_and_group_paths, request.paths,
@@ -550,6 +557,10 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
         if cached_result_usable(cached_entry):
             for original_path in original_paths:
                 results[original_path] = cached_entry
+            continue
+        if not can_match:
+            for original_path in original_paths:
+                results[original_path] = {"path": original_path, "matched": False}
             continue
         # Existence check happens inside the job loop so a missing file
         # doesn't fail the whole request, it just gets a matched=false

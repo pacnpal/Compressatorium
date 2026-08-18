@@ -20,6 +20,7 @@ import urllib.request
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import BackgroundTasks
 
 # Import the SAME module object ``routes.dat`` holds, not ``app.services.hasheous``.
 # Those are two distinct module objects under this suite's import layout, and
@@ -1899,4 +1900,46 @@ async def test_concurrent_toggles_leave_stored_and_live_state_agreeing(monkeypat
 
     assert stored[dat_routes.HASHEOUS_PREF_KEY]["enabled"] is hasheous.override(), (
         "persisted value and live override disagree"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sixteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_batch_routes_serve_cached_hits_with_matching_unavailable(
+    tmp_path, isolated_store, monkeypatch
+):
+    """Turning Hasheous off must not hide badges a DAT-less library already has.
+
+    Both batch entry points returned "unmatched" for every path *before*
+    reading the cache, even though cached_result_usable() keeps hits valid
+    regardless of the current provider and /dat/matches/lookup returns them.
+    The client-side half of this was fixed earlier; this is the server half.
+    """
+    iso = tmp_path / "game.iso"
+    iso.write_bytes(b"content")
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+    # No DATs imported and Hasheous off: nothing can answer a NEW lookup.
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: False)
+    hasheous.set_enabled_override(False)
+
+    await isolated_store.set_match(str(iso), {
+        "path": str(iso), "matched": True, "game_name": "Cached Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    batch = await dat_routes.match_batch(dat_routes.MatchBatchRequest(paths=[str(iso)]))
+    assert batch["results"][str(iso)]["game_name"] == "Cached Game", (
+        "match-batch hid a valid cached hit"
+    )
+
+    job = await dat_routes.match_batch_job(
+        dat_routes.MatchBatchRequest(paths=[str(iso)]), BackgroundTasks(),
+    )
+    assert job["status"] == "idle"
+    assert job["results"][str(iso)]["game_name"] == "Cached Game", (
+        "match-batch/job hid a valid cached hit"
     )
