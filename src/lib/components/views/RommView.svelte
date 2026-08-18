@@ -457,6 +457,12 @@
                     <dd>no usable path in ROM record</dd>
                   </div>
                 {/if}
+                {#if diag.not_readable > 0}
+                  <div class="diag-row">
+                    <dt>{diag.not_readable}</dt>
+                    <dd>file not readable (permissions or stale mount)</dd>
+                  </div>
+                {/if}
                 {#if diag.not_regular > 0}
                   <div class="diag-row">
                     <dt>{diag.not_regular}</dt>
@@ -484,7 +490,7 @@
                 <details class="diag-samples">
                   <summary>Sample paths attempted</summary>
                   <ul>
-                    {#each diag.sample_paths as p (p)}
+                    {#each diag.sample_paths as p, i (i)}
                       <li><code>{p}</code></li>
                     {/each}
                   </ul>

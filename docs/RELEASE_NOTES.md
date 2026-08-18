@@ -90,6 +90,12 @@
   converted, how much is left, and an estimate of the space converting the rest
   would reclaim, using the same size-ratio table the progress bar estimates from.
 
+- **RomM path resolution diagnostics.** When no ROMs from a platform resolve to
+  files on disk, the empty state now shows a breakdown of why each ROM was
+  dropped — file not found, path outside configured volumes, unreadable
+  (permissions or stale mount), or no usable path in the ROM record — along with
+  the configured library root, volumes, and sample paths that were attempted.
+
 ### Fixed
 
 - **A conversion can no longer be re-matched as the wrong game.** When two

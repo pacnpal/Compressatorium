@@ -2535,7 +2535,7 @@ async def test_romm_listing_includes_directory_records(tmp_path: Path) -> None:
             patch.object(
                 romm_routes, "is_within_configured_volumes", return_value=True,
             ):
-        entries = romm_routes._build_entries(roms, "ps3")
+        entries, _diag = romm_routes._build_entries(roms, "ps3")
 
     assert len(entries) == 1, entries
     assert entries[0].type == "directory"

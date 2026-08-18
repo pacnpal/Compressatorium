@@ -122,6 +122,7 @@ class RommDiagnostics(BaseModel):
     no_path: int = 0
     outside_volumes: int = 0
     not_found: int = 0
+    not_readable: int = 0
     not_regular: int = 0
     sample_paths: list[str] = []
     library_root: str = ""

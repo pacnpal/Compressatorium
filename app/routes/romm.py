@@ -434,8 +434,13 @@ def _build_entries(
             continue
         try:
             stat = os.stat(path)
-        except OSError:
+        except FileNotFoundError:
             diag.not_found += 1
+            if len(diag.sample_paths) < _MAX_SAMPLES:
+                diag.sample_paths.append(path)
+            continue
+        except OSError:
+            diag.not_readable += 1
             if len(diag.sample_paths) < _MAX_SAMPLES:
                 diag.sample_paths.append(path)
             continue
@@ -491,9 +496,9 @@ def _build_entries(
     if dropped:
         logger.info(
             "romm: %d/%d ROMs dropped (no_path=%d outside_volumes=%d "
-            "not_found=%d not_regular=%d)",
+            "not_found=%d not_readable=%d not_regular=%d)",
             dropped, diag.total, diag.no_path, diag.outside_volumes,
-            diag.not_found, diag.not_regular,
+            diag.not_found, diag.not_readable, diag.not_regular,
         )
     return entries, diag
 
