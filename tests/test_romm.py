@@ -2331,6 +2331,25 @@ async def test_forget_converted_lets_a_rule_run_again(
 
 
 @pytest.mark.asyncio
+async def test_job_manager_rechecks_tool_delete_safety() -> None:
+    """The last line of defence before a source is unlinked.
+
+    Both plan sites check `delete_on_verify_is_safe`, but a job can reach the
+    manager without passing either -- restored queue state, a hand-edited rule
+    blob. A Wii U `noverify` conversion passing only the structural check must
+    not be allowed to delete a 25 GB source.
+    """
+    from services.tools import registry as tool_registry
+
+    tool = tool_registry.for_mode("jwud_compress")
+    assert tool.delete_on_verify_is_safe("jwud_compress", "noverify") is False
+    assert tool.delete_on_verify_is_safe("jwud_compress", None) is True
+    # The mode itself advertises the capability -- which is exactly why the
+    # spec check alone was not enough to stop the delete.
+    assert tool_registry.spec("jwud_compress").supports_delete_on_verify is True
+
+
+@pytest.mark.asyncio
 async def test_a_queued_conversion_that_never_ran_is_retried(
     settings_db, tmp_path: Path,
 ) -> None:
@@ -2407,6 +2426,22 @@ async def test_romm_listing_includes_directory_records(tmp_path: Path) -> None:
     assert entries[0].type == "directory"
     assert entries[0].size == 1234
     assert "makeps3iso" in (entries[0].convertible_by or [])
+
+
+def test_redirect_origin_ignores_a_spelled_out_default_port() -> None:
+    """`https://romm` and `https://romm:443` are the same origin.
+
+    Refusing that would break an ordinary RomM behind a proxy that spells the
+    port out, while a scheme downgrade must still be refused.
+    """
+    origin_of = romm_service._SameOriginRedirectHandler._origin_of
+
+    assert origin_of("https://romm/api") == origin_of("https://romm:443/api")
+    assert origin_of("http://romm/api") == origin_of("http://romm:80/api")
+    # Still different origins.
+    assert origin_of("https://romm/api") != origin_of("http://romm:80/api")
+    assert origin_of("https://romm:8443/api") != origin_of("https://romm:443/api")
+    assert origin_of("https://romm/api") != origin_of("https://evil/api")
 
 
 def test_composite_modes_are_narrowed_per_platform() -> None:

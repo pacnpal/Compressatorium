@@ -2384,13 +2384,26 @@ class JobManager:
                 # keeps the source. One block runs it either way, so a verified
                 # output means the same thing however it was requested.
                 if job.delete_on_verify or job.verify_after:
-                    if (
-                        job.delete_on_verify
-                        and not registry.spec(job.mode.value).supports_delete_on_verify
+                    # Both halves of the contract, re-asked here because this is
+                    # where the source actually gets unlinked. The plan sites
+                    # (`routes/convert.py`, `romm_auto.normalize_rule`) check the
+                    # same pair, but a job can reach this point without passing
+                    # either -- restored queue state, a hand-edited rule blob, a
+                    # future caller. `supports_delete_on_verify` says the mode
+                    # can offer it at all; `delete_on_verify_is_safe` says THIS
+                    # job can, given its compression, and that is the one that
+                    # stops a Wii U `noverify` conversion from deleting a 25 GB
+                    # source on a structural check.
+                    if job.delete_on_verify and not (
+                        registry.spec(job.mode.value).supports_delete_on_verify
+                        and registry.for_mode(job.mode.value).delete_on_verify_is_safe(
+                            job.mode.value, job.compression,
+                        )
                     ):
                         raise RuntimeError(
-                            "Delete-on-verify is only supported for "
-                            "create/copy/Dolphin/3DS/Switch-compress modes"
+                            "Delete-on-verify is not safe for this conversion: "
+                            "the mode or its compression settings cannot prove "
+                            "the output before the source is removed"
                         )
                     if cancel_event.is_set():
                         raise ConversionCancelled("Conversion cancelled")

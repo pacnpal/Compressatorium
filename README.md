@@ -436,7 +436,6 @@ reach is picked up on the next one.
 | Run automatically | off | Master switch for scheduled sweeps. |
 | Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. Off silences both the manual and the automatic path. |
 | Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |
-| Retire unmatched after | 7 days | Give up on a saved re-pin whose output never appeared. |
 
 `ROMM_AUTO_CONVERT_INTERVAL_MINUTES`, `ROMM_AUTO_CONVERT_MAX_PER_RUN`,
 `ROMM_VERIFY_AFTER_CONVERT` and `ROMM_DELETE_SOURCE_AFTER_VERIFY` seed the

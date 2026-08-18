@@ -1417,8 +1417,16 @@ caller that wants the check on its own — an unattended sweep proving its outpu
 before it walks away — sets **`verify_after`** instead. One block in
 `_process_job` runs the verification for either flag, so a verified output means
 the same thing however it was requested, and only `delete_on_verify` reaches the
-delete half. Both are gated on `ModeSpec.supports_delete_on_verify`, the
-registry's answer to "can this mode's output be verified at all".
+delete half.
+
+The capability gate applies to the delete, not to the check. `verify_after`
+simply runs the tool's verification and keeps the source, so any mode whose tool
+can verify may ask for it. `delete_on_verify` must additionally satisfy
+**both** `ModeSpec.supports_delete_on_verify` ("can this mode's output be
+verified at all") and `ToolPlugin.delete_on_verify_is_safe(mode, compression)`
+("can *this* job's settings prove it") — re-asked in `_process_job` itself,
+because that is where the source is unlinked and a job can arrive there without
+having passed either plan-time check.
 
 ### 3.4 `registry.py`
 

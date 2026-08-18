@@ -431,12 +431,32 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # because that is what the caller submits and what the created jobs report
     # back; the destination is what a row is identified by.
     recorded_paths: dict[str, str] = {}
+
+    def _resolve_batch(paths: list[str]) -> dict[str, str | None]:
+        """Volume check and canonical key for each path, in one worker hop.
+
+        Both stat every path component, and the volume check stats each
+        configured volume on top -- per submitted path. Done inline in an
+        `async def`, one unresponsive NFS/SMB/rclone mount blocks the event
+        loop for the whole request instead of one worker, which is the failure
+        every other probe in this file already avoids.
+        """
+        return {
+            candidate: (
+                os.path.realpath(candidate)
+                if is_within_configured_volumes(candidate) else None
+            )
+            for candidate in paths
+        }
+
+    resolved_keys = await run_in_threadpool(_resolve_batch, payload.paths)
     for path in payload.paths:
-        if not is_within_configured_volumes(path):
+        # Same canonical key the index was built with (see roms_by_local_path).
+        key = resolved_keys.get(path)
+        if key is None:
             skipped += 1
             continue
-        # Same canonical key the index was built with (see roms_by_local_path).
-        rom = platform_roms.get(os.path.realpath(path))
+        rom = platform_roms.get(key)
         if not rom:
             skipped += 1
             continue
@@ -468,7 +488,8 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if decision != QUEUE or not destination:
             skipped += 1
             continue
-        if not is_within_configured_volumes(destination):
+        # Off the loop for the same reason as the batch resolve above.
+        if not await run_in_threadpool(is_within_configured_volumes, destination):
             skipped += 1
             continue
         if await run_in_threadpool(

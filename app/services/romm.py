@@ -125,14 +125,35 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     to another host is not a RomM we should be talking to.
     """
 
+    # Normalised so the *same* origin written two ways still matches. A
+    # redirect from `https://romm` to `https://romm:443/...` is same-origin by
+    # every definition that matters, but the raw netloc differs -- refusing it
+    # would break a perfectly ordinary RomM behind a proxy that spells the port
+    # out. Scheme still has to match exactly, so an HTTPS-to-HTTP downgrade is
+    # still a cross-origin refusal.
+    _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+    @classmethod
+    def _origin_of(cls, url: str) -> tuple[str, str, int | None]:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        try:
+            port = parsed.port
+        except ValueError:  # malformed port -- never matches a real origin
+            return (scheme, (parsed.hostname or "").lower(), -1)
+        return (
+            scheme,
+            (parsed.hostname or "").lower(),
+            port or cls._DEFAULT_PORTS.get(scheme),
+        )
+
     def __init__(self, origin_url: str) -> None:
         super().__init__()
-        parsed = urllib.parse.urlsplit(origin_url)
-        self._origin = (parsed.scheme.lower(), parsed.netloc.lower())
+        self._origin = self._origin_of(origin_url)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urllib.parse.urlsplit(newurl)
-        target = (parsed.scheme.lower(), parsed.netloc.lower())
+        target = self._origin_of(newurl)
         if parsed.scheme.lower() not in ("http", "https") or target != self._origin:
             logger.warning(
                 "romm: refusing cross-origin redirect to %r", parsed.netloc or newurl,

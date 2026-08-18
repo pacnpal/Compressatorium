@@ -103,6 +103,12 @@
   retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
   anything yet), and there is a **Forget history** button on each platform for
   when you restore from a backup or move outputs aside by hand.
+- **Delete-after-verify is now re-checked where the source is actually
+  deleted.** Both places that *plan* a conversion asked whether the tool
+  considers the settings safe enough to justify deleting the original — but the
+  job runner itself only checked whether the mode supports the option at all.
+  A Wii U conversion run with verification off could pass the structural check
+  and remove the only copy. The runner now asks both questions.
 - **A conversion that lands on a different path than planned no longer stamps
   its metadata onto the wrong file.** Planning predicts where the conversion
   will write; if something else takes that path before the batch is accepted,
@@ -121,6 +127,16 @@
 - **Leaving the RomM view during its first load no longer drops RomM rows into
   the ordinary file browser.** The startup sequence kept running after the view
   was gone.
+- **A RomM catalog refresh now honours the auto-refresh switch.** Listing a
+  platform stats every ROM in it, and the periodic refresh was skipping the
+  suppression check the directory listing gets — so turning auto-refresh off
+  during a conversion did not stop the most expensive refresh there is.
+- **A redirect that spells out the default port is no longer refused.**
+  `https://romm` and `https://romm:443` are the same origin; an HTTPS-to-HTTP
+  downgrade is still refused.
+- **In the RomM catalog the filename now sits under the game title** rather
+  than beside it, and a row missing both a title and a filename can no longer
+  break the sort for the whole listing.
 - **Saving RomM settings reads the catalog once, not twice** — even toggling a
   metadata checkbox was costing two full remote catalog reads and two
   filesystem scans of the library.

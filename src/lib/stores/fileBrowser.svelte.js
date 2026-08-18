@@ -165,8 +165,8 @@ class FileBrowserStore {
           // with the curated `display_name` (and the backend already orders
           // them that way); filesystem rows have none, so this is the plain
           // filename there and ordinary listings are unchanged.
-          av = (a.display_name || a.name).toLowerCase();
-          bv = (b.display_name || b.name).toLowerCase();
+          av = (a.display_name || a.name || '').toLowerCase();
+          bv = (b.display_name || b.name || '').toLowerCase();
       }
       if (av < bv) return -1 * order;
       if (av > bv) return 1 * order;
@@ -361,6 +361,12 @@ class FileBrowserStore {
     // different rows than the ones on screen. Selection is deliberately NOT
     // cleared here, so a background/auto refresh keeps the user's picks.
     if (this.rommPlatformId !== null) {
+      // Same auto-refresh suppression the directory path gets below. Listing a
+      // platform stats every ROM in it, so a periodic refresh while a
+      // conversion runs is the most expensive thing this store does — exactly
+      // what turning auto-refresh off is asking it not to do. A forced refresh
+      // (navigation, a mutation) still goes through.
+      if (!force && jobs.hasActive && !this.autoRefresh) return;
       await this._loadRommEntries(this.rommPlatformId);
       return;
     }

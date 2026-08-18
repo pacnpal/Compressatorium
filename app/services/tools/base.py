@@ -52,6 +52,12 @@ class ToolPlugin(Protocol):
     # Dolphin's recompressed RVZ/WIA/GCZ. False (default) for formats whose own
     # file SHA1 may legitimately be indexed (e.g. a CHD-container DAT).
     embedded_hash_is_exhaustive: bool
+    # Library-manager platform slugs whose media this tool handles, empty for
+    # "no opinion". Part of the contract, not just BaseTool's default:
+    # `ToolRegistry.narrow_to_platform` reads it off every registered tool, so
+    # an implementation that satisfies the protocol without it would fail there
+    # rather than at registration. See BaseTool.platform_slugs for the semantics.
+    platform_slugs: frozenset[str]
 
     def spec(self, mode: str) -> ModeSpec:
         """Return the ModeSpec for a mode this tool owns."""
