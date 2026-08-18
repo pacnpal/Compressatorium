@@ -295,6 +295,12 @@ async def lifespan(app: FastAPI):
     if romm_cfg.get("url"):
         logger.info("RomM integration configured (%s)", romm_cfg["url"])
 
+    # How a conversion *ended* is only knowable while the queue remembers the
+    # job, and its history is capped and in-memory. An automation rule needs
+    # that answer weeks later to know whether a ROM was really converted, so
+    # it listens for the outcome and writes it down as each job finishes.
+    job_manager.add_terminal_listener(romm_auto.note_job_finished)
+
     # The unattended-conversion scheduler always runs; it checks the master
     # switch each tick, so toggling auto-convert in the app takes effect
     # without a restart.  It sleeps first, so startup never queues anything.
@@ -310,6 +316,21 @@ async def lifespan(app: FastAPI):
             )
 
     romm_auto_task.add_done_callback(_log_romm_auto_error)
+
+    # The re-pin settler runs beside it: the request-driven pass skips rows it
+    # cannot finish inside a browser request, and without this nothing would
+    # ever finish a large output's hash.
+    romm_settle_task = asyncio.create_task(romm.settle_forever())
+    app.state.background_tasks.add(romm_settle_task)
+    romm_settle_task.add_done_callback(app.state.background_tasks.discard)
+
+    def _log_romm_settle_error(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "RomM re-pin settler exited unexpectedly", exc_info=t.exception(),
+            )
+
+    romm_settle_task.add_done_callback(_log_romm_settle_error)
 
     # Auto-sync MAMERedump DATs on startup.  Two independent triggers:
     #   1. MAMEREDUMP_AUTO_SYNC=true AND the store is empty  → fresh-install sync.

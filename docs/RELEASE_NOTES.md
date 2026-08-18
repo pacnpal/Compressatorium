@@ -299,6 +299,55 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **A conversion that failed is remembered as failed, even after a restart.**
+  Each rule records what it has produced so Overwrite and Write-alongside
+  happen once per ROM, and that record asked the job queue how the job ended —
+  which only works while the queue still remembers it. Once the job aged out of
+  the history, or the app restarted, the only evidence left was the destination
+  having changed, and a *failed* conversion changes it too (it can delete the
+  file it was replacing, or leave half of one). Those ROMs were then skipped by
+  every later run until you pressed **Forget history**. The outcome is now
+  written down the moment the job finishes.
+- **A filter pattern that repeats the same character several times over is
+  refused too.** The save-time check caught nested repetition — `(a+)+` — but
+  not `a*a*a*a*b`, which has no nesting and still takes minutes on one long
+  filename, with the scheduler blocked behind it. Patterns you would actually
+  write are unaffected: two repeats only count when they sit next to each other
+  *and* could both match the same character.
+- **Unticking every weekday now means "never on a schedule".** It was read as
+  "every day", so a rule you deliberately parked ran daily — unattended, and
+  with delete-after-verify if that was set. The editor says what an empty
+  selection does, and **Run now** still works.
+- **A manual Preview or Run now can no longer queue past the configured
+  maximum.** The optional limit those buttons accept was used verbatim, so it
+  could exceed *Max conversions per run* rather than narrow it; a non-numeric
+  value failed the request with a server error instead of a validation
+  message.
+- **Losing a race for an output path now reads as a conflict, not a crash.**
+  The queue refuses the second of two submissions that resolved the same
+  destination — that is the safety check working — but it surfaced as HTTP 500.
+  It is now a 409 the caller can retry or skip, and an automation sweep says
+  the destination was claimed rather than "could not be queued".
+- **Reading a RomM platform now has a real deadline.** The catalog scan was
+  moved off the shared worker pool so a dead mount could not starve unrelated
+  work, but nothing bounded it — so the request, and the spinner behind it,
+  waited forever. It now gives up with a clear error, on a budget that scales
+  with the size of the platform.
+- **Re-matching no longer holds a browser request open for a multi-gigabyte
+  hash.** The pass advertises a 120-second budget but checked it only between
+  files, while a single file could wait indefinitely for the disk lane and then
+  hash for five minutes or more — during which every other re-match request
+  reported busy. The budget now covers both. Large outputs still get their full
+  time: a background pass settles them with nobody waiting.
+- **Metadata that could not be re-saved after the queue redirected a
+  conversion now says so.** When the queue writes somewhere other than the
+  planned path the snapshot is re-recorded against the real one; if that second
+  call failed it was silently swallowed, leaving the conversion running with no
+  snapshot while the badge still promised a re-match.
+- **The "metadata is saved and restored" notice no longer appears when
+  metadata preservation is switched off.** With the setting off nothing is
+  saved, so the notice was reassuring you about a snapshot that did not exist —
+  while you converted, and possibly deleted, the only file carrying the match.
 - **Unsaved automation edits survive a trip to the library tab.** The editor
   tracked "you have unsaved changes" per screen while the changes themselves
   lived with the rules, so switching tabs and back hid the Save bar — and

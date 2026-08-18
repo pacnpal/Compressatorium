@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import string
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -42,7 +43,11 @@ from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from models import ConversionMode, JobStatus
 from services import romm_repin, romm_settings
-from services.job_manager import QueueBackpressureError, job_manager
+from services.job_manager import (
+    OutputClaimedError,
+    QueueBackpressureError,
+    job_manager,
+)
 from services.output_conflicts import (
     QUEUE,
     SKIP_EXISTING,
@@ -145,7 +150,7 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
     except re.error:
         logger.warning("romm_auto: refusing invalid filter pattern %r", pattern)
         return None, True
-    if _has_nested_quantifier(pattern):
+    if _has_nested_quantifier(pattern) or _has_overlapping_quantifiers(pattern):
         logger.warning(
             "romm_auto: refusing filter pattern %r, it backtracks too long",
             pattern,
@@ -241,6 +246,114 @@ def _strip_atoms(body: str) -> str:
         out.append(char)
         i += 1
     return "".join(out)
+
+
+# What each escape class can match, for the overlap test below. `None` means
+# "anything" -- an unknown escape is assumed to overlap, since guessing narrow
+# is the direction that lets a pathological pattern through.
+_CLASS_CHARS = {
+    "d": set("0123456789"),
+    "w": set(string.ascii_letters + string.digits + "_"),
+    "s": set(" \t\n\r\f\v"),
+}
+
+
+def _atom_chars(atom: str) -> set[str] | None:
+    """The first characters *atom* can match, or None for "anything".
+
+    Only the cases that appear in a filename filter are modelled: a literal, a
+    ``\\d``/``\\w``/``\\s`` class and their negations, ``.``, and a simple
+    character class. Anything else -- a group, a backreference, a class with
+    ranges -- answers None, which the caller reads as "assume it overlaps".
+    """
+    if not atom:
+        return None
+    if atom == ".":
+        return None
+    if atom.startswith("\\") and len(atom) == 2:
+        key = atom[1]
+        known = _CLASS_CHARS.get(key.lower())
+        if known is None:
+            # An escaped literal (\. \+ \/) matches exactly itself; a class we
+            # do not model (\b, \A) is treated as "anything".
+            return {key} if not key.isalpha() else None
+        # An uppercase class is the complement, which overlaps almost
+        # everything; treat it as unbounded rather than materialise it.
+        return known if key.islower() else None
+    if atom.startswith("[") and atom.endswith("]"):
+        body = atom[1:-1]
+        if body.startswith("^") or "-" in body or "\\" in body:
+            return None
+        return set(body)
+    if len(atom) == 1:
+        return {atom}
+    return None
+
+
+def _overlaps(first: set[str] | None, second: set[str] | None) -> bool:
+    """Whether two atoms can match the same character. Unknown means yes."""
+    if first is None or second is None:
+        return True
+    return bool(first & second)
+
+
+def _has_overlapping_quantifiers(pattern: str) -> bool:
+    """Whether *pattern* repeats the same character in two adjacent places.
+
+    The polynomial sibling of :func:`_has_nested_quantifier`. ``a*a*a*a*b`` has
+    no nested group, so the shape test above passes it, yet on a filename that
+    is a long run of ``a`` with no ``b`` the engine tries every way to split
+    that run between the four stars -- degree-four growth, which at a hundred
+    characters is already a hundred million attempts, with the sweep lock held
+    and ``re`` uninterruptible.
+
+    Adjacency is what makes it dangerous: ``a*x*`` is harmless because no
+    character can go to both, and ``.*/.*`` is fine because the ``/`` between
+    them fixes the split. So two unbounded quantifiers count only when they sit
+    next to each other *and* their atoms can match the same character. An atom
+    this does not model (a group, an exotic escape) counts as overlapping,
+    because refusing a working pattern costs one message at save time while
+    accepting a pathological one wedges the scheduler.
+    """
+    previous: set[str] | None = None
+    previous_quantified = False
+    i = 0
+    length = len(pattern)
+    while i < length:
+        char = pattern[i]
+        if char in "(|)":
+            # A group boundary neither separates nor joins: `(a*)(a*)b`
+            # backtracks exactly like `a*a*b`. An alternation does separate --
+            # the branches are alternatives, not neighbours.
+            if char == "|":
+                previous, previous_quantified = None, False
+            i += 1
+            continue
+        if char == "\\" and i + 1 < length:
+            atom, i = pattern[i:i + 2], i + 2
+        elif char == "[":
+            end = _skip_class(pattern, i)
+            atom, i = pattern[i:end], end
+        else:
+            atom, i = char, i + 1
+        quantifier = ""
+        if i < length and pattern[i] in "*+?{":
+            if pattern[i] == "{":
+                end = pattern.find("}", i)
+                quantifier, i = (pattern[i:end + 1], end + 1) if end != -1 else ("", i)
+            else:
+                quantifier, i = pattern[i], i + 1
+            # A lazy or possessive marker does not change what can match.
+            if i < length and pattern[i] in "?+":
+                i += 1
+        unbounded = bool(quantifier) and (
+            quantifier[0] in "*+" or (quantifier.startswith("{") and "," in quantifier)
+        )
+        chars = _atom_chars(atom)
+        if unbounded and previous_quantified and _overlaps(previous, chars):
+            return True
+        previous, previous_quantified = chars, unbounded
+    return False
 
 
 def default_rule(mode: str = "") -> dict[str, Any]:
@@ -423,7 +536,13 @@ def normalize_rule(
     days = raw.get("days")
     if isinstance(days, list):
         parsed = sorted({int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6})
-        out["days"] = parsed or list(ALL_DAYS)
+        # An empty list is a choice, not a missing value: deselecting every
+        # weekday used to come back as *all* of them, so a rule the operator
+        # had deliberately parked -- delete-on-verify and all -- ran every day
+        # instead of none. Omitting the field still inherits the default (all
+        # days); sending `[]` means "no scheduled days", and the editor says
+        # the rule will only run when you press Run now.
+        out["days"] = parsed
 
     out["max_per_run"] = _clamp(
         "max_per_run", raw.get("max_per_run"), out["max_per_run"],
@@ -840,6 +959,11 @@ def _was_produced(remembered: dict | None) -> bool:
     """
     if not remembered:
         return False
+    # The verdict the queue already gave us, written down when the job ended
+    # (`note_job_finished`). It is the only evidence that survives a prune or a
+    # restart, so it is asked first and nothing below can override it.
+    if "done" in remembered:
+        return bool(remembered["done"])
     job_id = remembered.get("job_id")
     if job_id:
         job = job_manager.get_job(job_id)
@@ -850,6 +974,90 @@ def _was_produced(remembered: dict | None) -> bool:
     if remembered.get("pre") is None:
         return True
     return romm_repin.path_fingerprint(remembered["path"]) != remembered["pre"]
+
+
+async def _persist_known_outcomes(platform_id: str, converted: dict) -> dict:
+    """Freeze into the record every outcome the queue can still answer for.
+
+    The queue's memory is the short-lived half of this: it is capped, and a
+    restart empties it. Asking it during the sweep and storing what it says
+    turns an answer that expires into one that does not, so a later sweep is
+    not left guessing from the filesystem.
+
+    Returns the (possibly updated) map so the caller keeps using one copy.
+    Always called from inside ``_sweep_lock``.
+    """
+    updates = {}
+    for rom_id, record in converted.items():
+        if not isinstance(record, dict) or "done" in record:
+            continue
+        job_id = record.get("job_id")
+        if not job_id:
+            continue
+        job = job_manager.get_job(job_id)
+        if job is None or job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+            continue
+        updates[rom_id] = job.status == JobStatus.COMPLETED
+    if not updates:
+        return converted
+    state = await get_state()
+    entry = dict(state.get(str(platform_id)) or {})
+    stored = dict(entry.get("converted") or {})
+    for rom_id, done in updates.items():
+        record = dict(stored.get(rom_id) or converted[rom_id])
+        record["done"] = done
+        stored[rom_id] = record
+        converted[rom_id] = record
+    entry["converted"] = stored
+    state[str(platform_id)] = entry
+    await preferences_store.put(STATE_KEY, state)
+    return converted
+
+
+async def note_job_finished(job) -> None:
+    """Write down how *job* ended, for the rule that queued it.
+
+    Registered with ``job_manager.add_terminal_listener`` at startup, and the
+    reason the history above is trustworthy at all. Job history is capped and
+    lives in memory: ask ``get_job()`` after a prune or a restart and the
+    answer is "unknown", at which point the only evidence left is the
+    destination having changed -- which a *failed* overwrite produces just as
+    well as a successful conversion, by unlinking the old artifact or leaving
+    a partial one. That ROM would then be skipped by every later sweep until
+    the operator pressed **Forget history**.
+
+    So the answer is recorded at the one moment it is certain. Idempotent: the
+    same outcome may be announced twice (a queued job cancelled before it
+    starts hears it from both `cancel_job` and `_process_job`), and writing
+    the same verdict again is a no-op.
+    """
+    status = getattr(job, "status", None)
+    if status not in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+        return
+    job_id = getattr(job, "id", None)
+    if not job_id:
+        return
+    done = status == JobStatus.COMPLETED
+    async with _sweep_lock:
+        # Under the same lock as every other write to this blob: a sweep
+        # rewrites the whole thing, so an unsynchronised update here would be
+        # lost, or would lose the sweep's.
+        state = await get_state()
+        changed = False
+        for platform_id, entry in state.items():
+            converted = (entry or {}).get("converted")
+            if not isinstance(converted, dict):
+                continue
+            for rom_id, record in converted.items():
+                if not isinstance(record, dict) or record.get("job_id") != job_id:
+                    continue
+                if record.get("done") == done:
+                    continue
+                record["done"] = done
+                state[platform_id]["converted"][rom_id] = record
+                changed = True
+        if changed:
+            await preferences_store.put(STATE_KEY, state)
 
 
 async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
@@ -1015,8 +1223,15 @@ async def _sweep_locked(
         result["stopped_reason"] = "not_configured"
         return result
 
-    cap = overall_limit if overall_limit is not None else int(
-        cfg.get("auto_convert_max_per_run", 25),
+    configured_cap = int(cfg.get("auto_convert_max_per_run", 25))
+    # A caller-supplied limit narrows the run; it never widens it. The manual
+    # endpoints accept one so an operator can try a rule on a handful of ROMs,
+    # which is a smaller ask than the configured maximum -- letting it exceed
+    # that maximum would make the safety limit advisory, from a button.
+    cap = (
+        max(1, min(int(overall_limit), configured_cap))
+        if overall_limit is not None
+        else configured_cap
     )
     wanted = {str(p) for p in platform_ids} if platform_ids else None
 
@@ -1132,6 +1347,12 @@ async def _sweep_locked(
             if rule["duplicate_action"] != "skip"
             else {}
         )
+        # Write down any outcome the queue still knows but the record does not.
+        # `note_job_finished` is told the moment a job ends, so this normally
+        # finds nothing -- it is the backstop for the paths that listener can
+        # miss: a job that finished before the sweep wrote its record, or an
+        # outcome announced while this process was not the one running.
+        converted = await _persist_known_outcomes(platform_id, converted)
         batch: list[str] = []
         rom_by_path: dict[str, dict] = {}
         destinations: dict[str, str] = {}
@@ -1291,6 +1512,22 @@ async def _sweep_locked(
                 result["stopped_reason"] = "queue_full"
                 result["platforms"].append(summary)
                 break
+            except OutputClaimedError as exc:
+                # Someone else took a destination between this sweep planning
+                # it and the queue accepting it -- a manual submit, or a
+                # conversion started from another tab. Not an error in the
+                # rule: the batch was refused whole, nothing was queued, and
+                # the next sweep re-plans against the destination that now
+                # exists. Named separately so the editor can say so instead of
+                # showing "could not be queued".
+                logger.info(
+                    "romm_auto: platform %s lost a destination to another job: %s",
+                    platform_id, exc,
+                )
+                result["errors"].append(
+                    {"platform_id": int(platform_id), "error": "destination_claimed"},
+                )
+                summary["queue_failed"] = True
             except Exception:
                 logger.warning(
                     "romm_auto: failed to queue platform %s", platform_id, exc_info=True,

@@ -90,6 +90,10 @@
   );
 
   const activeMode = $derived(registry.specFor(conversion.mode) ?? null);
+  // Absent means "not loaded yet"; the backend default is on, and promising
+  // the snapshot before the settings arrive is the safer of the two wrong
+  // states — the panel is unusable until they do.
+  const repinEnabled = $derived(romm.settings?.repin_enabled !== false);
   const losesMatch = $derived(romm.losesDatMatch(activeMode));
 
   /**
@@ -343,12 +347,26 @@
     {#if losesMatch}
       <div class="notice warn">
         <TriangleAlert size={16} />
-        <span>
-          RomM cannot hash-match <strong>{activeMode?.outputExt}</strong> files.
-          Their metadata is saved before converting and restored by
-          <em>Re-match in RomM</em> once RomM rescans. CHD and ZIP/7z keep their
-          match automatically.
-        </span>
+        {#if repinEnabled}
+          <span>
+            RomM cannot hash-match <strong>{activeMode?.outputExt}</strong> files.
+            Their metadata is saved before converting and restored by
+            <em>Re-match in RomM</em> once RomM rescans. CHD and ZIP/7z keep their
+            match automatically.
+          </span>
+        {:else}
+          <!-- The promise has to follow the setting. With re-pinning off,
+               /romm/repin/plan records nothing and returns "disabled", so the
+               reassuring version of this message was telling the operator a
+               snapshot existed while they converted — and possibly deleted —
+               the only file that carried the metadata. -->
+          <span>
+            RomM cannot hash-match <strong>{activeMode?.outputExt}</strong> files,
+            and <strong>metadata preservation is switched off</strong> (Settings →
+            Metadata). These conversions will lose their RomM match and need
+            re-identifying by hand. CHD and ZIP/7z keep their match automatically.
+          </span>
+        {/if}
       </div>
     {/if}
 

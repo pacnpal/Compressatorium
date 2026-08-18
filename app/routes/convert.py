@@ -22,7 +22,11 @@ from models import (
     JobStatus,
 )
 from services.archive import archive_service
-from services.job_manager import QueueBackpressureError, job_manager
+from services.job_manager import (
+    OutputClaimedError,
+    QueueBackpressureError,
+    job_manager,
+)
 from services.romz import romz_service
 from services.output_conflicts import (
     OutputPathExhausted,
@@ -944,6 +948,12 @@ async def create_job(request: JobCreateRequest):
             split=request.split,
             delete_snapshot=plan.delete_snapshot,
         )
+    except OutputClaimedError as exc:
+        # A concurrency outcome, not a malformed request: another live job took
+        # this destination between planning and queueing. 409 so the caller can
+        # retry or skip; a 500 said "server broke" for something working
+        # exactly as designed.
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 
@@ -1075,6 +1085,12 @@ async def create_batch_jobs(request: BatchJobCreateRequest):
             delete_on_verify=request.delete_on_verify,
             split=request.split,
         )
+    except OutputClaimedError as exc:
+        # A concurrency outcome, not a malformed request: another live job took
+        # this destination between planning and queueing. 409 so the caller can
+        # retry or skip; a 500 said "server broke" for something working
+        # exactly as designed.
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except QueueBackpressureError as exc:
         raise HTTPException(status_code=429, detail=exc.detail) from exc
 

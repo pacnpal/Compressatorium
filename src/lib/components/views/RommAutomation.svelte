@@ -559,6 +559,17 @@
                         >{label}</button>
                       {/each}
                     </div>
+                    <!-- An empty selection is honoured rather than widened
+                         back to every day, so it has to say what it means:
+                         the scheduler will never fire this rule. -->
+                    <span class="hint">
+                      {#if (rule.days ?? []).length === 0}
+                        No days selected — the scheduler will never run this
+                        rule. <strong>Run now</strong> still works.
+                      {:else}
+                        Scheduled runs only happen on the days selected here.
+                      {/if}
+                    </span>
                   </div>
 
                   <label class="field">

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 from logging_setup import get_logger
 import os
@@ -11,7 +12,7 @@ import uuid
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from config import settings
 from fastapi.concurrency import run_in_threadpool
@@ -69,6 +70,26 @@ def _paths_collide(path_a: str, path_b: str) -> bool:
         return False
 
 
+# The statuses a job never leaves. Anything else is still in flight.
+_TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+
+class OutputClaimedError(ValueError):
+    """Raised when a destination another live job holds is requested again.
+
+    A ``ValueError`` subclass so the callers that already treat a rejected
+    spec as a bad request keep working, but its own type because this is a
+    *concurrency* outcome rather than a malformed request: two submissions
+    resolved the same destination, and the loser should be told to retry or
+    skip (409) rather than shown a 500.
+    """
+
+    def __init__(self, detail: str, *, claimed_by: str | None = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.claimed_by = claimed_by
+
+
 class QueueBackpressureError(RuntimeError):
     """Raised when queue backpressure limits would be exceeded."""
 
@@ -100,6 +121,10 @@ class JobManager:
     def __init__(self, max_concurrent: int = 1, max_job_history: int = 500):
         self.jobs: OrderedDict[str, ConversionJob] = OrderedDict()
         self._archived_jobs: OrderedDict[str, Tuple[ConversionJob, float]] = OrderedDict()
+        # Called once per job that reaches a terminal status; see
+        # `add_terminal_listener` for why anything caring about *how* a job
+        # ended has to be told rather than ask later.
+        self._terminal_listeners: List[Callable[[ConversionJob], object]] = []
         self.max_concurrent = max(1, max_concurrent)
         self.max_job_history = max(0, max_job_history)
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
@@ -472,13 +497,14 @@ class JobManager:
             )
             claimed_by = self._active_job_writing(resolved)
             if claimed_by is not None:
-                raise ValueError(
+                raise OutputClaimedError(
                     f"Another queued job ({claimed_by}) is already writing "
                     f"{os.path.basename(resolved)}",
+                    claimed_by=claimed_by,
                 )
             for other, other_path in planned.items():
                 if _paths_collide(other_path, resolved):
-                    raise ValueError(
+                    raise OutputClaimedError(
                         "Two files in this batch would write the same output: "
                         f"{os.path.basename(other)} and "
                         f"{os.path.basename(file_path)}",
@@ -502,6 +528,46 @@ class JobManager:
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
         """Get a job by ID."""
         return self.jobs.get(job_id)
+
+    def add_terminal_listener(self, callback: Callable[[ConversionJob], object]) -> None:
+        """Call *callback* once each job reaches a terminal status.
+
+        For consumers that must remember how a job *ended* after the queue has
+        forgotten it. History is capped and lives in memory, so asking
+        ``get_job()`` later answers "unknown" for anything pruned or predating
+        a restart -- and a consumer that then guesses from the filesystem
+        cannot tell a finished conversion from a failed one that unlinked the
+        old artifact. A listener is told at the moment the answer is still
+        known, and can persist it wherever it needs it.
+
+        The callback may be sync or async (a coroutine is scheduled on the
+        loop). It runs after the status is final; exceptions are logged and
+        swallowed, because a listener must never fail a conversion.
+        """
+        self._terminal_listeners.append(callback)
+
+    def _notify_terminal(self, job: ConversionJob) -> None:
+        """Tell every listener that *job* is finished. Never raises."""
+        if not self._terminal_listeners:
+            return
+        if job.status not in _TERMINAL_STATUSES:
+            return
+        for callback in list(self._terminal_listeners):
+            try:
+                result = callback(job)
+            except Exception:  # a listener must never fail a conversion
+                logger.warning(
+                    "Terminal-job listener failed for %s", job.id, exc_info=True,
+                )
+                continue
+            if inspect.isawaitable(result):
+                try:
+                    self._spawn_background(result)
+                except RuntimeError:
+                    # No running loop (a synchronous test harness): the
+                    # coroutine is simply not awaited, and the consumer's own
+                    # fallback still applies.
+                    result.close()
 
     def _prune_archived_jobs(self) -> None:
         if not self._archived_jobs:
@@ -628,6 +694,7 @@ class JobManager:
         # cancel_all while the external task was still running.
         self._cancel_events.pop(job_id, None)
         self._cancelled.discard(job_id)
+        self._notify_terminal(job)
         event_type = "complete" if success else "error"
         await self._notify_subscribers(
             job_id,
@@ -667,6 +734,7 @@ class JobManager:
             job.message = message
         self._cancel_events.pop(job_id, None)
         self._cancelled.discard(job_id)
+        self._notify_terminal(job)
         await self._notify_subscribers(
             job_id,
             {
@@ -1339,6 +1407,9 @@ class JobManager:
             self._cancelled.add(job_id)
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.now(timezone.utc)
+            # A queued job cancelled before it starts never enters
+            # `_process_job`, so its listeners have to be told here.
+            self._notify_terminal(job)
             cancel_event = self._cancel_events.get(job_id)
             if cancel_event:
                 cancel_event.set()
@@ -2095,6 +2166,11 @@ class JobManager:
             self._cancelled.discard(job_id)
             if not job.completed_at:
                 job.completed_at = datetime.now(timezone.utc)
+            # Both early exits below return before the try/finally that
+            # notifies for every other outcome, so they announce themselves.
+            # Listeners may hear about one job twice (this path runs after
+            # `cancel_job` already fired) and must be idempotent.
+            self._notify_terminal(job)
             await self._notify_subscribers(
                 job_id,
                 {"type": "cancelled", "job_id": job_id, "status": job.status.value},
@@ -2115,6 +2191,7 @@ class JobManager:
                     job_id,
                     {"type": "cancelled", "job_id": job_id, "status": job.status.value},
                 )
+            self._notify_terminal(job)
             await self._cleanup_temp_dir(job)
             concurrency_manager.release(job_id)
             if job_id in self._cancel_events:
@@ -2787,6 +2864,11 @@ class JobManager:
             )
 
         finally:
+            # Before any cleanup: this is the one place every runner outcome
+            # (completed, failed, cancelled mid-run) passes through, and a
+            # listener that must record how the job ended has to hear about it
+            # while the job object still says so.
+            self._notify_terminal(job)
             # Only release lock if we acquired it
             if lock_acquired:
                 lock_manager.release_lock(job.output_path)

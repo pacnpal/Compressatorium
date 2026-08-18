@@ -537,19 +537,48 @@ class ConversionStore {
         if (actual && actual !== planned) misdirected[source] = actual;
       }
       if (Object.keys(misdirected).length) {
-        // Retire the rows aimed at the wrong path, then re-record against the
-        // paths the queue chose. Two calls, and only on a real mismatch.
-        await api
-          .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
-          .catch(() => {});
-        await api
-          .planRommRepin(
+        // Re-record first, retire second. The old row is only wrong once the
+        // new one exists: if the re-record fails — RomM went away between the
+        // first plan and now — cancelling first would leave the conversion
+        // running with no snapshot at all, and the operator none the wiser.
+        // Losing this ordering is how metadata disappears silently.
+        let replanned = null;
+        try {
+          replanned = await api.planRommRepin(
             Object.keys(misdirected), this.mode, this.outputDir || null,
             duplicateAction, rommPlatformId, misdirected,
-          )
-          .catch(() => {});
-        for (const [source, actual] of Object.entries(misdirected)) {
-          recorded[source] = actual;
+          );
+        } catch (e) {
+          // Say so rather than swallow it: the conversion is already queued,
+          // so this metadata now needs the manual path. The count is corrected
+          // below so the badge does not promise a re-match that is not coming.
+          toast.warning(
+            `Metadata could not be saved for ${Object.keys(misdirected).length} `
+            + `file(s) the queue redirected: ${e?.message ?? 'the request failed'}. `
+            + 'Re-match those in RomM by hand after converting.',
+          );
+        }
+        if (replanned) {
+          await api
+            .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
+            .catch(() => {});
+          for (const [source, actual] of Object.entries(misdirected)) {
+            recorded[source] = actual;
+          }
+        } else {
+          // Retire the old rows anyway. They point at a path this batch is no
+          // longer writing — under Overwrite that is the file the conversion
+          // was going to replace — and a row aimed at the wrong file is worse
+          // than no row at all. The `finally` block cannot do it: these
+          // sources did become jobs, so they are filtered out of `recorded`
+          // below and would be left behind.
+          await api
+            .cancelRommRepin(Object.keys(misdirected).map((k) => recorded[k]))
+            .catch(() => {});
+          for (const source of Object.keys(misdirected)) delete recorded[source];
+          this.lastRepinRecorded = Math.max(
+            0, this.lastRepinRecorded - Object.keys(misdirected).length,
+          );
         }
       }
       // What is left in `recorded` after this is the set the `finally` block

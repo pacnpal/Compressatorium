@@ -1383,11 +1383,21 @@ would therefore reconvert the whole library every interval.
 What is recorded is **production, not queueing**. `converted` on the platform's
 `romm.auto_state` entry maps each RomM id to `{path, pre}` — the destination the
 rule chose and a fingerprint of whatever occupied it at planning time — and
-`_was_produced()` answers the question by checking whether that path has changed
-since. A job that is cancelled, interrupted by a restart, or fails in the
-converter leaves it untouched, so the next sweep picks the ROM up again. Nothing
-has to be kept in sync with the queue and nothing needs reconciling after a
-crash, which is why this is not a "mark done on job success" callback.
+`_was_produced()` answers it in three steps, strongest evidence first: the
+verdict written down when the job ended (`done`), then the job's live status if
+the queue still remembers it, then — only for a record predating either — the
+fingerprint having changed.
+
+The written-down verdict is what makes the rest trustworthy. A *failed*
+`overwrite` job changes the destination just as visibly as a successful one, by
+unlinking the old artifact or leaving a partial file, so the fingerprint alone
+cannot tell them apart and the ROM would be skipped by every later sweep until
+**Forget history**. `job_manager.add_terminal_listener` (§3.4) hands
+`note_job_finished` the outcome at the moment it is certain; the sweep also
+freezes any outcome the queue can still answer for, which covers a job that
+finished before its record existed. Neither has to be kept in sync with the
+queue: a missing verdict degrades to the older evidence rather than to a wrong
+answer.
 
 It is invalidated where it stops being true: `set_rules` drops it for any
 platform whose `OUTPUT_IDENTITY_FIELDS` changed — a rule retargeted from RVZ to
@@ -1530,6 +1540,31 @@ conservative rules as `narrow_to_platform` one level down, and
 browser as each platform's `mode_ids` beside its `tool_ids`, so neither the
 automation editor nor the RomM target picker carries a second copy of the
 platform table. The sweep checks the *mode*, not `spec.tool_id`.
+
+#### How a job ended, after the queue forgets (`add_terminal_listener`)
+
+`JobManager.jobs` is capped (`max_job_history`) and lives in memory, so
+`get_job(id)` answers "unknown" for anything pruned or predating a restart.
+Any consumer that needs to know how a job *ended* — not whether it exists —
+therefore cannot ask later; it has to be told at the time.
+
+**`job_manager.add_terminal_listener(callback)`** registers a callback fired
+once per job reaching `COMPLETED` / `FAILED` / `CANCELLED`. It fires from
+`_process_job`'s `finally` (every runner outcome), from both
+`finish_external_job*` paths, from `cancel_job`'s QUEUED branch, and from the
+two early cancel returns that precede `_process_job`'s try block. The callback
+may be sync or async, exceptions are logged and swallowed (a listener must
+never fail a conversion), and the same job may be announced twice — listeners
+are required to be idempotent.
+
+The RomM automation is the first consumer: `romm_auto.note_job_finished` writes
+the verdict into the rule's converted-history record (`done: true|false`), and
+`_was_produced` reads that first. Without it, provenance fell back to "the
+destination changed since planning", which a *failed* overwrite produces just
+as well as a success — by unlinking the old artifact or leaving a partial one
+— and the ROM would be skipped by every later sweep until **Forget history**.
+The sweep also freezes any outcome the queue can still answer for
+(`_persist_known_outcomes`), covering the window before a record exists.
 
 #### A codec for "tool default" (`ToolPlugin.default_compression`)
 

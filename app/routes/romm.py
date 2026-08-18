@@ -26,7 +26,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from models import DirectoryListing, FileEntry
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from routes.files import (
     detect_directory_outputs,
     detect_file_outputs,
@@ -82,9 +82,19 @@ _SETTLE_PAGE = 50
 # for the better part of an hour. Stopping early costs nothing: every row not
 # reached is still pending, and the cursor means the next call resumes there.
 _MAX_SETTLE_SECONDS = 120
+# How often the background settler looks for rows the bounded pass left
+# behind. Minutes, not seconds: RomM has to rescan the output before there is
+# anything to match, which is never immediate.
+_SETTLE_TICK_SECONDS = 300
 # Floor on how long one hash may take, and the throughput assumed above it.
 # A multi-gigabyte image on a slow array is legitimately slow, so the budget
 # scales with the file rather than failing big outputs on a fixed timeout.
+# How long one platform's catalog scan may take. It stats every ROM, so the
+# budget grows with the count; the ceiling is what a listing may cost before
+# the answer is "this mount is not healthy" rather than "this library is big".
+_CATALOG_SCAN_BASE_S = 30
+_CATALOG_SCAN_PER_ROM_S = 0.2
+_CATALOG_SCAN_CEILING_S = 300
 _HASH_TIMEOUT_FLOOR_S = 300
 _HASH_MIN_BYTES_PER_S = 2 * 1024 * 1024
 
@@ -301,8 +311,19 @@ async def romm_roms(
     # In a shared pool that strands one worker per load, and a few tabs
     # reloading a large platform would starve unrelated API offloads -- the
     # same reasoning AGENTS.md applies to whole-file reads.
+    # `run_detached` is unbounded by design -- it says so -- so the deadline
+    # has to come from here, or the 504 below is unreachable and the request
+    # (and the spinner behind it) waits on a dead mount forever. The budget
+    # scales with the catalog: a stat per ROM is fast on a healthy mount and
+    # a 5000-ROM platform must not fail on a limit sized for 50.
+    budget = min(
+        _CATALOG_SCAN_CEILING_S,
+        _CATALOG_SCAN_BASE_S + _CATALOG_SCAN_PER_ROM_S * len(roms),
+    )
     try:
-        entries = await run_detached(_build_entries, roms, slug)
+        entries = await asyncio.wait_for(
+            run_detached(_build_entries, roms, slug), budget,
+        )
     except (asyncio.TimeoutError, OSError) as exc:
         logger.warning("romm: listing platform %s timed out", platform_id)
         raise HTTPException(
@@ -592,7 +613,7 @@ def _destination_has_pending_job(output_path: str) -> bool:
     return False
 
 
-async def _settle_one_repin(row: tuple) -> _Outcome:
+async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outcome:
     """Drive one pending re-pin row as far as it can go this pass.
 
     Extracted from the loop so the loop owns only paging and budgets: the
@@ -683,7 +704,7 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
 
     try:
         if not sha1:
-            sha1 = await _hash_output(output_path)
+            sha1 = await _hash_output(output_path, deadline)
             if sha1 is None:
                 # Storage stopped answering. Nothing is wrong with the row --
                 # leave it pending and let a later pass try again.
@@ -697,7 +718,7 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
     return await _match_and_settle(row_id, sha1, ids, output_path, created_at)
 
 
-async def _hash_output(output_path: str) -> str | None:
+async def _hash_output(output_path: str, deadline: float | None = None) -> str | None:
     """SHA-1 of *output_path*, or None if the read did not finish in time.
 
     Heavy disk work, so it takes the same lane the DAT matcher uses and a
@@ -723,8 +744,18 @@ async def _hash_output(output_path: str) -> str | None:
     except (asyncio.TimeoutError, OSError):
         size = 0
     timeout = max(_HASH_TIMEOUT_FLOOR_S, size / _HASH_MIN_BYTES_PER_S)
+    if deadline is not None:
+        # A caller with a deadline (the HTTP pass) gets the smaller of the
+        # two. Both halves are bounded by it: waiting for the heavy-IO lane
+        # behind a running conversion is exactly as good at holding the
+        # request open as the hash itself, and it had no bound at all.
+        timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+        if timeout <= 0:
+            return None
     try:
-        async with await workload_limiter.acquire("match"):
+        async with await asyncio.wait_for(
+            workload_limiter.acquire("match"), timeout,
+        ):
             return await asyncio.wait_for(
                 run_detached(compute_file_sha1_sync, output_path), timeout,
             )
@@ -811,8 +842,17 @@ async def settle_romm_repins() -> dict:
         return await _settle_pass()
 
 
-async def _settle_pass() -> dict:
-    """One pass over the pending rows. Always called with ``_settle_lock``."""
+async def _settle_pass(*, bounded: bool = True) -> dict:
+    """One pass over the pending rows. Always called with ``_settle_lock``.
+
+    ``bounded`` is what separates the two callers. A request-driven pass keeps
+    every row inside the pass budget -- the hash and the wait for the heavy-IO
+    lane included -- so the browser never holds a request open for the length
+    of a multi-gigabyte SHA-1, and stops starting rows once the budget is out.
+    The background pass has nobody waiting, so it gives each row the full
+    size-scaled timeout: that is what keeps a genuinely large output settling
+    at all rather than being cut short on every attempt forever.
+    """
     counts = {outcome: 0 for outcome in _Outcome}
     deadline = time.monotonic() + _MAX_SETTLE_SECONDS
 
@@ -846,7 +886,7 @@ async def _settle_pass() -> dict:
                 romm_repin.pending_rows, _SETTLE_PAGE, after_id=cursor,
             )
 
-        outcome = await _settle_one_repin(row)
+        outcome = await _settle_one_repin(row, deadline if bounded else None)
         counts[outcome] += 1
         if outcome is _Outcome.UPSTREAM_ERROR:
             break
@@ -867,6 +907,43 @@ async def _settle_pass() -> dict:
         "busy": False,
         "pending": await run_in_threadpool(romm_repin.count_pending),
     }
+
+
+async def settle_forever() -> None:
+    """Background re-pin settler. Ticks every few minutes.
+
+    The request-driven pass is deliberately impatient: it will not hold a
+    browser request open hashing a 40 GB output, so it skips whatever does not
+    fit its budget. Something has to finish those rows, and it cannot be the
+    next request either -- it would cut the same row short every time and the
+    metadata would never be restored. This loop is that something: no client
+    is waiting on it, so each row gets its full size-scaled timeout.
+
+    Shares ``_settle_lock`` with the endpoint, so a tick never runs beside a
+    request-driven pass, and skips entirely when one is in progress.
+    """
+    logger.info("romm: re-pin settler started")
+    while True:
+        try:
+            await asyncio.sleep(_SETTLE_TICK_SECONDS)
+            if not romm_settings.effective().get("repin_enabled", True):
+                continue
+            if _settle_lock.locked():
+                continue
+            pending = await run_in_threadpool(romm_repin.count_pending)
+            if not pending:
+                continue
+            async with _settle_lock:
+                result = await _settle_pass(bounded=False)
+            if result["repinned"]:
+                logger.info(
+                    "romm: re-matched %s ROM(s) in the background", result["repinned"],
+                )
+        except Exception:
+            # One bad pass must never end the loop; the next tick retries.
+            # CancelledError derives from BaseException, so shutdown still
+            # stops it.
+            logger.warning("romm: background re-pin pass failed", exc_info=True)
 
 
 async def _load_settle_cursor() -> int:
@@ -1113,35 +1190,49 @@ async def forget_romm_converted(payload: dict | None = None) -> dict:
     return {"cleared": cleared, "state": await romm_auto.get_state()}
 
 
+class SweepRequest(BaseModel):
+    """What a manual Preview / Run now may ask for.
+
+    Typed rather than a bare dict because both fields reach the sweep: an
+    unvalidated `limit` became the overall cap verbatim, so a number larger
+    than `auto_convert_max_per_run` queued past the configured safety limit and
+    a string failed the comparison inside the sweep with a 500. Here it can
+    only ever narrow: the sweep clamps it down to the configured maximum.
+    """
+
+    platform_ids: list[int] | None = None
+    limit: int | None = Field(default=None, ge=1)
+
+
 @router.post("/romm/auto-convert/preview")
-async def preview_auto_convert(payload: dict | None = None) -> dict:
+async def preview_auto_convert(payload: SweepRequest | None = None) -> dict:
     """What a sweep would queue right now, without queueing anything.
 
     Ignores each rule's schedule so the operator can see the effect of a rule
     they just wrote instead of waiting for its next window.
     """
     _require_configured()
-    payload = payload or {}
+    payload = payload or SweepRequest()
     return await romm_auto.sweep(
-        platform_ids=payload.get("platform_ids"),
+        platform_ids=payload.platform_ids,
         ignore_schedule=True,
         dry_run=True,
-        overall_limit=payload.get("limit"),
+        overall_limit=payload.limit,
     )
 
 
 @router.post("/romm/auto-convert/run")
-async def run_auto_convert(payload: dict | None = None) -> dict:
+async def run_auto_convert(payload: SweepRequest | None = None) -> dict:
     """Run a sweep now, queueing real jobs.
 
     Manual runs ignore the schedule -- pressing the button means "now" -- but
     still honour every other part of each rule (filters, caps, ordering).
     """
     _require_configured()
-    payload = payload or {}
+    payload = payload or SweepRequest()
     return await romm_auto.sweep(
-        platform_ids=payload.get("platform_ids"),
+        platform_ids=payload.platform_ids,
         ignore_schedule=True,
         dry_run=False,
-        overall_limit=payload.get("limit"),
+        overall_limit=payload.limit,
     )

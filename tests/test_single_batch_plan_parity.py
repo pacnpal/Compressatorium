@@ -27,6 +27,7 @@ from app.models import (
     JobCreateRequest,
 )
 from app.routes import convert as convert_routes
+from services.job_manager import OutputClaimedError
 from services.lock_manager import lock_manager
 
 
@@ -612,3 +613,44 @@ async def test_delete_on_verify_allows_the_verified_default(parity_env):
     assert "status" not in single, single
     assert "skipped" not in batch, batch
     assert single["output_path"] == batch["output_path"]
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_destination_is_a_conflict_not_a_server_error(
+    parity_env, monkeypatch,
+) -> None:
+    """Losing a race for a destination is a 409, on both routes.
+
+    The queue refuses the second of two submissions that resolved the same
+    output — correct, and the whole point of reserving destinations under its
+    own lock. But it surfaced as an unhandled `ValueError`, so a working
+    safety check answered 500: "the server broke" for something the caller can
+    simply retry or skip.
+    """
+    source = parity_env["tmp_path"] / "game.iso"
+    source.write_bytes(b"data")
+
+    def _claimed(*_args, **_kwargs):
+        raise OutputClaimedError(
+            "Another queued job (job-1) is already writing game.chd",
+            claimed_by="job-1",
+        )
+
+    async def _claimed_async(*args, **kwargs):
+        _claimed()
+
+    monkeypatch.setattr(convert_routes.job_manager, "create_jobs_atomic", _claimed_async)
+    monkeypatch.setattr(convert_routes.job_manager, "create_job", _claimed_async)
+
+    batch = await _run_batch(
+        parity_env, file_path=str(source), mode=ConversionMode.CREATECD,
+        duplicate_action=DuplicateAction.SKIP, delete_on_verify=False,
+    )
+    assert batch["status"] == 409, batch
+    assert "already writing" in batch["detail"]
+
+    single = await _run_single(
+        parity_env, file_path=str(source), mode=ConversionMode.CREATECD,
+        duplicate_action=DuplicateAction.SKIP, delete_on_verify=False,
+    )
+    assert single["status"] == 409, single

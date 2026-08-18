@@ -2077,6 +2077,54 @@ def test_a_codec_mode_with_no_declared_default_drops_the_level(monkeypatch) -> N
     assert romm_auto._compression_arg(rule) is None
 
 
+def test_a_polynomial_filter_pattern_is_refused_too() -> None:
+    """Nested quantifiers are not the only shape that wedges the sweep.
+
+    `a*a*a*a*a*a*b` has no group at all, so the nested-shape test passes it —
+    but on a long run of `a` with no `b` the engine tries every way to split
+    that run between six stars, and `re` cannot be interrupted while
+    `_sweep_lock` is held. Adjacency plus an overlapping atom is the tell.
+    """
+    from services import romm_auto
+
+    assert romm_auto._valid_pattern("a*a*a*a*a*a*b") == (None, True)
+    assert romm_auto._valid_pattern(r"\w*\d*x") == (None, True)
+    assert romm_auto._valid_pattern("(a*)(a*)b") == (None, True)
+
+    # And the filters an operator actually writes still go through: two
+    # quantifiers that cannot both take the same character are not a hazard,
+    # nor are quantifiers with something fixed between them.
+    for good in (
+        r"^Metroid.*\.iso$", "(USA)", ".*rev1.*", r"\w*\s*Disc", r"^\d{4}-.*",
+    ):
+        assert romm_auto._valid_pattern(good) == (good, False), good
+
+
+def test_deselecting_every_weekday_is_honoured_not_widened() -> None:
+    """An empty day list used to come back as all seven.
+
+    Which is the worst possible reading: a rule the operator parked by
+    unticking every day would run every day instead of none — unattended, and
+    with delete-on-verify if that was set.
+    """
+    from datetime import datetime, timezone
+
+    from services import romm_auto
+
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "enabled": True, "days": [],
+    })
+    assert rule["days"] == []
+    # And the scheduler agrees: no day is ever this rule's day.
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+    assert romm_auto._in_window(rule, now) is False
+
+    # Omitting the field still inherits every day, so an older stored rule (or
+    # one written by hand) is not silently switched off.
+    inherited = romm_auto.normalize_rule({"mode": "dolphin_rvz", "enabled": True})
+    assert inherited["days"] == list(romm_auto.ALL_DAYS)
+
+
 def test_a_mistyped_filter_pauses_the_rule_instead_of_widening_it() -> None:
     """An uncompilable regex must never come back as "no filter".
 
@@ -2763,6 +2811,262 @@ async def test_a_failed_job_does_not_count_as_converted(
         ):
             settled = await romm_auto.sweep(ignore_schedule=True)
         assert settled["queued"] == 0, settled
+
+
+@pytest.mark.asyncio
+async def test_a_pruned_failed_job_still_does_not_count_as_converted(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The outcome has to outlive the queue's memory of the job.
+
+    Job history is capped and in-memory, so `get_job()` answers "unknown" after
+    a prune or a restart — and the fingerprint fallback cannot tell a finished
+    conversion from a failed overwrite that unlinked the old artifact. The
+    verdict is written down when the job ends, and that record wins.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    (lib / "Game.rvz").write_bytes(b"previous")
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [_FakeJob(p, "job-77") for p in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+
+        # The job fails and announces it; the queue then forgets the job
+        # entirely, which is what a prune or a restart looks like from here.
+        await romm_auto.note_job_finished(
+            SimpleNamespace(id="job-77", status=JobStatus.FAILED),
+        )
+        (lib / "Game.rvz").unlink()
+        with patch.object(
+            romm_auto.job_manager, "get_job", return_value=None,
+        ), patch.object(
+            romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+        ):
+            retried = await romm_auto.sweep(ignore_schedule=True)
+        assert retried["queued"] == 1, retried
+
+
+@pytest.mark.asyncio
+async def test_a_completed_job_is_remembered_after_the_queue_forgets_it(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The other direction: a success recorded at the time is not re-run.
+
+    Without the persisted verdict this leaned on the destination having
+    changed, so an operator who moved the output aside got the whole platform
+    reconverted.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [_FakeJob(p, "job-78") for p in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+        await romm_auto.note_job_finished(
+            SimpleNamespace(id="job-78", status=JobStatus.COMPLETED),
+        )
+        # The output is produced and then moved away by hand; the queue has
+        # forgotten the job. The record still says it happened.
+        with patch.object(
+            romm_auto.job_manager, "get_job", return_value=None,
+        ), patch.object(
+            romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+        ):
+            again = await romm_auto.sweep(ignore_schedule=True)
+        assert again["queued"] == 0, again
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_writes_down_an_outcome_the_queue_can_still_answer_for(
+    sqlite_db,
+) -> None:
+    """The backstop for a listener that never fired.
+
+    A job that finished before its record was written — a fast conversion on an
+    idle queue — is not covered by the completion listener, so the sweep asks
+    the queue for anything it does not yet know and freezes the answer.
+    """
+    from services import romm_auto
+
+    record = {"path": "/x/Game.rvz", "pre": "1:2", "job_id": "job-9"}
+    await romm_auto.preferences_store.put(romm_auto.STATE_KEY, {
+        "7": {"converted": {"1": dict(record)}},
+    })
+    with patch.object(
+        romm_auto.job_manager, "get_job",
+        return_value=SimpleNamespace(id="job-9", status=JobStatus.FAILED),
+    ):
+        returned = await romm_auto._persist_known_outcomes("7", {"1": dict(record)})
+
+    assert returned["1"]["done"] is False
+    state = await romm_auto.get_state()
+    assert state["7"]["converted"]["1"]["done"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_hung_catalog_scan_answers_504_instead_of_hanging(
+    settings_db, tmp_path: Path, monkeypatch,
+) -> None:
+    """`run_detached` is unbounded by design; the deadline is the caller's job.
+
+    Without one the 504 below was unreachable: a mount that stops answering
+    mid-scan left the request — and the spinner behind it — waiting forever,
+    which is exactly the failure the detached thread was supposed to contain.
+    """
+    import asyncio as _asyncio
+
+    from fastapi import HTTPException
+
+    (tmp_path / "library").mkdir()
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _never_returns(*_args, **_kwargs):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(romm_routes, "run_detached", _never_returns)
+    monkeypatch.setattr(romm_routes, "_CATALOG_SCAN_BASE_S", 0.05)
+    monkeypatch.setattr(romm_routes, "_CATALOG_SCAN_PER_ROM_S", 0)
+
+    # The outer wait_for is the test's own guard: without the deadline under
+    # test this call never returns, and a hanging test says much less than a
+    # failing one.
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            pytest.raises(HTTPException) as excinfo:
+        await _asyncio.wait_for(romm_routes.romm_roms(platform_id=7), 10)
+    assert excinfo.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_the_settle_pass_bounds_the_hash_by_its_own_budget() -> None:
+    """A request-driven pass must not hold the lock for the length of a hash.
+
+    The pass advertises a 120-second budget but only checked it between rows,
+    while one row could wait unboundedly for the heavy-IO lane and then hash
+    for 300 seconds or more. The budget now reaches the hash itself; the
+    background settler is what still gives large outputs their full timeout.
+    """
+    import asyncio as _asyncio
+    import time
+
+    seen = {}
+
+    async def _slow_hash(*_args, **_kwargs):
+        await _asyncio.sleep(3600)
+
+    async def _record_timeout(coro, timeout):
+        seen["timeout"] = timeout
+        coro.close()
+        raise _asyncio.TimeoutError
+
+    with patch.object(romm_routes, "bounded_path_check", return_value=10 * 1024**3), \
+            patch.object(romm_routes, "run_detached", _slow_hash), \
+            patch.object(romm_routes.asyncio, "wait_for", _record_timeout):
+        # A 10 GB output would otherwise ask for ~5000 seconds; the pass has
+        # two left.
+        deadline = time.monotonic() + 2
+        assert await romm_routes._hash_output("/x/Game.rvz", deadline) is None
+    assert seen["timeout"] <= 2, seen
+
+    # With no deadline (the background settler) the file's own budget stands.
+    with patch.object(romm_routes, "bounded_path_check", return_value=10 * 1024**3), \
+            patch.object(romm_routes, "run_detached", _slow_hash), \
+            patch.object(romm_routes.asyncio, "wait_for", _record_timeout):
+        assert await romm_routes._hash_output("/x/Game.rvz") is None
+    assert seen["timeout"] > romm_routes._HASH_TIMEOUT_FLOOR_S, seen
+
+
+@pytest.mark.asyncio
+async def test_a_manual_limit_can_only_narrow_the_run(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Preview and Run now accept a limit; it must not raise the safety cap.
+
+    `auto_convert_max_per_run` is the configured ceiling on how much unattended
+    work one sweep may queue. A caller-supplied limit was taken verbatim, so a
+    button could queue far past it.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    for name in ("A", "B", "C"):
+        (lib / f"{name}.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080",
+        "library_root": str(tmp_path / "library"),
+        "auto_convert_max_per_run": 1,
+    })
+    roms = [
+        {"id": i, "name": name, "full_path": f"roms/gc/{name}.iso",
+         "fs_name": f"{name}.iso", "platform_slug": "ngc"}
+        for i, name in enumerate(("A", "B", "C"), start=1)
+    ]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return _fake_jobs(paths)
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+        widened = await romm_auto.sweep(ignore_schedule=True, overall_limit=500)
+        assert widened["queued"] == 1, widened
+        # Three ROMs were eligible and the platform stopped at one: the
+        # configured maximum decided, not the number the caller asked for.
+        assert len(roms) == 3
 
 
 @pytest.mark.asyncio
