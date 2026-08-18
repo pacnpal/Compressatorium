@@ -176,6 +176,13 @@ it or moving the schedule clock. Sections are newest-first.
 
 ### Fixed
 
+- **RomM path resolution: strip the `roms/` prefix automatically.** RomM's
+  `full_path` always starts with `roms/` (its standard library layout), but
+  many deployments mount the ROM content directly — no `roms/` subdirectory on
+  disk.  `local_path()` now tries both the original path and the stripped
+  variant, returning whichever exists.  Existing setups where `roms/` is on
+  disk are unaffected (the original path is tried first).
+
 - **The Hasheous lookup timeout now really is a whole-request timeout.** It
   bounded the response, but every phase before TLS existed had its own budget:
   `socket.create_connection` gives each address a host resolves to the *full*

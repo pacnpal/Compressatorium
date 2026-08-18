@@ -126,6 +126,28 @@ def test_roms_pages_until_short_page(client: RommClient) -> None:
 
 
 def test_local_path_joins_full_path(tmp_path: Path) -> None:
+    """When the roms/ subdirectory exists, local_path uses the full path."""
+    (tmp_path / "roms" / "snes").mkdir(parents=True)
+    (tmp_path / "roms" / "snes" / "Game.sfc").touch()
+    client = RommClient(base_url="http://romm:8080")
+    with patch.object(RommClient, "library_root", str(tmp_path)):
+        got = client.local_path({"full_path": "roms/snes/Game.sfc"})
+    assert got == str(tmp_path / "roms" / "snes" / "Game.sfc")
+
+
+def test_local_path_strips_roms_prefix(tmp_path: Path) -> None:
+    """When library_root points directly at the content (no roms/ on disk),
+    the roms/ prefix from RomM's full_path is stripped automatically."""
+    (tmp_path / "snes").mkdir()
+    (tmp_path / "snes" / "Game.sfc").touch()
+    client = RommClient(base_url="http://romm:8080")
+    with patch.object(RommClient, "library_root", str(tmp_path)):
+        got = client.local_path({"full_path": "roms/snes/Game.sfc"})
+    assert got == str(tmp_path / "snes" / "Game.sfc")
+
+
+def test_local_path_no_file_returns_first_candidate(tmp_path: Path) -> None:
+    """When neither candidate exists, return the first valid path for diagnostics."""
     client = RommClient(base_url="http://romm:8080")
     with patch.object(RommClient, "library_root", str(tmp_path)):
         got = client.local_path({"full_path": "roms/snes/Game.sfc"})
