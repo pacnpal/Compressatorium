@@ -19,7 +19,7 @@ down_revision: Union[str, Sequence[str], None] = '0005'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-_COLUMN = 'pre_fingerprint'
+_COLUMNS = ('pre_fingerprint', 'mode')
 
 
 def upgrade() -> None:
@@ -35,11 +35,17 @@ def upgrade() -> None:
     inspector = sa.inspect(bind)
     if 'romm_repin' not in inspector.get_table_names():
         return
-    if any(col['name'] == _COLUMN for col in inspector.get_columns('romm_repin')):
-        # Already present: a DB built straight from the ORM metadata is stamped
-        # at baseline and then run forward through here, as 0004 anticipates.
-        return
-    op.add_column('romm_repin', sa.Column(_COLUMN, sa.String(), nullable=True))
+    #
+    # `mode` rides along so the settle pass can ask the owning tool what it
+    # produced: a split build leaves numbered parts and no bare output, which
+    # from the path alone is indistinguishable from a conversion that never ran.
+    existing = {col['name'] for col in inspector.get_columns('romm_repin')}
+    for column in _COLUMNS:
+        # Column-by-column: a DB built straight from the ORM metadata is
+        # stamped at baseline and then run forward through here, as 0004
+        # anticipates, so some may already be present.
+        if column not in existing:
+            op.add_column('romm_repin', sa.Column(column, sa.String(), nullable=True))
 
 
 def downgrade() -> None:

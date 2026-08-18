@@ -103,6 +103,37 @@
   retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
   anything yet), and there is a **Forget history** button on each platform for
   when you restore from a backup or move outputs aside by hand.
+- **A conversion that was queued but never ran is no longer remembered as done.**
+  The rule history above recorded a ROM the moment its job was queued, so a job
+  you cancelled — or one interrupted by a restart, or one the converter failed on
+  — marked that ROM converted forever, and only **Forget history** brought it
+  back. It now records what was actually *produced*, so those ROMs are simply
+  picked up by the next run.
+- **Switching to a different RomM instance or library no longer skips your new
+  library.** The conversion history is keyed by RomM's own platform and ROM ids,
+  and a different RomM database reuses those numbers for entirely different
+  games — so an Overwrite rule could treat unrelated ROMs as already done and
+  never touch them. Changing the URL or library path now clears that history.
+  Your rules are kept.
+- **Editing a rule while a sweep is running no longer confuses the two.** The
+  save now waits for the sweep, so a retargeted rule cannot inherit the finishing
+  run's record of what it converted, or its schedule clock.
+- **A PS3 conversion split into 4 GB parts now says its metadata needs a manual
+  re-match**, instead of sitting in the pending queue for a week and then
+  reporting that its output never appeared. RomM matches a ROM on one file's
+  hash, and a set of parts has none. The same rule under 4 GB produces a single
+  ISO and re-pins normally, which is why this cannot be refused up front.
+- **Converting two catalog entries that write to the same output no longer loses
+  one of their metadata snapshots.** The batch collapses them into one job, and
+  discarding the losing entry's record took the winner's with it.
+- **The automation editor now says why a platform converted nothing** — a tool
+  that is not installed here, a saved format that is not for this system, an
+  output folder outside the configured volumes, or a platform RomM could not
+  list. Those were already refused; now they are visible.
+- **A failed platform list no longer leaves the previous library on screen.** The
+  error appeared beside a stale catalog whose rows were still selected and still
+  wired to the Convert panel, so a conversion could be submitted against a server
+  that was no longer connected.
 - **Two catalog entries for the same file no longer produce two jobs writing to
   one output.** With Overwrite plus *delete the source after verifying*, that
   meant two sources deleted for one surviving file. A sweep now claims each

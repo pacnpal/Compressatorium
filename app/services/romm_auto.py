@@ -387,16 +387,23 @@ async def set_rules(raw: Any) -> dict[str, dict]:
     retargeted rule would convert nothing, with no way to say otherwise --
     so a rule that changes what it produces starts its history over.
     """
-    previous = await get_rules()
-    rules = normalize_rules(raw)
-    stale = [
-        pid for pid in previous
-        if _output_identity(previous[pid]) != _output_identity(rules.get(pid))
-    ]
-    await preferences_store.put(RULES_KEY, rules)
-    if stale:
-        await forget_converted(stale)
-    return rules
+    # Under the sweep lock, and for the whole read-compare-write. A sweep
+    # holds the rules it started with, and finishes by writing back the ROM ids
+    # it queued and its schedule stamp under the same platform key. Clearing
+    # the history alongside it would let the old sweep's write land after the
+    # clear, so the retargeted rule would skip ROMs it never produced its new
+    # format for -- and inherit the old run's clock as well.
+    async with _sweep_lock:
+        previous = await get_rules()
+        rules = normalize_rules(raw)
+        stale = [
+            pid for pid in previous
+            if _output_identity(previous[pid]) != _output_identity(rules.get(pid))
+        ]
+        await preferences_store.put(RULES_KEY, rules)
+        if stale:
+            await _forget_converted_locked(stale)
+        return rules
 
 
 async def forget_converted(platform_ids: list[str] | None = None) -> int:
@@ -406,6 +413,12 @@ async def forget_converted(platform_ids: list[str] | None = None) -> int:
     outputs out of the way by hand, leaves the library in a state only they
     can see. Returns how many platforms were cleared.
     """
+    async with _sweep_lock:
+        return await _forget_converted_locked(platform_ids)
+
+
+async def _forget_converted_locked(platform_ids: list[str] | None = None) -> int:
+    """The body of :func:`forget_converted`. Called with ``_sweep_lock`` held."""
     state = await get_state()
     targets = (
         [str(p) for p in platform_ids] if platform_ids is not None else list(state)
@@ -413,8 +426,11 @@ async def forget_converted(platform_ids: list[str] | None = None) -> int:
     cleared = 0
     for pid in targets:
         entry = state.get(pid)
-        if isinstance(entry, dict) and entry.get("converted_ids"):
+        if isinstance(entry, dict) and (
+            entry.get("converted") or entry.get("converted_ids")
+        ):
             entry = dict(entry)
+            entry.pop("converted", None)
             entry.pop("converted_ids", None)
             state[pid] = entry
             cleared += 1
@@ -594,11 +610,11 @@ def _accepts_source(tool, spec, path: str) -> bool:
     return tool.converts_path(path)
 
 
-async def _converted_ids(platform_id: str) -> set:
-    """RomM ids this rule has already queued a conversion for.
+async def _converted_map(platform_id: str) -> dict:
+    """What this rule has produced, as ``{rom_id: {"path", "pre"}}``.
 
-    Provenance the filesystem cannot supply. ``skip`` is idempotent from the
-    destination alone, but the other two policies are not:
+    Provenance the filesystem cannot supply on its own. ``skip`` is idempotent
+    from the destination alone, but the other two policies are not:
 
     * ``overwrite`` resolves an existing destination as queueable by
       definition, so a standing rule reconverts and rewrites the same
@@ -606,29 +622,60 @@ async def _converted_ids(platform_id: str) -> set:
     * ``rename`` moves to the next free suffix each time, so the same source
       accumulates ``Game_1``, ``Game_2``, ... until the volume fills.
 
-    Recording the ids keeps both policies meaningful — overwrite really does
-    overwrite what was there, rename really does write alongside it — while
-    doing so exactly once per source. Bounded by the platform's ROM count,
-    which is the same order as the catalog each sweep already holds in memory.
+    The record is *not* "this was queued" -- queueing is not producing, and a
+    job that is cancelled, or interrupted by a restart, or fails in the
+    converter would otherwise mark its ROM done forever. What is stored is the
+    destination and a fingerprint of whatever occupied it at planning time, so
+    "did this actually happen" is answered by the destination having changed
+    since. A conversion that never ran leaves it untouched and the next sweep
+    picks the ROM up again, with no bookkeeping to keep in sync and nothing to
+    reconcile after a crash.
+
+    Bounded by the platform's ROM count, which is the same order as the catalog
+    each sweep already holds in memory.
     """
     state = await get_state()
-    stored = state.get(str(platform_id), {}).get("converted_ids")
-    return set(stored) if isinstance(stored, list) else set()
+    entry = state.get(str(platform_id), {})
+    stored = entry.get("converted")
+    out = {str(k): v for k, v in stored.items() if isinstance(v, dict)} if isinstance(
+        stored, dict,
+    ) else {}
+    # An earlier shape recorded ids alone, with no evidence of production.
+    # Honour them as done rather than reconverting a library on upgrade.
+    for rom_id in entry.get("converted_ids") or []:
+        out.setdefault(str(rom_id), {"path": "", "pre": None})
+    return out
 
 
-async def _mark_converted(platform_id: str, rom_ids: list) -> None:
-    """Add *rom_ids* to this rule's converted set."""
-    if not rom_ids:
+def _was_produced(remembered: dict | None) -> bool:
+    """Whether the conversion recorded in *remembered* actually happened.
+
+    ``pre`` is None for a legacy record that carries no evidence either way;
+    those are trusted, since the alternative is reconverting a whole library.
+    """
+    if not remembered:
+        return False
+    if remembered.get("pre") is None:
+        return True
+    return romm_repin.path_fingerprint(remembered["path"]) != remembered["pre"]
+
+
+async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
+    """Remember ``(rom_id, destination, pre_fingerprint)`` for each queued ROM."""
+    entries = {str(rid): {"path": dest, "pre": pre} for rid, dest, pre in produced
+               if rid is not None}
+    if not entries:
         return
     state = await get_state()
     entry = dict(state.get(str(platform_id)) or {})
-    merged = set(entry.get("converted_ids") or []) | {i for i in rom_ids if i is not None}
-    entry["converted_ids"] = sorted(merged)
+    merged = dict(entry.get("converted") or {})
+    merged.update(entries)
+    entry["converted"] = merged
     state[str(platform_id)] = entry
     await preferences_store.put(STATE_KEY, state)
 
 
-def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
+def _inspect_candidate(rom: dict, rule: dict, tool, spec, remembered: dict | None) -> dict:
     """Every disk-touching question about one candidate, answered in one hop.
 
     Mapping the RomM record onto a local path, the volume check, the input
@@ -647,9 +694,17 @@ def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
     ``resolved`` is still filled in whenever it could be, because the caller
     checks it against the in-flight set before acting on ``skip``.
     """
-    miss = {"skip": "unresolvable", "resolved": None, "destination": None, "path": None}
+    miss = {
+        "skip": "unresolvable", "resolved": None, "destination": None,
+        "path": None, "pre": None,
+    }
     if not _passes_filters(rom, rule):
         return {**miss, "skip": "filtered"}
+    # Already produced by this rule. Asked here rather than on the event loop
+    # because the answer is a stat of the destination this rule last chose --
+    # queueing is not producing, so the record alone does not settle it.
+    if _was_produced(remembered):
+        return {**miss, "skip": SKIP_EXISTING}
     path = romm_client.local_path(rom)
     if not path or not is_within_configured_volumes(path):
         return miss
@@ -683,6 +738,9 @@ def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
         "skip": None if decision == QUEUE else decision,
         "resolved": resolved,
         "destination": destination,
+        # What occupies the destination right now, so a later sweep can tell
+        # "the conversion ran" from "the job never happened".
+        "pre": romm_repin.path_fingerprint(destination) if destination else "",
     }
 
 
@@ -866,35 +924,31 @@ async def _sweep_locked(
             and romm_repin.mode_needs_repin(spec.output_ext)
         )
         # Only the destructive policies need provenance: `skip` is already
-        # idempotent from the destination alone, and consulting the set there
-        # would refuse to reconvert an output the operator deliberately
+        # idempotent from the destination alone, and consulting the record
+        # there would refuse to reconvert an output the operator deliberately
         # deleted.
         converted = (
-            await _converted_ids(platform_id)
+            await _converted_map(platform_id)
             if rule["duplicate_action"] != "skip"
-            else set()
+            else {}
         )
         batch: list[str] = []
         rom_by_path: dict[str, dict] = {}
         destinations: dict[str, str] = {}
         resolved_by_path: dict[str, str] = {}
+        pre_by_path: dict[str, str] = {}
         considered = 0
 
         for rom in sorted(roms, key=_rom_sort_key(rule)):
             if len(batch) >= per_platform_cap:
                 break
             considered += 1
-            # Already converted by this rule. Checked before the disk hop: it
-            # is the cheapest gate there is, and on a fully converted library
-            # it is the one that answers for every candidate.
-            if rom.get("id") in converted:
-                result["skipped_existing"] += 1
-                continue
             # One hop to a worker thread for every disk-touching check on this
             # candidate — the local-path mapping and volume check included,
             # since both resolve paths against a mount that may be remote.
             decision = await run_in_threadpool(
                 _inspect_candidate, rom, rule, tool, spec,
+                converted.get(str(rom.get("id"))),
             )
             path = decision["path"]
             if decision["skip"] == "filtered":
@@ -928,6 +982,7 @@ async def _sweep_locked(
             rom_by_path[path] = rom
             destinations[path] = decision["destination"]
             resolved_by_path[path] = decision["resolved"]
+            pre_by_path[path] = decision["pre"]
 
         result["considered"] += considered
         summary = {
@@ -996,6 +1051,7 @@ async def _sweep_locked(
                             continue
                         if await run_in_threadpool(
                             romm_repin.record, rom, destinations[path], ids,
+                            rule["mode"],
                         ):
                             repin_count += 1
                 summary["repins_recorded"] = repin_count
@@ -1005,10 +1061,11 @@ async def _sweep_locked(
                 # `rename` stop here instead of reconverting the same sources
                 # every interval. Only after the queue accepted them.
                 if rule["duplicate_action"] != "skip":
-                    await _mark_converted(
-                        platform_id,
-                        [rom_by_path[path].get("id") for path in batch],
-                    )
+                    await _mark_converted(platform_id, [
+                        (rom_by_path[path].get("id"), destinations[path],
+                         pre_by_path[path])
+                        for path in batch
+                    ])
 
                 # Claim them immediately so a later platform in the same sweep
                 # cannot queue the same source twice. Already resolved during

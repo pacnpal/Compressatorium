@@ -24,6 +24,7 @@ import os
 from logging_setup import get_logger
 from services import db as _db
 from services.romm import DAT_SAFE_OUTPUT_EXTS, METADATA_ID_FIELDS, romm_client
+from services.tools import registry
 from sqlalchemy.exc import IntegrityError
 
 logger = get_logger("romm_repin")
@@ -126,13 +127,16 @@ def path_fingerprint(path: str) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
-def _insert_pending(session, rom: dict, output_path: str, ids: dict) -> None:
+def _insert_pending(
+    session, rom: dict, output_path: str, ids: dict, mode: str | None,
+) -> None:
     session.add(
         _db.RommRepin(
             source_rom_id=rom.get("id"),
             source_name=rom.get("name") or rom.get("fs_name"),
             output_path=output_path,
             pre_fingerprint=path_fingerprint(output_path),
+            mode=mode,
             metadata_ids=ids,
             state="pending",
             created_at=utcnow_iso(),
@@ -140,7 +144,7 @@ def _insert_pending(session, rom: dict, output_path: str, ids: dict) -> None:
     )
 
 
-def record(rom: dict, output_path: str, ids: dict) -> bool:
+def record(rom: dict, output_path: str, ids: dict, mode: str | None = None) -> bool:
     """Insert a pending row unless one already covers this output.
 
     The dedupe on ``output_path`` is what makes re-submitting the same batch
@@ -159,15 +163,41 @@ def record(rom: dict, output_path: str, ids: dict) -> bool:
     """
     with _session() as session:
         _supersede_pending(session, output_path)
-        _insert_pending(session, rom, output_path, ids)
+        _insert_pending(session, rom, output_path, ids, mode)
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             _supersede_pending(session, output_path)
-            _insert_pending(session, rom, output_path, ids)
+            _insert_pending(session, rom, output_path, ids, mode)
             session.commit()
         return True
+
+
+def produced_companions(output_path: str, mode: str | None) -> list[str]:
+    """Files the owning tool actually produced for *output_path*, if not itself.
+
+    A makeps3iso ``-s`` build only splits past 4 GB, and until it finishes
+    nobody knows whether it will: under 4 GB it writes the bare output and the
+    row settles normally, over it writes ``<name>.iso.0``, ``.1``, ... and no
+    bare file at all. From the recorded path alone that second case is
+    indistinguishable from a conversion that never ran, so the row would wait
+    out ``repin_abandon_days`` and retire with a message that is simply untrue.
+
+    Registry-driven rather than a suffix guess: ``companion_outputs`` is the
+    tool's own answer, and reports the parts only when there is no primary
+    file, which is exactly the case worth naming.
+    """
+    if not mode:
+        return []
+    try:
+        tool = registry.for_mode(mode)
+    except KeyError:
+        return []
+    try:
+        return list(tool.companion_outputs(output_path, mode))
+    except (OSError, KeyError, ValueError):
+        return []
 
 
 def cancel(output_paths: list[str]) -> int:
@@ -224,7 +254,7 @@ def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
         # Detach into plain tuples: the session closes before the caller awaits.
         return [
             (r.output_path, r.output_sha1, r.source_rom_id, dict(r.metadata_ids or {}),
-             r.created_at, r.id, r.pre_fingerprint or "")
+             r.created_at, r.id, r.pre_fingerprint or "", r.mode or "")
             for r in rows
         ]
 

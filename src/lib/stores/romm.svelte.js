@@ -195,6 +195,14 @@ class RommStore {
     } catch (e) {
       this.platformsError = e?.message ?? 'Failed to list RomM platforms';
       this.platforms = [];
+      this.selectedPlatformId = null;
+      // Leave no catalog behind. Clearing `platforms` alone left the previous
+      // platform's rows on the Library tab, still selected and still wired to
+      // the Convert panel — so the user could submit conversions against a
+      // server or platform that is no longer the one selected, with the error
+      // shown right next to them. Leaving RomM mode also restores the ordinary
+      // directory listing, which is a working screen rather than a stale one.
+      fileBrowser.exitRomm();
     } finally {
       this.platformsLoading = false;
     }
@@ -287,10 +295,15 @@ class RommStore {
     }
   }
 
-  /** How many sources this rule remembers having converted. */
+  /** How many sources this rule remembers having produced an output for. */
   convertedCountFor(platformId) {
-    const ids = this.ruleState[String(platformId)]?.converted_ids;
-    return Array.isArray(ids) ? ids.length : 0;
+    const entry = this.ruleState[String(platformId)] ?? {};
+    if (entry.converted && typeof entry.converted === 'object') {
+      return Object.keys(entry.converted).length;
+    }
+    // The earlier shape, kept readable so an upgraded install still shows a
+    // count (and a Forget history button) for what it recorded before.
+    return Array.isArray(entry.converted_ids) ? entry.converted_ids.length : 0;
   }
 
   /**

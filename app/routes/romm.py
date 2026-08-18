@@ -410,7 +410,9 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if decision != QUEUE or not destination:
             skipped += 1
             continue
-        if await run_in_threadpool(romm_repin.record, rom, destination, ids):
+        if await run_in_threadpool(
+            romm_repin.record, rom, destination, ids, payload.mode,
+        ):
             recorded += 1
             recorded_paths[path] = destination
         else:
@@ -485,7 +487,8 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
     exists/lock/hash/match/update/settle chain is a single state machine and
     reads as one.
     """
-    output_path, sha1, _rom_id, ids, created_at, row_id, pre_fingerprint = row
+    (output_path, sha1, _rom_id, ids, created_at, row_id, pre_fingerprint,
+     mode) = row
 
     try:
         exists = await bounded_path_check(os.path.isfile, output_path)
@@ -514,6 +517,20 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
         # matches on the hash, not on where the file sits. So a row that has
         # been hashed keeps going even when nothing is at the recorded path.
         if not sha1:
+            # A split build produced numbered parts and no bare output. The
+            # conversion did run -- but RomM matches a ROM on one file's hash,
+            # and a set of parts has no single digest to join on, so this row
+            # can never settle. Say that now rather than waiting out the
+            # abandon period and then reporting "output never appeared".
+            if await run_in_threadpool(
+                romm_repin.produced_companions, output_path, mode,
+            ):
+                await run_in_threadpool(
+                    romm_repin.settle, row_id, "abandoned",
+                    "Output was split into parts; RomM matches on a single "
+                    "file's hash, so re-pin this ROM by hand",
+                )
+                return _Outcome.ABANDONED
             if not _is_stale(created_at):
                 return _Outcome.WAITING
             # Aged out, but only if nothing is still going to write it: a
@@ -798,8 +815,31 @@ async def get_romm_settings() -> dict:
 
 @router.put("/romm/settings")
 async def put_romm_settings(patch: RommSettingsPatch) -> dict:
-    """Save settings and apply them immediately (no restart)."""
+    """Save settings and apply them immediately (no restart).
+
+    Pointing the integration at a different RomM instance, or at a different
+    library on disk, invalidates the automation's conversion history: it is
+    keyed by RomM's own platform and ROM ids, and a different RomM database
+    reuses those numbers for entirely different games. Carried over, an
+    `overwrite` or `rename` rule would treat unrelated ROMs in the new library
+    as already done and skip them for good. The rules themselves are kept --
+    they are the operator's configuration, and a mistyped URL must not delete
+    it -- but what those rules believe they have produced starts over.
+
+    The orchestration lives here rather than in ``romm_settings``: the service
+    layer's dependency runs the other way (``romm_auto`` reads settings), and
+    a route is where cross-service consequences belong.
+    """
+    before = romm_settings.effective()
     values = await romm_settings.save(patch.model_dump(exclude_unset=True))
+    identity = ("url", "library_root")
+    if any(before.get(f) != values.get(f) for f in identity):
+        cleared = await romm_auto.forget_converted()
+        if cleared:
+            logger.info(
+                "romm: RomM instance or library changed; cleared the conversion "
+                "history for %s platform(s)", cleared,
+            )
     return romm_settings.public(values)
 
 

@@ -182,6 +182,11 @@ class RommRepin(Base):
     # artifact, and the settle pass hashes that and stamps this ROM's identity
     # onto whatever RomM knows the old file as.
     pre_fingerprint = Column(String, nullable=True)
+    # The conversion mode this row is waiting on, so the settle pass can ask
+    # the owning tool what it actually produced. A makeps3iso `-s` build past
+    # 4 GB leaves `<name>.iso.0`, `.1`, ... and no bare `<name>.iso`, which
+    # looks identical to "the conversion never ran" from the path alone.
+    mode = Column(String, nullable=True)
     # "pending" -> "done" | "abandoned"
     state = Column(String, nullable=False, default="pending")
     detail = Column(String, nullable=True)

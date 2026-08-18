@@ -374,8 +374,16 @@ using them would otherwise rewrite the same images — or write `Game_1`, `Game_
 `Game_3` — every interval, forever. Each rule therefore remembers which ROMs it
 has converted, and that memory is kept honest for you:
 
+- It records what was **produced**, not what was queued. A job you cancel, or one
+  interrupted by a restart, or one the converter fails on, leaves the ROM exactly
+  where it was — the next sweep picks it up again. Nothing to notice, nothing to
+  clear by hand.
 - Retargeting a rule clears it. A rule switched from RVZ to GCZ, or pointed at a
   new output folder, has not produced that file for anything yet.
+- Pointing Compressatorium at a **different RomM instance or library** clears it
+  too. The history is keyed by RomM's own ids, and another RomM database reuses
+  those numbers for entirely different games. Your rules are kept; only what they
+  believe they have produced starts over.
 - A **Forget history** button on the platform clears it on demand — for when you
   restore from a backup, or move outputs aside by hand, and want the rule to run
   over them again.
@@ -398,6 +406,12 @@ metadata **before** converting and re-applies it afterwards:
 1. Convert as usual. The view tells you up front which formats need this step.
 2. Let RomM rescan (its watcher, a scheduled scan, or a manual one).
 3. Press **Re-match in RomM** — or leave it to run automatically on page load.
+
+One case cannot work and says so instead of pretending: a PS3 rule that **splits
+its output into 4 GB parts** only actually splits past 4 GB, and when it does
+there is no single file for RomM to hash — that ROM is reported as needing a
+manual re-match rather than sitting in the queue for a week. Under 4 GB the same
+rule produces one ISO and re-pins normally.
 
 The match uses the converted file's SHA1, so it's exact and survives you renaming
 or moving the file in between — once the hash has been taken, where the file sits

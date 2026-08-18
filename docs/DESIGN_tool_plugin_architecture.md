@@ -1378,16 +1378,37 @@ that as. `cancel(paths)` retires such rows immediately rather than waiting out
 **"Has this rule already converted this source?"** `skip` is idempotent from the
 destination alone, but the other two policies are not: `overwrite` resolves an
 occupied destination as queueable, and `rename` always finds a free suffix. Both
-would therefore reconvert the whole library every interval. The sweep records the
-RomM ids it queued in **`converted_ids`** on the platform's `romm.auto_state`
-entry (bounded by the platform's ROM count) and consults it before the disk hop.
+would therefore reconvert the whole library every interval.
+
+What is recorded is **production, not queueing**. `converted` on the platform's
+`romm.auto_state` entry maps each RomM id to `{path, pre}` — the destination the
+rule chose and a fingerprint of whatever occupied it at planning time — and
+`_was_produced()` answers the question by checking whether that path has changed
+since. A job that is cancelled, interrupted by a restart, or fails in the
+converter leaves it untouched, so the next sweep picks the ROM up again. Nothing
+has to be kept in sync with the queue and nothing needs reconciling after a
+crash, which is why this is not a "mark done on job success" callback.
+
 It is invalidated where it stops being true: `set_rules` drops it for any
 platform whose `OUTPUT_IDENTITY_FIELDS` changed — a rule retargeted from RVZ to
-GCZ is asking for a different file — and `forget_converted()` (exposed as
+GCZ is asking for a different file — and does so **under `_sweep_lock`**, since
+a sweep running concurrently finishes by writing its own ids and schedule stamp
+under the same key. `routes/romm.py` also clears it when `url` or `library_root`
+changes, because a different RomM database reuses the same integer ids for
+different games. `forget_converted()` (exposed as
 `POST /api/romm/rules/forget-converted`, with a per-platform button in the
 automation editor) is the operator's escape hatch after restoring a backup.
 `_record_run` merges into the entry rather than replacing it, or every run would
 forget the history it shares a key with.
+
+**"What did the tool actually produce?"** A row also stores its `mode`, so the
+settle pass can ask the owning tool through `companion_outputs`. makeps3iso's
+`-s` build only splits past 4 GB — under it, the bare `.iso` appears and the row
+settles normally; over it, only `<name>.iso.0`, `.1`, … exist, which from the
+recorded path alone is indistinguishable from a conversion that never ran. RomM
+matches a ROM on one file's hash, so a part set has no digest to join on: the
+row is retired immediately with that as its reason rather than waiting out
+`repin_abandon_days` and reporting "output never appeared".
 
 ### 3.3.9 Verify without delete (`ConversionJob.verify_after`)
 

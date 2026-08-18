@@ -424,6 +424,62 @@ async def test_repin_waits_until_an_overwritten_output_actually_changes(
 
 
 @pytest.mark.asyncio
+async def test_repin_names_a_split_output_instead_of_waiting_it_out(
+    repin_db, tmp_path: Path,
+) -> None:
+    """A split build produced parts, not a file RomM can hash-match.
+
+    makeps3iso only splits past 4 GB, so this cannot be refused when the row is
+    written -- nobody knows yet. From the recorded path alone it looks exactly
+    like a conversion that never ran, and the row would age out reporting
+    "output never appeared", which is false and unactionable.
+    """
+    output = tmp_path / "Game.iso"
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42}, "folder_to_iso")
+    # The `-s` build crossed 4 GB: numbered parts, no bare ISO.
+    (tmp_path / "Game.iso.0").write_bytes(b"x" * 8)
+    (tmp_path / "Game.iso.1").write_bytes(b"y" * 8)
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "run_detached", AsyncMock(return_value="abc123"),
+            ) as hasher, \
+            patch.object(romm_routes.romm_client, "update_rom_metadata") as update:
+        result = await romm_routes.settle_romm_repins()
+
+    assert result["abandoned"] == 1, result
+    hasher.assert_not_awaited()
+    update.assert_not_called()
+    rows = romm_repin.pending_rows(10)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_repin_still_settles_a_split_rule_that_did_not_split(
+    repin_db, tmp_path: Path,
+) -> None:
+    """Under 4 GB a `-s` build writes the bare ISO, which re-pins normally."""
+    output = tmp_path / "Game.iso"
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42}, "folder_to_iso")
+    output.write_bytes(b"x" * 8)
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "run_detached", AsyncMock(return_value="abc123"),
+            ), \
+            patch.object(
+                romm_routes.romm_client, "rom_by_sha1", return_value={"id": 108},
+            ), \
+            patch.object(romm_routes.romm_client, "update_rom_metadata") as update:
+        result = await romm_routes.settle_romm_repins()
+
+    assert result["repinned"] == 1, result
+    update.assert_called_once_with(108, {"igdb_id": 42})
+
+
+@pytest.mark.asyncio
 async def test_repin_cancel_retires_rows_for_a_batch_that_never_ran(
     repin_db, tmp_path: Path,
 ) -> None:
@@ -2135,6 +2191,9 @@ async def test_forget_converted_lets_a_rule_run_again(
             "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
         }})
         assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+        # The conversion lands. Only now is the ROM recorded as converted --
+        # queueing is not producing.
+        (lib / "Game.rvz").write_bytes(b"\0" * 8)
         assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 0
 
         assert await romm_auto.forget_converted(["7"]) == 1
@@ -2144,6 +2203,109 @@ async def test_forget_converted_lets_a_rule_run_again(
     # share one state entry, and losing "last run" would restart the interval.
     state = await romm_auto.get_state()
     assert state["7"].get("last_run_at")
+
+
+@pytest.mark.asyncio
+async def test_a_queued_conversion_that_never_ran_is_retried(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Queueing is not producing.
+
+    A job can be cancelled, or interrupted by a restart, or fail in the
+    converter. Recording the ROM as converted the moment it was queued would
+    skip it on every later sweep, and only clearing the history by hand would
+    bring it back.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+
+        # The job never produced anything -- cancelled, or the process
+        # restarted while it waited. The destination is untouched.
+        retried = await romm_auto.sweep(ignore_schedule=True)
+        assert retried["queued"] == 1, retried
+
+        # Now it lands, and the rule stops.
+        (lib / "Game.rvz").write_bytes(b"\0" * 8)
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_changing_the_romm_instance_forgets_the_conversion_history(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A different RomM database reuses the same platform and ROM ids.
+
+    Carried over, an `overwrite` rule would treat unrelated games in the new
+    library as already converted and skip them permanently. The rules survive
+    -- they are the operator's configuration -- but what they believe they
+    produced does not.
+    """
+    from services import romm_auto
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+    await romm_auto.set_rules({"7": {
+        "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+    }})
+    await romm_auto._mark_converted("7", [(1, str(tmp_path / "Game.rvz"), "")])
+    assert (await romm_auto.get_state())["7"]["converted"]
+
+    await romm_routes.put_romm_settings(
+        romm_routes.RommSettingsPatch(url="http://other-romm:8080"),
+    )
+
+    assert not (await romm_auto.get_state())["7"].get("converted")
+    # The rule itself is untouched: a mistyped URL must not delete the config.
+    assert (await romm_auto.get_rules())["7"]["mode"] == "dolphin_rvz"
+
+
+@pytest.mark.asyncio
+async def test_retargeting_a_rule_cannot_race_a_running_sweep(
+    settings_db, tmp_path: Path,
+) -> None:
+    """`set_rules` clears history a sweep may still be about to write back."""
+    from services import romm_auto
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+    await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+
+    # Hold the sweep lock and confirm a save cannot slip past it.
+    async with romm_auto._sweep_lock:
+        saving = asyncio.create_task(
+            romm_auto.set_rules({"7": {"mode": "dolphin_gcz", "enabled": True}}),
+        )
+        await asyncio.sleep(0)
+        assert not saving.done(), "set_rules must serialise with sweeps"
+    await saving
+    assert (await romm_auto.get_rules())["7"]["mode"] == "dolphin_gcz"
 
 
 @pytest.mark.asyncio

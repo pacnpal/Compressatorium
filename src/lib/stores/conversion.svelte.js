@@ -513,11 +513,25 @@ class ConversionStore {
       // Narrow `recorded` down to the rows whose source did NOT become a job;
       // the `finally` block retires exactly those. Anything that did get
       // queued keeps its row, which is the whole point of having written it.
+      //
+      // Retire by destination, but decide by destination too: two sources can
+      // resolve to one output (duplicate basenames landing in a single output
+      // folder), the batch collapses them into one job, and cancelling on
+      // behalf of the source that lost would delete the row the winner needs.
+      // A destination any queued source claims is never retired.
       const queuedSources = new Set(
         (Array.isArray(result) ? result : []).map((job) => job?.file_path),
       );
+      const claimed = new Set(
+        Object.entries(recorded)
+          .filter(([source]) => queuedSources.has(source))
+          .map(([, destination]) => destination),
+      );
       recorded = Object.fromEntries(
-        Object.entries(recorded).filter(([source]) => !queuedSources.has(source)),
+        Object.entries(recorded).filter(
+          ([source, destination]) =>
+            !queuedSources.has(source) && !claimed.has(destination),
+        ),
       );
       // Report only the rows that survive, or the toast would claim metadata
       // was saved for conversions that are not happening.
