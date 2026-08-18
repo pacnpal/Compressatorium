@@ -195,7 +195,19 @@ class RommStore {
       // settings this save just installed with the ones it replaced.
       this.#settingsTicket += 1;
       this.settings = saved;
-      // Connection details may have changed; re-derive everything downstream.
+      // Only an identity change invalidates what is on screen. Re-deriving
+      // unconditionally meant that toggling automation, or saving a metadata
+      // preference, re-listed every platform and re-entered the selected one —
+      // whose catalog load stats every ROM in it. On a large remote library
+      // that holds the Save action for the catalog scan's multi-minute bound
+      // and discards a listing that was still correct, because none of those
+      // settings changes which server or which files are being described.
+      //
+      // Keyed off what the *patch* carried rather than off a diff of the saved
+      // settings, because the token is never returned to the browser: a
+      // credential change is only ever visible here as a submitted field.
+      const identityKeys = ['url', 'library_root', 'token', 'clear_token'];
+      if (!identityKeys.some((key) => key in (patch ?? {}))) return this.settings;
       await this.loadStatus();
       if (this.usable) {
         await this.loadPlatforms({ force: true });

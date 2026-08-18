@@ -1681,6 +1681,23 @@ whose body itself repeats (`(a+)+`, `(\w+\s?)*`) or is an alternation
 input. Escapes and character classes are stripped first, so a literal `\+` or a
 `[+|]` class is not mistaken for a quantifier.
 
+**The two quantifier sets are not the same set.** What may follow a *group*
+is `*+{` — `(...)?` cannot blow up, because the outer level consumes at most
+once. What counts *inside* a group that is already repeated unboundedly is
+`*+{?`, because there every optional atom doubles the ways the engine can split
+the same input: `^(a?){30}a{30}b$` compiles, looks tame, and walks
+exponentially many choices against a long run of `a`. Bounded repetition is not
+a reprieve — `{30}` is thirty levels of doubling. Getting this wrong is not just
+a slow sweep: the probe thread is abandoned rather than stopped, so repeated
+scheduled retries eat into the process-wide probe capacity that unrelated
+filesystem checks share.
+
+A group's leading `?` is stripped before that test, because in `(?:…)`, `(?=…)`,
+`(?<!…)`, `(?P<name>…)` and inline-flag groups it is *syntax*. Reading it as an
+optional atom would refuse every non-capturing group — and a refused filter
+disables the rule, so an operator who cannot write `(?:USA|Europe)` writes
+something looser instead, which is the widening this validator exists to stop.
+
 It is conservative on purpose — `(USA|Europe)+` is harmless and still refused —
 because being wrong at save time costs one clear message, while being wrong the
 other way wedges the scheduler.
@@ -1760,11 +1777,20 @@ because the honest answer for NSZ is a real walk of a possibly large share) and
 reports **not ready** when it expires: the same answer a missing binary gets,
 and the right one, since a tool whose prerequisites cannot be read cannot
 convert. `registry.ready_tool_ids()` is the fan-out form, concurrent rather
-than sequential. The blocked thread is not freed — Python can abandon the
-awaiter, never the OS thread — but the caller is, which is what a person is
-waiting on. The RomM sweep's `_ready_bounded` is a thin alias kept for its
+than sequential. The RomM sweep's `_ready_bounded` is a thin alias kept for its
 local consequence: the sweep holds `_sweep_lock` throughout, so a hang there
 also blocks previews, manual runs, rule edits and settings saves.
+
+**And the other half is the plugin's.** The bound frees the *caller*, and only
+the caller — Python can abandon an awaiter, never an OS thread. Whose thread is
+abandoned is decided by the implementation, so **an `is_ready()` that touches
+the filesystem must use `run_detached`, not `run_in_threadpool`.** A pooled
+worker wedged on a dead mount is never handed back, and since every caller fans
+out over the whole registry, repeated probes retire the pool one worker at a
+time until unrelated offloads have nowhere to run — the bound turns a hang into
+a leak rather than removing it. `nsz` (a recursive walk for `prod.keys`) and
+`jwud` (a stat for the `.jar`) are the two that touch the disk today; the
+requirement is stated on `ToolPlugin.is_ready` so a new gated tool inherits it.
 
 #### Resolving what to verify (`_verify_target_bounded`)
 
@@ -1784,6 +1810,29 @@ pressed while a mount is silent must return now rather than after the probe
 bound. An expired bound fails the job with a message naming the storage; a
 cancel raises `ConversionCancelled`, the same translation the verify makes, so
 nothing is judged and the source is not deleted on it.
+
+#### A platform claim is a promise about extensions
+
+`platform_slugs` and the modes' `input_extensions` are two halves of one
+statement, and nothing enforces the join — so they can disagree, and the
+disagreement is invisible until an operator hits it. ROMZ claimed NES, SNES,
+N64, Genesis, Game Gear and a dozen more while accepting only `.gb`, `.gbc`,
+`.gba` and `.nds`. RomM offered the ROMZ modes on an NES platform, every `.nes`
+row was unselectable, and an enabled automation rule skipped the whole platform
+as unconvertible on every sweep — silently, because "nothing to do" and
+"nothing I *can* do" report the same way.
+
+**Widen the extensions rather than dropping the slugs**, whenever the tool can
+honestly serve them: ROMZ is a `7z` wrapper with no per-format logic, so a
+`.nes` packs exactly as a `.gba` does. Dropping the claim would have been the
+smaller diff and the worse answer — it removes a capability to make a doc
+string true. And keep the two lists collision-free against other tools:
+`.bin` stays chdman's, because a Genesis dump sharing an extension with a CD
+track is not a collision worth creating.
+
+The frontend mirrors these lists in `src/lib/tools/registry.js`, and
+`tests/test_frontend_parity_186.py` fails when the two drift — so widening a
+tool's inputs is a two-file change by construction.
 
 #### What counts as a source (`registry.mode_input_kind`)
 

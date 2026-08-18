@@ -59,7 +59,16 @@ const CSO_SOURCE_EXTS = [...CSO_COMPRESS_EXTS, ...CSO_VERIFY_EXTS];
 // Handheld ROM packer (7z). Compress takes a loose GB/GBC/GBA/NDS ROM;
 // extract takes one of the .7z/.zip archives it writes. Both directions are
 // "sources" by mode. Output names preserve the ROM extension (Game.gba.7z).
-const ROMZ_COMPRESS_EXTS = ['.gb', '.gbc', '.gba', '.nds'];
+// Mirrors ROMZ_COMPRESS_EXTENSIONS in app/services/romz.py — one entry per
+// platform RomzTool claims, checked by tests/test_frontend_parity_186.py.
+// `.bin` is deliberately absent: chdman's disc modes own it.
+const ROMZ_COMPRESS_EXTS = [
+  '.gb', '.gbc', '.gba', '.nds',
+  '.nes', '.sfc', '.smc', '.z64', '.n64', '.v64',
+  '.sms', '.md', '.gen', '.smd', '.gg',
+  '.vb', '.ws', '.wsc', '.ngp', '.ngc', '.lnx',
+  '.d64', '.t64', '.prg', '.a26', '.a78',
+];
 const ROMZ_VERIFY_EXTS = ['.7z', '.zip'];
 const ROMZ_SOURCE_EXTS = [...ROMZ_COMPRESS_EXTS, ...ROMZ_VERIFY_EXTS];
 

@@ -683,7 +683,23 @@ class ConversionStore {
       const orphaned = Object.keys(recorded)
         .map((source) => recordedIds[source])
         .filter((id) => id != null);
-      if (orphaned.length) api.cancelRommRepin(orphaned).catch(() => {});
+      if (orphaned.length) {
+        // Awaited for its *count*, not for its success. `lastRepinPending` was
+        // measured by the plan call, before these rows were retired, so leaving
+        // it there showed the pre-reconciliation backlog on the badge — and a
+        // fire-and-forget retirement can never correct it, so it stayed wrong
+        // until a status reload or a settle pass. The reply carries the
+        // authoritative count; a failure leaves the old one, which is the
+        // existing best-effort behaviour and still ages out on its own.
+        try {
+          const reconciled = await api.cancelRommRepin(orphaned);
+          if (typeof reconciled?.pending === 'number') {
+            this.lastRepinPending = reconciled.pending;
+          }
+        } catch (_e) {
+          // Harmless: a row whose output never changes is never settled.
+        }
+      }
     }
   }
 }

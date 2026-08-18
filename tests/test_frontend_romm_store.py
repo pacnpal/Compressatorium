@@ -64,10 +64,12 @@ const __calls = [];
 const __defer = () => new Promise((resolve, reject) => {
   __calls.push({ resolve, reject });
 });
+const __reloads = [];
 const api = {
-  getRommPlatforms: __defer,
+  getRommPlatforms: (...a) => { __reloads.push('platforms'); return __defer(...a); },
   saveRommRules: __defer,
-  getRommStatus: __defer,
+  getRommStatus: (...a) => { __reloads.push('status'); return __defer(...a); },
+  saveRommSettings: async (patch) => ({ ...patch, saved: true }),
 };
 const fileBrowser = { rommPlatformId: null, exitRomm() {}, async enterRomm(id) {
   this.rommPlatformId = id;
@@ -354,3 +356,41 @@ def test_a_stale_status_answer_cannot_overwrite_the_new_connection(tmp_path):
     assert data["connected"] is True, data
     assert data["error"] is None, data
     assert data["loading"] is False, data
+
+
+_POLICY_SAVE = """
+const store = new RommStore();
+const before = __reloads.length;
+// Toggling automation, or saving a metadata preference. Neither says anything
+// about which server or which files are being described.
+await store.saveSettings({ auto_convert: true });
+await store.saveSettings({ repin_enabled: false, repin_abandon_days: 14 });
+const afterPolicy = __reloads.length - before;
+
+// ...whereas any of these is a different instance, or a different view of it.
+await Promise.race([store.saveSettings({ url: 'http://other:8080' }), tick()]);
+const afterUrl = __reloads.length - before - afterPolicy;
+
+process.stdout.write(JSON.stringify({ afterPolicy, afterUrl, reloads: __reloads }));
+"""
+
+
+def test_a_policy_only_save_does_not_rescan_the_catalog(tmp_path):
+    """Only an identity change invalidates what is on screen.
+
+    `saveSettings` re-read the status and force-reloaded the platform list
+    after *every* save, and reloading re-enters the selected platform, whose
+    catalog load stats every ROM in it. So toggling automation on a large
+    remote library held the Save action for the catalog scan's multi-minute
+    bound and discarded a listing that was still correct.
+
+    Keyed off what the patch carried rather than a diff of the saved settings,
+    because the token is never returned to the browser: a credential change is
+    only ever visible here as a submitted field.
+    """
+    data = _run(tmp_path, _POLICY_SAVE)
+
+    assert data["afterPolicy"] == 0, data
+    # The connection save still re-derives everything downstream.
+    assert data["afterUrl"] > 0, data
+    assert "status" in data["reloads"], data

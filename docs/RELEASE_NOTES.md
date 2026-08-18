@@ -92,6 +92,55 @@
 
 ### Fixed
 
+- **ROMZ now accepts a ROM from every platform it is offered on.** The tool
+  advertised itself for NES, SNES, N64, Master System, Genesis, Game Gear,
+  Virtual Boy, WonderSwan, Neo Geo Pocket, Lynx, C64 and Atari while actually
+  accepting only Game Boy, GBA and DS dumps. So RomM would offer "Compress ROM
+  → 7z" on an NES platform, every `.nes` row was unselectable, and an
+  automation rule for it skipped the whole platform on every run without
+  saying why. It is a `7z` wrapper with no per-format logic, so all of those
+  now work — `.nes`, `.sfc`, `.smc`, `.z64`, `.n64`, `.v64`, `.sms`, `.md`,
+  `.gen`, `.smd`, `.gg`, `.vb`, `.ws`, `.wsc`, `.ngp`, `.ngc`, `.lnx`, `.d64`,
+  `.t64`, `.prg`, `.a26` and `.a78`. (`.bin` stays with the disc tools.)
+
+- **Running or previewing automation with no platforms ticked no longer runs
+  all of them.** An explicitly empty selection was read as "no filter", which
+  means *everything* — so a client sending an empty list started every enabled
+  rule, delete-after-verify included, and Preview widened the same way so you
+  could not see it coming. **Forget history** had the identical flaw, where it
+  would clear the conversion record for every platform at once and make the
+  next sweep reconvert your whole library.
+
+- **Toggling automation or a metadata setting no longer re-scans your
+  library.** Saving anything on the RomM settings screen re-listed every
+  platform and reloaded the current catalog, which on a large remote library
+  meant waiting out a multi-minute scan to flip a checkbox — and it threw away
+  the listing you were looking at. Only a change of URL, library path or
+  credentials does that now, because only those change which files are being
+  described.
+
+- **A filter pattern that would hang the scheduler is caught in one more
+  shape.** Patterns are rejected at save time if they can backtrack
+  catastrophically, since Python's regex engine cannot be interrupted mid-match
+  and the sweep holds its lock while it runs. One shape slipped through: an
+  optional part inside a repeated group, like `(a?){30}`. Ordinary
+  non-capturing groups and lookarounds — `(?:USA|Europe)` and friends — are
+  unaffected and still accepted.
+
+- **The "Re-match in RomM" badge is right immediately after a submit.** When
+  some of the selected files did not become jobs — skipped duplicates, or two
+  rows resolving to the same output — their metadata snapshots are discarded,
+  but the badge still showed the count from before that clean-up and stayed
+  high until the next reload.
+
+- **A tool that cannot say whether it can run no longer costs you a worker.**
+  Switch (nsz) reports readiness by searching your volumes for `prod.keys`, and
+  Wii U (jwud) by checking for its runtime. On a mount that has stopped
+  answering, those checks were holding one of a small shared pool of workers
+  each time they were asked — so repeated page loads gradually starved
+  everything else that needs to touch the disk. They now run on their own
+  disposable threads.
+
 - **Your saved API token is no longer wiped by saving a metadata setting.**
   The Metadata card's Save correctly sent only its own fields, but the shared
   success handler still cleared the Connection card's token box and its "clear

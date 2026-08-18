@@ -781,7 +781,16 @@ async def romm_repin_cancel(payload: RepinCancelRequest) -> dict:
     cancelled = await run_in_threadpool(
         romm_repin.cancel, [i for i in payload.ids if i not in keep],
     )
-    return {"cancelled": cancelled}
+    # The backlog *after* the retirement, from the same source `/romm/repin/plan`
+    # and `/romm/status` report. The badge is set from a count, never adjusted by
+    # one: `record()` supersedes the pending row for a destination rather than
+    # stacking one, so neither what was recorded nor what was cancelled is a
+    # delta anyone can apply. Returning it here is what lets the submit path
+    # show the reconciled number instead of the one it measured before the
+    # rows that never became jobs were retired.
+    return {"cancelled": cancelled, "pending": await run_in_threadpool(
+        romm_repin.count_pending,
+    )}
 
 
 class _Outcome(str, Enum):
@@ -1586,8 +1595,13 @@ async def forget_romm_converted(payload: dict | None = None) -> dict:
     """
     payload = payload or {}
     ids = payload.get("platform_ids")
+    # `is not None` for the same reason the sweep uses it: an explicit empty
+    # list selects no platforms, and reading it as "no filter" cleared the
+    # conversion history for *every* one of them. This is the escape hatch
+    # after a restore -- wiping it wholesale on an empty selection makes the
+    # next sweep reconvert the entire library.
     cleared = await romm_auto.forget_converted(
-        [str(p) for p in ids] if ids else None,
+        [str(p) for p in ids] if ids is not None else None,
     )
     return {"cleared": cleared, "state": await romm_auto.get_state()}
 

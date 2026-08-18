@@ -272,6 +272,16 @@ class ToolPlugin(Protocol):
         Async because a readiness probe may touch the disk (nsz searches the
         configured volumes for ``prod.keys``); implementations that block
         should hop to a threadpool rather than stall the event loop.
+        
+        **Filesystem work here goes through ``run_detached``, never
+        ``run_in_threadpool``.** Callers all fan out over the whole registry
+        (``GET /api/tools``, the RomM platform list, every sweep) and bound the
+        wait through :meth:`ToolRegistry.tool_is_ready` -- but a bound can only
+        abandon the awaiter, never the OS thread. A probe wedged on an
+        unresponsive mount therefore keeps whatever thread it was given, and
+        one taken from the shared pool is never handed back, so repeated probes
+        retire the pool a worker at a time until unrelated offloads have
+        nowhere to run. A detached thread is disposable and costs nothing.
         """
 
     def active_pids(self) -> list[int]:

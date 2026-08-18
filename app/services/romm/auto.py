@@ -193,9 +193,19 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
     return pattern, False
 
 
-# Quantifiers that can repeat unboundedly. `?` is excluded: `(a?)?` cannot
-# blow up, because neither level can consume more than once.
+# Quantifiers that can repeat unboundedly. This is the test for what follows a
+# GROUP: `(...)?` cannot blow up, because the outer level consumes at most once.
 _UNBOUNDED_QUANTIFIERS = "*+{"
+
+# ...but inside a group that *is* repeated unboundedly, `?` counts. Every
+# optional atom doubles the ways the engine can split the same input, so
+# `(a?){30}a{30}b` explores exponentially many choices against a long run of
+# `a` while matching nothing -- and `re` cannot be interrupted, so the sweep
+# holds `_sweep_lock` throughout and each detached probe thread is abandoned
+# rather than stopped, eating into the process-wide probe capacity that
+# unrelated filesystem checks share. Bounded repetition counts as unbounded
+# here: `{30}` is thirty levels of doubling.
+_BODY_QUANTIFIERS = "*+{?"
 
 
 def _has_nested_quantifier(pattern: str) -> bool:
@@ -257,8 +267,37 @@ def _skip_class(pattern: str, i: int) -> int:
 
 
 def _contains_quantifier(body: str) -> bool:
-    """Whether *body* repeats anything, ignoring escapes and classes."""
-    return any(c in _UNBOUNDED_QUANTIFIERS for c in _strip_atoms(body))
+    """Whether *body* repeats or optionalises anything.
+
+    Escapes and classes are stripped first so a literal ``\\+`` or a ``[+?]``
+    class is not read as a quantifier, and so is any leading group prefix --
+    the ``?`` in ``(?:...)``, ``(?=...)`` or ``(?P<name>...)`` is syntax, not
+    an optional atom, and reading it as one would refuse every non-capturing
+    group in the codebase's own filters.
+    """
+    return any(c in _BODY_QUANTIFIERS for c in _strip_atoms(_strip_group_prefix(body)))
+
+
+def _strip_group_prefix(body: str) -> str:
+    """*body* without the inline prefix that makes a group non-capturing.
+
+    ``(?:``, ``(?=``, ``(?!``, ``(?<=``, ``(?<!``, ``(?P<name>`` and inline
+    flag groups all begin with a ``?`` that is part of the group's *syntax*.
+    Only what follows is the body whose repetition matters.
+    """
+    if not body.startswith("?"):
+        return body
+    rest = body[1:]
+    if rest.startswith(("P<", "<")):
+        closed = rest.find(">")
+        return rest[closed + 1:] if closed != -1 else rest
+    # `:`/`=`/`!` end the prefix; inline flags (`aiLmsux`, `-`) precede them.
+    i = 0
+    while i < len(rest) and rest[i] in "aiLmsux-":
+        i += 1
+    if i < len(rest) and rest[i] in ":=!":
+        i += 1
+    return rest[i:]
 
 
 def _strip_atoms(body: str) -> str:
@@ -1508,7 +1547,13 @@ async def _sweep_locked(
         if overall_limit is not None
         else configured_cap
     )
-    wanted = {str(p) for p in platform_ids} if platform_ids else None
+    # `is not None`, not truthiness. An explicit empty list means "these
+    # platforms", and there are none of them -- a multi-select with nothing
+    # ticked, forwarded verbatim. Reading it as "no filter" turned a request
+    # that selected nothing into a *global* run, queueing every eligible rule
+    # including the ones carrying delete-on-verify. Preview widened the same
+    # way, so the operator could not even see it coming.
+    wanted = {str(p) for p in platform_ids} if platform_ids is not None else None
 
     # Priority first (lower runs earlier), then id, so the order is total and
     # a capped sweep resumes where the last one stopped.

@@ -9,7 +9,7 @@ the shared, mtime-cached ``services.archive_members`` reader.
 
 Three modes:
 
-- ``romz_7z``      ``.gb``/``.gbc``/``.gba``/``.nds`` -> ``<name>.7z``
+- ``romz_7z``      a loose cartridge ROM (see ROMZ_COMPRESS_EXTENSIONS) -> ``<name>.7z``
 - ``romz_zip``     ``.gb``/``.gbc``/``.gba``/``.nds`` -> ``<name>.zip``
 - ``romz_extract`` ``.7z``/``.zip`` (single ROM member) -> original ROM
 
@@ -50,7 +50,31 @@ from utils.junk import is_junk_path
 _OWNER = "romz"
 
 # Compress takes a loose ROM; extract takes one of the archives this tool writes.
-ROMZ_COMPRESS_EXTENSIONS = {".gb", ".gbc", ".gba", ".nds"}
+#
+# One entry per platform `RomzTool.platform_slugs` claims. The two have to agree
+# or the claim is a lie the operator only discovers later: RomM offering an NES
+# platform the ROMZ modes, every `.nes` row unselectable because the extension
+# predicate rejects it, and an enabled automation rule skipping the entire
+# platform as unconvertible every sweep, silently.
+#
+# Widening rather than dropping the slugs is the honest direction: this tool is
+# a `7z` wrapper with no per-format logic at all, and the ROM extension is
+# preserved in front of the archive suffix, so a `.nes` packs and unpacks
+# exactly as a `.gba` does. `.bin` is deliberately absent -- chdman's disc modes
+# own it, and a Genesis dump sharing an extension with a CD track is not a
+# collision worth creating.
+ROMZ_COMPRESS_EXTENSIONS = {
+    # Nintendo handhelds and DS
+    ".gb", ".gbc", ".gba", ".nds",
+    # Nintendo consoles
+    ".nes", ".sfc", ".smc", ".z64", ".n64", ".v64",
+    # Sega
+    ".sms", ".md", ".gen", ".smd", ".gg",
+    # Other handhelds
+    ".vb", ".ws", ".wsc", ".ngp", ".ngc", ".lnx",
+    # Home computers / early consoles
+    ".d64", ".t64", ".prg", ".a26", ".a78",
+}
 ROMZ_ARCHIVE_EXTENSIONS = {".7z", ".zip"}
 
 # Output container is decided by the mode, not the input ROM. The ROM extension

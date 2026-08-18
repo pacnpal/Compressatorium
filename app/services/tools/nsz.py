@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from fastapi.concurrency import run_in_threadpool
+from services.subprocess_runner import run_detached
 
 from models import NszInfo, OutputStatus
 from services.lock_manager import lock_manager
@@ -141,10 +142,20 @@ class NszTool(BaseTool):
         operator supplies their own. Until they do, report unavailable so the
         UI hides the tool rather than offering jobs that can only fail.
 
-        ``keys_available`` can walk the configured volumes, so it goes to a
-        threadpool.
+        ``keys_available`` resolves the key file, which when ``SWITCH_KEYS`` is
+        unset means a **recursive walk of every configured volume**. On a
+        remote mount that has stopped answering that blocks in uninterruptible
+        I/O, and a pooled worker taken there is never given back -- a bound on
+        the *caller* frees the caller, not the thread. Every readiness caller
+        fans out over the whole registry (`GET /api/tools`, the RomM platform
+        list, each sweep), so repeated probes would retire the shared pool one
+        worker at a time until unrelated offloads had nowhere to run.
+
+        Detached: the abandoned thread is disposable and holds no shared
+        capacity. The bound belongs to the caller, which is
+        `ToolRegistry.tool_is_ready`.
         """
-        return await run_in_threadpool(self._service.keys_available)
+        return await run_detached(self._service.keys_available)
 
     def active_pids(self) -> list[int]:
         return self._service.active_pids()

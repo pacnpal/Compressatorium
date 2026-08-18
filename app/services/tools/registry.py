@@ -83,9 +83,16 @@ class ToolRegistry:
 
         Expiring answers **not ready**, which is the same answer a missing
         binary gets and the right one here: a tool whose prerequisites cannot
-        be read cannot convert. The blocked thread is not freed — Python can
-        abandon the awaiter, never the OS thread — but the caller is, which is
-        the part a person is waiting on.
+        be read cannot convert.
+
+        This bound frees the *caller*, and only the caller: Python can abandon
+        an awaiter, never an OS thread. Whose thread is abandoned is therefore
+        the implementation's problem and not this seam's — so an ``is_ready()``
+        that touches the filesystem must run it through ``run_detached`` rather
+        than ``run_in_threadpool``, or every expired probe retires one of the
+        shared pool's few workers and repeated probes starve every unrelated
+        offload in the process. nsz and jwud are the two that touch it; the
+        requirement is on ``ToolPlugin.is_ready``.
 
         One seam rather than a bound per call site, so a future caller of
         ``is_ready()`` is covered by using the registry the way every other

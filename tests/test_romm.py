@@ -4704,3 +4704,191 @@ async def test_the_sidebar_tool_list_is_bounded_too() -> None:
     assert "nsz" in result["unavailable"], result
     # ...and the tools behind it are still reported, rather than lost with it.
     assert result["available"], result
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_empty_platform_selection_selects_nothing(
+    settings_db, tmp_path: Path,
+) -> None:
+    """`[]` means "these platforms, and there are none" — not "all of them".
+
+    A client forwarding a multi-select with no rows ticked sends an empty list,
+    and the truthiness test read it as an absent filter. Run now then queued
+    every eligible rule, delete-on-verify included, for a request that selected
+    nothing — and Preview widened identically, so the operator could not even
+    see it coming.
+    """
+    from services.romm import auto as romm_auto
+
+    (tmp_path / "library").mkdir(parents=True)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    await romm_auto.set_rules({
+        "7": {"mode": "dolphin_rvz", "enabled": True, "max_per_run": 10},
+    })
+
+    async def _run(ids):
+        with patch.object(romm_routes.romm_client, "roms", return_value=[]):
+            return await romm_auto.sweep(
+                dry_run=True, ignore_schedule=True, platform_ids=ids,
+            )
+
+    # Nothing selected -> nothing considered.
+    empty = await _run([])
+    assert empty["platforms"] == [], empty
+    # ...while an omitted filter still means the whole configured set.
+    everything = await _run(None)
+    assert [p["platform_id"] for p in everything["platforms"]] == [7], everything
+
+
+def test_forgetting_history_for_no_platforms_forgets_nothing() -> None:
+    """The same widening, on the one control that is irreversible.
+
+    Forget history is the escape hatch after restoring a backup. Clearing it
+    for every platform on an empty selection makes the next sweep reconvert the
+    entire library — at full size, with whatever policy each rule carries.
+    """
+    from services.romm import auto as romm_auto
+    async def _forget(payload):
+        with patch.object(
+            romm_auto, "forget_converted", AsyncMock(return_value=0),
+        ) as forget, patch.object(
+            romm_auto, "get_state", AsyncMock(return_value={}),
+        ):
+            await romm_routes.forget_romm_converted(payload)
+        return forget.await_args.args[0]
+
+    assert asyncio.run(_forget({"platform_ids": []})) == [], "empty selection widened"
+    assert asyncio.run(_forget({})) is None, "an omitted filter must still mean all"
+
+
+def test_an_optional_atom_inside_a_repeated_group_is_refused() -> None:
+    """`?` is harmless as the *outer* quantifier and dangerous as an inner one.
+
+    `(a?)?` cannot blow up — neither level consumes more than once — which is
+    why `?` is not in the set tested against what follows a group. Inside a
+    group that *is* repeated it is the opposite: every optional atom doubles
+    the ways the engine can split the same input, so `^(a?){30}a{30}b$` walks
+    exponentially many choices against a long run of `a`. `re` cannot be
+    interrupted, the sweep holds `_sweep_lock` while it matches, and each
+    abandoned probe thread eats into the process-wide capacity that unrelated
+    filesystem checks share.
+    """
+    from services.romm import auto as romm_auto
+    _, refused = romm_auto._valid_pattern("^(a?){30}a{30}b$")
+    assert refused, "a bounded-repeat group of optional atoms was accepted"
+    for pattern in ("(a?)+", "(?:a?)+", "(a??)+"):
+        assert romm_auto._valid_pattern(pattern)[1], pattern
+
+
+def test_the_group_syntax_that_starts_with_a_question_mark_still_passes() -> None:
+    """`(?:`, `(?=`, `(?P<x>` and inline flags are syntax, not optional atoms.
+
+    Reading their `?` as one would refuse every non-capturing group, which is
+    the widening this validator exists to prevent: a refused filter disables
+    the rule, and an operator who cannot express "(?:USA|Europe)" writes
+    something looser instead.
+    """
+    from services.romm import auto as romm_auto
+    for pattern in ("(?:USA|Europe)", "(?:abc)+", "(?P<region>abc)+",
+                    "(?i:abc)+", "(?=abc)", "(USA)?", "[a?]+"):
+        value, refused = romm_auto._valid_pattern(pattern)
+        assert not refused, f"{pattern} was refused"
+        assert value == pattern
+
+
+def test_a_readiness_probe_never_takes_a_shared_pool_worker() -> None:
+    """The bound frees the caller; it cannot free the thread.
+
+    `tool_is_ready` times out the await, and the blocked `is_ready()` keeps
+    whatever thread it was given — Python can abandon an awaiter, never an OS
+    thread. nsz's answer is a recursive walk of every configured volume and
+    jwud's is a stat, so on an unresponsive mount each probe strands its
+    thread; taken from the shared pool that is one of a small fixed set, and
+    every caller fans out over the whole registry, so repeated probes would
+    retire the pool until unrelated offloads had nowhere to run.
+    """
+    import inspect
+
+    for tool_id in ("nsz", "jwud"):
+        source = inspect.getsource(registry.get(tool_id).is_ready)
+        assert "run_detached" in source, (
+            f"{tool_id}.is_ready puts filesystem work on the shared pool"
+        )
+        assert "run_in_threadpool" not in source, (
+            f"{tool_id}.is_ready still takes a pooled worker"
+        )
+
+
+def test_romz_accepts_a_rom_from_every_platform_it_claims() -> None:
+    """A platform claim the extension predicate rejects is a claim that lies.
+
+    RomM offering an NES platform the ROMZ modes, every `.nes` row
+    unselectable, and an enabled automation rule skipping the whole platform as
+    unconvertible every sweep — silently, because "nothing to do" and "nothing
+    I can do" looked the same.
+    """
+    romz = registry.get("romz")
+    accepted = set()
+    for spec in romz.modes:
+        accepted |= {ext.lower() for ext in spec.input_extensions}
+
+    # One representative dump per system in `platform_slugs`.
+    for slug, ext in (
+        ("nes", ".nes"), ("snes", ".sfc"), ("n64", ".z64"),
+        ("sms", ".sms"), ("genesis", ".md"), ("gamegear", ".gg"),
+        ("virtualboy", ".vb"), ("wonderswan", ".ws"),
+        ("neo-geo-pocket", ".ngp"), ("lynx", ".lnx"),
+        ("c64", ".d64"), ("atari2600", ".a26"), ("atari7800", ".a78"),
+        ("gb", ".gb"), ("gba", ".gba"), ("nds", ".nds"),
+    ):
+        assert slug in romz.platform_slugs, slug
+        assert ext in accepted, f"{slug} is offered romz, which rejects {ext}"
+        assert registry.modes_for_platform(slug), slug
+
+    # `.bin` stays chdman's: a Genesis dump must not collide with a CD track.
+    assert ".bin" not in accepted
+
+
+@pytest.mark.asyncio
+async def test_cancelling_plans_reports_the_backlog_that_is_left(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The submit path needs a count, and it cannot compute one itself.
+
+    `record()` supersedes the pending row for a destination rather than
+    stacking one, so neither what was recorded nor what was cancelled is a
+    delta anybody can apply to the badge — it is set from a count or it is
+    wrong. The plan call's count is measured *before* the rows for sources that
+    never became jobs are retired, and that retirement is fire-and-forget, so
+    without the reconciled figure here the badge showed the larger
+    pre-reconciliation backlog until a status reload or a settle pass.
+    """
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+    keep = romm_repin.record(
+        {"id": 1, "name": "Kept"}, str(tmp_path / "Kept.rvz"),
+        {"igdb_id": 10}, mode="dolphin_rvz",
+    )
+    drop = romm_repin.record(
+        {"id": 2, "name": "Gone"}, str(tmp_path / "Gone.rvz"),
+        {"igdb_id": 20}, mode="dolphin_rvz",
+    )
+    assert romm_repin.count_pending() == 2
+
+    # Sync: `_probe` hands this to a worker thread, so a coroutine would come
+    # back unawaited -- and truthy, which reads as "a job is writing there".
+    with patch.object(
+        romm_routes, "_destination_has_pending_job", lambda _path: False,
+    ):
+        result = await romm_routes.romm_repin_cancel(
+            romm_routes.RepinCancelRequest(ids=[drop]),
+        )
+
+    assert result["cancelled"] == 1, result
+    # The authoritative remainder, not the count from before the retirement.
+    assert result["pending"] == 1, result
+    assert romm_repin.count_pending() == 1
+    assert keep is not None
