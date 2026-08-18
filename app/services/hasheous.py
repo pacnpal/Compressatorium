@@ -24,6 +24,7 @@ Upstream shape (verified against the live API):
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import threading
@@ -46,6 +47,9 @@ _USER_AGENT = "compressatorium-hasheous/1.0"
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _SHA1_RE = re.compile(r"[0-9a-f]{40}")
+
+# Body is read in chunks so the total elapsed time can be checked between them.
+_READ_CHUNK_BYTES = 64 * 1024
 
 # How long to stop calling out after a failure. Without this, an outage during
 # a 1,000-file scan costs 1,000 x hasheous_timeout -- over four hours at the
@@ -149,8 +153,13 @@ def _probe(url: str) -> None:
             resp.read(1024)
     except urllib.error.HTTPError as exc:
         raise HasheousUnavailable(f"HTTP {exc.code}") from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise HasheousUnavailable(str(exc)) from exc
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # http.client.HTTPException covers IncompleteRead (a chunked response
+        # cut short) and malformed status lines. It is neither an OSError nor a
+        # URLError, so without it a truncated response escaped as a 500 and
+        # skipped the cooldown -- a bulk job then re-contacted the failing
+        # server once per file.
+        raise HasheousUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
 
 def _require_https(url: str) -> None:
@@ -224,7 +233,7 @@ def _fetch_json(url: str) -> dict | None:
             headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
         )
         with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
-            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+            raw = _read_bounded(resp)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             # The documented "no such hash" answer, not a failure.
@@ -238,8 +247,13 @@ def _fetch_json(url: str) -> dict | None:
         # as a 500 and skip the cooldown, so a bulk match would re-raise it
         # once per file.
         raise HasheousUnavailable(str(exc)) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise HasheousUnavailable(str(exc)) from exc
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # http.client.HTTPException covers IncompleteRead (a chunked response
+        # cut short) and malformed status lines. It is neither an OSError nor a
+        # URLError, so without it a truncated response escaped as a 500 and
+        # skipped the cooldown -- a bulk job then re-contacted the failing
+        # server once per file.
+        raise HasheousUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
     if len(raw) > _MAX_RESPONSE_BYTES:
         raise HasheousUnavailable("response exceeded size limit")
@@ -262,6 +276,30 @@ def _obj(value) -> dict:
     opened the cooldown, once per file.
     """
     return value if isinstance(value, dict) else {}
+
+
+def _read_bounded(resp) -> bytes:
+    """Read the body under a *total* deadline, not just a per-socket one.
+
+    urllib's ``timeout`` applies to each socket operation and is reset by every
+    successful read, so a server dripping a byte at a time keeps a single
+    ``read()`` alive indefinitely -- pinning a match request, or a whole
+    DAT-match/metadata-scan job, without ever tripping the timeout or opening
+    the cooldown. Reading in chunks lets the elapsed total be checked between
+    them.
+    """
+    deadline = time.monotonic() + _timeout()
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _MAX_RESPONSE_BYTES:
+        if time.monotonic() > deadline:
+            raise HasheousUnavailable("response exceeded the overall timeout")
+        chunk = resp.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 def _text(value) -> str | None:

@@ -1225,9 +1225,20 @@ Two orderings that look reasonable are both wrong, and each was a real bug here:
   embedded hashes must not leave the machine until that has been checked.
 
 `_try_embedded_hash_match` is therefore local-only by contract, and returns its
-candidates so the caller can carry them into the single remote pass. A
-size-capped file still gets a remote pass over whatever embedded candidates it
-did produce, and keeps its non-cacheable `reason` if that misses.
+candidates so the caller can carry them into the single remote pass.
+
+**The one place the rule is best-effort rather than absolute is a size-capped
+file**, and it is a deliberate trade. `MATCH_MAX_FILE_SIZE` forbids reading the
+file, so its container SHA1 can never be computed — meaning the local candidate
+set *cannot* be exhausted, and "we never disclose a hash the local DATs could
+have identified" is unachievable for that file by construction. The choice is
+between disclosing the (already-in-hand, free) embedded hashes and identifying
+the file at all. It still gets its remote pass, because the cap says "don't read
+this file's bytes", not "don't identify this file" — and for a CHD the hash a
+DAT actually indexes *is* the header SHA1, which is an embedded candidate and so
+is still checked locally first. The residual exposure needs an unusual DAT that
+indexes raw `.chd` container bytes rather than the header, plus a cap, plus a
+file over it. A size-capped miss keeps its non-cacheable `reason`.
 
 #### Cache entries are scoped to the sources that produced them
 

@@ -158,6 +158,14 @@ a file your DATs *can* identify is never disclosed to a third party. Matching is
 also deterministic: the same file resolves the same way whether or not the
 network is healthy.
 
+One exception, if you set `MATCH_MAX_FILE_SIZE`: a file over that cap is never
+read, so its file-level hash cannot be computed or checked locally at all. Such
+a file still gets looked up on whatever hashes it can offer for free (a CHD's
+header and data SHA1s), because the cap means "don't read this file", not
+"don't identify it". If you would rather large files were not looked up
+remotely at all, leave the cap unset and they will be matched locally first
+like everything else.
+
 Results are cached in the local database, so a file is looked up once, not once
 per browse. If you enable Hasheous *after* files were already recorded as "no
 match", those old verdicts are automatically re-checked against the new source —

@@ -5,6 +5,9 @@ No HTTP mocking library is used (the suite has none): the seam is
 ``tests/test_dat_sync.py`` patches ``sync_service._fetch_json``.
 """
 
+import http.client
+import json
+import time
 import urllib.error
 import urllib.request
 from unittest.mock import AsyncMock, patch
@@ -1336,3 +1339,93 @@ async def test_a_file_level_failure_still_drops_its_stale_row(
     )
 
     assert deleted == ["/vol/a.chd"]
+
+
+# ---------------------------------------------------------------------------
+# Eighth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+class _TruncatedResp:
+    """A chunked response the server cuts short."""
+
+    def read(self, _n=None):
+        raise http.client.IncompleteRead(b"partial", 500)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def test_a_truncated_response_is_a_service_failure(hasheous_on):
+    """IncompleteRead is an HTTPException -- neither OSError nor URLError.
+
+    Uncaught it escaped as a 500 and skipped the cooldown, so a bulk job
+    re-contacted the failing server once per file.
+    """
+    with patch.object(hasheous._opener, "open", return_value=_TruncatedResp()):
+        with pytest.raises(hasheous.HasheousUnavailable, match="IncompleteRead"):
+            hasheous._fetch_json("https://hasheous.example/x")
+
+
+def test_a_malformed_status_line_is_a_service_failure(hasheous_on):
+    with patch.object(
+        hasheous._opener, "open", side_effect=http.client.BadStatusLine("garbage"),
+    ):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            hasheous._fetch_json("https://hasheous.example/x")
+
+
+def test_a_slow_drip_server_cannot_pin_a_lookup(hasheous_on, monkeypatch):
+    """urllib's timeout is per socket operation and resets on every read.
+
+    A server delivering a byte at a time therefore keeps one read() alive
+    forever, pinning a match request -- or an entire scan job -- without ever
+    tripping the timeout or opening the cooldown.
+    """
+    monkeypatch.setattr(settings, "hasheous_timeout", 1)
+
+    class _Drip:
+        def read(self, _n=None):
+            time.sleep(0.01)
+            return b"x"  # never EOF
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    started = time.monotonic()
+    with patch.object(hasheous._opener, "open", return_value=_Drip()):
+        with pytest.raises(hasheous.HasheousUnavailable, match="overall timeout"):
+            hasheous._fetch_json("https://hasheous.example/x")
+
+    # Bounded by the configured timeout, not by the (never-reached) size cap.
+    assert time.monotonic() - started < 5
+
+
+def test_a_normal_body_still_reads_whole(hasheous_on):
+    """The chunked reader must not truncate a legitimate response."""
+    payload = json.dumps(SAMPLE_RESPONSE).encode()
+
+    class _Chunked:
+        def __init__(self):
+            self._left = payload
+
+        def read(self, n=None):
+            take, self._left = self._left[:n], self._left[n:]
+            return take
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    with patch.object(hasheous._opener, "open", return_value=_Chunked()):
+        data = hasheous._fetch_json("https://hasheous.example/x")
+
+    assert data["name"] == "Jumpman Junior"
