@@ -1163,9 +1163,92 @@ async def test_turning_hasheous_off_stops_the_current_remote_pass(
 
     monkeypatch.setattr(hasheous, "lookup", _remote)
 
-    result = await dat_routes._remote_lookup_match(
+    result, consulted = await dat_routes._remote_lookup_match(
         "/g.chd", [("a" * 40, "chd_sha1"), ("b" * 40, "chd_data_sha1")],
     )
 
     assert result is None
     assert sent == ["a" * 40]  # the second candidate never left the machine
+    # Cut short, so this was NOT a complete remote check and must not be
+    # stamped as one.
+    assert consulted is None
+
+
+# ---------------------------------------------------------------------------
+# Sixth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_miss_is_not_stamped_with_a_server_never_asked(
+    hasheous_on, monkeypatch,
+):
+    """The toggle can flip while an expensive hash is still being computed.
+
+    Stamping at function entry meant a miss could claim a remote check that
+    never happened -- and cached_result_usable would then serve it forever
+    once the feature was switched back on.
+    """
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: None)
+
+    async def _slow_hash(_path):
+        # The operator turns Hasheous off while the file is being hashed.
+        hasheous.set_enabled_override(False)
+        return SAMPLE_SHA1
+
+    monkeypatch.setattr(dat_routes, "compute_file_sha1", _slow_hash)
+    remote = AsyncMock()
+    monkeypatch.setattr(hasheous, "lookup", remote)
+
+    result = await dat_routes._match_single_file("/x.iso")
+
+    assert result["matched"] is False
+    remote.assert_not_awaited()
+    # Nothing was asked, so nothing is claimed.
+    assert result["checked_remote"] is None
+    # ...and re-enabling therefore re-checks this file rather than trusting it.
+    hasheous.set_enabled_override(True)
+    assert dat_routes.cached_result_usable(result) is False
+
+
+@pytest.mark.asyncio
+async def test_a_completed_remote_pass_is_stamped(hasheous_on, monkeypatch):
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: None)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=SAMPLE_SHA1),
+    )
+    monkeypatch.setattr(hasheous, "lookup", AsyncMock(return_value=None))
+
+    result = await dat_routes._match_single_file("/x.iso")
+
+    assert result["checked_remote"] == "https://hasheous.example"
+    assert dat_routes.cached_result_usable(result) is True
+
+
+@pytest.mark.asyncio
+async def test_a_successful_test_clears_the_cooldown(hasheous_on):
+    """Otherwise the button says "Reachable" while browsing still says down."""
+    hasheous._begin_cooldown()
+    assert hasheous._cooldown_remaining() > 0
+
+    with patch.object(hasheous._opener, "open", return_value=_Resp(b"OK")):
+        result = await hasheous.health()
+
+    assert result["ok"] is True
+    assert hasheous._cooldown_remaining() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_test_opens_the_cooldown(hasheous_on):
+    """The probe just established the outage; don't pay a timeout to re-learn it."""
+    with patch.object(
+        hasheous._opener, "open", side_effect=urllib.error.URLError("no route"),
+    ):
+        result = await hasheous.health()
+
+    assert result["ok"] is False
+    assert hasheous._cooldown_remaining() > 0

@@ -1058,12 +1058,22 @@ async def _local_lookup_match(
 
 async def _remote_lookup_match(
     file_path: str, candidates: list[tuple[str, str]],
-) -> dict | None:
-    """First of ``candidates`` Hasheous knows, or ``None`` when it's disabled.
+) -> tuple[dict | None, str | None]:
+    """Ask Hasheous about ``candidates``. Returns ``(match, consulted)``.
+
+    ``consulted`` is the server URL when every candidate was actually put to
+    it, and ``None`` otherwise -- disabled throughout, or switched off part-way
+    through. The caller stamps a cached miss with it, so the stamp records what
+    was *really* asked rather than what was merely configured when the match
+    began: an operator toggling the feature during a slow hash (a full-file
+    SHA1, a dolphin verify) would otherwise leave a miss claiming a remote
+    check that never happened, and `cached_result_usable` would serve that
+    miss forever once the feature was switched back on.
 
     Propagates :class:`HasheousUnavailable` -- a transient remote failure is
     *not* a miss, and the caller turns it into a non-cacheable error.
     """
+    consulted = False
     for sha1, match_type in candidates:
         # Re-checked every iteration, not once up front. A CHD sends up to
         # three hashes and each request can take seconds, so an operator who
@@ -1071,15 +1081,18 @@ async def _remote_lookup_match(
         # remaining candidates go out -- "off means nothing is sent" has to
         # hold for the request after the click, not just the next file.
         if not hasheous.enabled():
-            return None
+            # Never asked, or stopped part-way: either way this was not a
+            # complete remote check, so it must not be stamped as one.
+            return None, None
+        consulted = True
         # ponytail: unbounded concurrency. Each call is bounded by
         # hasheous_timeout, the bulk match job is already single-flight, and
         # the client short-circuits while the service is down; add a
         # workload_limiter lane if a large scan ever gets rate-limited.
         record = await hasheous.lookup(sha1)
         if record is not None:
-            return _match_result(file_path, sha1, match_type, record)
-    return None
+            return _match_result(file_path, sha1, match_type, record), hasheous.base_url()
+    return None, (hasheous.base_url() if consulted else None)
 
 
 async def _lookup_match(
@@ -1095,10 +1108,11 @@ async def _lookup_match(
     (expensive, lazily computed) file-level SHA1 into the local pass before any
     candidate goes out.
     """
-    return (
-        await _local_lookup_match(file_path, candidates)
-        or await _remote_lookup_match(file_path, candidates)
-    )
+    local = await _local_lookup_match(file_path, candidates)
+    if local is not None:
+        return local
+    remote, _consulted = await _remote_lookup_match(file_path, candidates)
+    return remote
 
 
 def remote_stamp() -> str | None:
@@ -1151,14 +1165,17 @@ async def _match_single_file(
     ``cancel_event`` is forwarded to the tool's (potentially expensive)
     embedded-hash hook so a background scan/match job can abort it promptly.
     """
-    # ``checked_remote`` records WHICH remote source this verdict was reached
-    # with (the server URL, or None), so a miss cached before Hasheous was
-    # enabled -- or against a different server -- isn't served forever (see
+    # ``checked_remote`` records WHICH remote source this verdict was actually
+    # reached with (the server URL, or None), so a miss cached before Hasheous
+    # was enabled -- or against a different server -- isn't served forever (see
     # cached_result_usable). Only misses need it: a hit is already the strongest
     # answer available.
-    base_result = {
-        "path": file_path, "matched": False, "checked_remote": remote_stamp(),
-    }
+    #
+    # It starts None and is filled in from the remote pass itself, NOT snapshot
+    # here: hashing a file can take a long time, and an operator toggling the
+    # feature meanwhile would otherwise stamp a miss with a server that was
+    # never asked.
+    base_result = {"path": file_path, "matched": False, "checked_remote": None}
 
     if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return base_result
@@ -1238,7 +1255,8 @@ async def _match_single_file(
     # Nothing local knows any of them. Now, and only now, ask Hasheous.
     if candidates:
         try:
-            remote = await _remote_lookup_match(file_path, candidates)
+            remote, consulted = await _remote_lookup_match(file_path, candidates)
+            base_result["checked_remote"] = consulted
         except HasheousUnavailable as e:
             # Same rule as the abandoned-hash case: a transient failure must
             # NOT be cached as "unmatched", or a single network blip

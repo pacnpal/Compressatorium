@@ -121,10 +121,18 @@ async def health() -> dict:
     started = time.monotonic()
     try:
         await run_in_threadpool(_probe, url)
-    except HasheousUnavailable as exc:
+    except (HasheousUnavailable, ValueError) as exc:
+        # A failed probe IS an outage observation, so record it: the next match
+        # then fails instantly instead of paying another full timeout to
+        # rediscover what the operator just watched the button discover.
+        _begin_cooldown()
         return {"ok": False, "url": url, "error": str(exc)}
-    except ValueError as exc:  # non-https base URL
-        return {"ok": False, "url": url, "error": str(exc)}
+
+    # ...and a successful probe clears it. Otherwise the button could report
+    # "Reachable" while browsing kept answering "Hasheous unavailable" from a
+    # stale cooldown for up to another minute -- the exact question the button
+    # exists to settle.
+    _clear_cooldown()
     return {
         "ok": True,
         "url": url,
