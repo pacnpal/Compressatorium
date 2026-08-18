@@ -136,7 +136,7 @@
       // Surface the follow-up straight away: the "Re-match in RomM" badge is
       // driven by this count, and leaving it stale hides the one action these
       // conversions will need once RomM rescans.
-      if (fromRomm) romm.notePendingRepins(conversion.lastRepinRecorded);
+      if (fromRomm) romm.setPendingRepins(conversion.lastRepinPending);
       conversion.clearDuplicateCheck();
       fileBrowser.clearSelection();
       // Honor the per-deployment auto-return-from-search setting

@@ -1461,6 +1461,15 @@ holder died mid-write comes back after `_CLAIM_STALE_SECONDS`, and a row left
 behind by the swap would then apply the *old* instance's provider ids to
 whatever the new one matches its digest to.
 
+Every remaining filesystem check on these paths is bounded the same way:
+`normalize_rules_bounded` (the save-time output-directory validation, inside
+`_sweep_lock`), `_within_volumes_bounded` (the sweep's re-check of a stored
+directory), and the re-pin plan's batch resolve, which is scaled by batch size
+like the catalog scan. Each degrades toward *refuse*: an output directory
+nobody can resolve pauses its rule or skips its platform, and a submitted path
+that does not answer is skipped — the same answer a path outside the volumes
+gets, which is what an unreachable one effectively is.
+
 Deciding *whether* the identity moved is itself bounded (`_identity_moved`),
 because it resolves both library roots and the old one is the unresponsive
 mount as often as not — that is why the operator is changing it. It runs
@@ -1695,6 +1704,14 @@ as well as a success — by unlinking the old artifact or leaving a partial one
 — and the ROM would be skipped by every later sweep until **Forget history**.
 The sweep also freezes any outcome the queue can still answer for
 (`_persist_known_outcomes`), covering the window before a record exists.
+
+The listener fires for **every** job in the app, most of them manual, so it
+cannot afford to search: `_mark_converted` files the `job id -> (platform,
+rom)` pairing in `_job_owners` as it queues, and `note_job_finished` pops that
+one entry. A miss means the job is not the automation's — a record can only
+name a job this process queued, since the queue is in memory — so there is
+nothing to write and nothing to scan. The alternative walked every remembered
+ROM of every platform per completion, on the event loop under `_sweep_lock`.
 
 #### A codec for "tool default" (`ToolPlugin.default_compression`)
 

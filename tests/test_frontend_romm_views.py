@@ -42,6 +42,11 @@ def _find_node() -> str | None:
     return None
 
 
+_SCRIPT_BLOCK = re.compile(
+    r"<script\b[^>]*>(.*?)</\s*script\s*>", re.DOTALL | re.IGNORECASE,
+)
+
+
 def _script_of(component: Path) -> str:
     """The component's `<script>` body as plain ESM.
 
@@ -51,7 +56,11 @@ def _script_of(component: Path) -> str:
     buffers from the loaded settings.
     """
     src = component.read_text(encoding="utf-8")
-    body = re.search(r"<script>(.*?)</script>", src, re.DOTALL)
+    # Case-insensitive, attribute- and whitespace-tolerant: a tag filter that
+    # only matches the one spelling it expects is the shape CodeQL flags as a
+    # bad HTML filter, and `<script lang="ts">` or `</SCRIPT >` would silently
+    # make this harness read an empty component and pass.
+    body = _SCRIPT_BLOCK.search(src)
     assert body, f"{component.name} has no <script> block"
     kept = [
         line for line in body.group(1).splitlines()

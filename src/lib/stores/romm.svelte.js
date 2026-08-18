@@ -41,6 +41,9 @@ class RommStore {
   // Monotonic ticket for `loadPlatforms`; see there. Not $state -- nothing
   // renders it, and it changes on every load.
   #platformsTicket = 0;
+  // Bumped by every rule edit; see `saveRules`. Not $state -- nothing renders
+  // it, and it changes on every keystroke in the editor.
+  #rulesRevision = 0;
   platformsError = $state(null);
   selectedPlatformId = $state(null);
 
@@ -385,6 +388,7 @@ class RommStore {
   setRule(platformId, rule) {
     this.rules = { ...this.rules, [String(platformId)]: rule };
     this.rulesDirty = true;
+    this.#rulesRevision += 1;
   }
 
   removeRule(platformId) {
@@ -392,12 +396,23 @@ class RommStore {
     delete next[String(platformId)];
     this.rules = next;
     this.rulesDirty = true;
+    this.#rulesRevision += 1;
   }
 
   async saveRules() {
     this.rulesSaving = true;
+    // The editor stays live while this is in flight, so anything typed after
+    // this point is NOT in what we just submitted.
+    const revision = this.#rulesRevision;
     try {
       const data = await api.saveRommRules(this.rules);
+      if (revision !== this.#rulesRevision) {
+        // Edited mid-save. Adopting the server's copy would replace those
+        // edits with the snapshot that was submitted before them — silently,
+        // and then clear the dirty flag so the Save bar stopped asking. The
+        // newer edits stay, still dirty, for the next save to normalize.
+        return this.rules;
+      }
       // Take the server's normalized copy: it clamps numbers and drops rules
       // whose mode no longer exists, so the editor shows what will actually run.
       this.rules = data?.rules ?? this.rules;
@@ -455,7 +470,7 @@ class RommStore {
       // pending rows. Without this the header badge keeps its old count and
       // the Re-match action stays hidden until the page is reloaded, which
       // hides the follow-up step from exactly the run that created the need.
-      this.notePendingRepins(this.sweepResult?.repins_recorded ?? 0);
+      this.setPendingRepins(this.sweepResult?.pending_repins);
       // The sweep already succeeded; a failing state refresh must not be
       // reported as a failed run. `rulesError` carries that failure instead.
       await this.loadRules().catch(() => {});
@@ -467,10 +482,19 @@ class RommStore {
 
   // ─── re-pin queue ─────────────────────────────────────────────────────
 
-  /** Bump the badge after a conversion recorded rows, without a full reload. */
-  notePendingRepins(count) {
-    if (!this.status || !count) return;
-    this.status.pendingRepins = (this.status.pendingRepins ?? 0) + count;
+  /**
+   * Set the badge from the count the backend just measured.
+   *
+   * Assigned, never added to: `record()` *supersedes* the pending row for a
+   * destination rather than stacking one, so re-recording after a failed or
+   * redirected conversion leaves the total unchanged. Adding each newly
+   * recorded row inflated the badge on every retry, and it stayed wrong until
+   * a status reload or a settle pass. Both the plan response and the sweep
+   * result carry the authoritative figure, which costs them one COUNT.
+   */
+  setPendingRepins(pending) {
+    if (!this.status || typeof pending !== 'number') return;
+    this.status.pendingRepins = Math.max(0, pending);
   }
 
   /**

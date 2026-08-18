@@ -104,6 +104,17 @@ _HASH_MIN_BYTES_PER_S = 2 * 1024 * 1024
 # How long the identity comparison may spend resolving the two library roots
 # before the save proceeds on their spelling alone. See `_identity_moved`.
 _IDENTITY_PROBE_SECONDS = 20
+# The re-pin plan resolves every submitted path (a realpath plus a stat of each
+# configured volume). Scaled like the catalog scan, for the same reason: a
+# hundred-file batch legitimately takes longer than a one-file one.
+_PLAN_BASE_S = 20
+_PLAN_PER_PATH_S = 0.5
+_PLAN_CEILING_S = 300
+
+
+def _plan_deadline(paths: int) -> float:
+    """Seconds the plan may spend resolving *paths* submitted paths."""
+    return min(_PLAN_BASE_S + _PLAN_PER_PATH_S * max(0, paths), _PLAN_CEILING_S)
 
 # One settle pass at a time, process-wide. The view settles on load, so two
 # tabs (or a reload mid-pass) otherwise walk the same cursor and pay the same
@@ -484,7 +495,11 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     planned: dict[str, str] = {}
     roms_by_path: dict[str, tuple[dict, dict]] = {}
 
-    def _resolve_batch(paths: list[str]) -> dict[str, str | None]:
+    # Every key present before the resolution starts, so a bound that expires
+    # part-way keeps the paths that did answer instead of discarding the lot.
+    resolved_keys: dict[str, str | None] = dict.fromkeys(payload.paths)
+
+    def _resolve_batch(paths: list[str]) -> None:
         """Volume check and canonical key for each path, in one worker hop.
 
         Both stat every path component, and the volume check stats each
@@ -493,15 +508,28 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         loop for the whole request instead of one worker, which is the failure
         every other probe in this file already avoids.
         """
-        return {
-            candidate: (
+        for candidate in paths:
+            resolved_keys[candidate] = (
                 os.path.realpath(candidate)
                 if is_within_configured_volumes(candidate) else None
             )
-            for candidate in paths
-        }
 
-    resolved_keys = await run_in_threadpool(_resolve_batch, payload.paths)
+    # Detached and bounded, not pooled: this cannot be cancelled once it is
+    # inside a dead mount, only abandoned, and abandoning a shared worker per
+    # submit would eventually starve every unrelated offload. A path left
+    # unresolved is skipped -- the same answer as one outside the volumes,
+    # which is what an unreachable path effectively is.
+    try:
+        await asyncio.wait_for(
+            run_detached(_resolve_batch, payload.paths),
+            _plan_deadline(len(payload.paths)),
+        )
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm: resolving %d submitted path(s) did not finish in time; "
+            "recording only the ones that answered (a volume is not answering)",
+            len(payload.paths),
+        )
     for path in payload.paths:
         # Same canonical key the index was built with (see roms_by_local_path).
         key = resolved_keys.get(path)
@@ -587,6 +615,12 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         "skipped": skipped,
         "recorded_paths": recorded_paths,
         "recorded_ids": recorded_ids,
+        # The authoritative backlog, for the badge. Recording is not addition:
+        # `record()` supersedes the pending row for a destination rather than
+        # stacking one, so a re-submitted or retried batch records rows without
+        # changing this figure. One COUNT, against the count the caller would
+        # otherwise have to infer.
+        "pending": await run_in_threadpool(romm_repin.count_pending),
     }
 
 

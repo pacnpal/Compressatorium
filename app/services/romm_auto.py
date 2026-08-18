@@ -92,6 +92,10 @@ _MAX_PATTERN = 500
 # unresponsive. Generous for a healthy mount (these are a resolve and two
 # stats) and short enough that a dead one costs a sweep rather than a restart.
 _CANDIDATE_PROBE_SECONDS = 30
+# How long the save-time output-directory validation may take. Generous: it
+# resolves each candidate and stats every configured volume, and a healthy
+# local mount answers instantly. See `normalize_rules_bounded`.
+_VOLUME_PROBE_SECONDS = 20
 
 # One sweep at a time, process-wide. The active-source snapshot is taken before
 # anything is queued, so the minute scheduler and a manual "Run now" could each
@@ -99,6 +103,12 @@ _CANDIDATE_PROBE_SECONDS = 30
 # manager's creation lock serialises the inserts but does not deduplicate
 # across two independently planned batches.
 _sweep_lock = asyncio.Lock()
+
+# job id -> (platform_id, rom_id) for the conversions this process queued.
+# Read by `note_job_finished` so a completion updates its one record instead of
+# scanning every remembered ROM of every platform. In memory on purpose: the
+# job queue it indexes is in memory too, so an entry has nothing to outlive.
+_job_owners: dict[str, tuple[str, str]] = {}
 
 
 def _clamp(field: str, value: Any, default: int) -> int:
@@ -435,6 +445,7 @@ def default_rule(mode: str = "") -> dict[str, Any]:
 
 def normalize_rule(
     raw: Any, *, mode_required: bool = True, check_volumes: bool = True,
+    volumes_unreachable: bool = False,
 ) -> dict[str, Any] | None:
     """Coerce one submitted/stored rule into the full schema.
 
@@ -492,17 +503,20 @@ def normalize_rule(
             out["enabled"] = False
     elif raw.get("output_dir"):
         candidate = str(raw["output_dir"])
+        within = False if volumes_unreachable else is_within_configured_volumes(candidate)
         # The sweep queues through the job manager directly, so it does not get
         # `/jobs/batch`'s containment check for free. An unvalidated rule could
         # otherwise point the converter at any writable path in the container.
         # Refused here, at the edge where the value is accepted, and again in
         # the sweep before anything is queued.
-        if is_within_configured_volumes(candidate):
+        if within:
             out["output_dir"] = candidate
         else:
             logger.warning(
-                "romm_auto: refusing output_dir outside the configured volumes: %r",
+                "romm_auto: refusing output_dir %r (%s)",
                 candidate,
+                "the volumes did not answer" if volumes_unreachable
+                else "outside the configured volumes",
             )
             out["output_dir"] = None
             out["invalid_output_dir"] = candidate
@@ -601,7 +615,18 @@ def normalize_rule(
     return out
 
 
-def normalize_rules(raw: Any, *, check_volumes: bool = True) -> dict[str, dict]:
+def normalize_rules(
+    raw: Any, *, check_volumes: bool = True, volumes_unreachable: bool = False,
+) -> dict[str, dict]:
+    """Normalize a whole rule set.
+
+    *volumes_unreachable* is the third answer to "is this output directory
+    inside the volumes": not yes, not "trust what was saved", but *nobody
+    could tell*. Every such rule is paused with its path recorded, because a
+    rule that cannot be honoured is paused here, never widened -- and an
+    output directory nobody can resolve is one the conversion could not have
+    written to anyway.
+    """
     if not isinstance(raw, dict):
         return {}
     rules: dict[str, dict] = {}
@@ -610,7 +635,11 @@ def normalize_rules(raw: Any, *, check_volumes: bool = True) -> dict[str, dict]:
             platform_id = int(key)
         except (TypeError, ValueError):
             continue
-        rule = normalize_rule(value, check_volumes=check_volumes)
+        rule = normalize_rule(
+            value,
+            check_volumes=check_volumes,
+            volumes_unreachable=volumes_unreachable,
+        )
         if rule is not None:
             rules[str(platform_id)] = rule
     return rules
@@ -667,6 +696,56 @@ async def paused():
         yield
 
 
+async def _within_volumes_bounded(path: str) -> bool:
+    """Is *path* inside the configured volumes, without risking the sweep?
+
+    The same stat-every-volume check as at save time, and the sweep holds
+    `_sweep_lock` while it runs — so a saved output directory that has since
+    become an unresponsive mount would block previews, manual runs, rule edits
+    and settings saves behind it, having stranded a pooled worker on the way.
+
+    A bound that expires answers *no*: the platform is skipped with a reason
+    the editor shows, which is what an unwritable destination deserves.
+    """
+    try:
+        return bool(await asyncio.wait_for(
+            run_detached(is_within_configured_volumes, path),
+            _VOLUME_PROBE_SECONDS,
+        ))
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm_auto: checking output_dir %r did not finish in %ss; skipping "
+            "the platform (a volume is not answering)", path, _VOLUME_PROBE_SECONDS,
+        )
+        return False
+
+
+async def normalize_rules_bounded(raw: Any) -> dict[str, dict]:
+    """`normalize_rules` with its volume checks off the event loop, bounded.
+
+    Validating an output directory resolves the candidate and stats every
+    configured volume. `set_rules` runs inside `_sweep_lock`, so on an
+    unresponsive NFS/SMB/rclone mount that check freezes the whole API *and*
+    everything waiting on the lock -- including the request to disable the very
+    rule that names the bad path.
+
+    A bound that expires means the volumes could not be read, which pauses
+    every rule with an output directory rather than accepting one nobody could
+    check. Disruptive, and correct: those conversions had nowhere to write.
+    """
+    try:
+        return await asyncio.wait_for(
+            run_detached(normalize_rules, raw), _VOLUME_PROBE_SECONDS,
+        )
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm_auto: validating the rules' output directories did not finish "
+            "in %ss; pausing the rules that name one (a volume is not answering)",
+            _VOLUME_PROBE_SECONDS,
+        )
+        return normalize_rules(raw, volumes_unreachable=True)
+
+
 async def set_rules(raw: Any) -> dict[str, dict]:
     """Replace the rule set, forgetting provenance the new rules invalidate.
 
@@ -684,7 +763,9 @@ async def set_rules(raw: Any) -> dict[str, dict]:
     # format for -- and inherit the old run's clock as well.
     async with _sweep_lock:
         previous = await get_rules()
-        rules = normalize_rules(raw)
+        # Off the loop and bounded: this stats every configured volume, and the
+        # lock we are holding is the one a rescue edit would need. See above.
+        rules = await normalize_rules_bounded(raw)
         stale = [
             pid for pid in previous
             if _output_identity(previous[pid]) != _output_identity(rules.get(pid))
@@ -1075,27 +1156,40 @@ async def note_job_finished(job) -> None:
     job_id = getattr(job, "id", None)
     if not job_id:
         return
+    # Whose record is this? Answered from the index this process filled when it
+    # queued the job, not by walking the history: the listener fires for every
+    # job in the app, most of them manual, and scanning every remembered ROM of
+    # every platform per completion is O(history) each time -- on the event
+    # loop, holding `_sweep_lock`, so a batch of completions against a large
+    # history delays every unrelated request behind it.
+    #
+    # A miss is not a fallback case: a record can only name a job this process
+    # queued (the queue is in memory and does not survive a restart), and
+    # `_mark_converted` indexes every one of those. So a miss means the job is
+    # not ours, and there is nothing to write.
+    owner = _job_owners.pop(job_id, None)
+    if owner is None:
+        return
+    platform_id, rom_id = owner
     done = status == JobStatus.COMPLETED
     async with _sweep_lock:
         # Under the same lock as every other write to this blob: a sweep
         # rewrites the whole thing, so an unsynchronised update here would be
         # lost, or would lose the sweep's.
         state = await get_state()
-        changed = False
-        for platform_id, entry in state.items():
-            converted = (entry or {}).get("converted")
-            if not isinstance(converted, dict):
-                continue
-            for rom_id, record in converted.items():
-                if not isinstance(record, dict) or record.get("job_id") != job_id:
-                    continue
-                if record.get("done") == done:
-                    continue
-                record["done"] = done
-                state[platform_id]["converted"][rom_id] = record
-                changed = True
-        if changed:
-            await preferences_store.put(STATE_KEY, state)
+        converted = ((state.get(platform_id) or {}).get("converted") or {})
+        record = converted.get(rom_id)
+        # Re-checked rather than trusted: `forget_converted` may have cleared
+        # the history since, and a re-planned conversion may have replaced the
+        # record with one naming a different job.
+        if not isinstance(record, dict) or record.get("job_id") != job_id:
+            return
+        if record.get("done") == done:
+            return
+        record = dict(record)
+        record["done"] = done
+        state[platform_id]["converted"][rom_id] = record
+        await preferences_store.put(STATE_KEY, state)
 
 
 async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
@@ -1106,6 +1200,13 @@ async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
     }
     if not entries:
         return
+    # The index `note_job_finished` reads, written where the pairing is known.
+    # Entries are removed as their jobs finish; one that never reaches a
+    # terminal status keeps a single small tuple, which is the same exposure
+    # the job itself already has in the queue.
+    for rom_id, record in entries.items():
+        if record["job_id"]:
+            _job_owners[str(record["job_id"])] = (str(platform_id), rom_id)
     state = await get_state()
     entry = dict(state.get(str(platform_id)) or {})
     merged = dict(entry.get("converted") or {})
@@ -1343,8 +1444,8 @@ async def _sweep_locked(
         # Belt and braces on the destination: `normalize_rule` refuses an
         # out-of-volume output_dir at save time, but a rules blob can also be
         # edited straight in the database.
-        if rule["output_dir"] and not await run_in_threadpool(
-            is_within_configured_volumes, rule["output_dir"],
+        if rule["output_dir"] and not await _within_volumes_bounded(
+            rule["output_dir"],
         ):
             logger.warning(
                 "romm_auto: skipping platform %s, output_dir outside volumes",
@@ -1648,6 +1749,11 @@ async def _sweep_locked(
         if not dry_run and not summary.get("queue_failed") and not unresponsive:
             await _record_run(platform_id, summary)
 
+    # The authoritative backlog for the badge, not the sum of what this run
+    # recorded: `record()` supersedes the pending row for a destination rather
+    # than stacking one, so a sweep that re-records a retried conversion adds
+    # rows without changing the total.
+    result["pending_repins"] = await run_in_threadpool(romm_repin.count_pending)
     return result
 
 

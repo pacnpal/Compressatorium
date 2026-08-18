@@ -64,6 +64,11 @@ class ConversionStore {
 
   // How many re-pin rows the last submit recorded, for the caller to surface.
   lastRepinRecorded = $state(0);
+  // The backend's own count of rows still waiting, as of the last plan. The
+  // badge is set from this rather than added to, because `record()` supersedes
+  // the row for a destination instead of stacking one — so a retry records a
+  // row without changing the total. Null when nothing was planned.
+  lastRepinPending = $state(null);
 
   duplicateCheck = $state(null);
   deletePlan = $state(null);
@@ -455,6 +460,7 @@ class ConversionStore {
     if (!filePaths?.length) return null;
     this.converting = true;
     this.lastRepinRecorded = 0;
+    this.lastRepinPending = null;
     // The metadata snapshot is taken before the batch is submitted, so any
     // path the batch does not end up queueing — a rejected submit, or one the
     // backend filters out during per-file validation — leaves a row describing
@@ -485,6 +491,7 @@ class ConversionStore {
           // from here: conversion is imported by fileBrowser, which the RomM
           // store imports, so a static import back would be a cycle.
           this.lastRepinRecorded = planned?.recorded ?? 0;
+          this.lastRepinPending = planned?.pending ?? null;
           recorded = planned?.recorded_paths ?? {};
           recordedIds = planned?.recorded_ids ?? {};
         } catch (e) {

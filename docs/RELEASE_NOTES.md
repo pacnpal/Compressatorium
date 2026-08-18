@@ -548,6 +548,30 @@
   edits all wait on, so the one request that would have fixed the mount
   wedged everything else instead.
 
+- **Editing a rule while the previous save is still in flight no longer
+  discards the edit.** The reply carries the server's tidied copy of what was
+  *submitted*, and taking it replaced anything typed since — then cleared the
+  "unsaved changes" bar, so nothing said the edit had gone. The edit that
+  matters most is the one that makes a rule safer.
+- **The re-match badge no longer creeps upward on retries.** Saving a snapshot
+  for a destination *replaces* the one already waiting rather than adding to
+  it, so a retried or redirected conversion does not change the backlog — but
+  the badge counted every newly saved row, and stayed wrong until the page
+  reloaded. It now shows the figure the backend actually measured.
+- **Saving automation rules can no longer freeze the app on a dead output
+  folder.** Validating one resolves the path and checks it against every
+  configured volume, and that ran on the thread serving the app while holding
+  the lock every sweep, preview and rule edit waits on — so the request to
+  disable the rule naming the bad folder queued up behind the folder itself.
+  It now runs off that thread with a deadline, and a folder that cannot be
+  checked pauses its rule instead of being accepted unchecked. The same
+  deadline covers the sweep's own re-check of a saved folder, and a submitted
+  batch's path resolution.
+- **A completed conversion no longer costs a walk through your whole
+  conversion history.** Every finishing job — including every manual one —
+  searched every remembered ROM of every platform for its own record, on the
+  app's thread. Each job now goes straight to its record.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

@@ -61,10 +61,12 @@ def _plain_js() -> str:
 
 _STUBS = """
 const __calls = [];
+const __defer = () => new Promise((resolve, reject) => {
+  __calls.push({ resolve, reject });
+});
 const api = {
-  getRommPlatforms: () => new Promise((resolve, reject) => {
-    __calls.push({ resolve, reject });
-  }),
+  getRommPlatforms: __defer,
+  saveRommRules: __defer,
 };
 const fileBrowser = { rommPlatformId: null, exitRomm() {}, async enterRomm(id) {
   this.rommPlatformId = id;
@@ -216,3 +218,90 @@ def test_an_abandoned_platform_load_cannot_re_enter_romm_mode(tmp_path):
     assert data["requests"] == 2, data
     assert data["entered_after_revisit"] == 9, data
     assert data["platforms"] == ["New"], data
+
+
+_SAVE_RACE = """
+const store = new RommStore();
+store.rules = { '7': { mode: 'dolphin_rvz', enabled: true } };
+
+// The operator saves...
+const saving = store.saveRules();
+await tick();
+// ...and keeps editing while the request is in flight. This one turns a
+// platform OFF, which is exactly the edit that must not be lost.
+store.setRule('9', { mode: 'dolphin_rvz', enabled: false });
+
+// The server answers with its normalized copy of what was SUBMITTED.
+__calls[0].resolve({ rules: { '7': { mode: 'dolphin_rvz', enabled: true } } });
+await saving;
+
+process.stdout.write(JSON.stringify({
+  rules: store.rules,
+  dirty: store.rulesDirty,
+}));
+"""
+
+
+def test_a_rule_edited_during_a_save_is_not_silently_discarded(tmp_path):
+    """The editor stays live while the save is in flight.
+
+    The response carries the server's copy of what was *submitted*, and
+    adopting it replaced anything typed since — then cleared the dirty flag, so
+    the Save bar stopped asking and the edit was gone with no warning. The one
+    that matters most is the edit that makes a rule safer.
+    """
+    data = _run(tmp_path, _SAVE_RACE)
+
+    assert "9" in data["rules"], data
+    assert data["rules"]["9"]["enabled"] is False, data
+    # Still dirty, so the next save normalizes it rather than losing it.
+    assert data["dirty"] is True, data
+
+
+_QUIET_SAVE = """
+const store = new RommStore();
+store.rules = { '7': { mode: 'dolphin_rvz', enabled: true } };
+const saving = store.saveRules();
+await tick();
+__calls[0].resolve({ rules: { '7': { mode: 'dolphin_rvz', enabled: true, order: 'largest' } } });
+await saving;
+process.stdout.write(JSON.stringify({ rules: store.rules, dirty: store.rulesDirty }));
+"""
+
+
+def test_an_undisturbed_save_still_adopts_the_server_copy(tmp_path):
+    """The server clamps numbers and drops stale modes; the editor must show it."""
+    data = _run(tmp_path, _QUIET_SAVE)
+    assert data["rules"]["7"]["order"] == "largest", data
+    assert data["dirty"] is False, data
+
+
+_BADGE = """
+const store = new RommStore();
+store.status = { pendingRepins: 3 };
+// A retry records a row that SUPERSEDES the existing one, so the backend's
+// count is unchanged. Adding the newly recorded row inflated the badge.
+store.setPendingRepins(3);
+const afterRetry = store.status.pendingRepins;
+store.setPendingRepins(0);
+const afterSettle = store.status.pendingRepins;
+// Nothing to report leaves it alone rather than zeroing a real backlog.
+store.setPendingRepins(undefined);
+process.stdout.write(JSON.stringify({
+  afterRetry, afterSettle, afterUnknown: store.status.pendingRepins,
+}));
+"""
+
+
+def test_the_repin_badge_is_set_from_the_backend_count(tmp_path):
+    """Recording is not addition.
+
+    `record()` supersedes the pending row for a destination rather than
+    stacking one, so re-recording a retried or redirected conversion leaves the
+    total unchanged — and adding each recorded row inflated the badge on every
+    retry, staying wrong until a status reload or a settle pass.
+    """
+    data = _run(tmp_path, _BADGE)
+    assert data["afterRetry"] == 3, data
+    assert data["afterSettle"] == 0, data
+    assert data["afterUnknown"] == 0, data

@@ -3290,6 +3290,273 @@ async def test_the_identity_comparison_cannot_hang_the_settings_save() -> None:
     assert same is False
 
 
+@pytest.mark.asyncio
+async def test_saving_rules_never_validates_volumes_on_the_event_loop(
+    settings_db,
+) -> None:
+    """The rescue edit waits behind the check it is trying to undo.
+
+    Validating an output directory resolves it and stats every configured
+    volume. `set_rules` runs inside `_sweep_lock`, so on an unresponsive mount
+    that check freezes the API *and* everything queued behind the lock —
+    including the request to disable the rule naming the bad path.
+    """
+    import threading
+
+    from services import romm_auto
+
+    stuck = threading.Event()
+    loop_thread = threading.get_ident()
+
+    def _within(path):
+        assert threading.get_ident() != loop_thread, (
+            f"is_within_configured_volumes({path}) ran on the event loop"
+        )
+        stuck.wait(30)
+        return True
+
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        with patch.object(romm_auto, "is_within_configured_volumes", _within), \
+                patch.object(romm_auto, "_VOLUME_PROBE_SECONDS", 0.2):
+            # The real entry point, so this covers the wiring and not just the
+            # helper: `set_rules` is what holds `_sweep_lock`.
+            rules = await asyncio.wait_for(
+                romm_auto.set_rules({
+                    "7": {"mode": "dolphin_rvz", "enabled": True,
+                          "output_dir": "/dead-mount/out"},
+                }),
+                timeout=5,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    assert ticks > 0
+    # Paused, with the path recorded — never accepted unchecked, and never
+    # silently rewritten to "beside the source", which would fill a filesystem
+    # the operator did not choose.
+    assert rules["7"]["enabled"] is False, rules
+    assert rules["7"]["output_dir"] is None, rules
+    assert rules["7"]["invalid_output_dir"] == "/dead-mount/out", rules
+
+
+@pytest.mark.asyncio
+async def test_planning_a_batch_keeps_the_paths_that_answered(
+    repin_db, tmp_path: Path,
+) -> None:
+    """A submit against a dying library must not hold the request open.
+
+    Resolving each submitted path stats every component and every configured
+    volume. On a pooled worker with no deadline the conversion request never
+    reached queueing, and repeated submissions stranded one shared worker each
+    until nothing else in the process could offload anything.
+    """
+    import threading
+
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    for name in ("Good.iso", "Slow.iso"):
+        (lib / name).write_bytes(b"\0" * 32)
+    good, slow = str(lib / "Good.iso"), str(lib / "Slow.iso")
+    rom = {"id": 7, "name": "Good", "igdb_id": 42}
+
+    stuck = threading.Event()
+    loop_thread = threading.get_ident()
+
+    def _within(path):
+        if path == slow:
+            assert threading.get_ident() != loop_thread, (
+                "the volume check ran on the event loop"
+            )
+            stuck.wait(30)
+        return True
+
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        with patch.object(RommClient, "base_url", "http://romm:8080"), \
+                patch.object(RommClient, "library_root", str(tmp_path)), \
+                patch.object(
+                    romm_routes.romm_repin, "roms_by_local_path",
+                    return_value={os.path.realpath(good): rom},
+                ), \
+                patch.object(romm_routes, "is_within_configured_volumes", _within), \
+                patch.object(romm_routes, "_PLAN_BASE_S", 0.2), \
+                patch.object(romm_routes, "_PLAN_PER_PATH_S", 0), \
+                patch.object(
+                    romm_routes, "_plan_deadline", lambda _n: 0.2,
+                ):
+            result = await asyncio.wait_for(
+                romm_routes.romm_repin_plan(
+                    romm_routes.RepinPlanRequest(
+                        # Good first: the resolution walks the list, so this
+                        # is the path that answers before the mount stops
+                        # answering — and what a bound that expires part-way
+                        # must keep rather than discard along with the rest.
+                        paths=[good, slow], mode="dolphin_rvz",
+                    ),
+                ),
+                timeout=5,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    assert ticks > 0
+    # The path that answered is recorded; the one that did not is skipped,
+    # which is the same answer an out-of-volume path gets — and what an
+    # unreachable path effectively is.
+    assert result["recorded"] == 1, result
+    assert list(result["recorded_paths"]) == [good], result
+
+
+@pytest.mark.asyncio
+async def test_a_dead_output_dir_stops_one_platform_not_the_whole_sweep(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The saved directory can go unresponsive long after it was validated.
+
+    That check ran on a pooled worker with no deadline while the sweep held
+    `_sweep_lock`, so it stranded a shared worker and blocked previews, manual
+    runs, rule edits and settings saves until a restart.
+    """
+    import threading
+
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    stuck = threading.Event()
+    loop_thread = threading.get_ident()
+
+    def _within(path):
+        if "/dead-mount/" in str(path):
+            assert threading.get_ident() != loop_thread, (
+                f"is_within_configured_volumes({path}) ran on the event loop"
+            )
+            stuck.wait(30)
+        return True
+
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        # Stored with a directory that was valid when it was saved and has
+        # since died — written straight to the blob, which is also how a
+        # hand-edited database reaches the sweep. `get_rules` reads it back
+        # without re-validating, by design, so the sweep is the check.
+        await romm_auto.preferences_store.put(romm_auto.RULES_KEY, {
+            "7": romm_auto.normalize_rule(
+                {"mode": "dolphin_rvz", "enabled": True,
+                 "output_dir": "/dead-mount/out"},
+                check_volumes=False,
+            ),
+        })
+        with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+                patch.object(
+                    romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+                ), \
+                patch.object(romm_auto, "is_within_configured_volumes", _within), \
+                patch.object(romm_auto, "_VOLUME_PROBE_SECONDS", 0.2):
+            result = await asyncio.wait_for(
+                romm_auto.sweep(ignore_schedule=True, dry_run=True), timeout=10,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    assert ticks > 0
+    assert result["queued"] == 0, result
+    assert result["errors"] == [
+        {"platform_id": 7, "error": "output_dir_outside_volumes"},
+    ], result
+
+
+@pytest.mark.asyncio
+async def test_a_finished_job_updates_one_record_not_the_whole_history(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Every completion scanned every remembered ROM of every platform.
+
+    The listener fires for *every* job in the app, most of them manual, and it
+    ran that scan on the event loop while holding `_sweep_lock` — so a batch of
+    completions against a large history delayed every unrelated request.
+    """
+    from services import romm_auto
+
+    class _Job:
+        def __init__(self, job_id, status):
+            self.id = job_id
+            self.status = status
+
+    # A history big enough that a scan is obvious, and one real record in it.
+    big = {
+        str(pid): {"converted": {
+            str(rid): {"path": f"/l/{pid}/{rid}.rvz", "pre": "", "job_id": f"j{pid}-{rid}"}
+            for rid in range(50)
+        }}
+        for pid in range(20)
+    }
+    await romm_auto.preferences_store.put(romm_auto.STATE_KEY, big)
+
+    reads = 0
+    real_get_state = romm_auto.get_state
+
+    async def _counted_get_state():
+        nonlocal reads
+        reads += 1
+        return await real_get_state()
+
+    # A job this process never queued: nothing to write, and nothing to read.
+    with patch.object(romm_auto, "get_state", _counted_get_state):
+        await romm_auto.note_job_finished(_Job("not-ours", JobStatus.COMPLETED))
+    assert reads == 0, "a manual job made the listener read the whole history"
+
+    # One this process did queue, indexed when it was marked.
+    await romm_auto._mark_converted("3", [(7, "/l/3/7.rvz", "", "job-7")])
+    await romm_auto.note_job_finished(_Job("job-7", JobStatus.FAILED))
+    state = await romm_auto.get_state()
+    assert state["3"]["converted"]["7"]["done"] is False, state["3"]["converted"]["7"]
+
+    # And only that record moved.
+    assert "done" not in state["4"]["converted"]["7"], state["4"]["converted"]["7"]
+
+    # The index entry is consumed, so a repeated announcement is a no-op and
+    # the map cannot grow without bound.
+    assert "job-7" not in romm_auto._job_owners
+
+
 def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:
     """A prefix of a regex is usually a valid regex that means something else.
 
