@@ -611,6 +611,29 @@ export const api = {
 
   getDATStats: () => fetchJson(`${API_BASE}/dat/stats`, undefined, 'Failed to get DAT stats'),
 
+  /** Turn the Hasheous fallback on/off. `null` hands control back to the env var. */
+  setHasheousEnabled(enabled) {
+    return fetchJson(
+      `${API_BASE}/dat/hasheous`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      },
+      'Failed to update the Hasheous setting',
+    );
+  },
+
+  /**
+   * Probe the configured Hasheous server. Resolves `{ ok, latency_ms, error }`
+   * when the backend answers — `ok: false` is a reachability answer, not a
+   * thrown error. Rejects only if the request itself fails (non-2xx, network),
+   * so callers still need a catch.
+   */
+  testHasheous() {
+    return jsonPost(`${API_BASE}/dat/hasheous/test`, {}, {}, 'Failed to reach Hasheous');
+  },
+
   matchBatch(paths) {
     return jsonPost(`${API_BASE}/dat/match-batch`, { paths }, {}, 'Failed to match files');
   },

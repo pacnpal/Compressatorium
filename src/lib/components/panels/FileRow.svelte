@@ -27,6 +27,35 @@
   const datMatch = $derived(datMatching.matchFor(path));
   const chdMeta = $derived(chdMetadata.metadataFor(path));
 
+  // A match resolved remotely (Hasheous) instead of from a locally imported
+  // DAT. Both carry the same payload keys; `source` is what tells them apart.
+  const remoteMatch = $derived(datMatch?.source === 'hasheous');
+
+  // Hasheous returns platform / publisher / year / region / originating DAT
+  // that a local match doesn't have. Build the tooltip from whichever of them
+  // are present so one expression covers both sources. Multi-line, because a
+  // remote match has enough to say that one run-on line stops being readable.
+  const matchTooltip = $derived.by(() => {
+    if (!datMatch?.matched) return null;
+    const lines = [
+      datMatch.dat_name ? `Matches ${datMatch.dat_name}` : 'Matches DAT entry',
+    ];
+    if (datMatch.game_name) lines.push(datMatch.game_name);
+    const facts = [datMatch.platform, datMatch.year, datMatch.region, datMatch.publisher]
+      .filter(Boolean)
+      .join(' · ');
+    if (facts) lines.push(facts);
+    if (datMatch.rom_name && datMatch.rom_name !== datMatch.game_name) {
+      lines.push(datMatch.rom_name);
+    }
+    const links = Array.isArray(datMatch.metadata_links) ? datMatch.metadata_links : [];
+    // Gate on the sources, not on links.length: entries without a `source`
+    // would otherwise render a dangling "Listed on ".
+    const sources = links.map((l) => l?.source).filter(Boolean);
+    if (sources.length) lines.push(`Listed on ${sources.join(', ')}`);
+    return lines.join('\n');
+  });
+
   const mediaType = $derived(chdMeta?.media_type ?? entry?.media_type ?? null);
 
   const convertibleBy = $derived(
@@ -137,8 +166,8 @@
       </Badge>
     {/if}
     {#if datMatch && datMatch.matched}
-      <Badge tone="dat-match" title={datMatch.title ?? 'Matches DAT entry'}>
-        <BadgeCheck size={11} aria-hidden="true" /> DAT
+      <Badge tone={remoteMatch ? 'info' : 'dat-match'} title={matchTooltip}>
+        <BadgeCheck size={11} aria-hidden="true" /> {remoteMatch ? 'HASH' : 'DAT'}
       </Badge>
     {/if}
     {#each outputs as out (out.tool_id)}

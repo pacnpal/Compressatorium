@@ -447,8 +447,8 @@ class DATSyncService:
                 )
             except Exception:
                 logger.exception(
-                    "dat_sync: failed to snapshot match paths; committing"
-                    " DATs without scheduling a post-sync rematch",
+                    "dat_sync: failed to snapshot match paths; the post-sync"
+                    " rematch will cover only the rows that survive the sync",
                 )
                 previous_match_paths = []
             old_ids = [d["id"] for d in existing_dats]
@@ -460,45 +460,27 @@ class DATSyncService:
                         "dat_sync: cleared %d existing DATs after full successful sync",
                         deleted,
                     )
-            if previous_match_paths:
-                # Lazy import: routes.dat transitively imports this module
-                # via _get_sync_service, so deferring the import to
-                # call-time keeps the module-load graph acyclic.  A true
-                # ImportError here indicates a broken deployment (routes
-                # package missing, syntax error in a transitive dep) and
-                # MUST propagate, letting it fall into the best-effort
-                # catch below would hide it behind a silent "complete"
-                # sync result.
-                from routes.dat import schedule_match_job
-                # Rematch scheduling itself is best-effort: the DAT
-                # import has already been committed. Runtime failures
-                # (job_manager queue full, loop already shutting down,
-                # etc.) must not mark the sync as errored, the DAT data
-                # is fine; the user can retry matching manually.
-                try:
-                    rematch_job_id = await schedule_match_job(previous_match_paths)
-                except Exception:
-                    logger.exception(
-                        "dat_sync: failed to schedule post-sync rematch for %d file(s); "
-                        "DAT import succeeded, user can trigger a manual match later",
-                        len(previous_match_paths),
-                    )
-                    rematch_status = "failed"
-                else:
-                    # previous_match_paths is non-empty at this point, so a
-                    # None return from schedule_match_job unambiguously
-                    # means "another match job is already active".
-                    if rematch_job_id:
-                        logger.info(
-                            "dat_sync: scheduled rematch job %s for %d previously-scanned file(s)",
-                            rematch_job_id, len(previous_match_paths),
-                        )
-                        rematch_status = "scheduled"
-                    else:
-                        logger.info(
-                            "dat_sync: skipped rematch, another match job is already active",
-                        )
-                        rematch_status = "deferred"
+            # Lazy import: routes.dat transitively imports this module
+            # via _get_sync_service, so deferring the import to
+            # call-time keeps the module-load graph acyclic.  A true
+            # ImportError here indicates a broken deployment (routes
+            # package missing, syntax error in a transitive dep) and
+            # MUST propagate, letting it fall into the best-effort
+            # catch below would hide it behind a silent "complete"
+            # sync result.
+            from routes.dat import rematch_after_dat_change
+            # One helper, shared with the manual-import path: both want
+            # "re-match what already had a verdict, against the new index".
+            # It never raises (the DATs are committed by now) and reports
+            # what happened, including the case where another match job is
+            # running -- those paths are queued, not dropped.
+            #
+            # Called unconditionally, even on an empty snapshot: the helper
+            # adds the rows that survived the sync, and a remote hit persisted
+            # during it is exactly the row the snapshot cannot contain.
+            rematch_status, rematch_job_id = await rematch_after_dat_change(
+                previous_match_paths, source="dat_sync",
+            )
         else:
             # Partial failure: discard all staged (uncommitted) new DATs so the
             # store stays in a clean, known-good state (previous working set intact).

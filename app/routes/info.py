@@ -169,27 +169,43 @@ async def _scan_phase_dat_match(
     Progress band: 65 % → 97 %. Returns the number of matched files.
     """
     # Lazy import keeps the routes modules import-order independent.
-    from routes.dat import _match_single_file
-    from services.dat_store import dat_store
+    from routes.dat import (
+        HASHEOUS_ERROR,
+        _match_single_file,
+        cached_result_usable,
+        drop_if_content_changed,
+        matching_available,
+    )
+    from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
 
     if not all_paths:
-        return 0
+        return 0, 0
+    store_ok = True
     try:
         has_dats = await run_in_threadpool(dat_store.has_dats)
     except Exception as e:
         # No DAT store available (e.g. DB not initialised); nothing to prime.
         logger.debug("Phase 3: DAT store unavailable, skipping match priming: %s", e)
         has_dats = False
-    if not has_dats:
+        store_ok = False
+    # A broken store skips the phase even when Hasheous could answer lookups:
+    # this phase exists to *prime the match cache*, and every write below goes
+    # through the same store. Proceeding would just fail the whole scan on the
+    # next dat_store call instead of degrading quietly the way it used to.
+    if not store_ok or not matching_available(has_dats):
         # Advance through the Phase 3 band so the job doesn't appear stuck at
         # the Phase 2 progress (and then jump straight to the flush) for
         # libraries with no DATs imported / no CHDs.
         await job_manager.update_external_job(
             scan_job_id,
             progress=97,
-            message="Phase 3: no DATs imported — skipping DAT match",
+            message=(
+                "Phase 3: DAT store unavailable — skipping DAT match"
+                if not store_ok
+                else "Phase 3: no DATs imported — skipping DAT match"
+            ),
         )
-        return 0
+        return 0, 0
 
     total = len(all_paths)
     logger.info("Phase 3: DAT-matching %d discovered file(s)...", total)
@@ -209,10 +225,16 @@ async def _scan_phase_dat_match(
         cached = await run_in_threadpool(dat_store.get_matches_batch, all_paths)
 
     matched = 0
+    # Counted, not swallowed: with the remote source down every remote-only
+    # path lands on a non-cacheable error, and the phase would otherwise finish
+    # "0 matched" -- indistinguishable from a library genuinely in no DAT, with
+    # nothing telling the operator the rescan they asked for did not refresh
+    # those identities.
+    hasheous_errors = 0
     for idx, path in enumerate(all_paths, start=1):
         if job_manager.is_cancelled(scan_job_id):
             raise ExternalJobCancelled()
-        if not force and cached.get(path) is not None:
+        if not force and cached_result_usable(cached.get(path)):
             if cached[path].get("matched"):
                 matched += 1
         else:
@@ -245,8 +267,37 @@ async def _scan_phase_dat_match(
                 # as the /dat/match-batch job).
                 if not result.get("reason") and not result.get("error"):
                     await dat_store.set_match(path, result)
+                elif result.get("error") == HASHEOUS_ERROR:
+                    hasheous_errors += 1
+                    # The remote service is down, which says nothing about this
+                    # file: deleting here would let one forced rescan during an
+                    # outage erase every remote match in the library (fast, too,
+                    # since the breaker makes each failure instant) and still
+                    # finish looking normal.
+                    #
+                    # But "unchanged" is a claim, not an assumption. When the
+                    # rescan recomputed a file-level hash we can check it: if it
+                    # no longer matches the hash the cached row was built from,
+                    # the file really did change and keeping the row would show
+                    # a badge naming whatever the file used to be -- and nothing
+                    # would re-check it, since cached_result_usable() accepts
+                    # hits unconditionally. With no recomputed hash (size cap,
+                    # embedded-only) we cannot prove staleness, so the row
+                    # stays: an unprovable suspicion is not worth the data loss.
+                    await drop_if_content_changed(path, result)
+                elif result.get(CANDIDATE_HASHES_KEY) or result.get("file_hash"):
+                    # A size-capped recompute is non-cacheable, but it is no
+                    # longer evidence-free: a large CHD's embedded hashes are
+                    # read even when its container is not. Deleting on that
+                    # unconditionally threw away a valid remote identity for a
+                    # file nobody had touched, purely because the container was
+                    # over the cap -- so it goes through the same same-domain
+                    # comparison as the outage case and drops the row only when
+                    # a recomputed hash actually contradicts it.
+                    await drop_if_content_changed(path, result)
                 else:
-                    # Non-cacheable recompute (size cap / hash unavailable):
+                    # Non-cacheable recompute where the *file* is the problem
+                    # and nothing was recomputed at all (hash unavailable):
                     # drop any stale prior row so /dat/matches/lookup doesn't
                     # keep showing an outdated match after a (forced) rescan.
                     await dat_store.delete_match(path)
@@ -268,8 +319,15 @@ async def _scan_phase_dat_match(
             message=f"Phase 3 [{idx}/{total}]: {os.path.basename(path)}",
         )
 
-    logger.info("Phase 3 complete: %d/%d file(s) matched a DAT", matched, total)
-    return matched
+    if hasheous_errors:
+        logger.warning(
+            "Phase 3 complete: %d/%d file(s) matched a DAT; %d could not be checked "
+            "remotely (Hasheous unavailable) and will be retried",
+            matched, total, hasheous_errors,
+        )
+    else:
+        logger.info("Phase 3 complete: %d/%d file(s) matched a DAT", matched, total)
+    return matched, hasheous_errors
 
 
 async def scan_metadata_task(
@@ -288,6 +346,7 @@ async def scan_metadata_task(
     scan_start = time.monotonic()
     count = 0
     embed_count = 0
+    hasheous_errors = 0
     scan_token = lane_token
     if scan_token is None:
         scan_token = await workload_limiter.acquire("metadata_scan")
@@ -558,7 +617,9 @@ async def scan_metadata_task(
         # through the per-tool embedded-hash fast path (CHD header SHA1, Dolphin
         # disc SHA1, ...) and falls back to a file-level SHA1. CHD metadata and
         # disc IDs are untouched here. Progress band: 65 % → 97 %.
-        await _scan_phase_dat_match(scan_job_id, all_paths, force=force)
+        _, hasheous_errors = await _scan_phase_dat_match(
+            scan_job_id, all_paths, force=force,
+        )
 
         # Flush all accumulated changes once at the end (async, non-blocking)
         logger.info("Flushing metadata store to disk...")
@@ -600,9 +661,16 @@ async def scan_metadata_task(
             )
         else:
             if scan_success:
-                final_msg = (
-                    f"{count} refreshed, {embed_count} disc ID(s) found \u2014 {elapsed:.1f}s"
-                )
+                parts = [f"{count} refreshed", f"{embed_count} disc ID(s) found"]
+                if hasheous_errors:
+                    # The scan itself succeeded -- metadata was collected -- so
+                    # this is not a failure. But saying so without saying the
+                    # remote matching phase did not run would let a rescan
+                    # during an outage look like a clean "nothing matched".
+                    parts.append(
+                        f"{hasheous_errors} not checked (Hasheous unreachable)"
+                    )
+                final_msg = ", ".join(parts) + f" \u2014 {elapsed:.1f}s"
             else:
                 final_msg = f"Scan failed: {scan_error or 'unknown error'}"
             await job_manager.update_external_job(

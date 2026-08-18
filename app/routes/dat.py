@@ -13,9 +13,12 @@ from pydantic import BaseModel
 
 from config import settings
 from models import ConversionMode
-from services.dat_store import dat_store
+from services import hasheous
+from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
 from services.file_hasher import compute_file_sha1
+from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
+from services.preferences_store import preferences_store
 from services.subprocess_runner import collect_abandonment
 from services.tools import registry
 from services.tools.base import EmbeddedHashUnavailable
@@ -97,6 +100,46 @@ class SyncRequest(BaseModel):
     force: bool = False
 
 
+class HasheousSettingsRequest(BaseModel):
+    """``None`` clears the override and falls back to the env var."""
+
+    enabled: bool | None = None
+
+
+# Preference key holding the Web UI's Hasheous override (see routes/preferences
+# for the sibling `layout` / `conversion` keys).
+HASHEOUS_PREF_KEY = "hasheous"
+
+# Serializes the toggle's persist-then-apply so the stored value and the live
+# override cannot end up disagreeing under concurrent writes.
+_hasheous_toggle_lock = asyncio.Lock()
+
+# The ``error`` a per-file result carries when the remote lookup failed. Named
+# rather than repeated as a literal because the batch job reads it back to tell
+# "the network is down" apart from "the volume is gone" -- two very different
+# things to tell an operator.
+HASHEOUS_ERROR = "hasheous unavailable"
+
+
+async def load_hasheous_override() -> None:
+    """Restore the persisted Hasheous toggle. Called once at startup.
+
+    Best-effort: a preferences read failure must not stop the app booting, it
+    just means the environment default applies for this run.
+    """
+    try:
+        stored = await preferences_store.get(HASHEOUS_PREF_KEY)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not load the Hasheous preference: %s", exc)
+        return
+    if stored and "enabled" in stored:
+        hasheous.set_enabled_override(stored["enabled"])
+        logger.info(
+            "Hasheous fallback %s (saved in the Web UI)",
+            "enabled" if hasheous.enabled() else "disabled",
+        )
+
+
 @router.post("/dat/import")
 async def import_dat(file: UploadFile = File(...)):
     """Import a MAME Redump DAT file (Logiqx XML format)."""
@@ -110,6 +153,7 @@ async def import_dat(file: UploadFile = File(...)):
     max_size = 100 * 1024 * 1024  # 100MB
     total = 0
     tmp_path = None
+    previous_match_paths: list[str] = []
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as tmp:
             tmp_path = tmp.name
@@ -125,6 +169,13 @@ async def import_dat(file: UploadFile = File(...)):
                 await run_in_threadpool(tmp.write, chunk)
 
         try:
+            # Snapshot BEFORE the import: it is the import that invalidates the
+            # cache, and remote hits deliberately survive it (they owe nothing
+            # to the local DATs). Without a rematch those preserved rows would
+            # be served forever even when the DAT just imported *does* know the
+            # hash -- local-first inverted. The MAMERedump sync path already
+            # does exactly this; the manual-import path did not.
+            previous_match_paths = await run_in_threadpool(dat_store.list_match_paths)
             # Pass the temp file path (not its contents) so parse_dat() can
             # iterparse directly from disk without a second in-memory copy.
             result = await dat_store.import_dat(tmp_path)
@@ -136,6 +187,11 @@ async def import_dat(file: UploadFile = File(...)):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    # Shared with the sync path: a preserved remote hit is only replaced if the
+    # local recompute actually matches -- set_match refuses to downgrade one to
+    # an unmatched result.
+    await rematch_after_dat_change(previous_match_paths, source="import_dat")
 
     return result
 
@@ -157,8 +213,79 @@ async def delete_dat(dat_id: str):
 
 @router.get("/dat/stats")
 async def get_dat_stats():
-    """Get DAT store statistics."""
-    return await run_in_threadpool(dat_store.get_stats)
+    """Get DAT store statistics.
+
+    Carries the Hasheous flags too, so the DAT view learns whether remote
+    lookup is on from the request it already makes rather than a second
+    endpoint.
+    """
+    stats = await run_in_threadpool(dat_store.get_stats)
+    state = _hasheous_state()
+    return {
+        **stats,
+        "hasheous_enabled": state["enabled"],
+        "hasheous_url": state["url"],
+        "hasheous_overridden": state["overridden"],
+        "hasheous_env_default": state["env_default"],
+    }
+
+
+def _hasheous_state() -> dict:
+    """Everything the UI needs to render the Hasheous panel."""
+    return {
+        "enabled": hasheous.enabled(),
+        "url": hasheous.base_url(),
+        # True when the switch below is what's deciding, rather than the env
+        # var, so the UI can say the setting came from the environment.
+        "overridden": hasheous.override() is not None,
+        "env_default": hasheous.env_default(),
+    }
+
+
+@router.get("/dat/hasheous")
+async def get_hasheous_settings():
+    """Current Hasheous state (also carried on /dat/stats for convenience)."""
+    return _hasheous_state()
+
+
+@router.put("/dat/hasheous")
+async def put_hasheous_settings(request: HasheousSettingsRequest):
+    """Turn the Hasheous fallback on or off from the Web UI.
+
+    Persisted in the preferences table and applied immediately -- no container
+    restart, no editing docker-compose. ``enabled: null`` clears the override
+    and hands control back to ``COMPRESSATORIUM_HASHEOUS_ENABLED``.
+
+    Cached "no match" rows do not need clearing here: they carry the sources
+    they were produced with, and ``cached_result_usable`` re-checks them the
+    moment a stronger source becomes available.
+    """
+    # Persist BEFORE applying, and hold a lock across both. The write runs in
+    # a thread pool, so two concurrent toggles can commit in one order and then
+    # resume their coroutines in the other -- leaving the persisted value and
+    # the live override disagreeing. For a privacy control that means a client
+    # who just switched the fallback OFF could keep sending hashes until
+    # restart. Persisting first also means a failed write (SQLite locked, disk
+    # full) errors out having changed nothing, rather than sending hashes
+    # remotely while the endpoint reports failure and the UI shows "off".
+    async with _hasheous_toggle_lock:
+        await preferences_store.put(HASHEOUS_PREF_KEY, {"enabled": request.enabled})
+        hasheous.set_enabled_override(request.enabled)
+    logger.info(
+        "Hasheous fallback %s via Web UI",
+        "enabled" if hasheous.enabled() else "disabled",
+    )
+    return _hasheous_state()
+
+
+@router.post("/dat/hasheous/test")
+async def test_hasheous():
+    """Probe the configured server so the operator can confirm it works.
+
+    Always 200 with an ``ok`` flag: an unreachable server is a result to show,
+    not an API error.
+    """
+    return await hasheous.health()
 
 
 @router.post("/dat/match")
@@ -192,6 +319,14 @@ async def match_file(request: MatchRequest):
                 f"({', '.join(abandoned)}); it is still running."
             ),
         )
+    # Deliberately NOT cached, in either direction. This route means "match
+    # this file now", and DATMatch carries no freshness metadata: serving a
+    # stored row would identify a replaced file as the game it used to be, for
+    # every existing caller, indefinitely. Caching it (added in review, then
+    # reverted) traded that correctness for fewer repeat lookups -- the wrong
+    # way round for a route whose whole contract is freshness. The batch route,
+    # the background job and the scan all cache; a client that wants the cached
+    # answer should ask them, or read /dat/matches/lookup.
     return result
 
 
@@ -247,8 +382,12 @@ def _resolve_and_group_paths(
 @router.post("/dat/match-batch")
 async def match_batch(request: MatchBatchRequest):
     """Match multiple files against imported DATs."""
-    if not await run_in_threadpool(dat_store.has_dats):
-        return {"results": {p: {"path": p, "matched": False} for p in request.paths}}
+    # NOT an early return. Cached hits stay valid when the provider that
+    # produced them is switched off -- cached_result_usable() says so, and
+    # /dat/matches/lookup returns them -- so answering "unmatched" before
+    # consulting the cache erased every persisted badge for a DAT-less library
+    # that turned Hasheous off. The gate belongs on new computation only.
+    can_match = matching_available(await run_in_threadpool(dat_store.has_dats))
 
     # Resolve all paths and check volume membership in a single thread-pool
     # call to avoid blocking the async event loop with filesystem I/O.
@@ -270,11 +409,16 @@ async def match_batch(request: MatchBatchRequest):
                 results[original_path] = result
             continue
         cached_result = cached.get(normalized_path)
-        if cached_result is not None:
+        if cached_result_usable(cached_result):
             for original_path in original_paths:
                 results[original_path] = cached_result
-        else:
+        elif can_match:
             to_compute.append(normalized_path)
+        else:
+            # Nothing can answer a new lookup, but that is not a fact about
+            # this file, so it is reported unmatched and not cached.
+            for original_path in original_paths:
+                results[original_path] = {"path": original_path, "matched": False}
 
     # Compute matches for uncached files
     new_matches: dict[str, dict] = {}
@@ -359,7 +503,10 @@ async def match_cache_lookup(request: MatchCacheLookupRequest):
                 }
             continue
         cached_entry = cached.get(normalized_path)
-        if cached_entry is None:
+        if not cached_result_usable(cached_entry):
+            # Withhold a row that predates a now-enabled lookup source, so the
+            # client sees the path as uncached and schedules a match job rather
+            # than rendering a stale "no match" forever.
             continue
         for original_path in original_paths:
             results[original_path] = cached_entry
@@ -396,11 +543,9 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
     if not request.paths:
         return {"status": "idle", "results": {}}
 
-    if not await run_in_threadpool(dat_store.has_dats):
-        return {
-            "status": "idle",
-            "results": {p: {"path": p, "matched": False} for p in request.paths},
-        }
+    # Same reasoning as /dat/match-batch: read the cache first, gate only the
+    # work. Returning early here hid valid persisted hits from the client.
+    can_match = matching_available(await run_in_threadpool(dat_store.has_dats))
 
     normalized_to_originals, denied_normalized = await run_in_threadpool(
         _resolve_and_group_paths, request.paths,
@@ -422,9 +567,13 @@ async def match_batch_job(request: MatchBatchRequest, background_tasks: Backgrou
                 }
             continue
         cached_entry = cached.get(normalized_path)
-        if cached_entry is not None:
+        if cached_result_usable(cached_entry):
             for original_path in original_paths:
                 results[original_path] = cached_entry
+            continue
+        if not can_match:
+            for original_path in original_paths:
+                results[original_path] = {"path": original_path, "matched": False}
             continue
         # Existence check happens inside the job loop so a missing file
         # doesn't fail the whole request, it just gets a matched=false
@@ -470,10 +619,179 @@ def _filter_paths_within_volumes(paths: list[str]) -> tuple[list[str], int]:
     return allowed, denied
 
 
+# Paths a DAT change asked to re-match while a match job was already running.
+# The matcher is single-flight, so schedule_match_job() returns None in that
+# window -- and both callers used to stop there, which made "best-effort" mean
+# "never": an import landing during a scan left those files on their old
+# verdicts until the operator happened to browse or rescan them. Held here and
+# drained when the running job releases the slot, so it means "later" instead.
+_deferred_rematch_paths: set[str] = set()
+
+
+def _discard_deferred_rematch(job_id: str) -> None:
+    """Drop the queued rematch because the job it was waiting behind was cancelled.
+
+    "Stop everything" has to mean it. Draining here started a *replacement*
+    job from inside the cancelled job's own teardown, and ``/jobs/cancel-all``
+    snapshots the job list before that replacement exists -- so the rematch
+    escaped the cancellation entirely and carried on hashing moments after the
+    operator asked for silence.
+
+    Dropped rather than left queued: nothing but a finishing job drains the
+    set, so keeping the paths would mean holding them until some unrelated
+    match job happened to end. Logged at INFO because it is a real loss of
+    scheduled work -- those files keep their previous verdicts until they are
+    browsed or a rescan runs, which is the ordinary lazy path.
+    """
+    global _deferred_rematch_paths  # noqa: PLW0603, intentional module-level state
+    if not _deferred_rematch_paths:
+        return
+    dropped = len(_deferred_rematch_paths)
+    _deferred_rematch_paths = set()
+    logger.info(
+        "match job %s was cancelled; dropped the deferred rematch of %d file(s)"
+        " -- they keep their current verdicts until browsed or rescanned",
+        job_id, dropped,
+    )
+
+
+async def _drain_deferred_rematch() -> None:
+    """Start the rematch a DAT change had to defer, now that the slot is free.
+
+    Called from the finishing job's own teardown. Best-effort by construction:
+    it runs inside a ``finally`` that must go on to finalize the job it belongs
+    to, so nothing here may raise -- and during interpreter shutdown there may
+    be no loop left to schedule on.
+    """
+    global _deferred_rematch_paths  # noqa: PLW0603, intentional module-level state
+    if not _deferred_rematch_paths:
+        return
+    paths, _deferred_rematch_paths = sorted(_deferred_rematch_paths), set()
+    try:
+        job_id = await schedule_match_job(
+            paths, defer_if_busy=True, local_only=True,
+        )
+    except Exception:
+        logger.exception(
+            "failed to start the deferred rematch for %d file(s)", len(paths),
+        )
+        return
+    if job_id:
+        logger.info(
+            "started deferred rematch job %s for %d file(s)", job_id, len(paths),
+        )
+
+
+async def _paths_needing_rematch(before: list[str]) -> list[str]:
+    """The pre-change snapshot, plus every row that *survived* the change.
+
+    Both callers snapshot before the change, because the change is what
+    invalidates. That snapshot is not transactional with it, though, and a
+    match already in flight can persist a remote hit inside the window between
+    the two. Invalidation preserves remote hits by design, so such a row
+    survives while being absent from the snapshot -- and since a cached hit is
+    always usable, nothing would ever recompute it. The DAT just imported could
+    know that hash and would never get the chance to say so.
+
+    Reading the surviving rows *after* the change closes that without making
+    the snapshot transactional with the import. Anything still cached once the
+    new index is live either predates the change (already in *before*) or was
+    written during it, and both need recomputing. A row written after the
+    commit was decided against the new index already, so including it is
+    redundant rather than wrong -- and the window is milliseconds wide.
+
+    Sorted because ``list_match_paths`` promises no order and the resulting job
+    should not depend on one.
+    """
+    try:
+        surviving = await run_in_threadpool(dat_store.list_match_paths)
+    except Exception:
+        # Best-effort, like the caller: the DATs are committed either way, and
+        # rematching the snapshot alone is strictly better than rematching
+        # nothing.
+        logger.exception(
+            "failed to list surviving match rows; rematching the pre-change "
+            "snapshot only",
+        )
+        return sorted(set(before))
+    return sorted(set(before) | set(surviving))
+
+
+async def rematch_after_dat_change(
+    paths: list[str], *, source: str,
+) -> tuple[str, str | None]:
+    """Re-match *paths* after the local DAT set changed. Returns (status, job id).
+
+    The one place both DAT-change paths go through -- a user upload
+    (``import_dat``) and the MAMERedump sync (``services.dat_sync``) -- since
+    they want the identical thing: the files that already had a verdict get it
+    recomputed against the new index. It had been written twice, and only the
+    sync copy reported what happened when the matcher was busy.
+
+    *paths* is the caller's pre-change snapshot; the rows that survived the
+    change are added here (see :func:`_paths_needing_rematch`), which is why an
+    empty snapshot is still worth calling with.
+
+    **Local-only.** The job runs the local pass and stops there. What changed
+    is the local index; the remote source is exactly as it was, so re-asking it
+    once per previously-verdicted file cannot produce an answer that differs
+    from the cached one -- it only discloses every hash again, thousands of
+    them per MAMERedump sync, on a schedule the operator did not choose. The
+    outcomes fall out of guards that already exist:
+
+    * the new DATs cover the file -> local hit, written, and the badge upgrades
+      from HASH to DAT. This is the entire point of the rematch.
+    * they still don't -> an *unstamped* miss, which
+      ``dat_store._would_downgrade_remote_hit`` refuses to write over a remote
+      hit. The badge stays.
+    * the file had a remote-checked *miss* -> that row was dropped by the
+      invalidation, so the unstamped miss replaces it and
+      ``cached_result_usable()`` finds no stamp, which re-checks it remotely
+      the next time it is browsed. Lazy, one file at a time, on the operator's
+      navigation rather than in a burst.
+
+    Never raises: the DAT is already committed by the time this runs, so a
+    scheduling failure must not turn a good import into an error.
+    """
+    paths = await _paths_needing_rematch(paths)
+    if not paths:
+        return "none", None
+    try:
+        # local_only: a DAT change tells us nothing new about the remote
+        # source, so re-asking it for every previously-verdicted file is pure
+        # cost -- thousands of hash disclosures and requests per sync, for
+        # answers that cannot differ from the ones already cached. See the
+        # docstring.
+        job_id = await schedule_match_job(
+            paths, defer_if_busy=True, local_only=True,
+        )
+    except Exception:
+        logger.exception(
+            "%s: failed to schedule a rematch for %d file(s); the DAT is "
+            "committed and matching can be re-run manually",
+            source, len(paths),
+        )
+        return "failed", None
+    if job_id:
+        logger.info(
+            "%s: scheduled rematch job %s for %d previously-scanned file(s)",
+            source, job_id, len(paths),
+        )
+        return "scheduled", job_id
+    logger.info(
+        "%s: deferred rematch, another match job is already active; "
+        "%d file(s) queued until it finishes",
+        source, len(paths),
+    )
+    return "deferred", None
+
+
 async def schedule_match_job(
     paths: list[str],
     *,
     background_tasks: BackgroundTasks | None = None,
+    defer_if_busy: bool = False,
+    local_only: bool = False,
 ) -> str | None:
     """Start a background DAT-match job for *paths*.
 
@@ -509,6 +827,9 @@ async def schedule_match_job(
         return None
     async with _get_match_job_lock():
         if _active_match_job_id is not None:
+            if defer_if_busy:
+                # Queued rather than dropped -- see _deferred_rematch_paths.
+                _deferred_rematch_paths.update(allowed)
             return None
         scan_job = job_manager.create_external_job(
             filename="DAT Match",
@@ -533,7 +854,10 @@ async def schedule_match_job(
     try:
         if background_tasks is not None:
             background_tasks.add_task(
-                _run_match_job, job_id=scan_job.id, paths_to_compute=allowed,
+                _run_match_job,
+                job_id=scan_job.id,
+                paths_to_compute=allowed,
+                local_only=local_only,
             )
         else:
             # Invariant: _background_match_tasks holds at most one task
@@ -547,7 +871,11 @@ async def schedule_match_job(
                     len(_background_match_tasks),
                 )
             task = asyncio.create_task(
-                _run_match_job(job_id=scan_job.id, paths_to_compute=allowed),
+                _run_match_job(
+                    job_id=scan_job.id,
+                    paths_to_compute=allowed,
+                    local_only=local_only,
+                ),
             )
             _background_match_tasks.add(task)
             task.add_done_callback(_background_match_tasks.discard)
@@ -578,7 +906,10 @@ async def schedule_match_job(
 
 
 async def _hash_one_for_job(
-    normalized_path: str, *, cancel_event: asyncio.Event | None = None,
+    normalized_path: str,
+    *,
+    cancel_event: asyncio.Event | None = None,
+    local_only: bool = False,
 ) -> tuple[dict, bool]:
     """Compute a match result for one path inside the background job loop.
 
@@ -604,7 +935,9 @@ async def _hash_one_for_job(
         return {"path": normalized_path, "matched": False}, False
 
     try:
-        result = await _match_single_file(normalized_path, cancel_event=cancel_event)
+        result = await _match_single_file(
+            normalized_path, cancel_event=cancel_event, local_only=local_only,
+        )
     except Exception as exc:  # pragma: no cover, isolated per-path
         # logger.exception rather than logger.warning: a KeyError /
         # AttributeError from a refactor bug should surface with a full
@@ -621,8 +954,13 @@ async def _run_match_job(
     *,
     job_id: str,
     paths_to_compute: list[str],
+    local_only: bool = False,
 ) -> None:
-    """Background task: hash paths serially, cache results, tick progress."""
+    """Background task: hash paths serially, cache results, tick progress.
+
+    ``local_only`` suppresses the remote pass for every path -- see
+    :func:`rematch_after_dat_change`, the only caller that sets it.
+    """
     global _active_match_job_id
 
     start = time.monotonic()
@@ -644,9 +982,14 @@ async def _run_match_job(
     #            "error" key in these cases). Informational only.
     errors = 0
     skips = 0
+    hasheous_errors = 0  # subset of `errors` caused by the remote lookup
     # Tri-state: True = success, False = failure, None = cancelled.
     job_success: bool | None = False
     job_error: str | None = None
+    # Set only by the `except Exception` branch. `job_success is False` cannot
+    # tell a mid-loop crash from a job that ran every path and reported
+    # failures, and only the first must withhold the deferred rematch.
+    job_crashed = False
 
     # Set when the job is cancelled; forwarded into expensive embedded-hash
     # hooks (e.g. dolphin-tool verify) so the in-flight file aborts promptly
@@ -666,7 +1009,9 @@ async def _run_match_job(
 
             with collect_abandonment() as abandoned:
                 result, cacheable = await _hash_one_for_job(
-                    normalized_path, cancel_event=cancel_event,
+                    normalized_path,
+                    cancel_event=cancel_event,
+                    local_only=local_only,
                 )
             # Before `set_match` and the counters, for the same reason as the
             # batch route: an abandoned helper's result is an ordinary unmatched
@@ -694,12 +1039,23 @@ async def _run_match_job(
                     logger.exception("Failed to cache match for %s", normalized_path)
                     errors += 1
             else:
+                # A non-cacheable result is not written, but it is not
+                # evidence-free either: a capped CHD's embedded hashes are
+                # read even when its container is not, and a DAT-change
+                # rematch is exactly when a replaced file needs its old badge
+                # retired. The scan has always pruned on that evidence; this
+                # path never did, so an oversized replaced file kept naming
+                # the previous game with nothing left to re-check it. Deletes
+                # only on proof in the row's own hash domain.
+                await drop_if_content_changed(normalized_path, result)
                 # Non-cacheable outcomes split into errors (something went
                 # wrong, see _hash_one_for_job) vs skips (policy: file
                 # too large, not a regular file). `result.get("error")`
                 # is the discriminator that _hash_one_for_job sets.
                 if result.get("error"):
                     errors += 1
+                    if result["error"] == HASHEOUS_ERROR:
+                        hasheous_errors += 1
                 else:
                     skips += 1
 
@@ -716,15 +1072,35 @@ async def _run_match_job(
             if job_manager.is_cancelled(job_id):
                 raise ExternalJobCancelled()
 
-        # If every single file errored, something structural is wrong
-        # (volume unmounted, DB down, etc.).  Flip the job to failure so
-        # the user sees a red signal rather than a misleading "complete,
-        # 0 matched" that looks like a DAT-coverage gap.
-        if total > 0 and errors == total:
+        # If every file the job could actually process errored, something
+        # structural is wrong (volume unmounted, DB down, Hasheous
+        # unreachable).  Flip the job to failure so the user sees a red
+        # signal rather than a misleading "complete, 0 matched" that looks
+        # like a DAT-coverage gap.
+        #
+        # Skips are excluded from the denominator, not counted as survivors:
+        # they are files the job deliberately did not check (over the size
+        # cap, not a regular file), so a single oversized ISO in the batch
+        # made `errors == total` false and downgraded a total outage to a
+        # green "complete" carrying a generic error count -- exactly the
+        # misread this branch exists to prevent.
+        checkable = total - skips
+        if checkable > 0 and errors == checkable:
             job_success = False
-            job_error = (
-                f"all {errors} file(s) failed, check volume accessibility"
-            )
+            if hasheous_errors == errors:
+                # Say what actually broke. The files and the volume are fine;
+                # pointing the operator at storage would send them debugging
+                # the wrong thing entirely, and this one recovers by itself.
+                job_error = (
+                    f"all {errors} file(s) failed: Hasheous is unreachable. "
+                    "Your files and volume are fine -- nothing was recorded as "
+                    "unmatched, so re-run this once the service is back "
+                    "(or turn the fallback off in the DAT Library)."
+                )
+            else:
+                job_error = (
+                    f"all {errors} file(s) failed, check volume accessibility"
+                )
         else:
             job_success = True
     except ExternalJobCancelled:
@@ -735,6 +1111,14 @@ async def _run_match_job(
         job_success = None
     except Exception as exc:
         logger.exception("DAT match job %s failed", job_id)
+        # Fatal, as opposed to "finished with failures": the loop stopped
+        # early and did not choose to. The abandonment guard is the case that
+        # matters -- a hash helper outlived SIGKILL and is still reading
+        # unresponsive storage, so the job raises to stop stranding more
+        # processes (issue #268). Handing its queue straight to a successor
+        # resumed hashing on that same volume seconds later, which is the one
+        # thing the guard exists to prevent.
+        job_crashed = True
         # Include counters so the final-status line tells the operator
         # how far the job got before the mid-loop failure.  Without
         # this, the user only sees the raw exception string and loses
@@ -755,6 +1139,17 @@ async def _run_match_job(
         async with _get_match_job_lock():
             if _active_match_job_id == job_id:
                 _active_match_job_id = None
+        # A cancelled or crashed job must not hand its queue to a successor:
+        # see _discard_deferred_rematch. `job_success is None` is set only by
+        # the ExternalJobCancelled branch, so it is the cancellation signal
+        # here -- job_manager.is_cancelled() is not, since a cancelled job can
+        # be reaped from the registry before this runs. `job_crashed` is the
+        # other stop-now signal; an ordinary "ran everything, some failed" job
+        # still drains, since nothing about it says the next batch would fail.
+        if job_success is None or job_crashed:
+            _discard_deferred_rematch(job_id)
+        else:
+            await _drain_deferred_rematch()
         elapsed = time.monotonic() - start
         if job_success is None:
             parts = [f"{processed}/{total} processed, {hashed} hashed, {matched} matched"]
@@ -881,31 +1276,305 @@ async def sync_cancel():
     raise HTTPException(status_code=409, detail="No sync in progress")
 
 
-async def _lookup_sha1_match(file_path: str, sha1: str, match_type: str) -> dict | None:
-    """Look ``sha1`` up in the imported DATs and build a match-result dict.
+def matching_available(has_dats: bool) -> bool:
+    """True when *something* can answer a hash lookup.
 
-    Shared by every match path (per-tool embedded hashes and the file-level
-    SHA1 fallback) so the DAT lookup + result-dict shape lives in one place.
-    Returns ``None`` when the hash isn't in any DAT.
+    Local DATs alone used to be the answer, so every match entry point gated on
+    ``dat_store.has_dats``. With Hasheous enabled an operator who has imported
+    no DATs at all can still match, and those gates would otherwise short-
+    circuit before the remote lookup is ever reached.
     """
+    return bool(has_dats) or hasheous.enabled()
+
+
+async def _local_dat_record(sha1: str) -> dict | None:
+    """Look ``sha1`` up in the imported DATs; ``None`` when absent."""
     record = await run_in_threadpool(dat_store.lookup_sha1, sha1)
     if not record:
         return None
     dat_name = await run_in_threadpool(dat_store.get_dat_name, record.get("dat_id", ""))
     return {
-        "path": file_path,
-        "matched": True,
         "dat_id": record.get("dat_id"),
         "dat_name": dat_name,
         "game_name": record.get("game_name"),
         "rom_name": record.get("rom_name"),
-        "match_type": match_type,
-        "file_hash": sha1,
+        "source": "dat",
     }
 
 
+def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> dict:
+    """Build the match-result dict from a lookup record. The one place it lives."""
+    return {
+        "path": file_path,
+        "matched": True,
+        "match_type": match_type,
+        "file_hash": sha1,
+        **record,
+    }
+
+
+def _carrying_candidates(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """Tag a verdict with the typed hashes it was reached from.
+
+    Two guards in the store read this, which is why it stays *typed*
+    ``(sha1, match_type)`` rather than a bare hash list:
+
+    * ``_local_index_now_covers()`` re-validates the local index against every
+      candidate inside the writing transaction. The local-first decision and
+      the cache write are separate operations and a DAT import can commit
+      between them, so a verdict the remote source took part in would otherwise
+      outrank a local identity that landed while the lookup was in flight.
+    * ``_proves_content_changed()`` needs to compare like with like. A hit is
+      stored against whichever hash matched -- ``file_sha1``, ``chd_sha1``,
+      ``dolphin_disc_sha1`` -- and comparing across domains is meaningless, so
+      it looks up the recomputed hash in the *stored* row's domain. A bare list
+      cannot answer that question.
+    """
+    return {**result, CANDIDATE_HASHES_KEY: list(candidates)}
+
+
+def _carrying_file_hash(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """An unmatched result that still carries the evidence of what the file *is*.
+
+    ``dat_store._would_downgrade_remote_hit()`` refuses to overwrite a remote
+    hit with an unmatched result unless ``_proves_content_changed()`` can find
+    a recomputed hash contradicting the stored one -- so a miss that drops its
+    hashes leaves a *replaced* file wearing the previous game's badge, with
+    nothing left to ever correct it.
+
+    Carries the whole typed set, not only the file-level SHA1: an exhaustive
+    tool (Dolphin RVZ/WIA/GCZ) never computes a ``file_sha1`` at all, so
+    keeping just that one left precisely the formats whose embedded hash *is*
+    the identity with no evidence at all. ``file_hash`` is still set from the
+    file-level candidate when there is one, because ``drop_if_content_changed()``
+    on the scan path reads that field directly.
+
+    Shared by the two exits that return an unmatched result after computing
+    hashes: a remote outage, and a local-only rematch.
+    """
+    result = _carrying_candidates(result, candidates)
+    file_level = next((h for h, kind in candidates if kind == "file_sha1"), None)
+    if file_level:
+        result["file_hash"] = file_level
+    return result
+
+
+async def _local_lookup_match(
+    file_path: str, candidates: list[tuple[str, str]],
+) -> dict | None:
+    """First of ``candidates`` the imported DATs know, or ``None``.
+
+    ``candidates`` is a list of ``(sha1, match_type)``: a tool can report
+    several content hashes for one file (a CHD carries a header SHA1 and a data
+    SHA1) and the file-level fallback supplies one more.
+    """
+    for sha1, match_type in candidates:
+        record = await _local_dat_record(sha1)
+        if record is not None:
+            return _match_result(file_path, sha1, match_type, record)
+    return None
+
+
+def _remote_pass_stopped(cancel_event: asyncio.Event | None) -> bool:
+    """True when the operator has asked the remote pass to stop.
+
+    Never asked, or stopped part-way: either way it was not a complete remote
+    check, so the caller must return without stamping one.
+
+    Cancellation counts for the same reason the toggle does. The outer job only
+    notices once ``_match_single_file`` returns, so without this a cancelled
+    scan kept sending a CHD's remaining candidate hashes -- disclosing them
+    after the operator asked it to stop, and paying a full timeout each on the
+    way out.
+    """
+    return not hasheous.enabled() or bool(cancel_event and cancel_event.is_set())
+
+
+async def _remote_lookup_match(
+    file_path: str,
+    candidates: list[tuple[str, str]],
+    *,
+    cancel_event: asyncio.Event | None = None,
+) -> tuple[dict | None, str | None]:
+    """Ask Hasheous about ``candidates``. Returns ``(match, consulted)``.
+
+    ``consulted`` is the server URL when every candidate was actually put to
+    it, and ``None`` otherwise -- disabled throughout, or switched off part-way
+    through. The caller stamps a cached miss with it, so the stamp records what
+    was *really* asked rather than what was merely configured when the match
+    began: an operator toggling the feature during a slow hash (a full-file
+    SHA1, a dolphin verify) would otherwise leave a miss claiming a remote
+    check that never happened, and `cached_result_usable` would serve that
+    miss forever once the feature was switched back on.
+
+    Propagates :class:`HasheousUnavailable` -- a transient remote failure is
+    *not* a miss, and the caller turns it into a non-cacheable error.
+    """
+    consulted = False
+    remote: dict | None = None
+    for sha1, match_type in candidates:
+        # Re-checked every iteration, not once up front. A CHD sends up to
+        # three hashes and each request can take seconds, so an operator who
+        # switches the fallback off mid-lookup would otherwise still have the
+        # remaining candidates go out -- "off means nothing is sent" has to
+        # hold for the request after the click, not just the next file.
+        # Two checks, one before this iteration's await and one after it.
+        # The early one keeps a stopped pass from doing further work at all;
+        # the later one is the load-bearing half, because the local recheck
+        # below is itself an await and a guard that only preceded it left a
+        # window where the operator could switch the fallback off (or cancel
+        # the job) and still have this hash go out -- reintroducing, one await
+        # later, the very gap the recheck was added to close.
+        if _remote_pass_stopped(cancel_event):
+            return None, None
+        if consulted:
+            # Between requests, not only after the last one. Each lookup is an
+            # await of seconds and a DAT import commits in its own
+            # transaction, so by the time candidate 2 goes out the local index
+            # may already identify it -- and disclosing a hash the local DATs
+            # can answer is precisely what local-first exists to prevent. The
+            # post-loop pass cannot help: it runs after the disclosure.
+            #
+            # Over the whole set rather than just this candidate: an import
+            # covering an *earlier* one means a local identity exists now, and
+            # returning it beats sending anything at all.
+            local = await _local_lookup_match(file_path, candidates)
+            if local is not None:
+                return local, hasheous.base_url()
+        if _remote_pass_stopped(cancel_event):
+            return None, None
+        consulted = True
+        # ponytail: unbounded concurrency. Each call is bounded by
+        # hasheous_timeout, the bulk match job is already single-flight, and
+        # the client short-circuits while the service is down; add a
+        # workload_limiter lane if a large scan ever gets rate-limited.
+        record = await hasheous.lookup(sha1)
+        if record is not None:
+            remote = _match_result(file_path, sha1, match_type, record)
+            break
+
+    # One more local pass, over the COMPLETE candidate set, covering every
+    # await above. A DAT import commits in its own transaction and each
+    # request can last seconds, so the index that missed a moment ago may now
+    # hold one of these hashes -- and whatever is written next is served
+    # unconditionally afterwards, so the remote answer (or a stamped miss)
+    # would outrank the local one for good.
+    #
+    # Over the whole set, not just the hash that hit: a CHD sends up to three,
+    # and the DAT that landed mid-flight may know a *later* one. Checking only
+    # the candidate that happened to match remotely left that case open, and
+    # the all-missed path had no re-check at all.
+    #
+    # This one covers the *final* await. The in-loop pass above covers each
+    # earlier one -- and has to, because a pass that runs only after the loop
+    # protects the verdict but not the disclosure: by then the hash the new
+    # DAT could have answered has already gone out.
+    local = await _local_lookup_match(file_path, candidates)
+    if local is not None:
+        return local, (hasheous.base_url() if consulted else None)
+    return remote, (hasheous.base_url() if consulted else None)
+
+
+async def _lookup_match(
+    file_path: str, candidates: list[tuple[str, str]],
+) -> dict | None:
+    """Local sources first, then remote, over the whole candidate set.
+
+    The two passes are kept separate and in this order deliberately.
+    Interleaving them -- remote-checking candidate 1 before local-checking
+    candidate 2 -- would both disclose a hash the local DATs could have
+    identified on their own, and let a remote timeout mask an available local
+    hit. ``_match_single_file`` calls the halves directly so it can slot its
+    (expensive, lazily computed) file-level SHA1 into the local pass before any
+    candidate goes out.
+    """
+    local = await _local_lookup_match(file_path, candidates)
+    if local is not None:
+        return local
+    remote, _consulted = await _remote_lookup_match(file_path, candidates)
+    return remote
+
+
+def remote_stamp() -> str | None:
+    """Identifies the remote source a verdict was reached with, or None.
+
+    The server *URL*, not a boolean: an operator who repoints
+    ``COMPRESSATORIUM_HASHEOUS_URL`` at a self-hosted instance has changed which
+    database answers, so misses recorded against the old one need re-checking
+    too -- not only misses recorded before the feature was switched on.
+    """
+    return hasheous.base_url() if hasheous.enabled() else None
+
+
+def cached_result_usable(payload: dict | None) -> bool:
+    """False when a cached row predates the lookup sources now configured.
+
+    A miss recorded before Hasheous was switched on -- or against a *different*
+    Hasheous server -- came from a different, or strictly weaker, matcher, so
+    re-running it can now succeed. Without this an existing install that enables
+    Hasheous keeps serving its old "not in any DAT" rows and the feature
+    silently does nothing for precisely the uncovered library it exists to
+    identify.
+
+    Hits are always usable: local DATs are consulted first anyway, so a remote
+    source could not have improved on one.
+
+    With Hasheous off, any miss is usable -- a local-only verdict is exactly
+    what a local-only configuration should produce.
+    """
+    if payload is None:
+        return False
+    if payload.get("matched"):
+        return True
+    stamp = remote_stamp()
+    if stamp is None:
+        return True
+    return payload.get("checked_remote") == stamp
+
+
+async def drop_if_content_changed(path: str, result: dict) -> None:
+    """Delete a cached match whose file demonstrably changed under it.
+
+    A non-cacheable result (a Hasheous outage, a size-cap skip) deliberately
+    leaves the previous row in place -- deleting on every transient failure was
+    a real data-loss bug. But "unchanged" is a claim, and when the recomputed
+    hash disproves it the stale row would keep naming the previous game with
+    nothing to re-check it, since ``cached_result_usable`` accepts hits
+    unconditionally.
+
+    Acts only on proof, which means comparing like with like: a CHD hit is
+    stored against its *embedded* hash (``chd_sha1`` / ``chd_data_sha1``) while
+    a rescan recomputes the *container* ``file_sha1``. Those are different hash
+    domains and differ for a perfectly unchanged file.
+
+    The comparison itself lives in the store, as ``drop_match_if_changed``:
+    it is the same question the write guard answers, keyed on the stored row's
+    ``match_type`` rather than demanding ``file_sha1`` (which is what lets an
+    exhaustive format be pruned at all -- a replaced RVZ carries a fresh
+    ``dolphin_disc_sha1`` and never a ``file_sha1``). Reading the row here and
+    deleting it in a second call left a window where a concurrent match job's
+    correct result for the *replacement* file could land in between and be
+    deleted instead, so compare and delete now share one transaction.
+
+    Every consumer of a non-cacheable result funnels through here -- the
+    metadata scan and the match job both -- because "the recompute proves this
+    row is stale" is one rule and it was previously applied in only one of the
+    two places.
+    """
+    # No recomputed hash of any kind means no claim can be disproved -- and
+    # this runs per file on every forced rescan, so it returns before touching
+    # the store rather than after.
+    if not result.get(CANDIDATE_HASHES_KEY) and not result.get("file_hash"):
+        return
+    if await dat_store.drop_match_if_changed(path, result):
+        logger.info("%s changed since its cached match; dropped the stale row", path)
+
+
 async def _match_single_file(
-    file_path: str, *, cancel_event: asyncio.Event | None = None,
+    file_path: str,
+    *,
+    cancel_event: asyncio.Event | None = None,
+    local_only: bool = False,
 ) -> dict:
     """Match a file against all imported DATs.
 
@@ -917,17 +1586,35 @@ async def _match_single_file(
     ``cancel_event`` is forwarded to the tool's (potentially expensive)
     embedded-hash hook so a background scan/match job can abort it promptly.
     """
-    base_result = {"path": file_path, "matched": False}
+    # ``checked_remote`` records WHICH remote source this verdict was actually
+    # reached with (the server URL, or None), so a miss cached before Hasheous
+    # was enabled -- or against a different server -- isn't served forever (see
+    # cached_result_usable). Only misses need it: a hit is already the strongest
+    # answer available.
+    #
+    # It starts None and is filled in from the remote pass itself, NOT snapshot
+    # here: hashing a file can take a long time, and an operator toggling the
+    # feature meanwhile would otherwise stamp a miss with a server that was
+    # never asked.
+    base_result = {"path": file_path, "matched": False, "checked_remote": None}
 
-    if not await run_in_threadpool(dat_store.has_dats):
+    if not matching_available(await run_in_threadpool(dat_store.has_dats)):
         return base_result
 
     # Per-tool embedded-hash fast path (already cached / cheap where the tool
     # can manage it, e.g. CHD header hashes from the metadata store).
+    #
+    # The whole body below is ordered around one rule: **every** local lookup
+    # happens before **any** remote one. Candidates accumulate as they become
+    # available -- the tool's embedded hashes first, then the file-level SHA1
+    # -- each is checked against the DATs as it appears, and only once all of
+    # them have missed locally does the complete set go out to Hasheous.
+    candidates: list[tuple[str, str]] = []
+    exhaustive = False
     tool = registry.tool_for_verify(file_path)
     if tool is not None:
         try:
-            match, had_candidates = await _try_embedded_hash_match(
+            match, candidates = await _try_embedded_hash_match(
                 file_path, tool, cancel_event=cancel_event,
             )
         except EmbeddedHashUnavailable as e:
@@ -939,58 +1626,142 @@ async def _match_single_file(
             return {**base_result, "error": "embedded hash unavailable"}
         if match:
             return match
-        if had_candidates and tool.embedded_hash_is_exhaustive:
-            # The tool's content hashes are exhaustive (e.g. Dolphin's disc
-            # SHA1): a miss is definitive and the container's file-level SHA1
-            # can never match the DAT, so record a (cacheable) unmatched result
-            # without re-reading the whole file. Tools whose own container
-            # bytes may be DAT-indexed (e.g. CHD) deliberately fall through to
-            # the file-level SHA1 below.
-            return base_result
+        # The tool's content hashes are exhaustive (e.g. Dolphin's disc SHA1):
+        # the container's file-level SHA1 can never match a DAT, so it is not
+        # worth reading the whole file for. Tools whose own container bytes may
+        # be DAT-indexed (e.g. CHD) still fall through to it below.
+        exhaustive = bool(candidates) and tool.embedded_hash_is_exhaustive
 
-    # Defense-in-depth: respect the operator-configured size cap so
-    # browsing a folder of 8 GB Wii ISOs doesn't stampede the hasher.
-    size_cap = max(0, int(getattr(settings, "match_max_file_size", 0) or 0))
-    if size_cap > 0:
-        try:
-            size_bytes = await run_in_threadpool(os.path.getsize, file_path)
-        except OSError:
-            size_bytes = 0
-        if size_bytes > size_cap:
-            return {
+    size_capped: dict | None = None
+    if not exhaustive:
+        # Defense-in-depth: respect the operator-configured size cap so
+        # browsing a folder of 8 GB Wii ISOs doesn't stampede the hasher.
+        size_cap = max(0, int(getattr(settings, "match_max_file_size", 0) or 0))
+        size_bytes = 0
+        if size_cap > 0:
+            try:
+                size_bytes = await run_in_threadpool(os.path.getsize, file_path)
+            except OSError:
+                size_bytes = 0
+
+        if size_cap > 0 and size_bytes > size_cap:
+            # Remember it rather than returning now: any embedded candidates
+            # this file did produce still deserve their remote pass.
+            size_capped = {
                 **base_result,
                 "reason": "file too large",
                 "file_size": size_bytes,
             }
+        else:
+            # File-level SHA1 (works for any format). Gate under the "match"
+            # workload lane so ``MAX_MATCH_CONCURRENCY`` bounds how many full-
+            # file hashes run at once when a directory of uncached files is
+            # browsed.
+            try:
+                async with await workload_limiter.acquire("match"):
+                    file_sha1 = await compute_file_sha1(file_path)
+            except OSError:
+                logger.warning("Failed to hash %s", file_path, exc_info=True)
+                return {**base_result, "error": "Unable to process file"}
 
-    # File-level SHA1 (works for any format). Gate under the "match"
-    # workload lane so ``MAX_MATCH_CONCURRENCY`` bounds how many full-
-    # file hashes run at once when a directory of uncached files is
-    # browsed.
-    try:
-        async with await workload_limiter.acquire("match"):
-            file_sha1 = await compute_file_sha1(file_path)
-    except OSError:
-        logger.warning("Failed to hash %s", file_path, exc_info=True)
-        return {**base_result, "error": "Unable to process file"}
+            # Check it locally BEFORE anything goes remote. For a CHD whose
+            # container bytes are the hash the local DAT actually holds, the
+            # old order sent the embedded hashes out first -- disclosing them
+            # needlessly, and letting a remote outage mask this local hit.
+            local = await _local_lookup_match(file_path, [(file_sha1, "file_sha1")])
+            if local:
+                return local
+            candidates.append((file_sha1, "file_sha1"))
 
-    return await _lookup_sha1_match(file_path, file_sha1, "file_sha1") or base_result
+    # Nothing local knows any of them. Now, and only now, ask Hasheous.
+    if candidates:
+        # One last local pass over the COMPLETE set first. Candidates are
+        # checked as they appear, and computing a file-level SHA1 can take
+        # minutes -- long enough for a DAT import or MAMERedump sync to land in
+        # between. An embedded hash that missed before that await may be in the
+        # library by now, and disclosing a hash the local DATs can identify is
+        # exactly what the local-first rule exists to prevent.
+        local = await _local_lookup_match(file_path, candidates)
+        if local:
+            return local
+        if local_only:
+            # A DAT change says nothing about the remote source, so the
+            # recompute it triggers must not pay a request for it. Returning
+            # the unstamped miss is deliberate and load-bearing: with no
+            # ``checked_remote`` the store's _would_downgrade_remote_hit()
+            # refuses to overwrite an existing remote hit, so a file the new
+            # DATs still don't cover simply keeps the badge it had.
+            #
+            # ...unless the file itself changed, which is why the recomputed
+            # hash rides along. "The DATs still don't know it" and "this is a
+            # different file now" both arrive here as an unmatched result, and
+            # only the hash tells them apart. Without it a replaced file kept
+            # the previous game's badge and nothing would ever correct it --
+            # the job path never calls drop_if_content_changed(), that is the
+            # scan's.
+            # Both exits carry the evidence, the capped one included. Its
+            # result is non-cacheable (``reason``), so the store never sees it
+            # -- but the scan's drop_if_content_changed() does, and for a
+            # large CHD the embedded hashes it *did* recompute are exactly
+            # what proves a swap. Dropping them here left a replaced oversized
+            # file wearing the previous game's badge.
+            return _carrying_file_hash(
+                size_capped if size_capped is not None else base_result,
+                candidates,
+            )
+        try:
+            remote, consulted = await _remote_lookup_match(
+                file_path, candidates, cancel_event=cancel_event,
+            )
+            base_result = _carrying_candidates(base_result, candidates)
+            base_result["checked_remote"] = consulted
+        except HasheousUnavailable as e:
+            # Same rule as the abandoned-hash case: a transient failure must
+            # NOT be cached as "unmatched", or a single network blip
+            # permanently marks every in-flight file as not in any DAT.
+            logger.warning("Hasheous unavailable for %s: %s", file_path, e)
+            # Carry the file-level hash when one was computed. A forced rescan
+            # keeps an existing cached hit through an outage (deleting it was
+            # a real data-loss bug), but "the service is down" and "this file
+            # changed" are different facts -- without the hash the scan cannot
+            # tell them apart and would keep a badge identifying the file as
+            # whatever it used to be.
+            return _carrying_file_hash(
+                {**base_result, "error": HASHEOUS_ERROR}, candidates,
+            )
+        if remote:
+            return _carrying_candidates(remote, candidates)
+
+    # A size-capped file was never fully checked, so its miss stays
+    # non-cacheable (``reason``) rather than being recorded as unmatched -- but
+    # it still carries whatever hashes were recomputed, for the same reason the
+    # local-only exit above does.
+    if size_capped is not None:
+        return _carrying_file_hash(size_capped, candidates) if candidates else size_capped
+    return base_result
 
 
 async def _try_embedded_hash_match(
     file_path: str, tool, *, cancel_event: asyncio.Event | None = None,
-) -> tuple[dict | None, bool]:
-    """Try matching ``file_path`` using the hashes ``tool`` reports for it.
+) -> tuple[dict | None, list[tuple[str, str]]]:
+    """Match ``file_path`` **locally** using the hashes ``tool`` reports for it.
 
-    Returns ``(match, had_candidates)``. ``match`` is the DAT hit (or ``None``).
-    ``had_candidates`` is True when the tool produced at least one embedded
-    hash. It is only an *input* to the caller's fallback decision, not the
-    decision itself: the caller skips the file-level SHA1 fallback after a miss
-    only when ``had_candidates`` AND ``tool.embedded_hash_is_exhaustive`` (the
-    container bytes can never be DAT-indexed, e.g. Dolphin RVZ/WIA/GCZ). Tools
-    whose own file SHA1 may be indexed (e.g. CHD) still fall back even though
-    they reported candidates. When ``had_candidates`` is False the tool has no
-    embedded hash and the file-level fallback is always the correct next step.
+    Returns ``(match, candidates)``. ``match`` is the local DAT hit (or
+    ``None``); ``candidates`` is the normalized ``(sha1, match_type)`` list the
+    tool produced, which the caller carries into a single remote pass once
+    every local option -- including its own file-level SHA1 -- has missed.
+
+    Deliberately local-only. Going remote here would send the embedded hashes
+    before the caller has checked the container's file-level SHA1 against the
+    DATs, which for a non-exhaustive tool (CHD) is a hash the local index may
+    well hold.
+
+    ``candidates`` is an *input* to the caller's fallback decision, not the
+    decision itself: the caller skips the file-level SHA1 only when the tool
+    reported candidates AND ``tool.embedded_hash_is_exhaustive`` (the container
+    bytes can never be DAT-indexed, e.g. Dolphin RVZ/WIA/GCZ). Tools whose own
+    file SHA1 may be indexed still fall back even though they reported
+    candidates. With no candidates the file-level fallback is always next.
     """
     try:
         candidates = await tool.embedded_hashes(file_path, cancel_event=cancel_event)
@@ -1005,16 +1776,14 @@ async def _try_embedded_hash_match(
             # SHA1 can never match the DAT, so falling back would cache a false
             # negative. Surface it as non-cacheable instead.
             raise EmbeddedHashUnavailable("embedded hash derivation failed") from exc
-        return None, False
+        return None, []
 
-    had_candidates = False
-    for raw_hash, match_type in candidates:
-        sha1 = (raw_hash or "").strip().lower()
-        if not sha1:
-            continue
-        had_candidates = True
-        match = await _lookup_sha1_match(file_path, sha1, match_type)
-        if match:
-            return match, True
+    usable = [
+        ((raw_hash or "").strip().lower(), match_type)
+        for raw_hash, match_type in candidates
+        if (raw_hash or "").strip()
+    ]
+    if not usable:
+        return None, []
 
-    return None, had_candidates
+    return await _local_lookup_match(file_path, usable), usable

@@ -325,6 +325,37 @@
       matches feed tools like Hasheous and RomM, so a verified set carries over.
     </p>
     <p>
+      Hasheous also works the other way round. Press <strong>Turn on</strong> in the DAT
+      Library's Hasheous panel — one click, no restart — and anything your DATs don't
+      recognise gets looked up at hasheous.org, which indexes 14 preservation databases —
+      Redump, No-Intro, TOSEC, MAMERedump, MAME arcade and MESS, WHDLoad,
+      RetroAchievements, FBNeo and more. No account or API key is needed. Since MAMERedump
+      is one of them, it covers everything the sync above pulls and a great deal besides,
+      so a fresh install matches your library without syncing any DATs first.
+    </p>
+    <p>
+      Those hits show a <strong>HASH</strong> badge instead of DAT, and their tooltip
+      names the DAT the hash came from, then the game name, ROM name, platform, year,
+      region and publisher, plus which metadata databases list the title. It's off until
+      you turn it on, because a lookup sends your file's SHA1 — and
+      nothing else, no names or paths — to that service. Your own DATs are always checked
+      first, so a library they already cover never makes a network call, and when a file
+      offers several hashes all of them are tried locally before any goes out. Turning it
+      on later re-checks files already marked "no match" as you browse them — no
+      rescan needed, though a folder you never open keeps its old verdict until
+      you do (or until you run a rescan).
+    </p>
+    <p>
+      A lookup that times out is reported as an error rather than recorded as "no match",
+      so a network blip can't permanently mark your library unmatched. Cover art and
+      descriptions aren't fetched — those Hasheous endpoints need an API key — but the
+      tooltip names which databases list the game (IGDB, TheGamesDB, RetroAchievements),
+      and the URLs themselves come back from
+      <code>/api/dat/matches/lookup</code>. Point
+      <code>COMPRESSATORIUM_HASHEOUS_URL</code> at your own instance to keep lookups on
+      your network.
+    </p>
+    <p>
       CHDs match on the header SHA1, which is codec-independent. Dolphin RVZ/WIA/GCZ match on
       the game image's content SHA1, reconstructed on the fly by
       <code>dolphin-tool verify --algorithm sha1</code> — the same hash Redump records — so any

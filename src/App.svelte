@@ -124,10 +124,15 @@
     // Rehydrate the verified set + DAT-library state so OK / DAT badges
     // survive reloads. Fire and forget, failure leaves the cache empty.
     verification.loadVerified();
-    datMatching.refreshHasDats();
+    // Polls only while nothing can answer a lookup, and stops itself as soon
+    // as something can -- so a provider enabled from another tab or by an API
+    // client reaches this one without a reload, and a configured install never
+    // makes the request at all.
+    datMatching.watchMatchingAvailability();
     jobs.connect();
     const stopRouter = startRouter();
     return () => {
+      datMatching.stopWatchingAvailability();
       stopRouter();
       jobs.dispose();
       jobToasts.dispose();

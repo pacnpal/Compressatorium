@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,9 +26,53 @@ from services.dat_parser import parse_dat
 
 logger = get_logger("dat_store")
 
+#: Transient key on a match dict: the candidate ``(sha1, match_type)`` pairs
+#: the verdict was reached from. Two guards at the write boundary read it --
+#: ``DATStore._local_index_now_covers`` (did a DAT import land mid-lookup?) and
+#: ``DATStore._proves_content_changed`` (is this a different file now?) -- and
+#: it is stripped before the row is persisted, being a check input rather than
+#: part of the cached record.
+#:
+#: Typed rather than a bare hash list because the second guard has to compare
+#: within the stored row's own hash domain, and a bare hash cannot say which
+#: domain it belongs to.
+CANDIDATE_HASHES_KEY = "candidate_hashes"
+
+
+def recomputed_hash_in(match: dict, match_type: str) -> str | None:
+    """The hash *match* recomputed in ``match_type``'s domain, or None.
+
+    Module level, not a method: two callers need it and they are the two ends
+    of the same rule. ``DATStore._proves_content_changed`` uses it before
+    overwriting a remote hit, and ``routes.dat.drop_if_content_changed`` uses
+    it before deleting a row a non-cacheable result left behind. Both are
+    answering "did this file change?", and both have to compare within the
+    domain the row was recorded in -- a CHD stored against its embedded
+    ``chd_sha1`` versus a rescan's container ``file_sha1`` differ for a file
+    nobody touched.
+
+    The typed candidates the route attaches (:data:`CANDIDATE_HASHES_KEY`) are
+    the general answer; the ``file_sha1`` fallback covers a result that carries
+    only the file-level hash with no candidates alongside it.
+    """
+    for sha1, kind in match.get(CANDIDATE_HASHES_KEY) or ():
+        if kind == match_type:
+            return sha1
+    if match_type == "file_sha1":
+        return match.get("file_hash")
+    return None
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _remote_hit_clause():
+    """SQL for "this row is a remote (Hasheous) hit"."""
+    return and_(
+        _db.DATMatch.matched.is_(True),
+        func.coalesce(_db.DATMatch.payload["source"].as_string(), "") == "hasheous",
+    )
 
 
 class DATStore:
@@ -164,8 +208,9 @@ class DATStore:
 
             # Importing a new DAT invalidates the match cache (a
             # previously-"unmatched" file may now match, or a previously
-            # matched file may now match against a different DAT).
-            session.execute(delete(_db.DATMatch))
+            # matched file may now match against a different DAT) -- except
+            # for remote hits, which the local DATs did not produce.
+            self._invalidate_dat_derived_matches(session)
 
             session.commit()
 
@@ -273,8 +318,7 @@ class DATStore:
                             },
                         )
                         session.execute(stmt)
-            # Importing new DATs invalidates the match cache.
-            session.execute(delete(_db.DATMatch))
+            self._invalidate_dat_derived_matches(session)
             session.commit()
 
     async def persist(self) -> None:
@@ -391,6 +435,143 @@ class DATStore:
             row = session.get(_db.DATMatch, normalized)
             return dict(row.payload) if row is not None else None
 
+    @staticmethod
+    def _would_downgrade_remote_hit(existing, match: dict) -> bool:
+        """True when writing *match* would replace a remote hit with a non-answer.
+
+        "Non-answer" is the operative word: an unmatched result only supersedes
+        a remote hit if it actually knows better. That means either the remote
+        source was consulted this time (``checked_remote``), or the recompute
+        can *prove* the file changed underneath the cached row.
+
+        The proof compares like with like. A CHD hit is stored against its
+        embedded hash (``chd_sha1``), while a rescan recomputes the container
+        ``file_sha1`` -- different domains that differ for an unchanged file,
+        so only a stored ``file_sha1`` match can be compared. Without this the
+        guard kept a stale badge on a replaced file forever, since cached hits
+        are always accepted on read.
+        """
+        if existing is None or not existing.matched:
+            return False
+        if (existing.payload or {}).get("source") != "hasheous":
+            return False
+        if match.get("matched"):
+            return False
+        if match.get("checked_remote"):
+            return False
+        return not DATStore._proves_content_changed(existing, match)
+
+    @staticmethod
+    def _proves_content_changed(existing, match: dict) -> bool:
+        """True only when a recomputed hash in the row's OWN domain contradicts it.
+
+        Comparing across domains is meaningless: a CHD hit is stored against
+        its embedded ``chd_sha1`` while a rescan recomputes the container's
+        ``file_sha1``, and those differ for a file nobody has touched. That is
+        why this used to demand ``existing.match_type == "file_sha1"`` and
+        refuse everything else.
+
+        Refusing everything else was too blunt, though. An exhaustive tool
+        recomputes the *same* typed hash it matched on -- Dolphin's
+        ``dolphin_disc_sha1`` -- so the domains do agree and the comparison is
+        sound. Keying on the stored row's own ``match_type`` keeps the
+        cross-domain case out while letting that one in, which matters because
+        an exhaustive format has no ``file_sha1`` to fall back on: a replaced
+        RVZ could never be proven changed, and kept its previous game's badge
+        for good.
+        """
+        if not existing.file_hash or not existing.match_type:
+            return False
+        recomputed = recomputed_hash_in(match, existing.match_type)
+        return bool(recomputed) and recomputed != existing.file_hash
+
+    # A row is a *remote* hit only if it says so. This is the one place the
+    # question is answered, and it is answered from the payload the writer
+    # recorded -- never inferred from ``dat_id IS NULL``. A local hit whose DAT
+    # was deleted between the match and the write has its dangling FK nulled by
+    # ``_upsert_match_sync``, so the FK proxy called that row remote, preserved
+    # it through every later import, and went on serving an identity from a DAT
+    # the operator had removed. ``coalesce`` because SQL NULL is not False: a
+    # payload with no ``source`` must compare unequal, not unknown, or the
+    # NOT below would spare exactly the rows it is meant to drop.
+    def _invalidate_dat_derived_matches(self, session) -> None:
+        """Drop the part of the match cache the local DATs are responsible for.
+
+        A new/refreshed DAT set can change any verdict it produced, and can
+        turn a previous miss into a hit -- so DAT-derived hits and cached
+        misses both go. A *remote* (Hasheous) hit owes nothing to the local
+        DATs, so it stays: deleting it stranded the badge permanently once the
+        provider was switched off, since the recompute would then miss locally
+        and cache "unmatched".
+
+        Shared by both import paths on purpose. It lived only in
+        ``_persist_sync`` at first, which left ``_import_dat_sync`` (the
+        user-uploaded-DAT path) still wiping everything.
+        """
+        session.execute(delete(_db.DATMatch).where(~_remote_hit_clause()))
+
+    @staticmethod
+    def _local_index_now_covers(session, match: dict) -> bool:
+        """True when the local DATs have since learned any candidate hash.
+
+        Read inside the writing transaction, which is the point: the route
+        decides local-first, but the decision and the write are separate
+        operations, and a DAT import can commit in between -- for a path with
+        no prior row the import's rematch snapshot cannot cover it either, so
+        the verdict would be written *after* invalidation and then served
+        unconditionally. Checking here closes that window at the boundary where
+        the write actually happens.
+
+        Applies to every verdict the remote source took part in, over the whole
+        candidate set:
+
+        * a stamped **miss** needs it as much as a hit. Restricting the guard
+          to hits let a clean remote miss through untouched, and because that
+          row is cacheable and its ``checked_remote`` stamp still matches, the
+          local match that had just landed stayed hidden until the *next* DAT
+          import happened to invalidate it.
+        * a hit needs the **other** candidates checked, not only the one that
+          matched. A CHD offers up to three hashes and the DAT that landed
+          mid-flight may know a different one, in which case a local identity
+          exists and the remote answer would outrank it.
+
+        ``candidate_hashes`` is the transient key the route attaches for
+        exactly this re-check (see :data:`CANDIDATE_HASHES_KEY`) -- typed
+        ``(sha1, match_type)`` pairs, of which only the hashes matter here;
+        ``file_hash`` is folded in so a hit stays covered even if that list is
+        absent.
+
+        Skipping the write (rather than rewriting the payload) keeps DAT-record
+        shape out of the store: the path is simply left uncached, and the next
+        match recomputes it local-first. That costs nothing extra remotely,
+        because this only fires when the local index *does* know a hash --
+        which is also why it re-checks hashes rather than comparing a DAT-index
+        generation: a generation would skip the write on any unrelated import
+        and send the file back out to the remote source for nothing.
+        """
+        if not (match.get("checked_remote") or match.get("source") == "hasheous"):
+            return False
+        hashes = [sha1 for sha1, _kind in (match.get(CANDIDATE_HASHES_KEY) or ())]
+        file_hash = match.get("file_hash")
+        if file_hash and file_hash not in hashes:
+            hashes.append(file_hash)
+        return any(
+            session.get(_db.DATHash, (sha1, "sha1")) is not None
+            for sha1 in hashes if sha1
+        )
+
+    @staticmethod
+    def _persistable_payload(match: dict) -> dict:
+        """The cached payload: the match minus the transient check inputs.
+
+        ``candidate_hashes`` exists to be revalidated at the write boundary,
+        not to be served back to the UI, so it is dropped in the one place
+        both writers build their payload.
+        """
+        payload = dict(match)
+        payload.pop(CANDIDATE_HASHES_KEY, None)
+        return payload
+
     def _upsert_match_sync(self, file_path: str, match: dict) -> None:
         normalized = self._normalize(file_path)
         with self._session() as session:
@@ -401,8 +582,27 @@ class DATStore:
             if dat_id is not None:
                 if session.get(_db.DAT, dat_id) is None:
                     dat_id = None
-            payload = dict(match)
+            if self._local_index_now_covers(session, match):
+                # A DAT covering this hash landed while the match was running.
+                # Leave the path uncached so the next one resolves it locally.
+                return
+            payload = self._persistable_payload(match)
             existing = session.get(_db.DATMatch, normalized)
+            if self._would_downgrade_remote_hit(existing, match):
+                # The post-sync rematch re-runs every previously-matched path.
+                # With Hasheous off, a path whose only identity came from the
+                # remote source misses locally and would be written back as
+                # "unmatched", undoing the preservation above -- so the
+                # selective invalidation alone was not enough end to end.
+                #
+                # Refused here rather than at each caller: the batch route, the
+                # background job and the scan all write through this one place.
+                # A file that genuinely changed is removed by
+                # routes.dat.drop_if_content_changed(), which deletes rather
+                # than downgrading, and a miss recorded while the remote source
+                # *was* consulted carries `checked_remote` and is allowed
+                # through.
+                return
             if existing is not None:
                 existing.matched = bool(match.get("matched", False))
                 existing.dat_id = dat_id
@@ -446,6 +646,34 @@ class DATStore:
         """
         return await run_in_threadpool(self._delete_match_sync, file_path)
 
+    def _drop_match_if_changed_sync(self, file_path: str, match: dict) -> bool:
+        normalized = self._normalize(file_path)
+        with self._session() as session:
+            row = session.get(_db.DATMatch, normalized)
+            if row is None or not self._proves_content_changed(row, match):
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    async def drop_match_if_changed(self, file_path: str, match: dict) -> bool:
+        """Delete ``file_path``'s cached row only if ``match`` disproves it.
+
+        The predicate is :meth:`_proves_content_changed`, the same one the
+        write guard uses -- a recomputed hash in the *stored row's own* domain
+        that contradicts it. Sharing it is the point: "did this file change?"
+        had grown a second, narrower copy in the route layer, and the two
+        answered differently for exhaustive formats.
+
+        Read and delete happen in one session because they are one decision. A
+        background match job can persist the replacement file's correct result
+        between a separate get and delete -- the ``match`` workload token
+        covers hashing, not this cache operation -- and the delete would then
+        remove the fresh row it never compared. Returns True when a row was
+        removed.
+        """
+        return await run_in_threadpool(self._drop_match_if_changed_sync, file_path, match)
+
     def _set_matches_batch_sync(self, matches: dict[str, dict]) -> None:
         if not matches:
             return
@@ -473,8 +701,18 @@ class DATStore:
                 dat_id = match.get("dat_id")
                 if dat_id is not None and dat_id not in valid_dat_ids:
                     dat_id = None
-                payload = dict(match)
+                if self._local_index_now_covers(session, match):
+                    # Same rule as _upsert_match_sync.
+                    continue
+                payload = self._persistable_payload(match)
                 existing = existing_matches.get(normalized)
+                if self._would_downgrade_remote_hit(existing, match):
+                    # Same rule as _upsert_match_sync. This path updated rows
+                    # unconditionally, so a concurrent batch match could still
+                    # erase a remote hit the single-path writer would refuse to
+                    # touch -- and the guard's comment claimed the batch route
+                    # wrote through it, which was simply untrue.
+                    continue
                 if existing is not None:
                     existing.matched = bool(match.get("matched", False))
                     existing.dat_id = dat_id

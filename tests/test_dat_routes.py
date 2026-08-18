@@ -351,12 +351,12 @@ async def test_chd_header_match_hit(tmp_path, isolated_dat_store, monkeypatch):
     monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
 
     with patch("services.chd_metadata_store.chd_metadata_store", mock_metadata_store):
-        result, had_candidates = await dat_routes._try_embedded_hash_match(
+        result, candidates = await dat_routes._try_embedded_hash_match(
             chd_path, registry.get("chdman"),
         )
 
     assert result is not None
-    assert had_candidates is True
+    assert candidates
     assert result["matched"] is True
     assert result["match_type"] == "chd_sha1"
     assert result["game_name"] == "Test Game"
@@ -425,12 +425,12 @@ async def test_chd_header_match_no_metadata(tmp_path, isolated_dat_store):
     mock_metadata_store.get_metadata = AsyncMock(return_value=None)
 
     with patch("services.chd_metadata_store.chd_metadata_store", mock_metadata_store):
-        result, had_candidates = await dat_routes._try_embedded_hash_match(
+        result, candidates = await dat_routes._try_embedded_hash_match(
             str(chd), registry.get("chdman"),
         )
 
     assert result is None
-    assert had_candidates is False  # -> caller falls back to file-level SHA1
+    assert not candidates  # -> caller falls back to file-level SHA1
 
 
 @pytest.mark.asyncio
@@ -450,10 +450,10 @@ async def test_dolphin_disc_hash_match_hit(tmp_path, isolated_dat_store, monkeyp
         dolphin._service, "disc_hashes", AsyncMock(return_value=[target_sha1]),
     )
 
-    result, had_candidates = await dat_routes._try_embedded_hash_match(str(rvz), dolphin)
+    result, candidates = await dat_routes._try_embedded_hash_match(str(rvz), dolphin)
 
     assert result is not None
-    assert had_candidates is True
+    assert candidates
     assert result["matched"] is True
     assert result["match_type"] == "dolphin_disc_sha1"
     assert result["file_hash"] == target_sha1
@@ -1288,7 +1288,7 @@ async def test_run_match_job_reports_errors_in_final_message(
         ({"path": "/c", "matched": False, "error": "boom"}, False),
     ]
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return hash_outcomes.pop(0)
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1317,7 +1317,7 @@ async def test_run_match_job_marks_failure_when_all_files_error(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def always_error(path, *, cancel_event=None):
+    async def always_error(path, *, cancel_event=None, local_only=False):
         return {"path": path, "matched": False, "error": "mount offline"}, False
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", always_error)
@@ -1329,6 +1329,75 @@ async def test_run_match_job_marks_failure_when_all_files_error(
     final = job_manager.jobs[scan_job.id]
     assert final.status.value == "failed"
     assert "all 3 file(s) failed" in final.message
+    assert "check volume accessibility" in final.message
+
+
+@pytest.mark.asyncio
+async def test_run_match_job_names_hasheous_instead_of_blaming_the_volume(
+    tmp_path, isolated_dat_store, monkeypatch,
+):
+    """A remote outage fails every file, but the volume is fine.
+
+    Reporting "check volume accessibility" would send the operator off
+    debugging storage for a network condition that recovers on its own.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    async def remote_down(path, *, cancel_event=None, local_only=False):
+        return (
+            {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR},
+            False,
+        )
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", remote_down)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/a", "/b", "/c"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "failed"
+    assert "all 3 file(s) failed" in final.message
+    assert "Hasheous is unreachable" in final.message
+    assert "check volume accessibility" not in final.message
+
+
+@pytest.mark.asyncio
+async def test_run_match_job_mixed_errors_still_blame_the_volume(
+    tmp_path, isolated_dat_store, monkeypatch,
+):
+    """Only an all-Hasheous failure is attributable to Hasheous."""
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    seen = []
+
+    async def mixed(path, *, cancel_event=None, local_only=False):
+        seen.append(path)
+        error = dat_routes.HASHEOUS_ERROR if len(seen) == 1 else "mount offline"
+        return {"path": path, "matched": False, "error": error}, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", mixed)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/a", "/b"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "failed"
     assert "check volume accessibility" in final.message
 
 
@@ -1353,7 +1422,7 @@ async def test_run_match_job_outer_exception_includes_counter_context(
     # update_external_job raises, tripping the outer except.
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 1:
@@ -1410,7 +1479,7 @@ async def test_run_match_job_skip_count_does_not_trip_failure(
         ({"path": "/c", "matched": False}, False),  # non-regular file shape
     ]
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return hash_outcomes.pop(0)
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1439,7 +1508,7 @@ async def test_run_match_job_cache_write_failure_counts_as_error(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return {"path": path, "matched": True}, True
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1478,7 +1547,7 @@ async def test_run_match_job_cancellation_ends_in_cancelled_status(
     # cancel-check at the top of the loop then fires ExternalJobCancelled.
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 2:
@@ -1516,7 +1585,7 @@ async def test_run_match_job_cancellation_keeps_partial_cache(
 
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 2:
@@ -1551,7 +1620,7 @@ async def test_run_match_job_cancel_on_last_file_ends_cancelled(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         # Simulate an aborted cancellable hook on the only path: cancel is
         # requested during the call and a non-cacheable error is returned.
         await job_manager.cancel_job(scan_job.id)
@@ -1592,11 +1661,11 @@ async def test_try_embedded_hash_match_non_exhaustive_tool_falls_back(tmp_path):
         async def embedded_hashes(self, path, *, cancel_event=None):
             raise RuntimeError("boom")
 
-    result, had_candidates = await dat_routes._try_embedded_hash_match(
+    result, candidates = await dat_routes._try_embedded_hash_match(
         str(tmp_path / "x.chd"), _NonExhaustiveBoom(),
     )
     assert result is None
-    assert had_candidates is False
+    assert not candidates
 
 
 @pytest.mark.asyncio
@@ -1607,7 +1676,7 @@ async def test_hash_one_for_job_logs_match_error_with_traceback(
     iso = tmp_path / "a.iso"
     iso.write_bytes(b"x")
 
-    async def raise_keyerror(_path, *, cancel_event=None):
+    async def raise_keyerror(_path, *, cancel_event=None, local_only=False):
         raise KeyError("missing_column")
 
     monkeypatch.setattr(dat_routes, "_match_single_file", raise_keyerror)

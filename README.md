@@ -80,6 +80,219 @@ Compressatorium can sync [MAME Redump](https://github.com/MetalSlug/MAMERedump) 
 - **Library scan**: The background scan discovers and DAT-matches tool outputs by extension (CHD, Dolphin RVZ/WIA/GCZ, 3DS, Switch, CSO/ZSO, `.iso`, and the `.bin` data track from CHDMAN extract), not just CHDs, so non-CHD libraries get cached match results too. A single PS3-packed `.iso` is matched like any other `.iso`; a 4 GB split set is not, since its `.iso.0`/`.iso.1` parts aren't scanned extensions. Heavy Dolphin disc-hashing during the scan honors `MATCH_MAX_FILE_SIZE` and stops promptly if you cancel the scan.
 - **DAT management**: Import, list, and delete DATs via the web UI "DAT Files" button
 - **Match badges**: Files matching a DAT entry show a blue "DAT" badge in the file list
+- **Wider coverage without curating DATs**: see [Hasheous Integration](#hasheous-integration-optional) to fall back on 14 preservation databases for anything your imported DATs don't recognise
+
+### Hasheous Integration (optional)
+
+[Hasheous](https://hasheous.org) is a hosted hash-lookup service run by the
+[Gaseous](https://github.com/gaseous-project/hasheous) project. It indexes **14
+preservation databases** and answers "what game is this hash?" for all of them
+at once. Turn it on and every hash your imported DATs *don't* recognise is
+looked up there, so your library gets identified without you curating DATs for
+every system you own.
+
+**Setup is one click.** Open **DAT Library** in the web UI and press **Turn on**
+in the Hasheous panel. It takes effect immediately — no restart, no editing
+`docker-compose.yml` — and the choice is saved, so it survives restarts. A
+**Test** button next to it confirms the server is reachable and reports the
+round-trip time.
+
+**No account, no API key, no signup** — the hash-lookup endpoint is public.
+
+If you'd rather set it declaratively (a fresh container that should come up with
+it already on), the environment variable does the same thing — but it has to
+reach the process, so put it where the process will actually see it.
+
+In `docker-compose.yml`, add it to the service's `environment:` list. That list
+is enumerated rather than inherited, so a value in your shell or in a `.env`
+file will **not** reach the container on its own:
+
+```yaml
+    environment:
+      - COMPRESSATORIUM_HASHEOUS_ENABLED=true
+```
+
+Running from a checkout, export it (or prefix the command) so the child process
+inherits it — a bare assignment on its own line sets a shell variable and
+launches nothing:
+
+```bash
+COMPRESSATORIUM_HASHEOUS_ENABLED=true ./run_dev.sh
+# or, for the whole shell session:
+export COMPRESSATORIUM_HASHEOUS_ENABLED=true
+```
+
+The UI toggle wins over the variable when both are set, and the panel tells you
+when that's the case.
+
+#### What it covers
+
+Redump · No-Intro · TOSEC · **MAMERedump** · MAMEArcade · MAMEMess · WHDLoad ·
+RetroAchievements · FBNeo · PureDOSDAT · Pleasuredome · TotalDOSCollection ·
+eXo · ScreenScraper
+
+Because MAMERedump is among them, Hasheous is a strict **superset** of the DATs
+the one-click sync pulls — including the CHD header hashes that only MAMERedump
+records. Nothing you get today is lost by enabling it.
+
+#### What you get per match
+
+A local DAT hit tells you the game name and the ROM filename. A Hasheous hit
+carries considerably more. Everything except the link URLs is shown in the
+file-list badge tooltip; the tooltip names which databases list the game, and
+the URLs themselves are stored with the match and returned by the API:
+
+| Field | Example |
+|---|---|
+| Game name | `Jumpman Junior` |
+| ROM name | `Jumpman Junior (1983)(Epyx).bin` |
+| **Source DAT** | `Redump` / `No-Intro` / `TOSEC` / `MAMERedump` … — which database actually knew the hash |
+| Platform | `Commodore 64` |
+| Publisher | `Epyx` |
+| Year | `1983` |
+| Region | `US`, `EU`, … (when the source records it) |
+| Metadata links | IGDB, TheGamesDB, RetroAchievements, Wikipedia, LaunchBox, SteamGridDB |
+
+The links are IDs and URLs into those databases, so a match is a jumping-off
+point for artwork or achievements even though Compressatorium doesn't fetch
+them itself (see [What it deliberately does not do](#what-it-deliberately-does-not-do)).
+The file list shows *which* of those databases list the game; the URLs are in
+the match payload from `/api/dat/matches/lookup` rather than being clickable in
+the row, since the badge tooltip is a native one and can't hold anchors.
+
+#### How a file gets matched
+
+The order is fixed, and **local always wins**:
+
+1. **Your imported DATs**, using every hash the file can offer. A CHD reports
+   both its header SHA1 and its data SHA1; a Dolphin RVZ/WIA/GCZ reports the
+   reconstructed disc SHA1. *All* of them are checked locally first.
+2. **Hasheous**, only if none of them matched, and only if you enabled it.
+
+So a library your own DATs already cover never makes a single network call, and
+a file your DATs *can* identify is never disclosed to a third party. Matching is
+also deterministic: the same file resolves the same way whether or not the
+network is healthy.
+
+One exception, if you set `MATCH_MAX_FILE_SIZE`: a file over that cap is never
+read, so its file-level hash cannot be computed or checked locally at all. Such
+a file still gets looked up on whatever hashes it can offer for free (a CHD's
+header and data SHA1s), because the cap means "don't read this file", not
+"don't identify it". Leaving the cap unset restores the ordinary order for
+those files — their own SHA1 is computed and checked against your DATs before
+anything is sent — but it is **not** a way to keep large files off the network:
+if your DATs don't know the file, its hashes still go to Hasheous like any
+other. There is no size-based opt-out; the controls that actually stop a
+disclosure are turning the fallback off, or pointing
+`COMPRESSATORIUM_HASHEOUS_URL` at your own instance.
+
+Results are cached in the local database, so a file is looked up once, not once
+per browse. If you enable Hasheous *after* files were already recorded as "no
+match", those old verdicts are automatically re-checked against the new source
+as you browse those files — the cached verdict records which source produced it,
+so it stops being accepted the moment a stronger one is available. Re-checking
+is lazy, not a library-wide sweep: a folder you never open keeps its old verdict
+until you open it, or until you run a rescan.
+
+#### Badges
+
+| Badge | Meaning |
+|---|---|
+| **DAT** (blue) | Matched one of your imported DATs |
+| **HASH** | Matched via Hasheous — hover for platform, year, region and source DAT |
+
+#### Privacy
+
+Enabling this sends **the SHA1 of your files** (and nothing else — no filenames,
+no paths, no account identifier) to whatever server `COMPRESSATORIUM_HASHEOUS_URL`
+points at. That is why it ships **off**, and why nothing is transmitted at all
+until you enable it — either with the toggle in the DAT Library or by setting
+the variable. Requests are HTTPS-only, and a redirect that would
+downgrade to plain HTTP is refused rather than followed.
+
+If you'd rather not talk to a third party at all, Hasheous is open source and
+self-hostable — point the URL at your own instance and lookups stay on your
+network.
+
+#### Behaviour when Hasheous is unreachable
+
+A failed lookup is reported as an **error**, never recorded as "not in any DAT".
+A network blip therefore can't permanently mark your library unmatched; the
+affected files are simply retried next time.
+
+To keep an outage cheap, the client stops calling out for 60 seconds after a
+failure. Without that, a 1,000-file scan against a dead endpoint would spend
+over four hours re-learning the same fact once per file.
+
+A metadata scan that ran while Hasheous was unreachable says so on its final
+line — `… 12 not checked (Hasheous unreachable)`. The scan itself still
+succeeds, because the metadata it collects is unaffected; without that count a
+rescan during an outage would finish looking like a clean "nothing matched".
+Those files are retried the next time you browse or rescan them.
+
+#### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Starting state of the master switch. The **DAT Library** toggle overrides it and persists. |
+| `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, from the TCP connect to the last byte: every address the host resolves to (one budget between them, not one each), a proxy `CONNECT` tunnel, headers and body. Not per socket read, so a server or proxy dripping the *response* a byte at a time can't stall a scan. Two things sit outside the budget: **name resolution** — `getaddrinfo` runs before any socket exists, so a stalled resolver is bounded by `/etc/resolv.conf` instead — and **a dripping TLS handshake**, which gets the remaining budget as its socket timeout (a peer that stalls or dies mid-handshake is bounded) but not a per-record deadline, so a peer trickling handshake records can outlast it. Both raise eventually, and the 60s cooldown then opens. This call sits in the file-browse path, so keep it short. |
+
+Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
+accepted as aliases.
+
+The DAT Library page shows the live state — on or off, which server it is
+pointed at, whether the setting came from the toggle or the environment, and a
+**Test** button that reports reachability and latency.
+
+Changing `COMPRESSATORIUM_HASHEOUS_URL` re-checks previously-unmatched files
+against the new server automatically — cached "no match" verdicts record *which*
+server produced them, so pointing at a different instance doesn't leave you with
+stale answers.
+
+#### Scale
+
+Hasheous has **no bulk endpoint** — its API accepts several hashes for *one*
+file, not a batch of files — so an uncached library costs at least one request
+per file.
+
+A file that matches *on its first candidate* costs one request. Anything else
+costs more, because candidates are tried in order and each one is a request: a
+CHD offers a header SHA1 and a data SHA1, and since a CHD's own container bytes
+may also be indexed, a miss on both falls back to a file-level SHA1 — **up to
+three requests, and three hashes disclosed, for one CHD**. That ceiling applies
+whether the CHD ends up matching on a later candidate or not; a match only stops
+the requests that would have come *after* it. Formats with a single hash (ISO, 3DS, Switch,
+CSO) cost one either way. Dolphin RVZ/WIA/GCZ report one exhaustive disc hash, so
+they cost one and never fall back.
+
+Responses are cached both locally and by Hasheous' CDN, so this is a one-time
+cost per file rather than a per-browse one. If you have a large uncached library,
+run the background library scan once and let it prime the cache rather than
+browsing folder by folder.
+
+**Importing a DAT, or syncing MAMERedump, does not re-send anything.** The
+re-match those trigger runs against your local DATs only. A file the new DATs
+now identify has its badge upgraded from **HASH** to **DAT**; a file they still
+don't cover keeps the badge it already had. Nothing goes back out over the
+network, so a sync costs zero requests no matter how large your library is.
+
+The one exception is a file that was previously recorded as *no match anywhere*.
+Those verdicts are dropped by the import (a new DAT can turn a miss into a hit),
+so the next time you browse such a file it is re-checked — locally first, then
+remotely if the local DATs still don't know it. That is one request at the
+moment you look at the file, not a burst of thousands at sync time.
+
+#### What it deliberately does not do
+
+- **No cover art or descriptions.** Hasheous proxies IGDB, TheGamesDB, GiantBomb
+  and ScreenScraper, but those endpoints require a Hasheous client API key. Only
+  the key-free hash lookup is used here. The metadata *links* above give you the
+  IDs if you want to fetch artwork yourself.
+- **No submissions.** Hasheous accepts hash corrections and dump reports; those
+  endpoints also need an API key, and are not called.
+- **Nothing is uploaded about your library.** Lookups are reads. Your file names,
+  paths, and collection contents are never sent.
 
 ---
 
@@ -1534,6 +1747,9 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `MAX_METADATA_SCAN_CONCURRENCY` | `1` | Maximum concurrent metadata scan tasks |
 | `MAX_MATCH_CONCURRENCY` | `1` | Maximum concurrent DAT hash-matching operations. Raise only if your storage can handle parallel full-file reads (matching a raw Wii ISO is a full-file SHA1). |
 | `MATCH_MAX_FILE_SIZE` | `0` | Skip DAT hash-matching for files larger than this many bytes (0 disables the cap). Set e.g. `2147483648` on slow storage to keep 8 GB ISOs from blocking the browse-triggered matcher. |
+| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Look hashes up at [Hasheous](https://hasheous.org) when the imported DATs don't recognise them. **Off by default**: enabling it sends the SHA1 of your files to a third-party service. Local DATs are always tried first, so a covered library makes no network calls. Legacy alias: `HASHEOUS_ENABLED`. |
+| `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Base URL of the Hasheous server. Hasheous is open source and self-hostable — point this at your own instance to keep lookups on your network. Must be `https`. Legacy alias: `HASHEOUS_URL`. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Request timeout in seconds for Hasheous lookups, covering connect, headers and body — but **not** name resolution or a peer trickling TLS handshake records, both of which sit outside the budget. See [Hasheous Integration](#hasheous-integration-optional) for what each exception is bounded by instead. This call sits in the file-browse path, so keep it short. Legacy alias: `HASHEOUS_TIMEOUT`. |
 | `MAX_JOB_HISTORY` | `500` | Maximum finished jobs (completed + failed + cancelled) to retain in history. Past the cap the oldest are dropped, but the Jobs tab badges still report the true total — the panel says how many of them are still listed. |
 | `COMPRESSATORIUM_TOOL_NICE` | `10` | Nice level for every conversion tool (0-19, higher = lower priority). Legacy alias: `CHD_CHDMAN_NICE`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` | `2` | I/O priority class for every tool (`1` realtime, `2` best-effort, `3` idle). Legacy alias: `CHD_CHDMAN_IOPRIO_CLASS`. |

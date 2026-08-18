@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { fileBrowser } from '$lib/stores/fileBrowser.svelte.js';
   import { jobs } from '$lib/stores/jobs.svelte.js';
   import { ui } from '$lib/stores/ui.svelte.js';
@@ -183,7 +184,15 @@
     // Track explicitly so the effect re-runs on dat_match completion.
     datMatchTerminalCount;
     const allPaths = entries.map((e) => e?.path).filter(Boolean);
-    if (allPaths.length === 0) return;
+    if (allPaths.length === 0) {
+      // Nothing visible, and this component does NOT unmount when a filter or
+      // search empties the list -- so the onDestroy teardown below never runs
+      // and hydrateAndMatch() (which retires a stale timer) is never reached.
+      // A retry armed for the previous view would otherwise fire and start
+      // hashing files nobody is looking at.
+      datMatching.cancelRetry();
+      return;
+    }
     // Hydrate archive-summary badges (member counts, verifiable_by) for the
     // archives on this visible page. Re-runs with this effect on page / sort /
     // filter changes because it reads the same visible `entries`.
@@ -201,7 +210,22 @@
     //      every page change, polluting the unmatched count and
     //      wasting I/O.
     chdMetadata.hydrate(allPaths).catch(() => {});
-    if (datMatching.hasDats) {
+    {
+      // NOT gated on datMatching.matchingAvailable. A library with no DATs
+      // that accumulated Hasheous hits and then turned Hasheous off still has
+      // valid cached matches -- cached_result_usable() keeps hits regardless of
+      // the current provider state -- and gating here made every persisted
+      // HASH badge vanish on the next render. hydrateAndMatch() reads the cache
+      // first and returns before creating any job when matching is off, so the
+      // gate belongs there, not around the read.
+      // Tracked deliberately. A provider flip in another tab -- or a DAT
+      // import, delete or finished sync -- clears the match cache, and this
+      // effect would otherwise never notice: hydrate() snapshots the map
+      // under untrack precisely so it does not subscribe to the cache it
+      // fills, and with local DATs present `matchingAvailable` does not flip
+      // either. Reading the policy generation re-runs the hydration that
+      // repopulates what the clear dropped.
+      const _policyGeneration = datMatching.policyGeneration;
       const matchableExts = registry.allFilterableExts();
       const matchExtSet = new Set(matchableExts.map((e) => e.toLowerCase()));
       const filePaths = entries
@@ -217,9 +241,24 @@
         .map((e) => e.path);
       if (filePaths.length > 0) {
         datMatching.hydrateAndMatch(filePaths).catch(() => {});
+      } else {
+        // Entries on screen, but none the DAT matcher can identify -- a folder
+        // of subdirectories, archives, manifests or folded split sets. The
+        // zero-entry guard above doesn't fire and hydrateAndMatch() is never
+        // reached, so this is the third way the visible set can change without
+        // retiring a timer armed for the previous folder.
+        datMatching.cancelRetry();
       }
     }
   });
+
+  // The retry timer is store-level, so it outlives this component. With the
+  // list gone there is nothing visible for it to re-check, and letting it fire
+  // would hydrate -- and possibly start a match job for -- a view the user has
+  // left. onDestroy rather than an $effect teardown on purpose: the effect
+  // re-runs on every page/sort/filter change, and cancelling there would kill
+  // legitimate retries for the set still on screen.
+  onDestroy(() => datMatching.cancelRetry());
 
   function openBulkVerify() {
     // Forward only filesystem paths; the verify-batch endpoint

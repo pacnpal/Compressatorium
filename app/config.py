@@ -214,6 +214,43 @@ class Settings(BaseSettings):
         description="Auto-sync DATs from MAMERedump on startup if none loaded",
     )
 
+    # Hasheous remote hash lookup (https://hasheous.org).
+    #
+    # Consulted ONLY when the locally imported DATs don't know a hash, so local
+    # matching stays instant and fully offline. Off by default on purpose: a
+    # lookup sends the SHA1 of the operator's file to a third-party service,
+    # which has to be a deliberate choice rather than a default.
+    hasheous_enabled: bool = Field(
+        default=False, alias="COMPRESSATORIUM_HASHEOUS_ENABLED",
+        validation_alias=AliasChoices(
+            "COMPRESSATORIUM_HASHEOUS_ENABLED", "HASHEOUS_ENABLED",
+        ),
+        description=(
+            "Fall back to Hasheous when a hash isn't in the imported DATs. "
+            "Sends file SHA1s to hasheous_base_url; off by default."
+        ),
+    )
+    hasheous_base_url: str = Field(
+        default="https://hasheous.org", alias="COMPRESSATORIUM_HASHEOUS_URL",
+        validation_alias=AliasChoices(
+            "COMPRESSATORIUM_HASHEOUS_URL", "HASHEOUS_URL",
+        ),
+        description=(
+            "Base URL of the Hasheous server. Hasheous is self-hostable; point "
+            "this at your own instance to keep lookups on your network."
+        ),
+    )
+    hasheous_timeout: int = Field(
+        default=15, alias="COMPRESSATORIUM_HASHEOUS_TIMEOUT",
+        validation_alias=AliasChoices(
+            "COMPRESSATORIUM_HASHEOUS_TIMEOUT", "HASHEOUS_TIMEOUT",
+        ),
+        description=(
+            "Per-request timeout (seconds) for Hasheous lookups. This call sits "
+            "in the file-browse path, so it must stay bounded."
+        ),
+    )
+
     # RomM catalog overlay. Compressatorium reads RomM's catalog over HTTP but
     # touches the ROM bytes only through the filesystem: RomM's library is
     # mounted as an ordinary Compressatorium volume (locally via the same bind

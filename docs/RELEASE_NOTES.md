@@ -25,6 +25,63 @@ it or moving the schedule clock. Sections are newest-first.
 
 ### Added
 
+- **Hasheous integration: match files that aren't in your DATs.** Press **Turn
+  on** in the DAT Library's Hasheous panel — one click, no restart, no
+  `docker-compose` edit, and the choice is remembered — and any hash the
+  imported DATs don't recognise is looked up at
+  [hasheous.org](https://hasheous.org), which indexes
+  **14 preservation databases** — Redump, No-Intro, TOSEC, MAMERedump,
+  MAMEArcade, MAMEMess, WHDLoad, RetroAchievements, FBNeo, PureDOSDAT,
+  Pleasuredome, TotalDOSCollection, eXo and ScreenScraper. No account and no API
+  key: the hash-lookup endpoint is public. Because MAMERedump is among the
+  sources, it is a strict superset of what the one-click sync pulls, so nothing
+  you match today stops matching.
+
+  Remote hits carry considerably more than a local one: **game name, ROM name,
+  the source DAT that actually knew the hash, platform, publisher, year,
+  region**, and links out to IGDB, TheGamesDB, RetroAchievements, Wikipedia,
+  LaunchBox and SteamGridDB. The badge tooltip shows all of it bar the link
+  URLs -- it names which databases list the game, and the URLs themselves are
+  stored with the match and returned by the API. These
+  matches get a **HASH** badge to distinguish them from a local **DAT** hit.
+  Once you enable it, a fresh install matches your library immediately, without
+  syncing hundreds of MB of DATs first.
+
+  It is **off by default and stays off until you turn it on**: a lookup sends
+  the SHA1 of your file — and nothing else, no filenames or paths — to a
+  third-party service, which should be your call, not a default. Local DATs are
+  always consulted first, so a library your DATs already cover never makes a
+  network call, and a file your own DATs can identify is never disclosed. When a
+  file offers several hashes (a CHD carries both a header and a data SHA1),
+  *all* of them are checked locally before *any* is sent remotely.
+
+  Enabling it on an existing install works retroactively: files already recorded
+  as "no match" by the local-only matcher are re-checked against the new source
+  as you browse them, with no forced rescan needed. The re-check is lazy rather
+  than a library-wide sweep — a folder you never open keeps its old verdict
+  until you do, or until you rescan.
+
+  The panel shows live state and has a **Test** button that reports whether the
+  server is reachable and how fast. `COMPRESSATORIUM_HASHEOUS_ENABLED=true`
+  still works for declarative setups (the toggle overrides it, and the panel
+  says so). Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you
+  self-host Hasheous (it is open source) — previously-unmatched files are
+  automatically re-checked against the new server, since cached verdicts record
+  which one produced them. `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default 15s)
+  bounds each lookup. Lookups are HTTPS-only and a redirect that would downgrade
+  to plain HTTP is refused rather than followed.
+
+  A lookup that fails — timeout, server error, unreachable — is reported as an
+  error rather than recorded as "not in any DAT", so one bad minute of network
+  can't permanently mark your library unmatched. After a failure the client
+  stops calling out for a minute, so an outage during a large scan costs one
+  timeout rather than one per file.
+
+  Cover art, descriptions and hash submissions are **not** included: those
+  Hasheous endpoints require a client API key, and only the key-free lookup is
+  used. The metadata links above give you the IDs if you want to fetch artwork
+  yourself.
+
 - **RomM library integration.** A new **RomM** view lists your
   [RomM](https://romm.app) library by platform and converts it in place — by
   hand or on a schedule. Pick a platform and you get real game names instead of
@@ -118,6 +175,164 @@ it or moving the schedule clock. Sections are newest-first.
   the configured library root, volumes, and sample paths that were attempted.
 
 ### Fixed
+
+- **The Hasheous lookup timeout now really is a whole-request timeout.** It
+  bounded the response, but every phase before TLS existed had its own budget:
+  `socket.create_connection` gives each address a host resolves to the *full*
+  timeout (measured: three blackholed addresses cost 9.0s under a 3s limit,
+  and a redirect starts over), and behind an `HTTPS_PROXY` the `CONNECT`
+  tunnel was read off the raw socket, where a proxy answering one byte at a
+  time could pin a lookup — and the scan job around it — without ever raising.
+  One deadline-aware connection now owns the socket from the first packet, so
+  connect, the proxy tunnel, the TLS handshake, headers and body all spend the
+  same budget. Two things stay outside it and are documented rather than
+  implied: name resolution, which runs before any socket exists, and a peer
+  trickling TLS *handshake* records, which would mean leaving `urllib` to bound
+  properly.
+
+- **A DAT that was deleted mid-match no longer haunts the cache.** When a DAT
+  went away between a file being matched and the result being written, the
+  dangling foreign key was nulled — which also let the row slip past the
+  delete's cascade *and* made every later import mistake it for a Hasheous hit
+  and preserve it. The result was a badge naming a game from a DAT you had
+  removed, and nothing ever re-checked it. Whether a match came from Hasheous
+  is now recorded on the row rather than guessed from a null key.
+
+- **Importing a DAT or syncing MAMERedump no longer sends every hash to
+  Hasheous again.** The re-match those trigger existed to recompute verdicts
+  against the new DATs, but it re-ran the whole pipeline — so every file that
+  had ever been identified remotely, plus every file previously recorded as
+  unmatched, went back out over the network. On a large library that was
+  thousands of hash disclosures and requests per sync, for answers that could
+  not differ from the ones already cached. The re-match is now local-only: a
+  file the new DATs identify has its badge upgraded from **HASH** to **DAT**,
+  and a file they still don't cover keeps the badge it already had. Files
+  previously recorded as "no match anywhere" are still re-checked, but lazily —
+  one request when you next browse that file, not a burst at sync time.
+
+- **A hash the local DATs can identify is no longer sent while a lookup is
+  already running.** For a file offering several hashes (a CHD sends up to
+  three), the local re-check happened only after the whole remote pass, so a DAT
+  import landing during the first request could not stop the second hash going
+  out — the check ran once it had already been disclosed. Local DATs are now
+  re-consulted between requests as well.
+
+- **A replaced file over the size cap no longer keeps the previous game's
+  badge.** Matching a file bigger than `MATCH_MAX_FILE_SIZE` skips its whole-file
+  hash, so the result is never cached — but for something like a large CHD the
+  *embedded* hashes are still read, and those are enough to prove the file on
+  disk is not the one the badge names. The metadata scan had always acted on
+  that; the background match job, which is what a DAT import or sync triggers,
+  had not, so an oversized file you replaced went on showing the old game with
+  nothing left to correct it. Both paths now retire a badge their own recomputed
+  hash contradicts — and only then: a size cap on its own is not evidence, and
+  a match recorded against one kind of hash is never compared against another.
+
+- **A match job that hit stuck storage no longer resumes on it.** When a hash
+  helper survives being killed and keeps reading an unresponsive volume, the job
+  stops on purpose rather than stranding more processes there. If a DAT import
+  had queued a re-match behind it, that queue was handed straight to a
+  replacement job, which started reading the same volume seconds later. A job
+  that stops this way now drops the queue, exactly as a cancelled one does; a
+  job that merely finished with failures still hands it over.
+
+- **A Hasheous toggle in another tab no longer takes a page reload to show
+  up.** Two halves of the same gap: turning the fallback on elsewhere cleared
+  this tab's badges without re-fetching them, so a folder sat blank until you
+  navigated away and back; and toggling it *here* re-applied its own answer
+  after refreshing, which could overwrite a newer state another tab had just
+  set — leaving the panel and the backend disagreeing for up to a minute.
+
+- **Cancelling a match job no longer starts another one.** If a DAT import or
+  sync had queued a re-match behind the running job, cancelling it kicked that
+  re-match off from the cancelled job's own teardown — and because **Cancel
+  all** takes its list of jobs before the replacement exists, the new job
+  escaped the cancellation and carried on hashing. Cancelling now drops the
+  queued re-match and says so in the log; those files keep their current
+  verdicts until you browse them or run a rescan.
+
+- **A replaced file is now recognised whatever hash identified it.** Pruning a
+  stale badge only ever compared plain file checksums, so formats matched on a
+  hash the tool reports — a Dolphin disc hash, a CHD's embedded hashes — kept
+  the old game's name after the file was swapped. Oversized files were in the
+  same position from the other direction: their embedded hashes *were*
+  recomputed, but were being thrown away before anything could use them.
+
+- **Enabling *or disabling* Hasheous in one browser tab now reaches the
+  others.** The previous fix only carried the switch one way: a tab noticed the
+  fallback being turned on, but stopped watching afterwards, so turning it off
+  and on again elsewhere left that tab matching nothing until a reload.
+
+- **Enabling Hasheous in one browser tab now reaches the others.** On a setup
+  with no DATs imported, a tab already sitting on the workspace had decided
+  nothing could identify files and never asked again — so turning the fallback
+  on elsewhere (or through the API) left that tab matching nothing until it was
+  reloaded or you opened the DAT Library in it. It re-checks on its own now,
+  and only while it has nothing to match with, so a configured install does no
+  extra work.
+
+- **A replaced Dolphin RVZ/WIA/GCZ no longer keeps the old game's badge.** The
+  fix below covered files identified by their own SHA1, but those formats are
+  matched on the disc hash the tool reports and the whole file is deliberately
+  never read — so there was no hash to compare and the stale badge survived. The
+  comparison now happens in whatever hash a match was recorded against.
+
+- **A file replaced after it was identified no longer keeps the old game's
+  badge through a DAT import.** The re-match an import triggers recomputes the
+  file's hash, but wasn't passing it on — and that hash is the only way the
+  cache can tell "your DATs still don't recognise this" apart from "this is a
+  different file now". The first has to keep the existing badge; the second has
+  to drop it. It now keeps them apart.
+
+- **A retry armed for one folder no longer follows you to another.** When a
+  Hasheous lookup failed, the badge retry was scheduled for the folder you were
+  looking at — but navigating elsewhere left it running, so it could later
+  wake up and start hashing files that were no longer on screen. It is now
+  retired as soon as you move on, and cancelled outright when the file list
+  closes — which also gives the folder a fresh retry budget, so coming back to
+  a folder whose retries ran out during an outage tries again instead of
+  staying blank until you reload.
+
+- **A match recorded *while* a DAT import was running is no longer left out of
+  the follow-up re-match.** The re-match works from a snapshot taken just
+  before the import, so a file identified through Hasheous in the moments
+  between the two ended up in a gap: the import keeps remote matches (they owe
+  nothing to your DATs), but the snapshot couldn't know about that one, and a
+  match that already has an answer is never re-checked on its own. The DAT you
+  had just imported might have identified the same file and would never have
+  got the chance to. The re-match now also covers whatever is still cached once
+  the new DATs are live, and the MAMERedump sync runs it even when nothing was
+  cached beforehand — that being precisely the case where the file caught in
+  the gap is the only one that needs it.
+
+- **A DAT import landing during a scan no longer skips its re-match.** The
+  matcher runs one job at a time, so an import or sync that finished while a
+  match job was running had its follow-up silently dropped and those files kept
+  their old verdicts until you happened to browse them again. They are queued
+  now and start as soon as the running job finishes. Both the manual upload and
+  the MAMERedump sync go through the same code for this.
+
+- **A newly imported DAT wins over a lookup that was already in flight.** The
+  local index is checked once more before a remote answer is accepted, and once
+  again inside the transaction that writes the result — over every hash the file
+  offered, for a recorded "no match" as much as for a hit. An import committing
+  during the request is not left behind a remote verdict that nothing would have
+  recomputed, whether that verdict was a Hasheous hit on one hash, a hit while
+  the new DAT knows a *different* hash of the same file, or a cached miss.
+
+- **A match job that hit a total Hasheous outage no longer reports success
+  because one file was skipped.** Files skipped on policy (over the size cap,
+  not a regular file) were counted as survivors, so a single oversized ISO in
+  the batch turned "every file we could check failed" into a green *complete*
+  with a generic error count — instead of the red "Hasheous is unreachable,
+  your files are fine, re-run it later" the outage deserves.
+
+- **Turning Hasheous on no longer leaves the files that were mid-check waiting
+  90 seconds.** A match request already in flight when you flipped the toggle
+  had its results correctly discarded, but the paths were still marked as
+  recently attempted — writing the suppression straight back into the retry
+  guard the toggle had just cleared, with no job event coming to shake it
+  loose. Those files now re-match immediately, as the toggle intends.
 
 - **A conversion can no longer be re-matched as the wrong game.** When two
   browser tabs (or a tab and a scheduled run) aim different ROMs at the same

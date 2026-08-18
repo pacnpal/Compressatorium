@@ -13,6 +13,8 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import XIcon from '@lucide/svelte/icons/x';
+  import Globe from '@lucide/svelte/icons/globe';
+  import PlugZap from '@lucide/svelte/icons/plug-zap';
 
   const dats = $derived(datMatching.dats);
   const loading = $derived(datMatching.datsLoading);
@@ -22,8 +24,45 @@
   const syncing = $derived(datMatching.syncing);
   const syncStatus = $derived(datMatching.syncStatus);
 
+  const hasheousOn = $derived(Boolean(stats?.hasheous_enabled));
+  // Interpolated straight into prose, so it needs a value before /dat/stats
+  // lands -- otherwise the panel reads "looking up misses at ." while loading.
+  const hasheousUrl = $derived(stats?.hasheous_url || 'the configured Hasheous server');
+
   let fileInputEl;
   let syncPollTimer = null;
+  let savingHasheous = $state(false);
+  let testingHasheous = $state(false);
+  let hasheousTest = $state(null);
+
+  async function handleToggleHasheous() {
+    const next = !hasheousOn;
+    savingHasheous = true;
+    hasheousTest = null;
+    try {
+      await datMatching.setHasheousEnabled(next);
+      toast.success(
+        next
+          ? 'Hasheous fallback on — unmatched files will be looked up remotely'
+          : 'Hasheous fallback off — nothing is sent anywhere',
+      );
+    } catch (e) {
+      toast.error(e?.message ?? 'Could not change the Hasheous setting');
+    } finally {
+      savingHasheous = false;
+    }
+  }
+
+  async function handleTestHasheous() {
+    testingHasheous = true;
+    try {
+      hasheousTest = await datMatching.testHasheous();
+    } catch (e) {
+      hasheousTest = { ok: false, error: e?.message ?? 'Request failed' };
+    } finally {
+      testingHasheous = false;
+    }
+  }
 
   onMount(() => {
     datMatching.loadDATs();
@@ -146,6 +185,78 @@
     </div>
   </header>
 
+  <!-- Hasheous state rides on /api/dat/stats (app/routes/dat.py:get_dat_stats)
+       rather than a second endpoint, since this view already fetches it. -->
+  <article class="panel hasheous" class:is-on={hasheousOn}>
+    <div class="hasheous-head">
+      <Globe size={16} aria-hidden="true" />
+      <div class="hasheous-title">
+        <strong>Hasheous fallback</strong>
+        <span class="hasheous-sub">
+          Match anything your DATs don't recognise against 14 preservation
+          databases — Redump, No-Intro, TOSEC, MAMERedump, RetroAchievements
+          and more. No account or API key needed.
+        </span>
+      </div>
+      <div class="hasheous-actions">
+        {#if hasheousOn}
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={testingHasheous}
+            disabled={testingHasheous}
+            onclick={handleTestHasheous}
+          >
+            {#snippet icon()}<PlugZap size={14} />{/snippet}
+            Test
+          </Button>
+        {/if}
+        <Button
+          variant={hasheousOn ? 'destructive' : 'primary'}
+          size="sm"
+          loading={savingHasheous}
+          disabled={savingHasheous}
+          onclick={handleToggleHasheous}
+        >
+          {hasheousOn ? 'Turn off' : 'Turn on'}
+        </Button>
+      </div>
+    </div>
+
+    <p class="hasheous-detail">
+      {#if hasheousOn}
+        On — looking up misses at <code>{hasheousUrl}</code>. Your own
+        DATs are always checked first, so a library they already cover makes no
+        network calls. These matches show a <strong>HASH</strong> badge, with
+        platform, year, region and source DAT in the tooltip.
+      {:else}
+        Off — nothing is sent anywhere. Turning it on sends a file's hashes
+        (and nothing else, no names or paths) to
+        <code>{hasheousUrl}</code> when your DATs come up empty — one SHA1 for
+        most formats, up to three for a CHD, which reports a header and a data
+        hash alongside the file's own. Takes effect immediately; no restart
+        needed.
+      {/if}
+      {#if stats?.hasheous_overridden}
+        <span class="hasheous-note">
+          Set here, overriding <code>COMPRESSATORIUM_HASHEOUS_ENABLED</code>.
+        </span>
+      {/if}
+    </p>
+
+    {#if hasheousTest}
+      <p class="hasheous-test" class:bad={!hasheousTest.ok} role="status">
+        {#if hasheousTest.ok}
+          Reachable{hasheousTest.latency_ms != null
+            ? ` — responded in ${hasheousTest.latency_ms} ms`
+            : ''}.
+        {:else}
+          Not reachable: {hasheousTest.error}
+        {/if}
+      </p>
+    {/if}
+  </article>
+
   <!-- Stats response shape (app/services/dat_store.py:get_stats):
        total_dats, total_sha1_hashes, total_md5_hashes,
        total_matches, total_unmatched. -->
@@ -244,6 +355,23 @@
   .panel-title { margin: 0; font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--text-1); text-transform: uppercase; letter-spacing: 0.05em; }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--space-3); }
+  .hasheous { display: flex; flex-direction: column; gap: var(--space-2); font-size: var(--text-sm); color: var(--text-2); line-height: 1.5; }
+  .hasheous-head { display: flex; align-items: flex-start; gap: var(--space-3); }
+  .hasheous-head > :global(svg) { flex: none; margin-top: 0.15em; color: var(--text-3); }
+  .hasheous.is-on .hasheous-head > :global(svg) { color: var(--accent); }
+  .hasheous-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .hasheous-title strong { color: var(--text-1); }
+  .hasheous-sub { color: var(--text-2); }
+  .hasheous-actions { display: flex; gap: var(--space-2); flex: none; }
+  .hasheous-detail { margin: 0; }
+  .hasheous-note { display: block; margin-top: var(--space-1); color: var(--text-3); font-size: var(--text-xs); }
+  .hasheous-test { margin: 0; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-1); }
+  .hasheous-test.bad { color: var(--error); background: var(--error-muted); }
+  .hasheous code { font-family: var(--font-mono); font-size: 0.92em; padding: 0.05em 0.35em; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-1); }
+  @media (max-width: 620px) {
+    .hasheous-head { flex-wrap: wrap; }
+    .hasheous-actions { width: 100%; }
+  }
   .stat { display: flex; flex-direction: column; gap: 2px; }
   .stat-label { color: var(--text-3); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.05em; }
   .stat-value { color: var(--text-1); font-size: var(--text-xl); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; }

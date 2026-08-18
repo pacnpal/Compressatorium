@@ -1194,6 +1194,414 @@ gone, or changed) it returns `None`, and the caller falls back to a file-level S
 is valid for any DAT that indexes the container bytes. New cache/tool code that needs
 freshness-gated metadata must call this rather than reintroducing the two-read pattern.
 
+### 3.3.5.1 Remote hash fallback (`services/hasheous/`)
+
+Hash matching has two sources, and the ordering between them lives in
+`routes.dat._lookup_match`, which runs `_local_lookup_match` and only then
+`_remote_lookup_match`. Every match path — `POST /dat/match`,
+`/dat/match-batch`, the background match job, and `info._scan_phase_dat_match`
+— reaches the sources through those helpers, so the fallback was added there
+rather than by introducing a provider registry. Two sources do not need an
+interface; a third would.
+
+One caller does not go through `_lookup_match`: `_match_single_file` calls
+`_local_lookup_match` and `_remote_lookup_match` directly, because it has to
+check *every* local candidate a file offers (embedded hashes, then the
+file-level SHA1) before any of them may go out remotely. `_match_result`
+builds the record both paths return.
+
+The order is **fixed and local-first**: `_local_dat_record` (the imported DATs)
+and only on a miss, and only when the operator opted in, `hasheous.lookup`. That
+keeps a covered library fully offline and makes a given hash resolve the same way
+regardless of network weather. Both helpers return the **same record shape** —
+`dat_id` / `dat_name` / `game_name` / `rom_name` / `source`, plus whatever extra
+identity fields the source carries — so `_match_result` builds the
+result dict once and splats the record into it. Adding a field to a remote match
+means adding a key to that record, not touching the builder.
+
+#### Candidate ordering: every local lookup before any remote one
+
+This rule has to hold across the *whole* of `_match_single_file`, not just
+within one helper, and it took three passes to get right — so the shape is
+deliberate.
+
+The lookup is split into `_local_lookup_match` and `_remote_lookup_match`, with
+`_lookup_match` as the local-then-remote composition. `_match_single_file` calls
+the halves directly, because its candidates do not all exist at the same time:
+
+1. `_try_embedded_hash_match` gets the tool's embedded hashes (a CHD reports a
+   header SHA1 *and* a data SHA1) and checks them **locally only**.
+2. Unless the tool's hashes are exhaustive, the file-level SHA1 is computed —
+   expensive, hence lazy and size-capped — and checked **locally**.
+3. Only once every one of those has missed does the **complete** candidate set
+   go to Hasheous, in a single remote pass.
+
+Two orderings that look reasonable are both wrong, and each was a real bug here:
+
+- *Remote-checking candidate 1 before local-checking candidate 2.* Discloses a
+  hash the local DATs could have identified, and a remote timeout on the first
+  raises before the second — the one that would have matched — is tried.
+- *Letting the embedded-hash helper go remote before the caller has hashed the
+  file.* Same failure, one level up: for a non-exhaustive tool like CHD the
+  container's own bytes may be exactly what the local DAT indexes, so the
+  embedded hashes must not leave the machine until that has been checked.
+
+`_try_embedded_hash_match` is therefore local-only by contract, and returns its
+candidates so the caller can carry them into the single remote pass.
+
+**The one place the rule is best-effort rather than absolute is a size-capped
+file**, and it is a deliberate trade. `MATCH_MAX_FILE_SIZE` forbids reading the
+file, so its container SHA1 can never be computed — meaning the local candidate
+set *cannot* be exhausted, and "we never disclose a hash the local DATs could
+have identified" is unachievable for that file by construction. The choice is
+between disclosing the (already-in-hand, free) embedded hashes and identifying
+the file at all. It still gets its remote pass, because the cap says "don't read
+this file's bytes", not "don't identify this file" — and for a CHD the hash a
+DAT actually indexes *is* the header SHA1, which is an embedded candidate and so
+is still checked locally first. The residual exposure needs an unusual DAT that
+indexes raw `.chd` container bytes rather than the header, plus a cap, plus a
+file over it. A size-capped miss keeps its non-cacheable `reason`.
+
+#### Cache entries are scoped to the sources that produced them
+
+Every cacheable miss carries `checked_remote`, and `cached_result_usable(payload)`
+is the single gate every cache read goes through (`/dat/match-batch`,
+`/dat/matches/lookup`, `/dat/match-batch/job`, and the scan's Phase 3 skip).
+
+A miss recorded before Hasheous was enabled came from a strictly weaker matcher,
+so it must not be served once the stronger one is available — otherwise an
+existing install switches the feature on and nothing happens, because every path
+in the library already has a cached "not in any DAT" row. Hits are always usable:
+local DATs are consulted first, so a remote source could not have improved on one.
+This is a payload field, not a schema change.
+
+#### Other load-bearing properties
+
+- **A failure is not a miss.** `hasheous.lookup` raises `HasheousUnavailable` for
+  timeouts, 5xx and unparseable bodies, and returns `None` **only** for the
+  documented 404. `_match_single_file` converts the exception into
+  `{**base_result, "error": ...}`, which the existing rule (see
+  `_abandoned_match_result`) refuses to cache. Without this, one network blip
+  would permanently record every in-flight file as being in no DAT.
+- **An outage is learned once, not once per file.** A failure opens a 60-second
+  module-level cooldown during which `lookup` raises immediately without a
+  request. Files still come back non-cacheable — just without paying
+  `hasheous_timeout` each. A 1,000-file scan against a dead endpoint would
+  otherwise burn over four hours rediscovering the same fact. **Everything that
+  can judge the server unhealthy sits inside the one `try`** — transport errors
+  *and* response validation — because a proxy returning an identity-less `200`
+  for every hash is exactly as much of an outage as a timeout, and validating
+  after the guarded call left that case re-requesting once per file. A clean
+  404 is the one non-failure: the server answered, so it clears the cooldown.
+- **The timeout bounds the request, not each socket read.** `urlopen(timeout=)`
+  restarts on every byte that arrives, so a server dripping slower than the
+  timeout but never stopping pins the lookup — and the scan job around it —
+  without ever raising, which also means the cooldown never opens. Measured:
+  an 18.5s `open()` under a 2s timeout, and unbounded for a longer header.
+  One `_DeadlineMixin` enforces one monotonic deadline (`_deadline_of`) inside
+  `recv_into`, and it is mixed into **both** socket classes a lookup can hold:
+  `_DeadlineSocket` (the raw socket) and `_DeadlineSSLSocket` (installed via
+  `SSLContext.sslsocket_class`). Two classes over one mixin, because
+  `wrap_socket` detaches the raw socket and rebuilds from its file descriptor,
+  so the raw class cannot carry through. Doing it at the socket rather than
+  around the body read is what makes the bound real: an earlier body-only
+  version left the identical hole in the headers, where a hostile or broken
+  server can drip just as easily.
+
+  The connection is deadline-aware from the first packet:
+  `_DeadlineHTTPSConnection` swaps in `_connect_with_deadline`, which loops the
+  `getaddrinfo` results itself and gives each attempt only what is *left* of
+  the budget. `socket.create_connection` gives each address the full timeout —
+  measured, three blackholed addresses cost 9.0s under a 3s timeout, and a
+  redirect opens a fresh connection with a fresh budget. `_DeadlineHTTPSHandler`
+  is what puts that connection in `_opener`'s hands; both halves of the wiring
+  (the handler class and the context's `sslsocket_class`) are pinned by tests,
+  because rebuilding the opener with stock parts removes the protection
+  silently while every behavioural test still passes.
+
+  That covers all four phases through one mechanism — raw connect, the proxy
+  `CONNECT` tunnel (`http.client._tunnel` reads it off the raw socket, so a
+  dripping proxy used to pin the request and never raise), the TLS handshake
+  (which makes **zero** `recv_into` calls, so `do_handshake` applies the
+  deadline itself), and the response.
+
+  Two things remain outside it, both accepted. A peer that drips one TLS
+  *handshake record* at a time inside the remaining budget is not bounded, and
+  **DNS is not bounded by `hasheous_timeout` at all** — `getaddrinfo` runs
+  before any socket exists and ignores socket timeouts. The resolver bounds
+  itself (`/etc/resolv.conf`: glibc defaults to 5s x 2 attempts per nameserver)
+  and, unlike a drip, it *raises* — so it opens the cooldown and the rest of a
+  bulk job short-circuits instead of stalling one file at a time. Closing
+  either means leaving urllib or resolving on an abandonable thread.
+- **The toggle persists before it applies.** `PUT /api/dat/hasheous` writes the
+  preference first and only then flips the in-process override. The other order
+  meant a failed write (locked SQLite, full disk) left the process sending
+  hashes remotely while the endpoint reported failure and the UI still showed
+  the switch off — a privacy-relevant lie, not just a stale display.
+- **`dat_id` is always `None` on a remote hit.** It is a FK into the local `dats`
+  table and a remote match has no row there. `dat_store` already nulls unknown
+  values before writing, so this keeps the cached row byte-identical across
+  re-runs rather than depending on that guard.
+- **"Remote hit" is recorded, never inferred.** `_remote_hit_clause()` in
+  `dat_store` is the one place the question is answered, and it answers from
+  `payload.source`, not from `dat_id IS NULL`. The FK proxy was wrong for one
+  real row: a *local* hit whose DAT was deleted between the match and the write
+  has its dangling FK nulled by `_upsert_match_sync`, which also dodges the
+  `WHERE dat_id = :id` cascade — so it was preserved through every later import
+  and went on serving an identity from a DAT the operator had removed.
+  `coalesce` is load-bearing there: SQL `NULL` is not `False`, so a payload with
+  no `source` must compare unequal rather than unknown, or the negation spares
+  exactly the rows it is meant to drop.
+- **Local-first holds across the whole call — for the disclosure, not only the
+  verdict.** The remote request is an await of its own, and a DAT import commits
+  in its own transaction, so `_remote_lookup_match` re-checks the local index
+  *between* candidate requests as well as once more after the loop. The post-loop
+  pass alone was not enough: it protects the answer, but by the time it runs the
+  hash the newly-imported DAT could have identified has already gone out. A CHD
+  sends up to three, so that is up to two avoidable disclosures per file. Each
+  check is over the whole candidate set, and each is one indexed lookup.
+
+  That recheck is itself an await, so the stop conditions
+  (`_remote_pass_stopped`: the toggle, and the job's cancel event) are tested on
+  **both** sides of it — before, to stop a halted pass doing further work, and
+  again immediately before the request, which is the load-bearing half. A guard
+  that only preceded the recheck reintroduced, one await later, exactly the
+  window the recheck existed to close.
+- **Concurrent DAT imports have a boundary, and it is the transaction.** A match
+  runs local-first, but the decision and the write are separate operations, so
+  three windows exist between them: the file hash (seconds), the remote request
+  (seconds), and decide-then-write (milliseconds). The first two are closed by
+  re-checking the local index — before the remote pass, and again over the whole
+  candidate set before a remote answer is accepted. The third is closed in
+  `dat_store._local_index_now_covers()`, which re-checks inside the writing
+  transaction and skips the write when the local index has since learned any of
+  the candidates (leaving the path uncached, so the next match resolves it
+  locally). What remains is the transaction boundary itself: an import
+  committing between that read and the write's commit leaves a remote hit,
+  which invalidation preserves by design — and which is now *scheduled for
+  rematch* unless its commit also lands after the post-change listing below,
+  so the residual window is the narrower one and sits entirely after the new
+  DATs are live.
+
+  That third guard covers **every verdict the remote source took part in, over
+  the whole candidate set** — not just the hit, and not just the hash that
+  matched. A stamped *miss* is cacheable too, and its `checked_remote` stamp
+  stays valid, so restricting the guard to hits let a fresh local match stay
+  hidden until the next import happened to invalidate the row; and a CHD offers
+  up to three hashes, so the DAT that landed mid-flight may know a candidate
+  other than the one that hit. The route attaches the candidate SHA1s under
+  `dat_store.CANDIDATE_HASHES_KEY` (`_carrying_candidates()`, on both cacheable
+  remote exits); the store revalidates them and strips the key in
+  `_persistable_payload()`, so it never reaches a persisted row. It is a hash
+  re-check rather than a DAT-index generation on purpose: a generation would
+  skip the write on any unrelated import and send the file straight back out to
+  the remote source, which is the same re-disclosure cost rejected just below.
+
+  That last one is deliberately *not* chased. Closing it read-side means
+  stamping remote hits with the DAT-set generation and rejecting stale ones,
+  which invalidates every remote hit on every DAT change — the recompute misses
+  locally (the new DAT usually doesn't cover the file that needed Hasheous) and
+  re-queries, re-disclosing thousands of hashes per sync, forever. That is a
+  worse trade than the thing it fixes, whose worst outcome is a HASH badge where
+  a DAT badge would do: same game, self-correcting on the next rescan. Closing it
+  write-side means serialising matches against imports, i.e. holding a lock
+  across a network call.
+- **A cancelled match job does not hand its queue to a successor.** The
+  deferred-rematch drain lives in `_run_match_job`'s `finally`, which a
+  cancellation reaches like any other exit — so the cancelled job started a
+  *replacement* job on its way out. `/jobs/cancel-all` snapshots the job list
+  before that replacement exists, so the rematch escaped the cancellation
+  entirely and went on hashing moments after the operator asked for silence.
+  Cancellation now discards the queue instead (`_discard_deferred_rematch`),
+  logged rather than silent: those files keep their current verdicts until they
+  are browsed or a rescan runs. Dropped rather than left queued because nothing
+  but a finishing job drains the set, so holding them would mean waiting on an
+  unrelated job that may never come.
+
+  A job that *crashed* is treated the same way, and for a sharper reason. The
+  abandonment guard raises when a hash helper outlives SIGKILL and is still
+  reading unresponsive storage, deliberately stopping so the rest of the
+  library does not strand another process on that volume (issue #268). But
+  `job_success is False` cannot tell that mid-loop crash from a job that ran
+  every path and merely reported failures, so the teardown drained the queue
+  and resumed hashing the same volume seconds later. `job_crashed`, set only by
+  the `except Exception` branch, is the distinction; an ordinary
+  finished-with-failures job still drains, since nothing about it says the next
+  batch cannot run.
+- **A match job fails on its *checkable* files, not its total.** Policy skips
+  (over `MATCH_MAX_FILE_SIZE`, not a regular file) are files the job
+  deliberately did not check, so they are excluded from the all-failed
+  denominator instead of counting as survivors. With `errors == total` a single
+  oversized ISO in the batch downgraded a complete Hasheous outage to a green
+  "complete" carrying a generic error count — exactly the misread that branch
+  exists to prevent. A batch of nothing but skips still completes: nothing was
+  attempted, so nothing went wrong.
+- **A DAT change re-matches through one helper, over before *and* after.**
+  `rematch_after_dat_change()` is shared by the manual upload (`import_dat`) and
+  the MAMERedump sync; both want "recompute what already had a verdict against
+  the new index", and it had been written twice. The matcher is single-flight,
+  so when a job is already running those paths go into
+  `_deferred_rematch_paths` and the finishing job drains them — "best-effort"
+  means *later*, not *never*, which is what dropping the `None` return used to
+  mean.
+
+  The caller's snapshot is taken *before* the change, because the change is
+  what invalidates — but it is not transactional with it, and a match already
+  in flight can persist a remote hit inside that window. Invalidation preserves
+  remote hits by design, so such a row survives while being absent from the
+  snapshot, and since a cached hit is always usable nothing would ever
+  recompute it: the DAT just imported could know that hash and never get the
+  chance to say so. `_paths_needing_rematch()` therefore unions the snapshot
+  with a listing taken *after* the change — anything still cached once the new
+  index is live either predates the change or was written during it, and both
+  need recomputing. A row written after the listing is redundant to include
+  rather than wrong. This is why the sync calls the hook unconditionally now:
+  an empty snapshot is exactly the case where the surviving row is the *only*
+  thing to rematch, and the old `if previous_match_paths:` guard skipped it.
+
+  **The rematch job is local-only** (`schedule_match_job(..., local_only=True)`,
+  threaded down to `_match_single_file`). What a DAT change alters is the local
+  index; the remote source is exactly as it was, so re-asking it once per
+  previously-verdicted file cannot yield an answer different from the cached
+  one — it only re-discloses every hash, thousands per MAMERedump sync, on a
+  schedule the operator never chose. This was the single largest disclosure
+  path in the feature and it was unintended: `_hash_one_for_job()` calls
+  `_match_single_file()` with no cache consult, so *every* rematched path ran
+  the full local-then-remote pipeline. The three outcomes fall out of guards
+  that already existed:
+
+  | after the change | result |
+  |---|---|
+  | new DATs cover the file | local hit written, badge upgrades HASH → DAT |
+  | they don't, row was a remote hit | unstamped miss, which `_would_downgrade_remote_hit()` refuses to write — badge stays |
+  | they don't, row was a remote-checked miss | that row was dropped by invalidation, so the unstamped miss replaces it and `cached_result_usable()` finds no stamp — re-checked remotely when the file is next browsed |
+
+  The third row is the residual: a previously-unmatched file *is* re-disclosed,
+  but lazily, one file at a time, on the operator's navigation rather than in a
+  burst at sync time. Closing it too means keeping remote-checked misses across
+  an invalidation, which would serve a stale negative for any file the new DAT
+  does cover — the trade the invalidation exists to avoid.
+
+  The unstamped miss must still **carry the recomputed hashes**
+  (`_carrying_file_hash()`). "The DATs still don't know it" and "this is a
+  different file now" both reach the store as an unmatched result, and a
+  recomputed hash is the only thing that separates them:
+  `_proves_content_changed()` compares against the stored one, and without it
+  the row-two guard protects the badge of a file that has been *replaced*,
+  permanently. The outage exit had carried the file-level hash for this reason
+  since round 7; the local-only exit was written without it, so one helper now
+  serves both.
+
+  Carrying the evidence is only half of it: **every** consumer of a
+  non-cacheable result runs the pruner. The scan did from the start; the match
+  job did not, so a capped file replaced between DAT imports produced a
+  non-cacheable result the store never saw, was never pruned by a scan that
+  might not run, and kept naming the previous game with nothing left to
+  re-check it. `drop_if_content_changed()` now sits on both paths, and the
+  comparison itself lives in `dat_store.drop_match_if_changed()` — one
+  predicate (`_proves_content_changed()`), one transaction. Reading the row in
+  the route and deleting it in a second call also left a window where a
+  concurrent match job could persist the *replacement* file's correct result in
+  between, and the delete removed that fresh row instead of the one it had
+  compared; the `match` workload token covers hashing, not this cache
+  operation, so the two really can overlap.
+
+  Both non-cacheable exits carry it too — a size-capped result never read the
+  container, but the embedded hashes it *did* recompute are exactly what proves
+  a swap to the scan's pruner. Which is also why the scan stopped *deleting*
+  those rows outright: a cap is not evidence a file changed, and with a
+  recomputed hash in hand the capped case goes through the same same-domain
+  comparison as the outage case rather than dropping a valid identity for a
+  file nobody touched.
+
+  It carries the **whole typed candidate set**, not just `file_sha1`, and the
+  comparison keys on the *stored row's own* `match_type` rather than demanding
+  `file_sha1`. `dat_store.recomputed_hash_in()` is that lookup, module level
+  because both ends of the rule need it: the store's write guard before
+  overwriting a remote hit, and `drop_match_if_changed()` before deleting a row
+  a non-cacheable result left behind. That restriction existed for a real reason — a CHD hit is stored
+  against its embedded `chd_sha1` while a rescan recomputes the container's
+  `file_sha1`, and those differ for a file nobody touched, so comparing them
+  deleted valid badges. But it was too blunt: an *exhaustive* tool (Dolphin
+  RVZ/WIA/GCZ) recomputes the very hash it matched on, so the domains agree and
+  the comparison is sound — and such a format never computes a `file_sha1` at
+  all, so under the old rule a replaced RVZ could never be proven changed and
+  kept its previous game's badge for good. Keying on the stored domain admits
+  that case and still refuses the cross-domain one.
+- **The workspace re-checks matchability only while it has none.**
+  `refreshMatchingAvailability()` already absorbs a provider flip made
+  elsewhere (another tab, an API client) — it resets the match cache and the
+  attempt guard when `hasheous_enabled` changed under it — but nothing drove it
+  after mount, so a DAT-less install whose operator enabled Hasheous in a
+  second tab sat at `matchingAvailable === false` and started no jobs until
+  this tab visited the DAT view or reloaded.
+  `watchMatchingAvailability()` polls it for as long as the workspace is
+  mounted. An earlier version stopped once something could answer, on the
+  reasoning that only `matchingAvailable === false` matters — but a provider
+  *disabled* elsewhere makes this tab merge now-unmatched rows into `matches`,
+  and stopping meant a later re-enable was never seen, so those paths stayed
+  "known" forever. One transition healed, the other made permanent; it watches
+  both now. The workspace owns the teardown, and the file list also cancels the
+  retry timer when its visible set empties — filtering to zero entries does not
+  unmount it, so neither the effect's normal path nor `onDestroy` would run.
+
+  Observing the flip is not the same as acting on it. Every policy change —
+  provider toggle, DAT import, delete, finished sync — clears `matches`, and
+  that clear is invisible to the file list's `$effect` by design: `hydrate()`
+  snapshots the map under `untrack` precisely so the effect does not subscribe
+  to the cache it fills. With local DATs present `matchingAvailable` never
+  flips either, so a provider enabled in another tab blanked the badges and
+  nothing re-hydrated them until navigation. `datMatching.policyGeneration`
+  (the reactive `_generation` counter) is the one dependency the effect reads
+  for this, which makes the clear self-healing. It moves only on a real policy
+  change — a `/dat/stats` poll that observes nothing new must not bump it, or
+  it invalidates in-flight match jobs on every tick.
+
+  The toggle itself re-applies its `PUT` response after refreshing stats, so a
+  failed `/dat/stats` cannot bury the state the backend just switched to — but
+  only when that refresh brought nothing back. Unconditionally it did the
+  opposite harm: another tab flipping the provider while the refresh was in
+  flight makes the refresh the newer truth, and re-applying the older response
+  on top of it reported the opposite of the backend for up to a poll interval.
+- **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
+  gates predate the remote source and would otherwise short-circuit before it is
+  ever reached for an operator who imported no DATs at all. The frontend has the
+  same gate — `datMatching.matchingAvailable`, derived from `total_dats > 0 ||
+  hasheous_enabled` — and it is deliberately *not* named `hasDats`, because
+  reading it as "are there DATs" is exactly what would silently stop the browse
+  path from ever scheduling a match job.
+- **A broken store still skips Phase 3.** `_scan_phase_dat_match` tracks store
+  health separately from `has_dats`: the phase exists to prime the match cache
+  and every write goes through that store, so proceeding on a dead DB would fail
+  the whole scan instead of degrading quietly.
+- **A scan says when its remote phase failed.** `_scan_phase_dat_match` returns
+  `(matched, hasheous_errors)` and the scan's final line carries the second
+  number. The errors are still non-cacheable and still retried, but a rescan
+  run during an outage used to finish "0 matched" — indistinguishable from a
+  library genuinely in no DAT. The scan is *not* reported as failed: phases 1
+  and 2 succeeded and metadata was collected, so the honest signal is a
+  qualified success, not a flipped boolean.
+
+`services/hasheous/` is a two-module package: `__init__.py` is the client (the
+toggle, the cooldown, `_fetch_json`, `lookup`, `health`, normalization) and
+`transport.py` is the deadline-aware HTTPS stack described above. They are
+split because the transport is a self-contained concern with its own failure
+modes, and because the four phases it now covers were each found a review round
+apart and patched separately before being made one mechanism. The package
+re-exports the transport names, so `from services import hasheous` still
+reaches the whole surface and `_fetch_json` remains the single patch seam —
+important, because a second module object here is exactly how a test suite ends
+up silently hitting the real network.
+
+The client is stdlib-only (`urllib.request`), mirroring `services/dat_sync.py`:
+`_require_https`, an explicit `User-Agent`, a hard timeout, a response size cap,
+and `_fetch_json` as the single seam tests patch. Redirects go through
+`_HTTPSOnlyRedirectHandler`, which re-runs the scheme check on every hop —
+`urlopen` follows redirects itself, so validating only the initial URL would let
+a misconfigured or hostile server bounce a lookup to `http://` and put the file's
+SHA1 on the wire in the clear. Extra fields ride in the existing
+`dat_matches.payload` JSON column, so no migration is involved.
+
 ### 3.3.6 Re-run fast path (`JobManager._output_already_verified`)
 
 `_process_job` recognizes a prior success before it re-spawns the converter: a
