@@ -46,6 +46,7 @@ class DATMatchingStore {
   // job per interval (it re-checks the size cap without hashing).
   _attemptedPaths = Object.create(null);
   _retryTimer = null;
+  _retryPaths = null;
   _autoRetries = 0;
 
   matchFor(path) {
@@ -205,6 +206,7 @@ class DATMatchingStore {
     if (this._retryTimer) {
       clearTimeout(this._retryTimer);
       this._retryTimer = null;
+      this._retryPaths = null;
     }
   }
 
@@ -217,12 +219,30 @@ class DATMatchingStore {
    */
   _scheduleRetry(paths) {
     if (!this.stats?.hasheous_enabled) return;
-    if (this._retryTimer || this._autoRetries >= MAX_AUTO_RETRIES) return;
+
+    // A pending timer holds the paths it was scheduled with. If the user has
+    // navigated since, those are off-screen now: retarget rather than letting
+    // the stale set win, or the retry rehydrates a folder nobody is looking at
+    // and the visible failures never get revisited.
+    if (this._retryTimer) {
+      if (this._samePaths(paths, this._retryPaths)) return;
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
+    if (this._autoRetries >= MAX_AUTO_RETRIES) return;
+
     this._autoRetries += 1;
+    this._retryPaths = paths;
     this._retryTimer = setTimeout(() => {
       this._retryTimer = null;
+      this._retryPaths = null;
       this.hydrateAndMatch(paths, { fromRetry: true }).catch(() => {});
     }, ATTEMPT_RETRY_MS);
+  }
+
+  _samePaths(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    return a.every((p, i) => p === b[i]);
   }
 
   /**

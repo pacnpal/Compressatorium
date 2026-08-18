@@ -1252,3 +1252,87 @@ async def test_a_failed_test_opens_the_cooldown(hasheous_on):
 
     assert result["ok"] is False
     assert hasheous._cooldown_remaining() > 0
+
+
+# ---------------------------------------------------------------------------
+# Seventh review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_forced_rescan_during_an_outage_keeps_existing_matches(
+    hasheous_on, scan_phase_stubs, monkeypatch,
+):
+    """Data loss, not cosmetics.
+
+    A forced rescan recomputes every path. With Hasheous down each one comes
+    back non-cacheable, and the delete-stale-row branch would erase every
+    previously-matched file -- fast, because the breaker makes each failure
+    instant, and the scan would still finish looking normal. The remote being
+    down says nothing about the file, whose earlier match is still correct.
+    """
+    import routes.dat as dat_internal
+    from services.dat_store import dat_store as global_dat_store
+
+    monkeypatch.setattr(global_dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(
+        global_dat_store, "get_matches_batch", lambda _paths: {},
+    )
+
+    deleted, stored = [], []
+
+    async def _delete(path):
+        deleted.append(path)
+
+    async def _set(path, result):
+        stored.append(path)
+
+    monkeypatch.setattr(global_dat_store, "delete_match", _delete)
+    monkeypatch.setattr(global_dat_store, "set_match", _set)
+
+    async def _outage(path, *, cancel_event=None):
+        return {
+            "path": path, "matched": False,
+            "error": dat_internal.HASHEOUS_ERROR,
+        }
+
+    monkeypatch.setattr(dat_internal, "_match_single_file", _outage)
+
+    await scan_phase_stubs._scan_phase_dat_match(
+        "job-1", ["/vol/a.chd", "/vol/b.chd"], force=True,
+    )
+
+    assert deleted == []   # the previously-good rows survive the outage
+    assert stored == []    # ...and nothing bogus is written either
+
+
+@pytest.mark.asyncio
+async def test_a_file_level_failure_still_drops_its_stale_row(
+    hasheous_on, scan_phase_stubs, monkeypatch,
+):
+    """The distinction is service-vs-file: a file we can no longer verify
+    should not keep showing an old badge."""
+    import routes.dat as dat_internal
+    from services.dat_store import dat_store as global_dat_store
+
+    monkeypatch.setattr(global_dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(global_dat_store, "get_matches_batch", lambda _paths: {})
+
+    deleted = []
+
+    async def _delete(path):
+        deleted.append(path)
+
+    monkeypatch.setattr(global_dat_store, "delete_match", _delete)
+    monkeypatch.setattr(global_dat_store, "set_match", AsyncMock())
+
+    async def _unreadable(path, *, cancel_event=None):
+        return {"path": path, "matched": False, "error": "Unable to process file"}
+
+    monkeypatch.setattr(dat_internal, "_match_single_file", _unreadable)
+
+    await scan_phase_stubs._scan_phase_dat_match(
+        "job-1", ["/vol/a.chd"], force=True,
+    )
+
+    assert deleted == ["/vol/a.chd"]
