@@ -295,6 +295,17 @@ async def lifespan(app: FastAPI):
     if romm_cfg.get("url"):
         logger.info("RomM integration configured (%s)", romm_cfg["url"])
 
+    # A change of RomM instance or library root clears the records that
+    # belonged to the old one. If the process died between installing the new
+    # identity and finishing that cleanup, the marker written with it says so,
+    # and the stale rows would otherwise stay live against the new instance
+    # forever. Best-effort: a failure here must not stop the app from starting,
+    # and the marker survives for the next attempt.
+    try:
+        await romm.replay_identity_cleanup()
+    except Exception:
+        logger.exception("Failed to finish a pending RomM identity cleanup")
+
     # How a conversion *ended* is only knowable while the queue remembers the
     # job, and its history is capped and in-memory. An automation rule needs
     # that answer weeks later to know whether a ROM was really converted, so

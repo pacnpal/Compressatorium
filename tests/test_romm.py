@@ -2711,7 +2711,8 @@ async def test_changing_the_romm_instance_forgets_the_conversion_history(
         "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
     }})
     await romm_auto._mark_converted(
-        "7", [(1, str(tmp_path / "Game.rvz"), "", None)],
+        "7",
+        romm_auto._converted_entries([(1, str(tmp_path / "Game.rvz"), "", None)]),
     )
     assert (await romm_auto.get_state())["7"]["converted"]
 
@@ -3544,7 +3545,9 @@ async def test_a_finished_job_updates_one_record_not_the_whole_history(
     assert reads == 0, "a manual job made the listener read the whole history"
 
     # One this process did queue, indexed when it was marked.
-    await romm_auto._mark_converted("3", [(7, "/l/3/7.rvz", "", "job-7")])
+    await romm_auto._mark_converted(
+        "3", romm_auto._converted_entries([(7, "/l/3/7.rvz", "", "job-7")]),
+    )
     await romm_auto.note_job_finished(_Job("job-7", JobStatus.FAILED))
     state = await romm_auto.get_state()
     assert state["3"]["converted"]["7"]["done"] is False, state["3"]["converted"]["7"]
@@ -3555,6 +3558,128 @@ async def test_a_finished_job_updates_one_record_not_the_whole_history(
     # The index entry is consumed, so a repeated announcement is a no-op and
     # the map cannot grow without bound.
     assert "job-7" not in romm_auto._job_owners
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_that_arrives_before_its_record_is_not_lost(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Ownership is registered at acceptance; the record lands a few awaits on.
+
+    The listener fires from the queue worker, so a fast conversion on an idle
+    queue can end while the post-queue bookkeeping is still running. It finds
+    its owner and no record to write to — and dropping the answer there leaves
+    the row with no verdict at all, after which the only evidence is the
+    destination having changed, which a *failed* overwrite produces just as
+    convincingly as a real conversion.
+    """
+    from services.romm import auto as romm_auto
+
+    class _Job:
+        def __init__(self, job_id, status):
+            self.id = job_id
+            self.status = status
+
+    entries = romm_auto._converted_entries([(11, "/l/7/11.rvz", "", "job-fast")])
+    # Acceptance: owner registered, record not written yet.
+    romm_auto._own_jobs("7", entries)
+
+    # The conversion fails before `_mark_converted` gets to run.
+    await romm_auto.note_job_finished(_Job("job-fast", JobStatus.FAILED))
+
+    # ...and the record, when it lands, carries the verdict anyway.
+    await romm_auto._mark_converted("7", entries)
+    state = await romm_auto.get_state()
+    assert state["7"]["converted"]["11"]["done"] is False, state["7"]["converted"]
+
+    # The stash is drained, so it cannot grow without bound.
+    assert "job-fast" not in romm_auto._late_verdicts
+
+
+@pytest.mark.asyncio
+async def test_an_identity_change_leaves_a_marker_until_its_cleanup_runs(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Save and cleanup are two operations; either can be the one that survives.
+
+    Cleanup-then-save leaves the old identity live with its history gone and
+    its snapshots retired. Save-then-cleanup leaves the retry comparing the new
+    values with themselves, so the previous instance's ids stay live against
+    the new one forever. The marker rides in the same row as the new identity,
+    so whichever half is interrupted, the other replays.
+    """
+    from services.romm import repin as romm_repin, settings as romm_settings
+
+    romm_repin.record({"id": 5, "igdb_id": 42}, str(tmp_path / "A.rvz"), {"igdb_id": 42})
+    assert romm_repin.count_pending() == 1
+
+    # The save half lands, the cleanup half does not.
+    await romm_settings.save(
+        {"url": "http://elsewhere:8080", "library_root": str(tmp_path)},
+        cleanup_pending=True,
+    )
+    assert romm_settings.cleanup_owed() is True
+    # The new identity is in force, so a naive retry would see nothing moved.
+    assert romm_settings.effective()["url"] == "http://elsewhere:8080"
+
+    # Startup finishes what the interrupted request owed.
+    await romm_routes.replay_identity_cleanup()
+    assert romm_repin.count_pending() == 0
+    assert romm_settings.cleanup_owed() is False
+
+    # Idempotent, and it does not run again once the marker is cleared.
+    romm_repin.record({"id": 6, "igdb_id": 43}, str(tmp_path / "B.rvz"), {"igdb_id": 43})
+    await romm_routes.replay_identity_cleanup()
+    assert romm_repin.count_pending() == 1
+
+
+@pytest.mark.asyncio
+async def test_a_plan_refuses_to_record_across_an_identity_change(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The plan holds neither the settle lock nor the sweep pause.
+
+    It reads the catalog, then writes rows carrying that catalog's provider
+    ids, with awaits in between. A change landing in that window retires the
+    existing rows and installs the new instance — and the plan would then
+    insert the *old* instance's ids into a fresh row the cleanup never saw, so
+    the conversion is re-pinned as a game from a library it does not belong to.
+    """
+    from fastapi import HTTPException
+
+    from services.romm import settings as romm_settings
+
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    rom = {"id": 7, "name": "Game", "igdb_id": 42}
+
+    def _roms_and_swap(*_args, **_kwargs):
+        # The identity moves while the catalog is being read.
+        asyncio.run(romm_settings.save(
+            {"url": "http://elsewhere:8080"}, cleanup_pending=True,
+        ))
+        return {os.path.realpath(lib / "Game.iso"): rom}
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.romm_repin, "roms_by_local_path", _roms_and_swap,
+            ), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ), \
+            pytest.raises(HTTPException) as caught:
+        await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(lib / "Game.iso")], mode="dolphin_rvz",
+            ),
+        )
+
+    assert caught.value.status_code == 409
+    # Nothing recorded: a batch converted without a snapshot needs a manual
+    # re-match, which is recoverable; a row holding another library's ids is not.
+    assert romm_routes.romm_repin.count_pending() == 0
 
 
 def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:

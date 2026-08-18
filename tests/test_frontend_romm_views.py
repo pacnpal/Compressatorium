@@ -201,6 +201,27 @@ def test_enabling_automation_commits_pending_rule_edits():
                      body.group(1)), body.group(1)
 
 
+def test_navigating_into_a_catalog_folder_leaves_the_romm_view():
+    """Dropping catalog mode has to drop the screen that renders it.
+
+    A RomM row can resolve to a directory (a decrypted PS3 game). Clicking it
+    exits catalog mode and loads the folder, but the view stayed on `romm` --
+    so the platform toolbar sat above unrelated directory entries, and that
+    shell renders no breadcrumbs and no parent link. The folder was a one-way
+    trip, with no route back to the catalog short of leaving and reopening the
+    whole view.
+    """
+    src = (_SRC / "lib" / "stores" / "fileBrowser.svelte.js").read_text(encoding="utf-8")
+    body = re.search(
+        r"if \(this\.rommPlatformId !== null\) \{(.*?)\n    \}", src, re.DOTALL,
+    )
+    assert body, "the exit-RomM branch of navigate() is no longer where this guard looks"
+    assert "ui.navigate('workspace')" in body.group(1), (
+        "navigate() drops RomM mode without leaving the RomM view, which has "
+        "no breadcrumbs to get back with"
+    )
+
+
 def test_the_repin_promise_is_qualified_for_split_builds():
     """A split build has no single file for RomM to hash.
 

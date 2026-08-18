@@ -504,6 +504,15 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     if not romm_repin.mode_needs_repin(spec.output_ext):
         return {"recorded": 0, "skipped": len(payload.paths), "reason": "dat_safe"}
 
+    # Which RomM this plan is about. Re-checked before the rows are written:
+    # this route holds neither `_settle_lock` nor the sweep pause, so an
+    # identity change in another tab can retire the existing rows and install a
+    # new instance while this one is still resolving -- after which recording
+    # would insert the *old* instance's provider ids into a fresh row the
+    # cleanup never saw, and the conversion would be re-pinned as a game from a
+    # library it does not belong to.
+    generation = romm_settings.identity_generation()
+
     # One catalog read for the whole batch, indexed by local path, instead of a
     # by-hash lookup per file.
     try:
@@ -657,6 +666,19 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # the batch, from the same helper.
     winners = collapse_to_winners(planned)
     skipped += len(planned) - len(winners)
+    if romm_settings.identity_generation() != generation:
+        # The catalog these ids came from belongs to an instance nobody is
+        # pointed at any more. Nothing is recorded, and the caller is told --
+        # a batch converted without a snapshot needs a manual re-match, which
+        # is recoverable; a row holding another library's ids is not.
+        logger.warning(
+            "romm: the RomM identity changed while planning; recording nothing",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="The RomM connection changed while this batch was being "
+                   "planned; submit it again to save the metadata",
+        )
     for path, destination in winners.items():
         rom, ids = roms_by_path[path]
         # Taken here, bounded, rather than inside `record()`:
@@ -1267,34 +1289,66 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
             **{k: v for k, v in submitted.items() if k in _IDENTITY_FIELDS},
         }
         changed = await _identity_moved(before, proposed)
-        cleared = await romm_auto.forget_converted_locked() if changed else 0
+        # The new identity and the promise to clean up after it go into one
+        # row, so neither half can commit alone: whichever is interrupted, the
+        # marker survives and `_run_identity_cleanup` replays the other. Both
+        # halves of the cleanup are idempotent, so replaying costs nothing.
+        values = await romm_settings.save(submitted, cleanup_pending=changed)
+        cleared = await _run_identity_cleanup() if changed else 0
         if cleared:
             logger.info(
                 "romm: RomM instance or library changed; cleared the conversion "
                 "history for %s platform(s)", cleared,
             )
-        if changed:
-            # The pending re-pin rows go too, and for a sharper reason than the
-            # conversion history: each holds provider ids read from the *old*
-            # instance and a destination under the *old* library root. Left
-            # pending, the next settle pass would hash whatever now sits at
-            # that path and hand the previous instance's ids to whichever ROM
-            # the new instance matches -- one library's identity written onto
-            # another's game. They cannot be re-homed, so they are retired.
-            retired = await run_in_threadpool(
-                romm_repin.retire_all_pending,
-                "The RomM instance or library path changed before this could "
-                "be re-matched; re-pin this ROM by hand",
-            )
-            if retired:
-                logger.info(
-                    "romm: retired %s pending re-pin row(s) belonging to the "
-                    "previous RomM instance", retired,
-                )
-        # Last, so that everything above having succeeded is the precondition
-        # for the new identity being in force.
-        values = await romm_settings.save(submitted)
     return romm_settings.public(values)
+
+
+async def _run_identity_cleanup() -> int:
+    """Drop everything the previous RomM instance or library owned.
+
+    Two records, one reason: both name things that only mean something against
+    the instance and root they were written for.
+
+    The pending re-pin rows are the sharper case -- each holds provider ids
+    read from the *old* instance and a destination under the *old* library
+    root, so the next settle pass would hash whatever now sits at that path and
+    hand the previous instance's ids to whichever ROM the new instance matches.
+    One library's identity written onto another's game. They cannot be
+    re-homed, so they are retired.
+
+    Idempotent, and called from two places: the settings route, and startup
+    (for the change whose cleanup a crash interrupted). The marker that says it
+    is owed is cleared only once this returns.
+
+    The caller must hold `_settle_lock` and the sweep pause.
+    """
+    cleared = await romm_auto.forget_converted_locked()
+    retired = await run_in_threadpool(
+        romm_repin.retire_all_pending,
+        "The RomM instance or library path changed before this could "
+        "be re-matched; re-pin this ROM by hand",
+    )
+    if retired:
+        logger.info(
+            "romm: retired %s pending re-pin row(s) belonging to the "
+            "previous RomM instance", retired,
+        )
+    await romm_settings.clear_cleanup_owed()
+    return cleared
+
+
+async def replay_identity_cleanup() -> None:
+    """Finish an identity change whose cleanup did not complete.
+
+    Called at startup. A crash between installing a new URL/library root and
+    clearing the records that belonged to the old one leaves the marker set;
+    without this the stale rows stay live against the new instance forever.
+    """
+    if not romm_settings.cleanup_owed():
+        return
+    logger.info("romm: finishing the cleanup an identity change left owed")
+    async with _settle_lock, romm_auto.paused():
+        await _run_identity_cleanup()
 
 
 # The settings that decide *which* RomM and *which* library these records

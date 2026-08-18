@@ -44,6 +44,14 @@ class RommStore {
   // Bumped by every rule edit; see `saveRules`. Not $state -- nothing renders
   // it, and it changes on every keystroke in the editor.
   #rulesRevision = 0;
+  // One ticket per read that a settings save re-issues. Every one of these can
+  // still be waiting on the OLD instance -- a slow or unreachable URL is
+  // exactly why the operator is changing it -- and a late answer overwriting
+  // the new one leaves the view describing a server nobody is pointed at.
+  // `loadPlatforms` has its own (`#platformsTicket`) because it is also the
+  // one that can be superseded mid-flight by `cancelPlatformLoad`.
+  #statusTicket = 0;
+  #settingsTicket = 0;
   platformsError = $state(null);
   selectedPlatformId = $state(null);
 
@@ -130,10 +138,12 @@ class RommStore {
   // ─── status / settings ────────────────────────────────────────────────
 
   async loadStatus() {
+    const ticket = ++this.#statusTicket;
     this.statusLoading = true;
     this.statusError = null;
     try {
       const data = await api.getRommStatus();
+      if (ticket !== this.#statusTicket) return;
       this.status = {
         configured: data?.configured === true,
         connected: data?.connected === true,
@@ -147,17 +157,24 @@ class RommStore {
         error: data?.error ?? null,
       };
     } catch (e) {
+      if (ticket !== this.#statusTicket) return;
       this.statusError = e?.message ?? 'Failed to get RomM status';
       this.status = null;
     } finally {
-      this.statusLoading = false;
+      // Only the newest read clears the spinner, or a superseded one returning
+      // last would report "done" while its replacement is still running.
+      if (ticket === this.#statusTicket) this.statusLoading = false;
     }
   }
 
   async loadSettings() {
+    const ticket = ++this.#settingsTicket;
     try {
-      this.settings = await api.getRommSettings();
+      const data = await api.getRommSettings();
+      if (ticket !== this.#settingsTicket) return this.settings;
+      this.settings = data;
     } catch (e) {
+      if (ticket !== this.#settingsTicket) return this.settings;
       this.statusError = e?.message ?? 'Failed to load RomM settings';
     }
     return this.settings;
@@ -166,7 +183,12 @@ class RommStore {
   async saveSettings(patch) {
     this.settingsSaving = true;
     try {
-      this.settings = await api.saveRommSettings(patch);
+      const saved = await api.saveRommSettings(patch);
+      // Supersede any read still waiting on the previous connection before
+      // adopting the answer: one of them landing afterwards would replace the
+      // settings this save just installed with the ones it replaced.
+      this.#settingsTicket += 1;
+      this.settings = saved;
       // Connection details may have changed; re-derive everything downstream.
       await this.loadStatus();
       if (this.usable) {

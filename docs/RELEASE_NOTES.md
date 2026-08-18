@@ -572,6 +572,38 @@
   searched every remembered ROM of every platform for its own record, on the
   app's thread. Each job now goes straight to its record.
 
+- **Changing your RomM connection now finishes what it starts, even across a
+  crash.** Pointing at a different instance or library clears the conversion
+  history and retires the pending metadata snapshots, because both belong to
+  the instance they were recorded against. That was two separate operations,
+  and whichever one survived an interruption left the other undone — either the
+  old connection still in force with its records already destroyed, or the new
+  one running with the previous instance's metadata rows still live against it.
+  The two now commit together, and an interrupted change is completed on the
+  next start.
+- **A metadata snapshot can no longer be saved against the wrong RomM.**
+  Planning reads the catalog and then writes rows carrying that catalog's
+  identifiers. If you changed the connection in another tab in between, those
+  rows described one library's game using another library's identity. The plan
+  now notices and asks you to submit again.
+- **A conversion that finishes almost instantly is remembered correctly.** The
+  outcome is written down the moment a job ends, but for a very fast conversion
+  that could arrive before the record it belongs to existed — and the verdict
+  was dropped, leaving the rule to fall back on "the destination changed",
+  which a *failed* overwrite does just as convincingly. The answer is now held
+  until the record catches up.
+- **Opening a folder from the RomM catalog no longer strands you in it.**
+  Clicking a directory-backed entry (a decrypted PS3 game) left the RomM
+  toolbar sitting above ordinary directory contents, with no breadcrumbs and no
+  parent link — the only way back was to leave and reopen the whole view. It
+  now moves to the workspace, which is the screen that knows how to show a
+  folder.
+- **A slow answer from the RomM you just replaced no longer overwrites the new
+  one's status.** An unreachable URL is exactly the reason to change it, so
+  that request is the one most likely to still be in flight when you save — and
+  its late reply left the library reporting the new instance as unusable while
+  its catalog had already loaded.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

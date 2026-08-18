@@ -1470,6 +1470,25 @@ nobody can resolve pauses its rule or skips its platform, and a submitted path
 that does not answer is skipped — the same answer a path outside the volumes
 gets, which is what an unreachable one effectively is.
 
+The change and its cleanup **commit together or not at all**. They are two
+operations and either can be the one that survives a crash: cleanup-then-save
+leaves the old identity live with its history gone and its snapshots retired,
+while save-then-cleanup leaves the retry comparing the new values with
+themselves — concluding nothing moved, and leaving the previous instance's ids
+live against the new one forever. So `romm_settings.save(patch,
+cleanup_pending=True)` writes the marker in the *same row* as the new identity,
+`_run_identity_cleanup()` clears it only once the work is done, and
+`replay_identity_cleanup()` finishes an interrupted change at startup. Both
+halves of the cleanup are idempotent, so replaying costs nothing.
+
+The re-pin **plan** holds neither `_settle_lock` nor the sweep pause, and it
+reads the catalog and then writes rows carrying that catalog's provider ids.
+`romm_settings.identity_generation()` is read before and re-checked after: a
+change landing in that window means the ids belong to an instance nobody is
+pointed at, and the plan answers 409 rather than recording them. A batch
+converted without a snapshot needs a manual re-match, which is recoverable; a
+row holding another library's ids is not.
+
 Deciding *whether* the identity moved is itself bounded (`_identity_moved`),
 because it resolves both library roots and the old one is the unresponsive
 mount as often as not — that is why the operator is changing it. It runs
@@ -1683,6 +1702,15 @@ converter fail on a directory it cannot open.
 `get_job(id)` answers "unknown" for anything pruned or predating a restart.
 Any consumer that needs to know how a job *ended* — not whether it exists —
 therefore cannot ask later; it has to be told at the time.
+
+Ownership is registered the instant the queue accepts a batch (`_own_jobs`),
+before the first await after acceptance — the listener fires from the queue
+worker, so a fast conversion on an idle queue can end while the post-queue
+bookkeeping is still running. The *record* it writes into does not exist until
+a few awaits later, so a verdict arriving in between is stashed in
+`_late_verdicts` and applied by `_mark_converted`. Dropping it instead left the
+row with no verdict at all, after which the only evidence is the destination
+having changed — which a *failed* overwrite produces just as convincingly.
 
 **`job_manager.add_terminal_listener(callback)`** registers a callback for every
 job reaching `COMPLETED` / `FAILED` / `CANCELLED`. Delivery is **at least once**,

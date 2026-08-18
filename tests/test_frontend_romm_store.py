@@ -67,6 +67,7 @@ const __defer = () => new Promise((resolve, reject) => {
 const api = {
   getRommPlatforms: __defer,
   saveRommRules: __defer,
+  getRommStatus: __defer,
 };
 const fileBrowser = { rommPlatformId: null, exitRomm() {}, async enterRomm(id) {
   this.rommPlatformId = id;
@@ -305,3 +306,51 @@ def test_the_repin_badge_is_set_from_the_backend_count(tmp_path):
     assert data["afterRetry"] == 3, data
     assert data["afterSettle"] == 0, data
     assert data["afterUnknown"] == 0, data
+
+
+_STALE_STATUS = """
+const store = new RommStore();
+
+// The first status read is still waiting on the old, unreachable URL.
+const first = store.loadStatus();
+await tick();
+// The operator saves a new connection, which reads status again.
+const second = store.loadStatus();
+await tick();
+
+// The new instance answers first: reachable, library mounted.
+__calls[1].resolve({ configured: true, connected: true, library_root: '/new',
+                     library_root_mounted: true });
+await second;
+// ...and the old one answers afterwards, reporting the failure that made the
+// operator change it in the first place.
+__calls[0].resolve({ configured: true, connected: false, library_root: '/old',
+                     library_root_mounted: false, error: 'unreachable' });
+await first;
+await tick();
+
+process.stdout.write(JSON.stringify({
+  requests: __calls.length,
+  libraryRoot: store.status?.libraryRoot,
+  connected: store.status?.connected,
+  error: store.status?.error,
+  loading: store.statusLoading,
+}));
+"""
+
+
+def test_a_stale_status_answer_cannot_overwrite_the_new_connection(tmp_path):
+    """The read that is still waiting is asking the server being replaced.
+
+    A slow or unreachable URL is exactly why the operator is changing it, so
+    that request is the one most likely to be outstanding when the save runs.
+    Letting its answer land afterwards left the view reporting the new instance
+    as unusable while its platforms and catalog had already loaded.
+    """
+    data = _run(tmp_path, _STALE_STATUS)
+
+    assert data["requests"] == 2, data
+    assert data["libraryRoot"] == "/new", data
+    assert data["connected"] is True, data
+    assert data["error"] is None, data
+    assert data["loading"] is False, data

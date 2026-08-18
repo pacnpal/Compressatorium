@@ -6,6 +6,7 @@ import { api } from '$lib/api/endpoints.js';
 import { STORAGE_KEYS, readString, writeString } from '$lib/util/localStorage.js';
 import { jobs } from './jobs.svelte.js';
 import { conversion } from './conversion.svelte.js';
+import { ui } from './ui.svelte.js';
 
 const DEFAULT_PAGE_SIZE = 50;
 // Rows-per-page choices offered in the file list footer.
@@ -296,6 +297,13 @@ class FileBrowserStore {
       this.entries = [];
       this.entriesError = null;
       this._loadedPath = null;
+      // ...and leave the RomM screen with it. Dropping catalog mode while the
+      // view stays on `romm` left the platform toolbar sitting above unrelated
+      // directory entries, and that shell renders no breadcrumbs and no parent
+      // link — so a decrypted PS3 folder was a one-way trip, with no way back
+      // to the catalog short of leaving and reopening the whole view. The
+      // workspace is the screen that knows how to show a directory.
+      ui.navigate('workspace');
     }
     this.currentPath = path;
     this.currentArchivePath = null;

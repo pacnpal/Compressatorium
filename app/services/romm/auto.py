@@ -111,6 +111,11 @@ _sweep_lock = asyncio.Lock()
 # job queue it indexes is in memory too, so an entry has nothing to outlive.
 _job_owners: dict[str, tuple[str, str]] = {}
 
+# job id -> outcome, for a job that ended before its record was written. Drained
+# by `_mark_converted`; see there. Bounded by the same thing that bounds
+# `_job_owners`: one entry per queued conversion, removed when it is applied.
+_late_verdicts: dict[str, bool] = {}
+
 
 def _clamp(field: str, value: Any, default: int) -> int:
     try:
@@ -1203,6 +1208,15 @@ async def note_job_finished(job) -> None:
         state = await get_state()
         converted = ((state.get(platform_id) or {}).get("converted") or {})
         record = converted.get(rom_id)
+        if record is None and rom_id not in converted:
+            # Queued, but the record has not been persisted yet -- the owner is
+            # registered at acceptance and the record lands a few awaits later.
+            # Leave the answer for `_mark_converted` to pick up rather than
+            # dropping it: without it the row keeps no verdict, and after a
+            # restart the only evidence left is the destination having changed,
+            # which a *failed* overwrite produces just as convincingly.
+            _late_verdicts[job_id] = done
+            return
         # Re-checked rather than trusted: `forget_converted` may have cleared
         # the history since, and a re-planned conversion may have replaced the
         # record with one naming a different job.
@@ -1216,21 +1230,50 @@ async def note_job_finished(job) -> None:
         await preferences_store.put(STATE_KEY, state)
 
 
-async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
-    """Remember ``(rom_id, destination, pre_fingerprint, job_id)`` per queued ROM."""
-    entries = {
+def _own_jobs(platform_id: str, entries: dict) -> None:
+    """Register `note_job_finished`'s owner map for these queued conversions.
+
+    Called the instant `create_batch_jobs` returns, with no await in between,
+    because the listener fires from the queue worker: a fast conversion on an
+    idle queue can finish while the post-queue bookkeeping is still running,
+    and an outcome that arrives before its owner is registered is discarded.
+    The record then carries no verdict, and after a restart the only evidence
+    left is the destination having changed -- true of a *failed* overwrite too,
+    so the ROM is skipped by every later sweep until **Forget history**.
+
+    Entries are removed as their jobs finish; one that never reaches a terminal
+    status keeps a single small tuple, the same exposure the job itself already
+    has in the queue.
+    """
+    for rom_id, record in entries.items():
+        if record.get("job_id"):
+            _job_owners[str(record["job_id"])] = (str(platform_id), str(rom_id))
+
+
+def _converted_entries(produced: list[tuple]) -> dict:
+    """``{rom_id: record}`` for the conversions a sweep just queued."""
+    return {
         str(rid): {"path": dest, "pre": pre, "job_id": job_id}
         for rid, dest, pre, job_id in produced if rid is not None
     }
+
+
+async def _mark_converted(platform_id: str, entries: dict) -> None:
+    """Persist what this rule just produced, one record per queued ROM."""
     if not entries:
         return
-    # The index `note_job_finished` reads, written where the pairing is known.
-    # Entries are removed as their jobs finish; one that never reaches a
-    # terminal status keeps a single small tuple, which is the same exposure
-    # the job itself already has in the queue.
-    for rom_id, record in entries.items():
-        if record["job_id"]:
-            _job_owners[str(record["job_id"])] = (str(platform_id), rom_id)
+    # Idempotent: ownership is registered at acceptance, and re-registering the
+    # same pairing costs a dict write.
+    _own_jobs(platform_id, entries)
+    # Verdicts that arrived before this record existed. Ownership is registered
+    # the moment the queue accepts the batch, but the listener it feeds writes
+    # into a *record* that is not persisted until here -- so a fast conversion
+    # on an idle queue can end in between, find its owner, find no record, and
+    # have nothing to write to. It leaves the answer here instead.
+    for record in entries.values():
+        verdict = _late_verdicts.pop(str(record.get("job_id") or ""), None)
+        if verdict is not None:
+            record["done"] = verdict
     state = await get_state()
     entry = dict(state.get(str(platform_id)) or {})
     merged = dict(entry.get("converted") or {})
@@ -1680,6 +1723,19 @@ async def _sweep_locked(
                 summary["queued"] = len(jobs)
                 result["queued"] += len(jobs)
 
+                # Before the first await after acceptance. The terminal-job
+                # listener fires from the queue worker, so a fast conversion on
+                # an idle queue can end while the bookkeeping below is still
+                # running -- and an outcome announced before its owner is
+                # registered is discarded. See `_own_jobs`.
+                job_by_path = {j.file_path: j.id for j in jobs}
+                converted = _converted_entries([
+                    (rom_by_path[path].get("id"), destinations[path],
+                     pre_by_path[path], job_by_path.get(path))
+                    for path in batch
+                ])
+                _own_jobs(platform_id, converted)
+
                 # Only now, with the jobs actually queued: snapshot the RomM
                 # metadata for formats RomM cannot hash-match, or an automatic
                 # RVZ sweep destroys exactly the metadata the re-pin feature
@@ -1735,16 +1791,12 @@ async def _sweep_locked(
                 # `rename` stop here instead of reconverting the same sources
                 # every interval. Only after the queue accepted them.
                 if rule["duplicate_action"] != "skip":
-                    # Paired by source path, not by position: the record is
-                    # only meaningful if it names the job whose outcome decides
+                    # Paired by source path, not by position (see
+                    # `_converted_entries` above): the record is only
+                    # meaningful if it names the job whose outcome decides
                     # whether this ROM was really converted.
-                    job_by_path = {j.file_path: j.id for j in jobs}
                     try:
-                        await _mark_converted(platform_id, [
-                            (rom_by_path[path].get("id"), destinations[path],
-                             pre_by_path[path], job_by_path.get(path))
-                            for path in batch
-                        ])
+                        await _mark_converted(platform_id, converted)
                     except Exception:
                         # Isolated for the same reason as the re-pin write
                         # above, and this one is worse: the batch is already

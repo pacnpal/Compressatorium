@@ -48,6 +48,11 @@ SETTINGS_KEY = "romm.settings"
 # a credential, and the secret-scanners read the name.)
 CLEARED_KEY = "token_cleared"
 
+# Persisted alongside the settings: an identity change whose cleanup has not
+# been confirmed. Written in the same row as the new URL/library root so the
+# two commit together; see `cleanup_owed`.
+CLEANUP_KEY = "identity_cleanup_pending"
+
 # field -> (env var, default, kind). One table, so a new setting is one row and
 # every layer (env fallback, coercion, serialization) picks it up for free.
 _FIELDS: dict[str, tuple[str, Any, str]] = {
@@ -80,6 +85,11 @@ _INT_BOUNDS = {
 _cache: dict[str, Any] | None = None
 _token: str | None = None
 _token_cleared = False
+_cleanup_pending = False
+# Bumped by every save that moves the identity. Anything that reads the catalog
+# and then writes rows against it -- the re-pin plan -- carries this across its
+# awaits and refuses to write if it changed underneath. See `identity_generation`.
+_identity_generation = 0
 _lock = threading.Lock()
 # Serialises the read-modify-write in save(). Two concurrent saves would
 # otherwise each read the pre-patch row and the later put would drop the
@@ -144,7 +154,7 @@ def token() -> str | None:
 
 async def load(*, force: bool = False) -> dict[str, Any]:
     """Prime the cache from the store. Called once at startup."""
-    global _cache, _token, _token_cleared
+    global _cache, _token, _token_cleared, _cleanup_pending
     with _lock:
         if _cache is not None and not force:
             return dict(_cache)
@@ -156,16 +166,23 @@ async def load(*, force: bool = False) -> dict[str, Any]:
         _cache = merged
         _token = stored_token if stored_token else None
         _token_cleared = bool(row.get(CLEARED_KEY))
+        _cleanup_pending = bool(row.get(CLEANUP_KEY))
     return dict(merged)
 
 
-async def save(patch: dict[str, Any]) -> dict[str, Any]:
+async def save(
+    patch: dict[str, Any], *, cleanup_pending: bool = False,
+) -> dict[str, Any]:
     """Apply *patch* and persist it. Unknown keys are ignored.
 
     Only the fields present in *patch* change, so a form that edits one card
     cannot blank the settings another card owns.
+
+    *cleanup_pending* stamps the row with :data:`CLEANUP_KEY` in the *same*
+    write that installs the new identity, so the two cannot commit apart. See
+    :func:`cleanup_owed`.
     """
-    global _cache, _token, _token_cleared
+    global _cache, _token, _token_cleared, _cleanup_pending, _identity_generation
     # Read-modify-write, so it has to be one critical section: concurrent saves
     # of two different cards would otherwise each read the pre-patch row and the
     # later put would silently discard the earlier one.
@@ -190,13 +207,76 @@ async def save(patch: dict[str, Any]) -> dict[str, Any]:
         # form that cannot display the secret does not blank it just by being
         # submitted.
 
+        if cleanup_pending:
+            stored[CLEANUP_KEY] = True
+
         await preferences_store.put(SETTINGS_KEY, stored)
         merged = _merge(stored)
         with _lock:
             _cache = merged
             _token = stored.get("token") or None
             _token_cleared = bool(stored.get(CLEARED_KEY))
+            _cleanup_pending = bool(stored.get(CLEANUP_KEY))
+            if cleanup_pending:
+                # Only an identity move asks for cleanup, so this is the one
+                # signal that says "anything holding the old catalog is stale".
+                _identity_generation += 1
         return dict(merged)
+
+
+def identity_generation() -> int:
+    """A counter that changes whenever the RomM instance or library root does.
+
+    The settings route serialises against sweeps and the settle pass, but a
+    manual re-pin plan holds neither lock -- and it reads the catalog, then
+    writes rows carrying that catalog's provider ids, with awaits in between.
+    A change landing in that window retires the existing rows and installs the
+    new identity, and the plan then inserts old ids into a fresh row that the
+    cleanup never saw. Reading this before and after is what lets the plan
+    notice and refuse.
+    """
+    with _lock:
+        return _identity_generation
+
+
+def cleanup_owed() -> bool:
+    """Is a post-identity-change cleanup still outstanding?
+
+    The conversion history and the pending re-pin rows belong to whichever RomM
+    and library they were recorded against, so a change of either has to clear
+    them. Save and cleanup are two operations, and either can be the one that
+    survives a crash:
+
+    * cleanup first, then a failed save -> the old identity stays in force with
+      its history gone and its snapshots retired, unrecoverably;
+    * save first, then a failed cleanup -> the retry compares the new values
+      with themselves, concludes nothing moved, and leaves the previous
+      instance's ids live against the new one, forever.
+
+    So the marker is written in the same row as the new identity, and only
+    cleared once the cleanup has actually run. Whichever half is interrupted,
+    the marker is what makes the other half replay -- and both halves are
+    idempotent, so replaying costs nothing.
+    """
+    with _lock:
+        if _cache is not None:
+            return bool(_cleanup_pending)
+    return False
+
+
+async def clear_cleanup_owed() -> None:
+    """Record that the cleanup this identity change owed has been done."""
+    global _cleanup_pending
+    async with _save_lock:
+        stored = await preferences_store.get(SETTINGS_KEY)
+        stored = dict(stored) if isinstance(stored, dict) else {}
+        if stored.pop(CLEANUP_KEY, None) is None:
+            with _lock:
+                _cleanup_pending = False
+            return
+        await preferences_store.put(SETTINGS_KEY, stored)
+        with _lock:
+            _cleanup_pending = False
 
 
 def public(values: dict[str, Any] | None = None) -> dict[str, Any]:
