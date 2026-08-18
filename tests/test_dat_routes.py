@@ -1288,7 +1288,7 @@ async def test_run_match_job_reports_errors_in_final_message(
         ({"path": "/c", "matched": False, "error": "boom"}, False),
     ]
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return hash_outcomes.pop(0)
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1317,7 +1317,7 @@ async def test_run_match_job_marks_failure_when_all_files_error(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def always_error(path, *, cancel_event=None):
+    async def always_error(path, *, cancel_event=None, local_only=False):
         return {"path": path, "matched": False, "error": "mount offline"}, False
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", always_error)
@@ -1350,7 +1350,7 @@ async def test_run_match_job_names_hasheous_instead_of_blaming_the_volume(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def remote_down(path, *, cancel_event=None):
+    async def remote_down(path, *, cancel_event=None, local_only=False):
         return (
             {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR},
             False,
@@ -1385,7 +1385,7 @@ async def test_run_match_job_mixed_errors_still_blame_the_volume(
 
     seen = []
 
-    async def mixed(path, *, cancel_event=None):
+    async def mixed(path, *, cancel_event=None, local_only=False):
         seen.append(path)
         error = dat_routes.HASHEOUS_ERROR if len(seen) == 1 else "mount offline"
         return {"path": path, "matched": False, "error": error}, False
@@ -1422,7 +1422,7 @@ async def test_run_match_job_outer_exception_includes_counter_context(
     # update_external_job raises, tripping the outer except.
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 1:
@@ -1479,7 +1479,7 @@ async def test_run_match_job_skip_count_does_not_trip_failure(
         ({"path": "/c", "matched": False}, False),  # non-regular file shape
     ]
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return hash_outcomes.pop(0)
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1508,7 +1508,7 @@ async def test_run_match_job_cache_write_failure_counts_as_error(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         return {"path": path, "matched": True}, True
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", fake_hash_one)
@@ -1547,7 +1547,7 @@ async def test_run_match_job_cancellation_ends_in_cancelled_status(
     # cancel-check at the top of the loop then fires ExternalJobCancelled.
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 2:
@@ -1585,7 +1585,7 @@ async def test_run_match_job_cancellation_keeps_partial_cache(
 
     hash_calls = 0
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         nonlocal hash_calls
         hash_calls += 1
         if hash_calls == 2:
@@ -1620,7 +1620,7 @@ async def test_run_match_job_cancel_on_last_file_ends_cancelled(
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         # Simulate an aborted cancellable hook on the only path: cancel is
         # requested during the call and a non-cacheable error is returned.
         await job_manager.cancel_job(scan_job.id)
@@ -1676,7 +1676,7 @@ async def test_hash_one_for_job_logs_match_error_with_traceback(
     iso = tmp_path / "a.iso"
     iso.write_bytes(b"x")
 
-    async def raise_keyerror(_path, *, cancel_event=None):
+    async def raise_keyerror(_path, *, cancel_event=None, local_only=False):
         raise KeyError("missing_column")
 
     monkeypatch.setattr(dat_routes, "_match_single_file", raise_keyerror)

@@ -2681,7 +2681,7 @@ async def test_one_skipped_file_cannot_hide_a_total_outage(monkeypatch):
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def _outage_plus_one_skip(path, *, cancel_event=None):
+    async def _outage_plus_one_skip(path, *, cancel_event=None, local_only=False):
         if path == "/big.iso":
             # A policy skip: over the size cap, no error, nothing cacheable.
             return {"path": path, "matched": False, "reason": "too large"}, False
@@ -2722,7 +2722,7 @@ async def test_a_skip_alone_is_still_a_completed_job(monkeypatch):
     )
     monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
 
-    async def _all_skips(path, *, cancel_event=None):
+    async def _all_skips(path, *, cancel_event=None, local_only=False):
         return {"path": path, "matched": False, "reason": "too large"}, False
 
     monkeypatch.setattr(dat_routes, "_hash_one_for_job", _all_skips)
@@ -2984,3 +2984,216 @@ async def test_an_import_leaves_its_surviving_hit_where_the_rematch_looks(tmp_pa
     assert store.list_match_paths() == [path], (
         "the surviving remote hit is not visible to the post-import listing"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thirtieth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_dat_change_does_not_re_ask_hasheous_about_every_file(
+    hasheous_on, monkeypatch,
+):
+    """The rematch is local-only, and this is the claim the whole cost story rests on.
+
+    A DAT change alters the local index and nothing else. Re-running the full
+    pipeline meant every previously-verdicted file went back out to Hasheous --
+    thousands of hash disclosures per MAMERedump sync, for answers that cannot
+    differ from the ones already cached.
+    """
+    header, container = "a" * 40, "c" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = False
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=container),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+
+    sent = []
+
+    async def _remote(sha1):
+        sent.append(sha1)
+        return None
+
+    monkeypatch.setattr(hasheous, "lookup", _remote)
+
+    result = await dat_routes._match_single_file("/vol/game.chd", local_only=True)
+
+    assert sent == [], "a local-only rematch still disclosed hashes to Hasheous"
+    assert result["matched"] is False
+    assert result.get("checked_remote") is None, (
+        "an unasked pass must not be stamped as a completed remote check"
+    )
+
+    # The control: the same file, ordinary mode, does consult it.
+    sent.clear()
+    await dat_routes._match_single_file("/vol/game.chd")
+    assert sent == [header, container]
+
+
+@pytest.mark.asyncio
+async def test_a_local_only_miss_cannot_erase_the_badge_it_could_not_check(tmp_path):
+    """...and the file keeps the identity the rematch had no way to re-derive.
+
+    An unstamped miss is exactly what _would_downgrade_remote_hit() refuses to
+    write over a remote hit, so "don't ask again" costs nothing: the row that
+    the new DATs still don't cover simply stays.
+    """
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Remote Name",
+        "match_type": "chd_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    # What a local-only rematch produces when the new DATs still miss.
+    await store.set_match(path, {"path": path, "matched": False, "checked_remote": None})
+
+    cached = store.get_match(path)
+    assert cached is not None and cached["matched"] is True, (
+        "the local-only rematch erased a hit it never re-checked"
+    )
+    assert cached["game_name"] == "Remote Name"
+
+
+@pytest.mark.asyncio
+async def test_the_rematch_asks_for_a_local_only_job(monkeypatch):
+    """The flag has to reach the scheduler, not just exist on the job."""
+    seen: list[dict] = []
+
+    async def _schedule(paths, **kwargs):
+        seen.append(kwargs)
+        return "job-1"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+    monkeypatch.setattr(dat_routes.dat_store, "list_match_paths", lambda: [])
+
+    await dat_routes.rematch_after_dat_change(["/vol/a.chd"], source="import_dat")
+
+    assert seen == [{"defer_if_busy": True, "local_only": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_dat_import_mid_lookup_stops_the_next_candidate_going_out(
+    hasheous_on, monkeypatch,
+):
+    """Local-first is about disclosure, not only about the verdict.
+
+    The complete local pass sat after the whole remote loop, so a DAT import
+    landing during candidate 1's request could not stop candidate 2 being sent
+    -- the recheck ran once the hash was already gone.
+    """
+    header, data = "a" * 40, "b" * 40
+    imported: dict[str, dict | None] = {}
+
+    async def _local(hash_value):
+        return imported.get(hash_value)
+
+    sent = []
+
+    async def _remote(hash_value):
+        sent.append(hash_value)
+        # The import lands during the first request and covers the second
+        # candidate -- the one about to go out.
+        imported[data] = {
+            "dat_id": "dat1", "dat_name": "Local.dat", "game_name": "Local Name",
+            "rom_name": "local.bin", "source": "dat",
+        }
+        return None
+
+    monkeypatch.setattr(dat_routes, "_local_dat_record", _local)
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+
+    match, consulted = await dat_routes._remote_lookup_match(
+        "/vol/game.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+    )
+
+    assert sent == [header], "the second candidate was disclosed after the DAT landed"
+    assert match is not None and match["game_name"] == "Local Name"
+    assert consulted, "the first hash did go out; the stamp must say so"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_job_does_not_start_the_rematch_it_was_holding(monkeypatch):
+    """"Stop everything" has to mean it.
+
+    The deferred drain ran from the cancelled job's own teardown, and
+    /jobs/cancel-all snapshots the job list before that replacement exists --
+    so the rematch escaped the cancellation and kept hashing.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", {"/vol/queued.chd"})
+
+    started: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        started.append(list(paths))
+        return "job-2"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+
+    async def _cancelled(path, *, cancel_event=None, local_only=False):
+        raise dat_routes.ExternalJobCancelled()
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _cancelled)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/vol/a.chd"],
+    )
+
+    assert job_manager.jobs[scan_job.id].status.value == "cancelled"
+    assert started == [], "a cancelled job spawned the rematch it was holding"
+    assert not dat_routes._deferred_rematch_paths, (
+        "the dropped queue must not linger for an unrelated job to pick up"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_completed_job_still_hands_over_its_deferred_rematch(monkeypatch):
+    """...but only cancellation drops it. A normal finish still drains."""
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", {"/vol/queued.chd"})
+
+    started: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        started.append(list(paths))
+        return "job-2"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+
+    async def _ok(path, *, cancel_event=None, local_only=False):
+        return {"path": path, "matched": False}, True
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _ok)
+    monkeypatch.setattr(dat_routes.dat_store, "set_match", AsyncMock())
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/vol/a.chd"],
+    )
+
+    assert started == [["/vol/queued.chd"]]

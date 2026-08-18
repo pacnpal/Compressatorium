@@ -628,6 +628,33 @@ def _filter_paths_within_volumes(paths: list[str]) -> tuple[list[str], int]:
 _deferred_rematch_paths: set[str] = set()
 
 
+def _discard_deferred_rematch(job_id: str) -> None:
+    """Drop the queued rematch because the job it was waiting behind was cancelled.
+
+    "Stop everything" has to mean it. Draining here started a *replacement*
+    job from inside the cancelled job's own teardown, and ``/jobs/cancel-all``
+    snapshots the job list before that replacement exists -- so the rematch
+    escaped the cancellation entirely and carried on hashing moments after the
+    operator asked for silence.
+
+    Dropped rather than left queued: nothing but a finishing job drains the
+    set, so keeping the paths would mean holding them until some unrelated
+    match job happened to end. Logged at INFO because it is a real loss of
+    scheduled work -- those files keep their previous verdicts until they are
+    browsed or a rescan runs, which is the ordinary lazy path.
+    """
+    global _deferred_rematch_paths  # noqa: PLW0603, intentional module-level state
+    if not _deferred_rematch_paths:
+        return
+    dropped = len(_deferred_rematch_paths)
+    _deferred_rematch_paths = set()
+    logger.info(
+        "match job %s was cancelled; dropped the deferred rematch of %d file(s)"
+        " -- they keep their current verdicts until browsed or rescanned",
+        job_id, dropped,
+    )
+
+
 async def _drain_deferred_rematch() -> None:
     """Start the rematch a DAT change had to defer, now that the slot is free.
 
@@ -641,7 +668,9 @@ async def _drain_deferred_rematch() -> None:
         return
     paths, _deferred_rematch_paths = sorted(_deferred_rematch_paths), set()
     try:
-        job_id = await schedule_match_job(paths, defer_if_busy=True)
+        job_id = await schedule_match_job(
+            paths, defer_if_busy=True, local_only=True,
+        )
     except Exception:
         logger.exception(
             "failed to start the deferred rematch for %d file(s)", len(paths),
@@ -703,6 +732,24 @@ async def rematch_after_dat_change(
     change are added here (see :func:`_paths_needing_rematch`), which is why an
     empty snapshot is still worth calling with.
 
+    **Local-only.** The job runs the local pass and stops there. What changed
+    is the local index; the remote source is exactly as it was, so re-asking it
+    once per previously-verdicted file cannot produce an answer that differs
+    from the cached one -- it only discloses every hash again, thousands of
+    them per MAMERedump sync, on a schedule the operator did not choose. The
+    outcomes fall out of guards that already exist:
+
+    * the new DATs cover the file -> local hit, written, and the badge upgrades
+      from HASH to DAT. This is the entire point of the rematch.
+    * they still don't -> an *unstamped* miss, which
+      ``dat_store._would_downgrade_remote_hit`` refuses to write over a remote
+      hit. The badge stays.
+    * the file had a remote-checked *miss* -> that row was dropped by the
+      invalidation, so the unstamped miss replaces it and
+      ``cached_result_usable()`` finds no stamp, which re-checks it remotely
+      the next time it is browsed. Lazy, one file at a time, on the operator's
+      navigation rather than in a burst.
+
     Never raises: the DAT is already committed by the time this runs, so a
     scheduling failure must not turn a good import into an error.
     """
@@ -710,7 +757,14 @@ async def rematch_after_dat_change(
     if not paths:
         return "none", None
     try:
-        job_id = await schedule_match_job(paths, defer_if_busy=True)
+        # local_only: a DAT change tells us nothing new about the remote
+        # source, so re-asking it for every previously-verdicted file is pure
+        # cost -- thousands of hash disclosures and requests per sync, for
+        # answers that cannot differ from the ones already cached. See the
+        # docstring.
+        job_id = await schedule_match_job(
+            paths, defer_if_busy=True, local_only=True,
+        )
     except Exception:
         logger.exception(
             "%s: failed to schedule a rematch for %d file(s); the DAT is "
@@ -737,6 +791,7 @@ async def schedule_match_job(
     *,
     background_tasks: BackgroundTasks | None = None,
     defer_if_busy: bool = False,
+    local_only: bool = False,
 ) -> str | None:
     """Start a background DAT-match job for *paths*.
 
@@ -799,7 +854,10 @@ async def schedule_match_job(
     try:
         if background_tasks is not None:
             background_tasks.add_task(
-                _run_match_job, job_id=scan_job.id, paths_to_compute=allowed,
+                _run_match_job,
+                job_id=scan_job.id,
+                paths_to_compute=allowed,
+                local_only=local_only,
             )
         else:
             # Invariant: _background_match_tasks holds at most one task
@@ -813,7 +871,11 @@ async def schedule_match_job(
                     len(_background_match_tasks),
                 )
             task = asyncio.create_task(
-                _run_match_job(job_id=scan_job.id, paths_to_compute=allowed),
+                _run_match_job(
+                    job_id=scan_job.id,
+                    paths_to_compute=allowed,
+                    local_only=local_only,
+                ),
             )
             _background_match_tasks.add(task)
             task.add_done_callback(_background_match_tasks.discard)
@@ -844,7 +906,10 @@ async def schedule_match_job(
 
 
 async def _hash_one_for_job(
-    normalized_path: str, *, cancel_event: asyncio.Event | None = None,
+    normalized_path: str,
+    *,
+    cancel_event: asyncio.Event | None = None,
+    local_only: bool = False,
 ) -> tuple[dict, bool]:
     """Compute a match result for one path inside the background job loop.
 
@@ -870,7 +935,9 @@ async def _hash_one_for_job(
         return {"path": normalized_path, "matched": False}, False
 
     try:
-        result = await _match_single_file(normalized_path, cancel_event=cancel_event)
+        result = await _match_single_file(
+            normalized_path, cancel_event=cancel_event, local_only=local_only,
+        )
     except Exception as exc:  # pragma: no cover, isolated per-path
         # logger.exception rather than logger.warning: a KeyError /
         # AttributeError from a refactor bug should surface with a full
@@ -887,8 +954,13 @@ async def _run_match_job(
     *,
     job_id: str,
     paths_to_compute: list[str],
+    local_only: bool = False,
 ) -> None:
-    """Background task: hash paths serially, cache results, tick progress."""
+    """Background task: hash paths serially, cache results, tick progress.
+
+    ``local_only`` suppresses the remote pass for every path -- see
+    :func:`rematch_after_dat_change`, the only caller that sets it.
+    """
     global _active_match_job_id
 
     start = time.monotonic()
@@ -933,7 +1005,9 @@ async def _run_match_job(
 
             with collect_abandonment() as abandoned:
                 result, cacheable = await _hash_one_for_job(
-                    normalized_path, cancel_event=cancel_event,
+                    normalized_path,
+                    cancel_event=cancel_event,
+                    local_only=local_only,
                 )
             # Before `set_match` and the counters, for the same reason as the
             # batch route: an abandoned helper's result is an ordinary unmatched
@@ -1044,7 +1118,15 @@ async def _run_match_job(
         async with _get_match_job_lock():
             if _active_match_job_id == job_id:
                 _active_match_job_id = None
-        await _drain_deferred_rematch()
+        # A cancelled job must not hand its queue to a successor: see
+        # _discard_deferred_rematch. `job_success is None` is set only by the
+        # ExternalJobCancelled branch, so it is the cancellation signal here --
+        # job_manager.is_cancelled() is not, since a cancelled job can be
+        # reaped from the registry before this runs.
+        if job_success is None:
+            _discard_deferred_rematch(job_id)
+        else:
+            await _drain_deferred_rematch()
         elapsed = time.monotonic() - start
         if job_success is None:
             parts = [f"{processed}/{total} processed, {hashed} hashed, {matched} matched"]
@@ -1275,6 +1357,20 @@ async def _remote_lookup_match(
             # candidate hashes -- disclosing them after the operator asked it
             # to stop, and paying a full timeout each on the way out.
             return None, None
+        if consulted:
+            # Between requests, not only after the last one. Each lookup is an
+            # await of seconds and a DAT import commits in its own
+            # transaction, so by the time candidate 2 goes out the local index
+            # may already identify it -- and disclosing a hash the local DATs
+            # can answer is precisely what local-first exists to prevent. The
+            # post-loop pass cannot help: it runs after the disclosure.
+            #
+            # Over the whole set rather than just this candidate: an import
+            # covering an *earlier* one means a local identity exists now, and
+            # returning it beats sending anything at all.
+            local = await _local_lookup_match(file_path, candidates)
+            if local is not None:
+                return local, hasheous.base_url()
         consulted = True
         # ponytail: unbounded concurrency. Each call is bounded by
         # hasheous_timeout, the bulk match job is already single-flight, and
@@ -1295,8 +1391,12 @@ async def _remote_lookup_match(
     # Over the whole set, not just the hash that hit: a CHD sends up to three,
     # and the DAT that landed mid-flight may know a *later* one. Checking only
     # the candidate that happened to match remotely left that case open, and
-    # the all-missed path had no re-check at all. Placed here, after the loop,
-    # it is one pass covering both exits instead of a check per await.
+    # the all-missed path had no re-check at all.
+    #
+    # This one covers the *final* await. The in-loop pass above covers each
+    # earlier one -- and has to, because a pass that runs only after the loop
+    # protects the verdict but not the disclosure: by then the hash the new
+    # DAT could have answered has already gone out.
     local = await _local_lookup_match(file_path, candidates)
     if local is not None:
         return local, (hasheous.base_url() if consulted else None)
@@ -1394,7 +1494,10 @@ async def drop_if_content_changed(path: str, result: dict) -> None:
 
 
 async def _match_single_file(
-    file_path: str, *, cancel_event: asyncio.Event | None = None,
+    file_path: str,
+    *,
+    cancel_event: asyncio.Event | None = None,
+    local_only: bool = False,
 ) -> dict:
     """Match a file against all imported DATs.
 
@@ -1504,6 +1607,14 @@ async def _match_single_file(
         local = await _local_lookup_match(file_path, candidates)
         if local:
             return local
+        if local_only:
+            # A DAT change says nothing about the remote source, so the
+            # recompute it triggers must not pay a request for it. Returning
+            # the unstamped miss is deliberate and load-bearing: with no
+            # ``checked_remote`` the store's _would_downgrade_remote_hit()
+            # refuses to overwrite an existing remote hit, so a file the new
+            # DATs still don't cover simply keeps the badge it had.
+            return size_capped if size_capped is not None else base_result
         try:
             remote, consulted = await _remote_lookup_match(
                 file_path, candidates, cancel_event=cancel_event,

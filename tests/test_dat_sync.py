@@ -550,7 +550,9 @@ async def test_do_sync_schedules_rematch_after_success(sync_service, tmp_path):
         result = await sync_service.sync(tag="0.285")
 
     assert result["status"] == "complete"
-    mock_schedule.assert_awaited_once_with(snapshot, defer_if_busy=True)
+    mock_schedule.assert_awaited_once_with(
+        snapshot, defer_if_busy=True, local_only=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -626,7 +628,9 @@ async def test_do_sync_rematches_a_hit_persisted_during_the_sync(sync_service, t
         result = await sync_service.sync(tag="0.285")
 
     assert result["status"] == "complete"
-    mock_schedule.assert_awaited_once_with(["/data/late.chd"], defer_if_busy=True)
+    mock_schedule.assert_awaited_once_with(
+        ["/data/late.chd"], defer_if_busy=True, local_only=True,
+    )
     assert result["rematch_status"] == "scheduled"
 
 

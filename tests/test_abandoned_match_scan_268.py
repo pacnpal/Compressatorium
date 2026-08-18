@@ -289,7 +289,7 @@ async def test_match_job_fails_instead_of_working_through_the_list(
 
     calls = []
 
-    async def fake_hash_one(path, *, cancel_event=None):
+    async def fake_hash_one(path, *, cancel_event=None, local_only=False):
         calls.append(path)
         _note()
         return {"path": path, "matched": False}, False

@@ -253,6 +253,13 @@ class DATMatchingStore {
     // navigated or reloaded. (The gate itself has to stay below the hydrate:
     // cached hits must load even when matching is unavailable.)
     const canMatch = this.matchingAvailable;
+    // A pending retry belongs to the set it was armed with. _scheduleRetry()
+    // retargets when it runs again, but the branch that starts a job never
+    // reaches it -- so navigating from a folder whose lookups failed to one
+    // with work to do left the old timer running, and it later hydrated (and
+    // could start a remote match job for) files nobody is looking at any more.
+    // Retiring it here covers every entry, not just the one that re-arms.
+    if (!fromRetry) this._cancelRetryUnless(paths);
     await this.hydrate(paths);
     if (!canMatch) return;
     // Drop paths the backend attempted recently: if they came back uncached
@@ -359,6 +366,34 @@ class DATMatchingStore {
       this._retryPaths = null;
       this.hydrateAndMatch(paths, { fromRetry: true }).catch(() => {});
     }, ATTEMPT_RETRY_MS);
+  }
+
+  /**
+   * Retire a pending retry that was armed for some other set of paths.
+   *
+   * `paths` is the set now on screen; a timer holding exactly that set is
+   * still wanted and survives. Anything else is stale.
+   */
+  _cancelRetryUnless(paths) {
+    if (!this._retryTimer) return;
+    if (this._samePaths(paths, this._retryPaths)) return;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+    this._retryPaths = null;
+    // The budget belongs to the set that just went away, not to this one.
+    this._autoRetries = 0;
+  }
+
+  /**
+   * Drop any pending retry outright. Called when the file list goes away:
+   * nothing is visible, so a timer that fires would hydrate and potentially
+   * hash for a view that no longer exists.
+   */
+  cancelRetry() {
+    if (!this._retryTimer) return;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+    this._retryPaths = null;
   }
 
   _samePaths(a, b) {

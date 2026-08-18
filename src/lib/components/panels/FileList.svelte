@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { fileBrowser } from '$lib/stores/fileBrowser.svelte.js';
   import { jobs } from '$lib/stores/jobs.svelte.js';
   import { ui } from '$lib/stores/ui.svelte.js';
@@ -227,6 +228,14 @@
       }
     }
   });
+
+  // The retry timer is store-level, so it outlives this component. With the
+  // list gone there is nothing visible for it to re-check, and letting it fire
+  // would hydrate -- and possibly start a match job for -- a view the user has
+  // left. onDestroy rather than an $effect teardown on purpose: the effect
+  // re-runs on every page/sort/filter change, and cancelling there would kill
+  // legitimate retries for the set still on screen.
+  onDestroy(() => datMatching.cancelRetry());
 
   function openBulkVerify() {
     // Forward only filesystem paths; the verify-batch endpoint

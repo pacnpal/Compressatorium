@@ -1337,12 +1337,14 @@ This is a payload field, not a schema change.
   `coalesce` is load-bearing there: SQL `NULL` is not `False`, so a payload with
   no `source` must compare unequal rather than unknown, or the negation spares
   exactly the rows it is meant to drop.
-- **Local-first holds across the whole call.** The remote request is an await of
-  its own, and a DAT import commits in its own transaction, so
-  `_remote_lookup_match` re-checks the local index once more before *accepting*
-  a remote hit. Without it an import landing inside that window left the remote
-  answer authoritative for good, since a cached hit is served unconditionally
-  afterwards. One indexed lookup, and only on a hit.
+- **Local-first holds across the whole call — for the disclosure, not only the
+  verdict.** The remote request is an await of its own, and a DAT import commits
+  in its own transaction, so `_remote_lookup_match` re-checks the local index
+  *between* candidate requests as well as once more after the loop. The post-loop
+  pass alone was not enough: it protects the answer, but by the time it runs the
+  hash the newly-imported DAT could have identified has already gone out. A CHD
+  sends up to three, so that is up to two avoidable disclosures per file. Each
+  check is over the whole candidate set, and each is one indexed lookup.
 - **Concurrent DAT imports have a boundary, and it is the transaction.** A match
   runs local-first, but the decision and the write are separate operations, so
   three windows exist between them: the file hash (seconds), the remote request
@@ -1382,6 +1384,17 @@ This is a payload field, not a schema change.
   a DAT badge would do: same game, self-correcting on the next rescan. Closing it
   write-side means serialising matches against imports, i.e. holding a lock
   across a network call.
+- **A cancelled match job does not hand its queue to a successor.** The
+  deferred-rematch drain lives in `_run_match_job`'s `finally`, which a
+  cancellation reaches like any other exit — so the cancelled job started a
+  *replacement* job on its way out. `/jobs/cancel-all` snapshots the job list
+  before that replacement exists, so the rematch escaped the cancellation
+  entirely and went on hashing moments after the operator asked for silence.
+  Cancellation now discards the queue instead (`_discard_deferred_rematch`),
+  logged rather than silent: those files keep their current verdicts until they
+  are browsed or a rescan runs. Dropped rather than left queued because nothing
+  but a finishing job drains the set, so holding them would mean waiting on an
+  unrelated job that may never come.
 - **A match job fails on its *checkable* files, not its total.** Policy skips
   (over `MATCH_MAX_FILE_SIZE`, not a regular file) are files the job
   deliberately did not check, so they are excluded from the all-failed
@@ -1412,6 +1425,29 @@ This is a payload field, not a schema change.
   rather than wrong. This is why the sync calls the hook unconditionally now:
   an empty snapshot is exactly the case where the surviving row is the *only*
   thing to rematch, and the old `if previous_match_paths:` guard skipped it.
+
+  **The rematch job is local-only** (`schedule_match_job(..., local_only=True)`,
+  threaded down to `_match_single_file`). What a DAT change alters is the local
+  index; the remote source is exactly as it was, so re-asking it once per
+  previously-verdicted file cannot yield an answer different from the cached
+  one — it only re-discloses every hash, thousands per MAMERedump sync, on a
+  schedule the operator never chose. This was the single largest disclosure
+  path in the feature and it was unintended: `_hash_one_for_job()` calls
+  `_match_single_file()` with no cache consult, so *every* rematched path ran
+  the full local-then-remote pipeline. The three outcomes fall out of guards
+  that already existed:
+
+  | after the change | result |
+  |---|---|
+  | new DATs cover the file | local hit written, badge upgrades HASH → DAT |
+  | they don't, row was a remote hit | unstamped miss, which `_would_downgrade_remote_hit()` refuses to write — badge stays |
+  | they don't, row was a remote-checked miss | that row was dropped by invalidation, so the unstamped miss replaces it and `cached_result_usable()` finds no stamp — re-checked remotely when the file is next browsed |
+
+  The third row is the residual: a previously-unmatched file *is* re-disclosed,
+  but lazily, one file at a time, on the operator's navigation rather than in a
+  burst at sync time. Closing it too means keeping remote-checked misses across
+  an invalidation, which would serve a stale negative for any file the new DAT
+  does cover — the trade the invalidation exists to avoid.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

@@ -267,6 +267,18 @@ cost per file rather than a per-browse one. If you have a large uncached library
 run the background library scan once and let it prime the cache rather than
 browsing folder by folder.
 
+**Importing a DAT, or syncing MAMERedump, does not re-send anything.** The
+re-match those trigger runs against your local DATs only. A file the new DATs
+now identify has its badge upgraded from **HASH** to **DAT**; a file they still
+don't cover keeps the badge it already had. Nothing goes back out over the
+network, so a sync costs zero requests no matter how large your library is.
+
+The one exception is a file that was previously recorded as *no match anywhere*.
+Those verdicts are dropped by the import (a new DAT can turn a miss into a hit),
+so the next time you browse such a file it is re-checked — locally first, then
+remotely if the local DATs still don't know it. That is one request at the
+moment you look at the file, not a burst of thousands at sync time.
+
 #### What it deliberately does not do
 
 - **No cover art or descriptions.** Hasheous proxies IGDB, TheGamesDB, GiantBomb

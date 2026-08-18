@@ -85,6 +85,40 @@
   removed, and nothing ever re-checked it. Whether a match came from Hasheous
   is now recorded on the row rather than guessed from a null key.
 
+- **Importing a DAT or syncing MAMERedump no longer sends every hash to
+  Hasheous again.** The re-match those trigger existed to recompute verdicts
+  against the new DATs, but it re-ran the whole pipeline — so every file that
+  had ever been identified remotely, plus every file previously recorded as
+  unmatched, went back out over the network. On a large library that was
+  thousands of hash disclosures and requests per sync, for answers that could
+  not differ from the ones already cached. The re-match is now local-only: a
+  file the new DATs identify has its badge upgraded from **HASH** to **DAT**,
+  and a file they still don't cover keeps the badge it already had. Files
+  previously recorded as "no match anywhere" are still re-checked, but lazily —
+  one request when you next browse that file, not a burst at sync time.
+
+- **A hash the local DATs can identify is no longer sent while a lookup is
+  already running.** For a file offering several hashes (a CHD sends up to
+  three), the local re-check happened only after the whole remote pass, so a DAT
+  import landing during the first request could not stop the second hash going
+  out — the check ran once it had already been disclosed. Local DATs are now
+  re-consulted between requests as well.
+
+- **Cancelling a match job no longer starts another one.** If a DAT import or
+  sync had queued a re-match behind the running job, cancelling it kicked that
+  re-match off from the cancelled job's own teardown — and because **Cancel
+  all** takes its list of jobs before the replacement exists, the new job
+  escaped the cancellation and carried on hashing. Cancelling now drops the
+  queued re-match and says so in the log; those files keep their current
+  verdicts until you browse them or run a rescan.
+
+- **A retry armed for one folder no longer follows you to another.** When a
+  Hasheous lookup failed, the badge retry was scheduled for the folder you were
+  looking at — but navigating elsewhere left it running, so it could later
+  wake up and start hashing files that were no longer on screen. It is now
+  retired as soon as you move on, and cancelled outright when the file list
+  closes.
+
 - **A match recorded *while* a DAT import was running is no longer left out of
   the follow-up re-match.** The re-match works from a snapshot taken just
   before the import, so a file identified through Hasheous in the moments
