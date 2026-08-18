@@ -1179,7 +1179,7 @@ gone, or changed) it returns `None`, and the caller falls back to a file-level S
 is valid for any DAT that indexes the container bytes. New cache/tool code that needs
 freshness-gated metadata must call this rather than reintroducing the two-read pattern.
 
-### 3.3.5.1 Remote hash fallback (`services/hasheous.py`)
+### 3.3.5.1 Remote hash fallback (`services/hasheous/`)
 
 Hash matching has two sources, and the ordering between them lives in
 `routes.dat._lookup_match`, which runs `_local_lookup_match` and only then
@@ -1368,6 +1368,17 @@ This is a payload field, not a schema change.
   library genuinely in no DAT. The scan is *not* reported as failed: phases 1
   and 2 succeeded and metadata was collected, so the honest signal is a
   qualified success, not a flipped boolean.
+
+`services/hasheous/` is a two-module package: `__init__.py` is the client (the
+toggle, the cooldown, `_fetch_json`, `lookup`, `health`, normalization) and
+`transport.py` is the deadline-aware HTTPS stack described above. They are
+split because the transport is a self-contained concern with its own failure
+modes, and because the four phases it now covers were each found a review round
+apart and patched separately before being made one mechanism. The package
+re-exports the transport names, so `from services import hasheous` still
+reaches the whole surface and `_fetch_json` remains the single patch seam —
+important, because a second module object here is exactly how a test suite ends
+up silently hitting the real network.
 
 The client is stdlib-only (`urllib.request`), mirroring `services/dat_sync.py`:
 `_require_https`, an explicit `User-Agent`, a hard timeout, a response size cap,
