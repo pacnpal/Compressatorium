@@ -153,7 +153,7 @@ class DATMatchingStore {
    * navigation is cheap. Skipped when no DATs are imported, the
    * match job would just no-op.
    */
-  async hydrateAndMatch(paths) {
+  async hydrateAndMatch(paths, { fromRetry = false } = {}) {
     if (!paths?.length) return;
     await this.hydrate(paths);
     if (!this.matchingAvailable) return;
@@ -173,7 +173,12 @@ class DATMatchingStore {
       if (stillUnknown.length) this._scheduleRetry(paths);
       return;
     }
-    this._autoRetries = 0;  // real work to do; this isn't a quiet re-check
+    // Only a genuinely new hydration refills the budget. Resetting it here
+    // unconditionally made MAX_AUTO_RETRIES meaningless: a timer-driven pass
+    // finds the window expired, does "real work", and would hand the next
+    // cycle a fresh budget -- looping every 90s for as long as the tab is open
+    // on a path that is never going to become cacheable.
+    if (!fromRetry) this._autoRetries = 0;
     try {
       await this.startMatchJob(uncached);
       // Mark attempts only AFTER the backend accepted the job. A 409
@@ -216,7 +221,7 @@ class DATMatchingStore {
     this._autoRetries += 1;
     this._retryTimer = setTimeout(() => {
       this._retryTimer = null;
-      this.hydrateAndMatch(paths).catch(() => {});
+      this.hydrateAndMatch(paths, { fromRetry: true }).catch(() => {});
     }, ATTEMPT_RETRY_MS);
   }
 

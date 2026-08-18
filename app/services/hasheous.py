@@ -205,12 +205,16 @@ def _fetch_json(url: str) -> dict | None:
     The single seam tests patch (the same pattern as
     ``tests/test_dat_sync.py`` patching ``sync_service._fetch_json``).
     """
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
-    )
     try:
         _require_https(url)
+        # Built inside the guard: Request() itself raises ValueError on an
+        # empty or schemeless URL (an unset COMPRESSATORIUM_HASHEOUS_URL), and
+        # from outside the try that escaped as a 500 without opening the
+        # cooldown -- so a bulk job repeated it once per file.
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
+        )
         with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:

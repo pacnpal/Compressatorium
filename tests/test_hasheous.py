@@ -1119,3 +1119,53 @@ async def test_all_files_failing_on_hasheous_does_not_blame_the_volume(
 
     # This exact marker is what the all-failed branch keys off.
     assert result["error"] == dat_routes.HASHEOUS_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Fifth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["", "hasheous.org", "://broken"])
+async def test_an_unusable_base_url_is_a_service_failure(base_url, monkeypatch):
+    """Request() itself raises on a schemeless URL, before _require_https runs.
+
+    From outside the guard that escaped as a 500 with no cooldown, so a bulk
+    job repeated it once per file.
+    """
+    monkeypatch.setattr(settings, "hasheous_enabled", True)
+    monkeypatch.setattr(settings, "hasheous_base_url", base_url)
+
+    with pytest.raises(hasheous.HasheousUnavailable):
+        await hasheous.lookup(SAMPLE_SHA1)
+
+    assert hasheous._cooldown_remaining() > 0
+
+
+@pytest.mark.asyncio
+async def test_turning_hasheous_off_stops_the_current_remote_pass(
+    hasheous_on, monkeypatch,
+):
+    """"Off means nothing is sent" has to bind the very next request.
+
+    A CHD sends up to three hashes and each can take seconds; checking the
+    switch once before the loop let the rest of an in-flight lookup go out
+    after the operator had already opted out.
+    """
+    sent = []
+
+    async def _remote(sha1):
+        sent.append(sha1)
+        # The operator hits "Turn off" while this first request is in flight.
+        hasheous.set_enabled_override(False)
+        return None
+
+    monkeypatch.setattr(hasheous, "lookup", _remote)
+
+    result = await dat_routes._remote_lookup_match(
+        "/g.chd", [("a" * 40, "chd_sha1"), ("b" * 40, "chd_data_sha1")],
+    )
+
+    assert result is None
+    assert sent == ["a" * 40]  # the second candidate never left the machine

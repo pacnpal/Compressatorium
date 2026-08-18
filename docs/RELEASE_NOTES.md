@@ -19,7 +19,9 @@
   Remote hits carry considerably more than a local one: **game name, ROM name,
   the source DAT that actually knew the hash, platform, publisher, year,
   region**, and links out to IGDB, TheGamesDB, RetroAchievements, Wikipedia,
-  LaunchBox and SteamGridDB. All of it shows in the badge tooltip, and these
+  LaunchBox and SteamGridDB. The badge tooltip shows all of it bar the link
+  URLs -- it names which databases list the game, and the URLs themselves are
+  stored with the match and returned by the API. These
   matches get a **HASH** badge to distinguish them from a local **DAT** hit. A
   fresh install now matches your library immediately, without syncing hundreds
   of MB of DATs first.

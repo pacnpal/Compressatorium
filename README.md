@@ -122,7 +122,9 @@ records. Nothing you get today is lost by enabling it.
 #### What you get per match
 
 A local DAT hit tells you the game name and the ROM filename. A Hasheous hit
-carries considerably more, all of it shown in the file-list badge tooltip:
+carries considerably more. Everything except the link URLs is shown in the
+file-list badge tooltip; the tooltip names which databases list the game, and
+the URLs themselves are stored with the match and returned by the API:
 
 | Field | Example |
 |---|---|
@@ -138,6 +140,9 @@ carries considerably more, all of it shown in the file-list badge tooltip:
 The links are IDs and URLs into those databases, so a match is a jumping-off
 point for artwork or achievements even though Compressatorium doesn't fetch
 them itself (see [What it deliberately does not do](#what-it-deliberately-does-not-do)).
+The file list shows *which* of those databases list the game; the URLs are in
+the match payload from `/api/dat/matches/lookup` rather than being clickable in
+the row, since the badge tooltip is a native one and can't hold anchors.
 
 #### How a file gets matched
 

@@ -1064,9 +1064,14 @@ async def _remote_lookup_match(
     Propagates :class:`HasheousUnavailable` -- a transient remote failure is
     *not* a miss, and the caller turns it into a non-cacheable error.
     """
-    if not hasheous.enabled():
-        return None
     for sha1, match_type in candidates:
+        # Re-checked every iteration, not once up front. A CHD sends up to
+        # three hashes and each request can take seconds, so an operator who
+        # switches the fallback off mid-lookup would otherwise still have the
+        # remaining candidates go out -- "off means nothing is sent" has to
+        # hold for the request after the click, not just the next file.
+        if not hasheous.enabled():
+            return None
         # ponytail: unbounded concurrency. Each call is bounded by
         # hasheous_timeout, the bulk match job is already single-flight, and
         # the client short-circuits while the service is down; add a
