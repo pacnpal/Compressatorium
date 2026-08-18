@@ -517,9 +517,6 @@ export const api = {
       'Failed to list RomM ROMs',
     ),
 
-  // Records the metadata to carry across a conversion. MUST be called before
-  // the batch is submitted: the provider ids are read from the RomM record for
-  // the source file, which goes stale once that file is converted.
   // ── RomM settings, rules, and unattended conversion ──────────────────
   getRommSettings: () =>
     fetchJson(`${API_BASE}/romm/settings`, undefined, 'Failed to load RomM settings'),
@@ -570,6 +567,9 @@ export const api = {
   runRommAutoConvert: (body = {}) =>
     jsonPost(`${API_BASE}/romm/auto-convert/run`, body, {}, 'Auto-convert run failed'),
 
+  // Records the metadata to carry across a conversion. MUST be called before
+  // the batch is submitted: the provider ids are read from the RomM record for
+  // the source file, which goes stale once that file is converted.
   planRommRepin: (paths, mode, outputDir = null, duplicateAction = 'skip') =>
     jsonPost(
       `${API_BASE}/romm/repin/plan`,
