@@ -299,6 +299,25 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **"Verify each converted file" is available for PS3 folder → ISO.** The
+  setting was gated on whether the mode could *delete* its source, and that
+  conversion deliberately never deletes a curated game folder — so the one
+  check it does offer, reading PARAM.SFO back out of the ISO it built, could
+  not be switched on. Verification and deletion are separate capabilities now.
+- **Changing the RomM instance or library path retires pending re-match rows.**
+  Each row holds provider ids read from the old instance and a path under the
+  old library, so the next pass could hand those ids to whichever ROM the *new*
+  instance matched the digest to — one library's identity written onto
+  another's game. The switch also waits for any re-match pass already running.
+- **A bookkeeping failure after a batch is queued no longer causes the whole
+  platform to be converted twice.** If saving a metadata snapshot failed once
+  the jobs were already accepted — a locked database, a full volume — the run
+  was recorded as "the queue rejected this batch" and the production record was
+  skipped, so the next scheduled run queued every one of those ROMs again while
+  the first batch was still converting them.
+- **One more unbounded stat.** Checking whether an overwrite destination has
+  changed ran without a deadline, so a mount that died mid-pass held the
+  re-match lock until a restart.
 - **Setting only one end of a schedule window no longer runs the rule all
   day.** Typing the start of a 22:00–04:00 window and not yet the end was read
   as "no time restriction", so an operator narrowing a rule started unattended

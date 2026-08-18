@@ -499,17 +499,23 @@ def normalize_rule(
             out["enabled"] = False
     if raw.get("duplicate_action") in DUPLICATE_ACTIONS:
         out["duplicate_action"] = raw["duplicate_action"]
-    # Both gated on what the mode actually allows, mirroring the manual path.
-    # `supports_delete_on_verify` is the registry's answer to "can this mode's
-    # output be verified at all", which is the precondition for either switch:
-    # deleting needs the check to pass first, verify_after wants only the check.
-    if spec is not None and spec.supports_delete_on_verify:
+    # Each gated on its own capability. They are not the same question:
+    # `supports_delete_on_verify` says the *source may be removed* once the
+    # check passes, while `mode_supports_verify` says the check exists at all.
+    # Asking the delete flag for both put "verify each converted file" out of
+    # reach for a mode that can be checked but must never delete -- makeps3iso
+    # reads PARAM.SFO back out of the ISO it built, and deleting the curated
+    # game folder on that basis is what the mode refuses, not the reading.
+    if spec is not None and registry.mode_supports_verify(out["mode"]):
         # `out[...]` as the fallback, not False: an omitted field must inherit
         # the configured default rather than silently overriding it.
+        out["verify_after"] = bool(raw.get("verify_after", out["verify_after"]))
+    else:
+        out["verify_after"] = False
+    if spec is not None and spec.supports_delete_on_verify:
         out["delete_on_verify"] = bool(
             raw.get("delete_on_verify", out["delete_on_verify"]),
         )
-        out["verify_after"] = bool(raw.get("verify_after", out["verify_after"]))
         # A mode that *can* be verified is not always safely deletable: jwud's
         # verify is a structural WUX walk backed only by JWUDTool's own
         # byte-for-byte pass, which `-noVerify` turns off. The manual route
@@ -527,7 +533,6 @@ def normalize_rule(
             out["unsafe_delete_on_verify"] = True
     else:
         out["delete_on_verify"] = False
-        out["verify_after"] = False
     out["split"] = bool(raw.get("split", False))
 
     # `out[...]` as the fallback, not a literal: `default_rule()` already seeded
@@ -1516,19 +1521,35 @@ async def _sweep_locked(
                         ids = romm_repin.metadata_ids(rom) if rom else {}
                         if not ids:
                             continue
-                        # The fingerprint comes from candidate inspection, not
-                        # from now: on an idle queue a fast conversion can
-                        # finish between `create_batch_jobs` returning and this
-                        # call, and stating the destination here would record
-                        # the *finished* output as the pre-conversion state --
-                        # after which the settler sees nothing change and
-                        # abandons the row, losing exactly the metadata this
-                        # exists to protect.
-                        if await run_in_threadpool(
-                            romm_repin.record, rom, destinations[path], ids,
-                            rule["mode"], pre_by_path[path],
-                        ):
-                            repin_count += 1
+                        try:
+                            # The fingerprint comes from candidate inspection,
+                            # not from now: on an idle queue a fast conversion
+                            # can finish between `create_batch_jobs` returning
+                            # and this call, and stating the destination here
+                            # would record the *finished* output as the
+                            # pre-conversion state -- after which the settler
+                            # sees nothing change and abandons the row, losing
+                            # exactly the metadata this exists to protect.
+                            if await run_in_threadpool(
+                                romm_repin.record, rom, destinations[path], ids,
+                                rule["mode"], pre_by_path[path],
+                            ):
+                                repin_count += 1
+                        except Exception:  # bookkeeping only; see below
+                            # A write that fails here (a locked database, a
+                            # full volume) costs this ROM its metadata, and
+                            # nothing more. It must not reach the handler
+                            # below: that marks the platform `queue_failed`
+                            # and skips the provenance record, while the jobs
+                            # it is reporting as failed are running -- so the
+                            # next sweep would queue every one of them again.
+                            logger.warning(
+                                "romm_auto: could not record the re-pin for %s",
+                                path, exc_info=True,
+                            )
+                            summary["repins_failed"] = (
+                                summary.get("repins_failed", 0) + 1
+                            )
                 summary["repins_recorded"] = repin_count
                 result["repins_recorded"] += repin_count
 

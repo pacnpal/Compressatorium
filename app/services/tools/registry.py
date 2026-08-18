@@ -52,6 +52,18 @@ class ToolRegistry:
     def spec(self, mode: str) -> ModeSpec:
         return self.for_mode(mode).spec(mode)
 
+    def mode_supports_verify(self, mode: str) -> bool:
+        """Whether this mode's output can be verified after conversion.
+
+        Wider than :attr:`ModeSpec.supports_delete_on_verify`, which answers
+        "may this job delete its source once the check passes". A mode can be
+        verifiable and still never be allowed to delete -- makeps3iso's
+        folder->iso is the case -- so asking the delete flag put the operator's
+        "verify each converted file" out of reach for it.
+        """
+        spec = self.spec(mode)
+        return spec.supports_delete_on_verify or spec.supports_verify
+
     def default_compression(self, mode: str) -> str | None:
         """The codec to send when a level is set and the codec is "tool default".
 

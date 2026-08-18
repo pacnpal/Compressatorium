@@ -270,6 +270,37 @@ def cancel(output_paths: list[str]) -> int:
         return int(retired)
 
 
+def retire_all_pending(detail: str) -> int:
+    """Retire every pending row. Returns how many were retired.
+
+    For when the rows stop meaning anything: pointing Compressatorium at a
+    different RomM instance (or a different library root) leaves rows holding
+    the *old* instance's provider ids and an output digest taken from the old
+    library. The settle pass would then hand those ids to whatever ROM the new
+    instance happens to match that digest to -- stamping one library's identity
+    onto another's game. There is no way to re-home them, so they are retired
+    with the reason.
+
+    Retire, never delete, like :func:`cancel`: the row is the record of what
+    was planned, and only *pending* rows are constrained by the unique index.
+    """
+    with _session() as session:
+        retired = (
+            session.query(_db.RommRepin)
+            .filter(_db.RommRepin.state == "pending")
+            .update(
+                {
+                    "state": "abandoned",
+                    "detail": detail,
+                    "settled_at": utcnow_iso(),
+                },
+                synchronize_session=False,
+            )
+        )
+        session.commit()
+        return int(retired)
+
+
 def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
     """A page of pending rows, oldest first, starting after *after_id*.
 

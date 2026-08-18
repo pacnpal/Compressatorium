@@ -675,14 +675,22 @@
                     label="Only ROMs RomM could not identify"
                     onchange={(v) => setIdFilter(platform.id, 'only_unmatched', v)}
                   />
-                  {#if spec?.supportsDeleteOnVerify}
+                  <!-- Two capabilities, not one. A mode can be verifiable and
+                       still refuse to delete its source (PS3 folder → ISO), so
+                       gating the check on the delete flag hid it exactly where
+                       verification is the only safety net on offer. -->
+                  {#if spec?.supportsDeleteOnVerify || spec?.supportsVerify}
                     <Checkbox
                       checked={rule.verify_after || rule.delete_on_verify}
                       disabled={rule.delete_on_verify}
                       label="Verify each converted file"
-                      description="Deleting the source already verifies first."
+                      description={spec?.supportsDeleteOnVerify
+                        ? 'Deleting the source already verifies first.'
+                        : 'This format is checked after conversion; its source is never deleted.'}
                       onchange={(v) => update(platform.id, { verify_after: v })}
                     />
+                  {/if}
+                  {#if spec?.supportsDeleteOnVerify}
                     <Checkbox
                       checked={rule.delete_on_verify}
                       label="Delete the source after the new file verifies"

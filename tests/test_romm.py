@@ -3024,6 +3024,90 @@ async def test_the_settle_pass_bounds_the_hash_by_its_own_budget() -> None:
     assert seen["timeout"] > romm_routes._HASH_TIMEOUT_FLOOR_S, seen
 
 
+def test_verify_is_offered_where_deleting_is_refused() -> None:
+    """Two capabilities, not one.
+
+    makeps3iso reads PARAM.SFO back out of the ISO it built, but refuses to
+    delete the curated game folder that produced it. Gating "verify each
+    converted file" on the delete flag therefore made the only check that mode
+    offers unreachable — for the one conversion whose source is irreplaceable.
+    """
+    from services import romm_auto
+    from services.tools import registry
+
+    assert registry.mode_supports_verify("folder_to_iso") is True
+    assert registry.spec("folder_to_iso").supports_delete_on_verify is False
+
+    rule = romm_auto.normalize_rule({
+        "mode": "folder_to_iso", "enabled": True, "verify_after": True,
+        "delete_on_verify": True,
+    })
+    assert rule["verify_after"] is True
+    # And deleting is still refused, which is the half that must not move.
+    assert rule["delete_on_verify"] is False
+
+    # A mode that offers neither keeps both off: chdman's extractcd produces a
+    # cue/bin pair the tool does not verify.
+    plain = romm_auto.normalize_rule({
+        "mode": "extractcd", "enabled": True,
+        "verify_after": True, "delete_on_verify": True,
+    })
+    assert registry.mode_supports_verify("extractcd") is False
+    assert plain["verify_after"] is False
+    assert plain["delete_on_verify"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_repin_write_still_records_what_was_queued(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Post-queue bookkeeping must not be reported as a failed queue.
+
+    The jobs are already accepted and running by then. Treating a locked
+    database as "the batch failed" skipped the production record, so the next
+    sweep queued every one of those ROMs a second time — with `overwrite`,
+    rewriting the files the first batch was still producing.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc", "igdb_id": 42,
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return _fake_jobs(paths)
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True), \
+            patch.object(romm_auto.romm_repin, "record", _explode):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        first = await romm_auto.sweep(ignore_schedule=True)
+
+    assert first["queued"] == 1, first
+    # Not reported as a queue failure — the jobs went in.
+    assert first["errors"] == [], first
+    # And the production record exists, so the next sweep leaves it alone.
+    state = await romm_auto.get_state()
+    assert "1" in state["7"]["converted"], state
+
+
 def test_half_a_schedule_window_pauses_the_rule() -> None:
     """One endpoint filled in must not mean "no time restriction".
 

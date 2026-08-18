@@ -36,6 +36,14 @@ class ModeSpec:
     supports_compression: bool = False
     supports_compression_level: bool = False  # dolphin rvz/wia only
     supports_delete_on_verify: bool = False
+    # Whether the tool can verify this mode's product *without* the question of
+    # deleting anything. Implied by `supports_delete_on_verify` (deleting needs
+    # a verify first), so only a mode that can be checked but must never delete
+    # its source declares it: makeps3iso's folder->iso reads PARAM.SFO back out
+    # of the ISO it built, while deleting a curated game folder on the strength
+    # of that is not something to offer. Gating "verify each result" on the
+    # delete flag made that check unreachable for exactly those modes.
+    supports_verify: bool = False
     allows_archive_input: bool = False         # chdman create modes only
     # Sibling outputs this mode writes beside its primary output_path, expressed
     # as suffix swaps off the primary (e.g. extractcd's ``.cue`` -> ``.bin``
@@ -94,6 +102,10 @@ class ChainSpec:
     supports_compression: bool = False
     supports_compression_level: bool = False
     supports_delete_on_verify: bool = True   # of the ORIGINAL source, gated on final verify
+    # Structural parity with ModeSpec: a chain's final step verifies the
+    # output, and its delete flag already implies that, so this stays False and
+    # `registry.mode_supports_verify` reads them together.
+    supports_verify: bool = False
     allows_archive_input: bool = True        # == step 1's
     input_kinds: frozenset[InputKind] = field(
         default_factory=lambda: frozenset({InputKind.FILE})

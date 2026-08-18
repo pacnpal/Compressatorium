@@ -44,6 +44,9 @@ class MakePs3IsoTool(BaseTool):
             # destructive and makeps3iso has no native verify (only the light
             # PARAM.SFO TITLE_ID readback).
             supports_delete_on_verify=False,
+            # The build is checked by reading PARAM.SFO back out of the
+            # ISO; only the *deletion* of the source folder is refused.
+            supports_verify=True,
             allows_archive_input=False,
             input_kinds=frozenset({InputKind.DIRECTORY}),
         ),

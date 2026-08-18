@@ -42,6 +42,7 @@ _COMPARED_FIELDS = (
     "supports_compression",
     "supports_compression_level",
     "supports_delete_on_verify",
+    "supports_verify",
     "allows_archive_input",
 )
 
@@ -105,6 +106,7 @@ def _frontend_rows(tmp_path: Path) -> dict[str, dict]:
         " supports_compression: !!m.supportsCompression,"
         " supports_compression_level: !!m.supportsCompressionLevel,"
         " supports_delete_on_verify: !!m.supportsDeleteOnVerify,"
+        " supports_verify: !!m.supportsVerify,"
         " allows_archive_input: !!m.allowsArchiveInput,"
         "})));\n"
         "process.stdout.write(JSON.stringify(__rows));\n"
@@ -139,6 +141,7 @@ def _backend_rows() -> dict[str, dict]:
             "supports_compression": spec.supports_compression,
             "supports_compression_level": spec.supports_compression_level,
             "supports_delete_on_verify": spec.supports_delete_on_verify,
+            "supports_verify": spec.supports_verify,
             "allows_archive_input": spec.allows_archive_input,
         }
     return rows

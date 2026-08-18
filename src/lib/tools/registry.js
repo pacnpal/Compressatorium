@@ -518,7 +518,10 @@ export const TOOLS = [
       { mode: 'folder_to_iso', kind: 'create', label: 'PS3 Folder → ISO', group: 'makeps3iso',
         outputExt: '.iso', inputExtensions: [], inputKinds: ['directory'],
         supportsCompression: false, supportsCompressionLevel: false,
-        supportsDeleteOnVerify: false, allowsArchiveInput: false,
+        // Verifiable but never deletable: the build is checked by reading
+        // PARAM.SFO back out of the ISO, while removing a curated game folder
+        // on the strength of that is not something to offer.
+        supportsDeleteOnVerify: false, supportsVerify: true, allowsArchiveInput: false,
         // makeps3iso -s: split the output into ~4 GB parts for FAT32 targets.
         supportsSplit: true },
     ],

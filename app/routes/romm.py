@@ -636,10 +636,15 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
         # onto whatever RomM identifies the *old* file as. That happens for
         # real whenever a batch is planned and then never submitted.
         try:
-            current = await run_in_threadpool(
+            # Bounded like the `isfile` probe above it, and for the same
+            # reason: a mount can stop answering between the two, and a stat
+            # with no deadline holds `_settle_lock` (and a pooled worker) for
+            # as long as the mount stays dead -- which the pass budget cannot
+            # interrupt, because it is only checked between rows.
+            current = await bounded_path_check(
                 romm_repin.path_fingerprint, output_path,
-            )
-        except OSError:
+            ) or ""
+        except (asyncio.TimeoutError, OSError):
             current = ""
         if current == pre_fingerprint:
             exists = False
@@ -1056,7 +1061,10 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
     # root, so swapping that root mid-sweep makes it queue whatever unrelated
     # files sit at the same relative paths in the new library -- and with
     # delete-on-verify on, delete them.
-    async with romm_auto.paused():
+    # `_settle_lock` as well as the sweep pause: a settle pass in flight has
+    # already read the old configuration and is about to ask *some* RomM to
+    # match a digest, so the identity must not change underneath it.
+    async with _settle_lock, romm_auto.paused():
         before = romm_settings.effective()
         values = await romm_settings.save(patch.model_dump(exclude_unset=True))
         identity = ("url", "library_root")
@@ -1067,6 +1075,24 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
                 "romm: RomM instance or library changed; cleared the conversion "
                 "history for %s platform(s)", cleared,
             )
+        if changed:
+            # The pending re-pin rows go too, and for a sharper reason than the
+            # conversion history: each holds provider ids read from the *old*
+            # instance and a destination under the *old* library root. Left
+            # pending, the next settle pass would hash whatever now sits at
+            # that path and hand the previous instance's ids to whichever ROM
+            # the new instance matches -- one library's identity written onto
+            # another's game. They cannot be re-homed, so they are retired.
+            retired = await run_in_threadpool(
+                romm_repin.retire_all_pending,
+                "The RomM instance or library path changed before this could "
+                "be re-matched; re-pin this ROM by hand",
+            )
+            if retired:
+                logger.info(
+                    "romm: retired %s pending re-pin row(s) belonging to the "
+                    "previous RomM instance", retired,
+                )
     return romm_settings.public(values)
 
 
