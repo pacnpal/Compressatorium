@@ -550,7 +550,7 @@ async def test_do_sync_schedules_rematch_after_success(sync_service, tmp_path):
         result = await sync_service.sync(tag="0.285")
 
     assert result["status"] == "complete"
-    mock_schedule.assert_awaited_once_with(snapshot)
+    mock_schedule.assert_awaited_once_with(snapshot, defer_if_busy=True)
 
 
 @pytest.mark.asyncio
@@ -640,7 +640,9 @@ async def test_do_sync_logs_when_rematch_is_skipped_due_to_active_job(sync_servi
 
     mock_schedule = AsyncMock(return_value=None)
 
-    with caplog.at_level("INFO", logger="compressatorium.dat_sync"), \
+    # The busy case is reported by the shared helper in routes.dat now, so
+    # capture that logger rather than dat_sync's.
+    with caplog.at_level("INFO", logger="compressatorium.dat"), \
          patch.object(sync_service, "_fetch_latest_tag", return_value="0.285"), \
          patch.object(sync_service, "_list_dat_files", side_effect=[
              [{"name": "test.dat", "path": "MAME Redump/test.dat", "size": 100}],
@@ -652,7 +654,7 @@ async def test_do_sync_logs_when_rematch_is_skipped_due_to_active_job(sync_servi
         result = await sync_service.sync(tag="0.285")
 
     assert result["status"] == "complete"
-    assert any("skipped rematch" in r.message for r in caplog.records)
+    assert any("deferred rematch" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -825,7 +827,7 @@ async def test_do_sync_rematch_schedule_exception_does_not_poison_sync(sync_serv
 
     assert result["status"] == "complete"
     assert sync_service._state.get("last_sync_tag") == "0.285"
-    assert any("failed to schedule post-sync rematch" in r.message for r in caplog.records)
+    assert any("failed to schedule a rematch" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

@@ -188,19 +188,10 @@ async def import_dat(file: UploadFile = File(...)):
             except OSError:
                 pass
 
-    if previous_match_paths:
-        # Best-effort, exactly as in dat_sync: the DAT is already committed, so
-        # a scheduling failure must not fail the import. A preserved remote hit
-        # is only replaced if the local recompute actually matches -- set_match
-        # refuses to downgrade one to an unmatched result.
-        try:
-            await schedule_match_job(previous_match_paths)
-        except Exception:
-            logger.exception(
-                "import_dat: failed to schedule post-import rematch for %d file(s); "
-                "the DAT imported fine, matching can be re-run manually",
-                len(previous_match_paths),
-            )
+    # Shared with the sync path: a preserved remote hit is only replaced if the
+    # local recompute actually matches -- set_match refuses to downgrade one to
+    # an unmatched result.
+    await rematch_after_dat_change(previous_match_paths, source="import_dat")
 
     return result
 
@@ -628,10 +619,84 @@ def _filter_paths_within_volumes(paths: list[str]) -> tuple[list[str], int]:
     return allowed, denied
 
 
+# Paths a DAT change asked to re-match while a match job was already running.
+# The matcher is single-flight, so schedule_match_job() returns None in that
+# window -- and both callers used to stop there, which made "best-effort" mean
+# "never": an import landing during a scan left those files on their old
+# verdicts until the operator happened to browse or rescan them. Held here and
+# drained when the running job releases the slot, so it means "later" instead.
+_deferred_rematch_paths: set[str] = set()
+
+
+async def _drain_deferred_rematch() -> None:
+    """Start the rematch a DAT change had to defer, now that the slot is free.
+
+    Called from the finishing job's own teardown. Best-effort by construction:
+    it runs inside a ``finally`` that must go on to finalize the job it belongs
+    to, so nothing here may raise -- and during interpreter shutdown there may
+    be no loop left to schedule on.
+    """
+    global _deferred_rematch_paths  # noqa: PLW0603, intentional module-level state
+    if not _deferred_rematch_paths:
+        return
+    paths, _deferred_rematch_paths = sorted(_deferred_rematch_paths), set()
+    try:
+        job_id = await schedule_match_job(paths, defer_if_busy=True)
+    except Exception:
+        logger.exception(
+            "failed to start the deferred rematch for %d file(s)", len(paths),
+        )
+        return
+    if job_id:
+        logger.info(
+            "started deferred rematch job %s for %d file(s)", job_id, len(paths),
+        )
+
+
+async def rematch_after_dat_change(
+    paths: list[str], *, source: str,
+) -> tuple[str, str | None]:
+    """Re-match *paths* after the local DAT set changed. Returns (status, job id).
+
+    The one place both DAT-change paths go through -- a user upload
+    (``import_dat``) and the MAMERedump sync (``services.dat_sync``) -- since
+    they want the identical thing: the files that already had a verdict get it
+    recomputed against the new index. It had been written twice, and only the
+    sync copy reported what happened when the matcher was busy.
+
+    Never raises: the DAT is already committed by the time this runs, so a
+    scheduling failure must not turn a good import into an error.
+    """
+    if not paths:
+        return "none", None
+    try:
+        job_id = await schedule_match_job(paths, defer_if_busy=True)
+    except Exception:
+        logger.exception(
+            "%s: failed to schedule a rematch for %d file(s); the DAT is "
+            "committed and matching can be re-run manually",
+            source, len(paths),
+        )
+        return "failed", None
+    if job_id:
+        logger.info(
+            "%s: scheduled rematch job %s for %d previously-scanned file(s)",
+            source, job_id, len(paths),
+        )
+        return "scheduled", job_id
+    logger.info(
+        "%s: deferred rematch, another match job is already active; "
+        "%d file(s) queued until it finishes",
+        source, len(paths),
+    )
+    return "deferred", None
+
+
 async def schedule_match_job(
     paths: list[str],
     *,
     background_tasks: BackgroundTasks | None = None,
+    defer_if_busy: bool = False,
 ) -> str | None:
     """Start a background DAT-match job for *paths*.
 
@@ -667,6 +732,9 @@ async def schedule_match_job(
         return None
     async with _get_match_job_lock():
         if _active_match_job_id is not None:
+            if defer_if_busy:
+                # Queued rather than dropped -- see _deferred_rematch_paths.
+                _deferred_rematch_paths.update(allowed)
             return None
         scan_job = job_manager.create_external_job(
             filename="DAT Match",
@@ -927,6 +995,7 @@ async def _run_match_job(
         async with _get_match_job_lock():
             if _active_match_job_id == job_id:
                 _active_match_job_id = None
+        await _drain_deferred_rematch()
         elapsed = time.monotonic() - start
         if job_success is None:
             parts = [f"{processed}/{total} processed, {hashed} hashed, {matched} matched"]
@@ -1150,6 +1219,19 @@ async def _remote_lookup_match(
         # workload_limiter lane if a large scan ever gets rate-limited.
         record = await hasheous.lookup(sha1)
         if record is not None:
+            # One more local look before accepting it. A DAT import commits in
+            # its own transaction and this await can last seconds, so the index
+            # that missed a moment ago may now hold this very hash -- and a
+            # cached hit is served unconditionally afterwards, so the remote
+            # answer would outrank the local one for good. Local-first has to
+            # hold across the whole call, not just up to the last time we
+            # looked. One indexed lookup, and only on a hit.
+            local = await _local_dat_record(sha1)
+            if local is not None:
+                return (
+                    _match_result(file_path, sha1, match_type, local),
+                    hasheous.base_url(),
+                )
             return _match_result(file_path, sha1, match_type, record), hasheous.base_url()
     return None, (hasheous.base_url() if consulted else None)
 

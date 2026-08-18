@@ -28,6 +28,7 @@ import contextlib
 import http.client
 import json
 import re
+import socket
 import ssl
 import threading
 import time
@@ -193,8 +194,8 @@ class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
 _deadline = threading.local()
 
 
-class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
-    """A TLS socket that enforces one deadline across the whole request.
+class _DeadlineMixin:
+    """Applies one monotonic deadline to every read the socket performs.
 
     ``urlopen(timeout=...)`` bounds each *socket operation*, not the request:
     every byte that arrives resets it. A server dripping slower than the
@@ -203,48 +204,15 @@ class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
     opens either. Measured against a real dripping server: an 18.5s
     ``open()`` under a 2s timeout, unbounded for a longer header.
 
-    Enforcing it here rather than around the body read is what makes the bound
-    real: every byte of the response, status line and headers included, arrives
-    through ``recv_into``, so connect, headers and body share one deadline.
+    Mixed into both socket classes a lookup can be holding, so the plain
+    socket (proxy ``CONNECT`` tunnel) and the TLS socket (handshake, status
+    line, headers, body) enforce the same deadline through the same code
+    rather than through four mechanisms that each cover one phase.
 
-    The TLS handshake is the exception: measured, it makes **zero**
-    ``recv_into`` calls, reading through the C layer instead, so
-    ``do_handshake`` has to apply the deadline itself. It sets the remaining
-    budget as the socket timeout, which bounds a peer that stalls or dies
-    mid-handshake. A peer that drips a handshake record at a time, each within
-    the remaining budget, is not fully bounded by this -- doing that properly
-    means leaving urllib. It is called out in the design doc rather than
-    silently implied.
-
-    Two other things sit outside it. **A proxy CONNECT tunnel**: when
-    ``HTTPS_PROXY`` is set, ``build_opener`` installs a ``ProxyHandler`` and
-    ``http.client._tunnel`` reads the proxy's status line and headers off the
-    *raw* socket, before ``wrap_socket`` exists, so a proxy dripping that
-    response pins the request exactly the way a dripping origin server used to.
-    This one is the same severity as the bugs that justified this class -- it
-    never raises -- and it is only unfixed here because bounding it means a
-    deadline-aware raw socket and a custom connection/handler pair, i.e. a
-    fifth deadline mechanism. It belongs in a consolidation that covers
-    CONNECT, handshake, headers and body from one place. Only reachable with a
-    proxy configured.
-
-    What the deadline also does not cover is DNS: ``urllib`` resolves the hostname
-    before this socket exists, and ``getaddrinfo`` ignores socket timeouts. A
-    stalled resolver is still bounded -- by ``/etc/resolv.conf`` (glibc default
-    5s x 2 attempts per nameserver), not by ``hasheous_timeout`` -- and it
-    *raises*, so it opens the cooldown and the rest of a scan short-circuits.
-    That is the difference from a dripping server, which never raises at all.
-    Bounding it properly would mean resolving on an abandonable thread; the
-    trade is documented rather than taken.
-
-    ``dup()`` is abstract on ``ssl.SSLSocket`` upstream (CPython raises
-    ``NotImplementedError``), hence the pylint waiver: nothing here duplicates
-    the socket, and overriding it would only re-raise the same error.
+    ``recv_into`` is the only read override needed: every byte of either
+    phase arrives through it, ``http.client`` reading its status line and
+    headers via ``makefile("rb")`` -> ``SocketIO.readinto`` -> ``recv_into``.
     """
-
-    def do_handshake(self, *args, **kwargs):
-        self._apply_deadline()
-        return super().do_handshake(*args, **kwargs)
 
     def _apply_deadline(self) -> None:
         end = getattr(_deadline, "at", None)
@@ -260,6 +228,107 @@ class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
         return super().recv_into(*args, **kwargs)
 
 
+class _DeadlineSocket(_DeadlineMixin, socket.socket):
+    """The raw socket, deadline-aware before TLS exists.
+
+    This is what bounds a *dripping proxy*: with ``HTTPS_PROXY`` set,
+    ``http.client._tunnel`` reads the proxy's ``CONNECT`` response off the raw
+    socket before ``wrap_socket``, so a proxy answering one byte at a time
+    used to pin the request exactly the way a dripping origin server did.
+    """
+
+
+class _DeadlineSSLSocket(_DeadlineMixin, ssl.SSLSocket):  # pylint: disable=abstract-method
+    """The TLS socket, installed via ``SSLContext.sslsocket_class``.
+
+    ``wrap_socket`` detaches the raw socket and builds a new object from its
+    file descriptor, so :class:`_DeadlineSocket` cannot carry through -- hence
+    two classes over one mixin rather than one class.
+
+    The handshake needs its own hook: measured, it makes **zero**
+    ``recv_into`` calls, reading through the C layer instead. Applying the
+    remaining budget as the socket timeout bounds a peer that stalls or dies
+    mid-handshake. A peer that drips a handshake record at a time, each within
+    the remaining budget, is still not bounded -- doing that properly means
+    leaving urllib, and it is documented rather than silently implied.
+
+    ``dup()`` is abstract on ``ssl.SSLSocket`` upstream (CPython raises
+    ``NotImplementedError``), hence the pylint waiver: nothing here duplicates
+    the socket, and overriding it would only re-raise the same error.
+    """
+
+    def do_handshake(self, *args, **kwargs):
+        self._apply_deadline()
+        return super().do_handshake(*args, **kwargs)
+
+
+def _connect_with_deadline(address, timeout, source_address=None) -> socket.socket:
+    """``socket.create_connection`` that spends the deadline, not N x timeout.
+
+    The stdlib helper applies its timeout to *each* address ``getaddrinfo``
+    returns, so a host resolving to several blackholed addresses costs one
+    full timeout apiece -- measured, three dropped addresses take 9.0s under a
+    3s timeout, and a redirect opens a fresh connection with a fresh budget.
+    Looping here instead keeps every attempt inside the one budget the caller
+    asked for.
+
+    What this still does not cover is DNS: ``getaddrinfo`` runs before any
+    socket exists and ignores socket timeouts. A stalled resolver is bounded
+    by ``/etc/resolv.conf`` (glibc default 5s x 2 attempts per nameserver),
+    not by ``hasheous_timeout`` -- but unlike a drip it *raises*, so it opens
+    the cooldown and the rest of a scan short-circuits. Bounding it properly
+    would mean resolving on an abandonable thread; the trade is documented
+    rather than taken.
+    """
+    host, port = address
+    err: Exception | None = None
+    for family, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
+        host, port, 0, socket.SOCK_STREAM,
+    ):
+        sock = _DeadlineSocket(family, socktype, proto)
+        try:
+            sock.settimeout(_remaining(timeout))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            err = exc
+            sock.close()
+    raise err if err is not None else OSError(f"no address returned for {host}")
+
+
+def _remaining(default: float | None) -> float | None:
+    """Seconds left on this request's deadline, or *default* when unset."""
+    end = getattr(_deadline, "at", None)
+    if end is None:
+        return default
+    left = end - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("lookup exceeded the overall timeout")
+    return left
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """Connects through :func:`_connect_with_deadline`.
+
+    Overriding the connection factory rather than ``connect()`` keeps the
+    stdlib's own TLS wiring (server_hostname, ALPN, hostname checking) as the
+    single source of truth; only where the raw socket comes from changes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_with_deadline
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    """Makes urllib open :class:`_DeadlineHTTPSConnection` instead of the stock one."""
+
+    def https_open(self, req):
+        return self.do_open(_DeadlineHTTPSConnection, req, context=self._context)
+
+
 def _ssl_context() -> ssl.SSLContext:
     """The stock verifying context, with our socket class installed."""
     context = ssl.create_default_context()
@@ -269,7 +338,7 @@ def _ssl_context() -> ssl.SSLContext:
 
 _opener = urllib.request.build_opener(
     _HTTPSOnlyRedirectHandler,
-    urllib.request.HTTPSHandler(context=_ssl_context()),
+    _DeadlineHTTPSHandler(context=_ssl_context()),
 )
 
 

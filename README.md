@@ -204,13 +204,19 @@ To keep an outage cheap, the client stops calling out for 60 seconds after a
 failure. Without that, a 1,000-file scan against a dead endpoint would spend
 over four hours re-learning the same fact once per file.
 
+A metadata scan that ran while Hasheous was unreachable says so on its final
+line — `… 12 not checked (Hasheous unreachable)`. The scan itself still
+succeeds, because the metadata it collects is unaffected; without that count a
+rescan during an outage would finish looking like a clean "nothing matched".
+Those files are retried the next time you browse or rescan them.
+
 #### Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Starting state of the master switch. The **DAT Library** toggle overrides it and persists. |
 | `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
-| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, covering connect, headers and body — not per socket read, so a slow-dripping server can't stall a scan. This call sits in the file-browse path, so keep it short. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, covering DNS-to-body: the TCP connect (every address the host resolves to, not one budget each), a proxy `CONNECT` tunnel, the TLS handshake, headers and body. Not per socket read, so a slow-dripping server or proxy can't stall a scan. This call sits in the file-browse path, so keep it short. |
 
 Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
 accepted as aliases.

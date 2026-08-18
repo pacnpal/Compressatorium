@@ -205,7 +205,7 @@ async def _scan_phase_dat_match(
                 else "Phase 3: no DATs imported — skipping DAT match"
             ),
         )
-        return 0
+        return 0, 0
 
     total = len(all_paths)
     logger.info("Phase 3: DAT-matching %d discovered file(s)...", total)
@@ -225,6 +225,12 @@ async def _scan_phase_dat_match(
         cached = await run_in_threadpool(dat_store.get_matches_batch, all_paths)
 
     matched = 0
+    # Counted, not swallowed: with the remote source down every remote-only
+    # path lands on a non-cacheable error, and the phase would otherwise finish
+    # "0 matched" -- indistinguishable from a library genuinely in no DAT, with
+    # nothing telling the operator the rescan they asked for did not refresh
+    # those identities.
+    hasheous_errors = 0
     for idx, path in enumerate(all_paths, start=1):
         if job_manager.is_cancelled(scan_job_id):
             raise ExternalJobCancelled()
@@ -262,6 +268,7 @@ async def _scan_phase_dat_match(
                 if not result.get("reason") and not result.get("error"):
                     await dat_store.set_match(path, result)
                 elif result.get("error") == HASHEOUS_ERROR:
+                    hasheous_errors += 1
                     # The remote service is down, which says nothing about this
                     # file: deleting here would let one forced rescan during an
                     # outage erase every remote match in the library (fast, too,
@@ -302,8 +309,15 @@ async def _scan_phase_dat_match(
             message=f"Phase 3 [{idx}/{total}]: {os.path.basename(path)}",
         )
 
-    logger.info("Phase 3 complete: %d/%d file(s) matched a DAT", matched, total)
-    return matched
+    if hasheous_errors:
+        logger.warning(
+            "Phase 3 complete: %d/%d file(s) matched a DAT; %d could not be checked "
+            "remotely (Hasheous unavailable) and will be retried",
+            matched, total, hasheous_errors,
+        )
+    else:
+        logger.info("Phase 3 complete: %d/%d file(s) matched a DAT", matched, total)
+    return matched, hasheous_errors
 
 
 async def scan_metadata_task(
@@ -322,6 +336,7 @@ async def scan_metadata_task(
     scan_start = time.monotonic()
     count = 0
     embed_count = 0
+    hasheous_errors = 0
     scan_token = lane_token
     if scan_token is None:
         scan_token = await workload_limiter.acquire("metadata_scan")
@@ -592,7 +607,9 @@ async def scan_metadata_task(
         # through the per-tool embedded-hash fast path (CHD header SHA1, Dolphin
         # disc SHA1, ...) and falls back to a file-level SHA1. CHD metadata and
         # disc IDs are untouched here. Progress band: 65 % → 97 %.
-        await _scan_phase_dat_match(scan_job_id, all_paths, force=force)
+        _, hasheous_errors = await _scan_phase_dat_match(
+            scan_job_id, all_paths, force=force,
+        )
 
         # Flush all accumulated changes once at the end (async, non-blocking)
         logger.info("Flushing metadata store to disk...")
@@ -634,9 +651,16 @@ async def scan_metadata_task(
             )
         else:
             if scan_success:
-                final_msg = (
-                    f"{count} refreshed, {embed_count} disc ID(s) found \u2014 {elapsed:.1f}s"
-                )
+                parts = [f"{count} refreshed", f"{embed_count} disc ID(s) found"]
+                if hasheous_errors:
+                    # The scan itself succeeded -- metadata was collected -- so
+                    # this is not a failure. But saying so without saying the
+                    # remote matching phase did not run would let a rescan
+                    # during an outage look like a clean "nothing matched".
+                    parts.append(
+                        f"{hasheous_errors} not checked (Hasheous unreachable)"
+                    )
+                final_msg = ", ".join(parts) + f" \u2014 {elapsed:.1f}s"
             else:
                 final_msg = f"Scan failed: {scan_error or 'unknown error'}"
             await job_manager.update_external_job(

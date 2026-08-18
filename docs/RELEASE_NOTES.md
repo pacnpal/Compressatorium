@@ -63,6 +63,37 @@
 
 ### Fixed
 
+- **The Hasheous lookup timeout now really is a whole-request timeout.** It
+  bounded the response, but every phase before TLS existed had its own budget:
+  `socket.create_connection` gives each address a host resolves to the *full*
+  timeout (measured: three blackholed addresses cost 9.0s under a 3s limit,
+  and a redirect starts over), and behind an `HTTPS_PROXY` the `CONNECT`
+  tunnel was read off the raw socket, where a proxy answering one byte at a
+  time could pin a lookup — and the scan job around it — without ever raising.
+  One deadline-aware connection now owns the socket from the first packet, so
+  connect, the proxy tunnel, the TLS handshake, headers and body all spend the
+  same budget.
+
+- **A DAT that was deleted mid-match no longer haunts the cache.** When a DAT
+  went away between a file being matched and the result being written, the
+  dangling foreign key was nulled — which also let the row slip past the
+  delete's cascade *and* made every later import mistake it for a Hasheous hit
+  and preserve it. The result was a badge naming a game from a DAT you had
+  removed, and nothing ever re-checked it. Whether a match came from Hasheous
+  is now recorded on the row rather than guessed from a null key.
+
+- **A DAT import landing during a scan no longer skips its re-match.** The
+  matcher runs one job at a time, so an import or sync that finished while a
+  match job was running had its follow-up silently dropped and those files kept
+  their old verdicts until you happened to browse them again. They are queued
+  now and start as soon as the running job finishes. Both the manual upload and
+  the MAMERedump sync go through the same code for this.
+
+- **A newly imported DAT wins over a lookup that was already in flight.** The
+  local index is checked once more before a remote answer is accepted, so an
+  import committing during the request is not left behind a remote result that
+  nothing would have recomputed.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

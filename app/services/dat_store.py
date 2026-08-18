@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -29,6 +29,14 @@ logger = get_logger("dat_store")
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _remote_hit_clause():
+    """SQL for "this row is a remote (Hasheous) hit"."""
+    return and_(
+        _db.DATMatch.matched.is_(True),
+        func.coalesce(_db.DATMatch.payload["source"].as_string(), "") == "hasheous",
+    )
 
 
 class DATStore:
@@ -425,25 +433,30 @@ class DATStore:
             return False
         return bool(existing.file_hash) and existing.file_hash != new_hash
 
+    # A row is a *remote* hit only if it says so. This is the one place the
+    # question is answered, and it is answered from the payload the writer
+    # recorded -- never inferred from ``dat_id IS NULL``. A local hit whose DAT
+    # was deleted between the match and the write has its dangling FK nulled by
+    # ``_upsert_match_sync``, so the FK proxy called that row remote, preserved
+    # it through every later import, and went on serving an identity from a DAT
+    # the operator had removed. ``coalesce`` because SQL NULL is not False: a
+    # payload with no ``source`` must compare unequal, not unknown, or the
+    # NOT below would spare exactly the rows it is meant to drop.
     def _invalidate_dat_derived_matches(self, session) -> None:
         """Drop the part of the match cache the local DATs are responsible for.
 
         A new/refreshed DAT set can change any verdict it produced, and can
         turn a previous miss into a hit -- so DAT-derived hits and cached
-        misses both go. A *remote* (Hasheous) hit has ``dat_id IS NULL`` and
-        owes nothing to the local DATs, so it stays: deleting it stranded the
-        badge permanently once the provider was switched off, since the
-        recompute would then miss locally and cache "unmatched".
+        misses both go. A *remote* (Hasheous) hit owes nothing to the local
+        DATs, so it stays: deleting it stranded the badge permanently once the
+        provider was switched off, since the recompute would then miss locally
+        and cache "unmatched".
 
         Shared by both import paths on purpose. It lived only in
         ``_persist_sync`` at first, which left ``_import_dat_sync`` (the
         user-uploaded-DAT path) still wiping everything.
         """
-        session.execute(
-            delete(_db.DATMatch).where(
-                or_(_db.DATMatch.dat_id.is_not(None), _db.DATMatch.matched.is_(False))
-            )
-        )
+        session.execute(delete(_db.DATMatch).where(~_remote_hit_clause()))
 
     def _upsert_match_sync(self, file_path: str, match: dict) -> None:
         normalized = self._normalize(file_path)

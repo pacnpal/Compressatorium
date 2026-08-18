@@ -1283,31 +1283,41 @@ This is a payload field, not a schema change.
   timeout but never stopping pins the lookup — and the scan job around it —
   without ever raising, which also means the cooldown never opens. Measured:
   an 18.5s `open()` under a 2s timeout, and unbounded for a longer header.
-  `_DeadlineSSLSocket` enforces one monotonic deadline (`_deadline_of`) inside
-  `recv_into`, so connect, status line, headers and body all share it. Doing it
-  at the socket rather than around the body read is what makes the bound real:
-  an earlier body-only version left the identical hole in the headers, where a
-  hostile or broken server can drip just as easily. `_opener` must therefore
-  keep its `HTTPSHandler(context=_ssl_context())` — rebuilding it without that
-  removes the protection silently, so a test pins the wiring.
+  One `_DeadlineMixin` enforces one monotonic deadline (`_deadline_of`) inside
+  `recv_into`, and it is mixed into **both** socket classes a lookup can hold:
+  `_DeadlineSocket` (the raw socket) and `_DeadlineSSLSocket` (installed via
+  `SSLContext.sslsocket_class`). Two classes over one mixin, because
+  `wrap_socket` detaches the raw socket and rebuilds from its file descriptor,
+  so the raw class cannot carry through. Doing it at the socket rather than
+  around the body read is what makes the bound real: an earlier body-only
+  version left the identical hole in the headers, where a hostile or broken
+  server can drip just as easily.
 
-  Three things sit outside the deadline. The most serious is a **proxy
-  CONNECT tunnel**: with `HTTPS_PROXY` set, `http.client._tunnel` reads the
-  proxy's status line and headers off the raw socket before TLS wrapping, so a
-  dripping proxy pins the request and never raises — the same failure the
-  deadline exists to prevent, reachable only when a proxy is configured. It is
-  a known gap, not an accepted one: bounding it needs a deadline-aware raw
-  socket plus a custom connection/handler, which should be done as part of
-  consolidating the deadline handling rather than as a fourth partial patch.
-  The other two are accepted. A peer that drips
-  one TLS *handshake record* at a time inside the remaining budget is not
-  bounded, and **DNS is not bounded by `hasheous_timeout` at all** —
-  `getaddrinfo` runs before the socket exists and ignores socket timeouts. The
-  resolver bounds itself (`/etc/resolv.conf`: glibc defaults to 5s x 2
-  attempts per nameserver) and, unlike a drip, it *raises* — so it opens the
-  cooldown and the rest of a bulk job short-circuits instead of stalling one
-  file at a time. Closing either gap means leaving urllib or resolving on an
-  abandonable thread; neither is worth a fifth deadline mechanism here.
+  The connection is deadline-aware from the first packet:
+  `_DeadlineHTTPSConnection` swaps in `_connect_with_deadline`, which loops the
+  `getaddrinfo` results itself and gives each attempt only what is *left* of
+  the budget. `socket.create_connection` gives each address the full timeout —
+  measured, three blackholed addresses cost 9.0s under a 3s timeout, and a
+  redirect opens a fresh connection with a fresh budget. `_DeadlineHTTPSHandler`
+  is what puts that connection in `_opener`'s hands; both halves of the wiring
+  (the handler class and the context's `sslsocket_class`) are pinned by tests,
+  because rebuilding the opener with stock parts removes the protection
+  silently while every behavioural test still passes.
+
+  That covers all four phases through one mechanism — raw connect, the proxy
+  `CONNECT` tunnel (`http.client._tunnel` reads it off the raw socket, so a
+  dripping proxy used to pin the request and never raise), the TLS handshake
+  (which makes **zero** `recv_into` calls, so `do_handshake` applies the
+  deadline itself), and the response.
+
+  Two things remain outside it, both accepted. A peer that drips one TLS
+  *handshake record* at a time inside the remaining budget is not bounded, and
+  **DNS is not bounded by `hasheous_timeout` at all** — `getaddrinfo` runs
+  before any socket exists and ignores socket timeouts. The resolver bounds
+  itself (`/etc/resolv.conf`: glibc defaults to 5s x 2 attempts per nameserver)
+  and, unlike a drip, it *raises* — so it opens the cooldown and the rest of a
+  bulk job short-circuits instead of stalling one file at a time. Closing
+  either means leaving urllib or resolving on an abandonable thread.
 - **The toggle persists before it applies.** `PUT /api/dat/hasheous` writes the
   preference first and only then flips the in-process override. The other order
   meant a failed write (locked SQLite, full disk) left the process sending
@@ -1317,6 +1327,29 @@ This is a payload field, not a schema change.
   table and a remote match has no row there. `dat_store` already nulls unknown
   values before writing, so this keeps the cached row byte-identical across
   re-runs rather than depending on that guard.
+- **"Remote hit" is recorded, never inferred.** `_remote_hit_clause()` in
+  `dat_store` is the one place the question is answered, and it answers from
+  `payload.source`, not from `dat_id IS NULL`. The FK proxy was wrong for one
+  real row: a *local* hit whose DAT was deleted between the match and the write
+  has its dangling FK nulled by `_upsert_match_sync`, which also dodges the
+  `WHERE dat_id = :id` cascade — so it was preserved through every later import
+  and went on serving an identity from a DAT the operator had removed.
+  `coalesce` is load-bearing there: SQL `NULL` is not `False`, so a payload with
+  no `source` must compare unequal rather than unknown, or the negation spares
+  exactly the rows it is meant to drop.
+- **Local-first holds across the whole call.** The remote request is an await of
+  its own, and a DAT import commits in its own transaction, so
+  `_remote_lookup_match` re-checks the local index once more before *accepting*
+  a remote hit. Without it an import landing inside that window left the remote
+  answer authoritative for good, since a cached hit is served unconditionally
+  afterwards. One indexed lookup, and only on a hit.
+- **A DAT change re-matches through one helper.** `rematch_after_dat_change()`
+  is shared by the manual upload (`import_dat`) and the MAMERedump sync; both
+  want "recompute what already had a verdict against the new index", and it had
+  been written twice. The matcher is single-flight, so when a job is already
+  running those paths go into `_deferred_rematch_paths` and the finishing job
+  drains them — "best-effort" means *later*, not *never*, which is what dropping
+  the `None` return used to mean.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the
@@ -1328,6 +1361,13 @@ This is a payload field, not a schema change.
   health separately from `has_dats`: the phase exists to prime the match cache
   and every write goes through that store, so proceeding on a dead DB would fail
   the whole scan instead of degrading quietly.
+- **A scan says when its remote phase failed.** `_scan_phase_dat_match` returns
+  `(matched, hasheous_errors)` and the scan's final line carries the second
+  number. The errors are still non-cacheable and still retried, but a rescan
+  run during an outage used to finish "0 matched" — indistinguishable from a
+  library genuinely in no DAT. The scan is *not* reported as failed: phases 1
+  and 2 succeeded and metadata was collected, so the honest signal is a
+  qualified success, not a flipped boolean.
 
 The client is stdlib-only (`urllib.request`), mirroring `services/dat_sync.py`:
 `_require_https`, an explicit `User-Agent`, a hard timeout, a response size cap,

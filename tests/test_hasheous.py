@@ -418,7 +418,7 @@ async def test_scan_phase3_skips_when_the_dat_store_is_broken(
 
     monkeypatch.setattr(dat_internal, "_match_single_file", _fake_match)
 
-    matched = await scan_phase_stubs._scan_phase_dat_match(
+    matched, _ = await scan_phase_stubs._scan_phase_dat_match(
         "job-1", ["/vol/a.iso"], force=True,
     )
 
@@ -448,7 +448,7 @@ async def test_scan_phase3_runs_with_no_dats_when_hasheous_is_on(
 
     monkeypatch.setattr(dat_internal, "_match_single_file", _fake_match)
 
-    matched = await scan_phase_stubs._scan_phase_dat_match(
+    matched, _ = await scan_phase_stubs._scan_phase_dat_match(
         "job-1", ["/vol/a.iso"], force=True,
     )
 
@@ -2216,3 +2216,273 @@ async def test_the_batch_writer_honours_the_same_guard(tmp_path):
     assert store.get_match(path)["matched"] is True, (
         "a batch write erased a remote hit the single-path writer would refuse"
     )
+
+
+# ---------------------------------------------------------------------------
+# The deadline covers the pre-TLS phases too (raw connect, proxy CONNECT).
+# ---------------------------------------------------------------------------
+
+
+def test_the_opener_uses_the_deadline_aware_connection():
+    """Pin the second half of the wiring.
+
+    The socket class alone only covers what happens *after* the raw connection
+    exists. Rebuilding the opener with a stock ``HTTPSHandler`` would silently
+    hand connect and proxy CONNECT back to the stdlib while every behavioural
+    test still passed.
+    """
+    handlers = [
+        h for h in hasheous._opener.handlers
+        if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    assert handlers, "opener has no HTTPS handler"
+    assert all(isinstance(h, hasheous._DeadlineHTTPSHandler) for h in handlers)
+
+
+def test_connect_spends_one_budget_across_several_addresses(monkeypatch):
+    """A host resolving to N blackholes must not cost N x the timeout.
+
+    ``socket.create_connection`` applies its timeout to each address in turn,
+    so the documented whole-request bound did not survive a multi-address
+    host -- measured against the real helper, three dropped addresses took
+    9.0s under a 3s timeout.
+    """
+    addrs = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{i}", 443))
+        for i in (1, 2, 3)
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: addrs)
+
+    budgets = []
+    real_settimeout = socket.socket.settimeout
+
+    def _record(self, value):
+        budgets.append(value)
+        real_settimeout(self, value)
+
+    monkeypatch.setattr(socket.socket, "settimeout", _record)
+
+    def _blackhole(self, sockaddr):
+        time.sleep(0.2)
+        raise TimeoutError("blackholed")
+
+    monkeypatch.setattr(hasheous._DeadlineSocket, "connect", _blackhole)
+
+    with hasheous._deadline_of(0.3):
+        with pytest.raises(OSError):
+            hasheous._connect_with_deadline(("multi.invalid", 443), 30)
+
+    # Two attempts, not three: the budget is gone before the third address,
+    # and the second attempt inherits only what the first left.
+    assert len(budgets) == 2, budgets
+    assert budgets[0] <= 0.3
+    assert budgets[1] < budgets[0]
+
+
+def _tcp_serve_once(handler) -> int:
+    """Run a one-shot plain-TCP server on a loopback port and return the port."""
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _run():
+        try:
+            conn, _ = sock.accept()
+            handler(conn)
+            conn.close()
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return sock.getsockname()[1]
+
+
+def test_a_dripping_proxy_cannot_pin_a_lookup(request):
+    """The CONNECT tunnel is read off the raw socket, before TLS exists.
+
+    A proxy answering one byte at a time was the same failure the deadline was
+    built to prevent -- it never raises -- and it was outside the TLS socket's
+    reach, so it needed the raw socket to be deadline-aware too.
+    """
+    def _drip(conn):
+        conn.recv(4096)  # the CONNECT request line + headers
+        try:
+            for _ in range(200):
+                conn.sendall(b"X")
+                time.sleep(0.5)
+        except OSError:
+            pass
+
+    # A regressed deadline hangs rather than fails; a hung job is a much worse
+    # CI failure than a red one.
+    signal.alarm(60)
+    request.addfinalizer(lambda: signal.alarm(0))  # noqa: PT021
+
+    port = _tcp_serve_once(_drip)
+    conn = hasheous._DeadlineHTTPSConnection("127.0.0.1", port, timeout=30)
+    conn.set_tunnel("example.invalid", 443)
+
+    started = time.monotonic()
+    with hasheous._deadline_of(2):
+        with pytest.raises(OSError):
+            conn.connect()
+    elapsed = time.monotonic() - started
+    conn.close()
+
+    assert elapsed < 10, f"the CONNECT drip was not bounded ({elapsed:.1f}s)"
+
+
+@pytest.mark.asyncio
+async def test_a_local_hit_from_a_deleted_dat_is_not_mistaken_for_a_remote_one(tmp_path):
+    """"Remote hit" has to be recorded, not inferred from a null FK.
+
+    ``_upsert_match_sync`` nulls a ``dat_id`` whose DAT no longer exists rather
+    than violating the FK -- a local hit written while the operator was
+    deleting that DAT. Preserving on ``dat_id IS NULL`` therefore classed it as
+    remote: it dodged the ``WHERE dat_id = :id`` cascade at write time and then
+    survived every later import, so browsing kept serving an identity from a
+    DAT that had been removed.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    orphan, remote = "/vol/orphan.iso", "/vol/remote.chd"
+
+    await store.import_dat(SAMPLE_DAT_XML)
+    # A local hit whose DAT vanished before the write: the FK is nulled, but
+    # the payload still says where the identity came from.
+    await store.set_match(orphan, {
+        "path": orphan, "matched": True, "game_name": "From A Deleted DAT",
+        "dat_id": "gone1234", "match_type": "file_sha1", "file_hash": "c" * 40,
+        "source": "dat",
+    })
+    await store.set_match(remote, {
+        "path": remote, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+    assert store.get_match(orphan) is not None
+
+    await store.import_dat(SAMPLE_DAT_XML)  # triggers invalidation
+
+    assert store.get_match(orphan) is None, (
+        "a local hit from a deleted DAT was preserved as if it were a remote hit"
+    )
+    assert store.get_match(remote) is not None, "the remote hit was not preserved"
+
+
+@pytest.mark.asyncio
+async def test_a_busy_matcher_queues_the_rematch_instead_of_dropping_it(
+    tmp_path, monkeypatch,
+):
+    """"Best-effort" has to mean "later", not "never".
+
+    The matcher is single-flight, so a DAT change landing while a match job
+    runs got ``None`` from ``schedule_match_job`` -- and both callers stopped
+    there. Nothing recovered those paths afterwards, so the files kept their
+    old verdicts until someone browsed or rescanned them.
+    """
+    target = tmp_path / "queued.iso"
+    target.write_bytes(b"x")
+    path = str(target)
+
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", set())
+
+    # A match job is already running.
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", "busy-job")
+    status, job_id = await dat_routes.rematch_after_dat_change(
+        [path], source="test",
+    )
+    assert (status, job_id) == ("deferred", None)
+    assert dat_routes._deferred_rematch_paths == {path}, "the rematch was dropped"
+
+    # ...and when that job releases the slot, the queued work actually starts.
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", None)
+    scheduled: list[list[str]] = []
+
+    async def _fake_schedule(paths, **kwargs):
+        scheduled.append(list(paths))
+        return "drained-job"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _fake_schedule)
+    await dat_routes._drain_deferred_rematch()
+
+    assert scheduled == [[path]], "the deferred rematch never started"
+    assert not dat_routes._deferred_rematch_paths, "the queue was not cleared"
+
+
+@pytest.mark.asyncio
+async def test_a_dat_import_during_the_remote_await_still_wins(
+    hasheous_on, tmp_path, isolated_store, monkeypatch,
+):
+    """Local-first has to hold across the whole call, not up to the last look.
+
+    The remote request is an await of its own: an import committing inside it
+    left the Hasheous answer authoritative, and because a cached hit is served
+    unconditionally nothing ever recomputed it.
+    """
+    sha1 = "d" * 40
+    imported: dict[str, dict | None] = {"row": None}
+
+    async def _local(hash_value):
+        return imported["row"]
+
+    async def _remote(hash_value):
+        # The import lands while the lookup is in flight.
+        imported["row"] = {
+            "dat_id": "dat1", "dat_name": "Local.dat", "game_name": "Local Name",
+            "rom_name": "local.bin", "source": "dat",
+        }
+        return {"game_name": "Remote Name", "source": "hasheous"}
+
+    monkeypatch.setattr(dat_routes, "_local_dat_record", _local)
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+
+    match, consulted = await dat_routes._remote_lookup_match(
+        "/vol/game.chd", [(sha1, "file_sha1")],
+    )
+
+    assert match is not None
+    assert match["game_name"] == "Local Name", (
+        "the remote answer outranked a DAT that had just been imported"
+    )
+    assert match["source"] == "dat"
+    assert consulted  # the hash did go out; that part is unavoidable
+
+
+@pytest.mark.asyncio
+async def test_a_scan_reports_that_its_remote_phase_failed(
+    hasheous_on, scan_phase_stubs, monkeypatch,
+):
+    """A rescan during an outage must not look like a clean "nothing matched".
+
+    Every remote-only path lands on a non-cacheable HASHEOUS_ERROR, which is
+    the right thing to do with the row -- but the phase used to swallow it and
+    finish "0 matched", telling the operator nothing about the identities the
+    rescan they asked for did not refresh.
+    """
+    import routes.dat as dat_internal
+    from services.dat_store import dat_store as global_dat_store
+
+    monkeypatch.setattr(global_dat_store, "has_dats", lambda: True)
+
+    async def _unavailable(path, *, cancel_event=None):
+        return {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR}
+
+    monkeypatch.setattr(dat_internal, "_match_single_file", _unavailable)
+    monkeypatch.setattr(dat_internal, "drop_if_content_changed", AsyncMock())
+    monkeypatch.setattr(
+        global_dat_store, "get_matches_batch", lambda paths: {p: None for p in paths},
+    )
+
+    matched, hasheous_errors = await scan_phase_stubs._scan_phase_dat_match(
+        "job-1", ["/vol/a.iso", "/vol/b.iso"], force=True,
+    )
+
+    assert matched == 0
+    assert hasheous_errors == 2, "the phase did not count its remote failures"
