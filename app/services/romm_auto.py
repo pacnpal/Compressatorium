@@ -142,6 +142,23 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
         return None, False
     pattern = value.strip()[:_MAX_PATTERN]
     try:
+        # codeql[py/regex-injection]
+        # lgtm[py/regex-injection]
+        #
+        # Accepted, and narrowly. An operator-authored filter *is* a regex --
+        # "convert only (USA)" is the feature, and `re.escape`, the sanitizer
+        # this query wants, would turn it into a literal search and delete it.
+        # The value is configuration typed by whoever administers this
+        # instance, at the same trust level as the output directory beside it,
+        # and it reaches here only through the settings API.
+        #
+        # The risk the query names is ReDoS, and that is bounded rather than
+        # ignored: the pattern is capped at `_MAX_PATTERN` characters, its
+        # runtime is probed below and a catastrophic one is refused at save
+        # time, and the names it runs against are bounded filenames. This
+        # check is what made the flow visible to CodeQL in the first place --
+        # compiling and matching in one place -- so suppressing it here keeps
+        # the mitigation rather than removing it.
         compiled = re.compile(pattern)
     except re.error:
         logger.warning("romm_auto: refusing invalid filter pattern %r", pattern)

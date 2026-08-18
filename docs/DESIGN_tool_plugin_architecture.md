@@ -1483,6 +1483,31 @@ catalog listing narrows each row's `convertible_by`, and `/romm/platforms`
 returns the narrowed `tool_ids` so the automation editor offers a platform only
 the modes it can actually use.
 
+#### Operator-authored filter patterns
+
+The automation rules take real regexes — "convert only `(USA)`" is the feature —
+which makes them the one place user input becomes executable. Two bounds, and
+one accepted alert.
+
+`_valid_pattern` caps the source at `_MAX_PATTERN` characters, refuses one that
+does not compile (refuses, never drops: a rule whose filter silently vanished
+would come back as *unfiltered*, and the next unattended sweep could queue the
+whole platform with delete-on-verify attached), and then refuses one that
+backtracks. `re` cannot be interrupted, so a pattern like `(a+)+$` would hold
+`_sweep_lock` indefinitely — blocking previews, manual runs, and the very rule
+edit that would remove it. `_backtracks_catastrophically` therefore probes at
+save time, escalating 12 → 16 → 20 characters and stopping at the first
+over-budget length, because the runtime of the thing it is detecting doubles per
+character and measuring it at full length would hang the check itself. The probe
+alphabet comes from the pattern, since the trigger is pattern-specific:
+`(x+x+)+y` only blows up on a run of `x`.
+
+CodeQL's `py/regex-injection` fires on the compile-then-match flow and is
+suppressed inline with that reasoning. Its only sanitizer is `re.escape`, which
+would make the filter a literal search — the feature, removed. The value is
+configuration at the same trust level as the output directory beside it, and the
+risk the query names is the one bounded above.
+
 #### Composite modes narrow per mode (`ModeSpec.platform_slugs`)
 
 Narrowing by tool cannot separate a composite tool's modes. `ChainTool` is a
