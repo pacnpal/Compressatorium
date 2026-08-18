@@ -61,11 +61,20 @@ class DATMatchingStore {
   // The path set the last match job was started for, so a re-run of the same
   // visible page doesn't count as a new hydration and refill the retry budget.
   _lastJobPaths = null;
-  // Bumped whenever the provider state changes or a /dat/stats request starts.
-  // One counter, not two: both the availability refresh and the cache
-  // hydration have to discard responses that were in flight across a change,
-  // and giving them separate counters was how the second case got missed.
-  _generation = 0;
+  // Bumped whenever the matching policy changes: a provider toggle (here or
+  // in another tab), a DAT import, delete or finished sync. One counter, not
+  // two: both the availability refresh and the cache hydration have to
+  // discard responses that were in flight across a change, and giving them
+  // separate counters was how the second case got missed.
+  //
+  // Reactive, and read through `policyGeneration` by the file list's effect.
+  // Every one of those changes clears `matches`, but clearing it is invisible
+  // to that effect by design -- hydrate() snapshots the map under untrack so
+  // the effect does not subscribe to the cache it fills. With local DATs
+  // present `matchingAvailable` never flips either, so a provider enabled in
+  // another tab cleared the badges and nothing re-hydrated them until
+  // navigation. This is the dependency that makes the clear self-healing.
+  _generation = $state(0);
   // Hydration ordering. _hydrateSeq numbers each request as it goes out;
   // _appliedSeq records the newest one that has actually written to the map.
   // Two counters, not one: discarding on "a newer request exists" would throw
@@ -80,6 +89,17 @@ class DATMatchingStore {
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
+  }
+
+  /**
+   * The current matching policy, as a counter that changes when it does.
+   *
+   * Read this from an `$effect` that must re-run when the policy changes --
+   * the file list's hydration does. Exposed as a getter so the reason to read
+   * it lives here rather than in an underscore-prefixed field access.
+   */
+  get policyGeneration() {
+    return this._generation;
   }
 
   /**
@@ -200,14 +220,24 @@ class DATMatchingStore {
     this._generation += 1;
     this.matches.clear();
     this._resetAttempts();
+    // Identity, not a flag: `refreshMatchingAvailability()` assigns a freshly
+    // deserialized `stats` object on every success, so an unchanged reference
+    // means it brought nothing back -- /dat/stats failed, or its answer was
+    // discarded as stale.
+    const before = this.stats;
     await this.refreshMatchingAvailability();
-    // ...and re-apply it afterwards. refreshMatchingAvailability() swallows a
-    // failed /dat/stats and falls back to `matchingAvailable = false`, which
-    // would bury the state the PUT just established -- reporting success while
-    // the panel shows off and browsing stays gated, with the backend already
-    // switched over. The merge is idempotent, so this is a no-op when the
-    // refresh succeeded.
-    this._applyHasheousState(state);
+    // ...and re-apply it only then. The re-apply exists because that refresh
+    // swallows a failed /dat/stats and falls back to
+    // `matchingAvailable = false`, which would bury the state the PUT just
+    // established -- reporting success while the panel shows off and browsing
+    // stays gated, with the backend already switched over.
+    //
+    // Unconditionally, though, it did the opposite harm: another tab flipping
+    // the provider while the refresh was in flight makes that refresh the
+    // NEWER truth, and re-applying this PUT's response on top restored the
+    // older one for up to a poll interval -- gating valid matching, or
+    // attempting work the backend had just disabled.
+    if (this.stats === before) this._applyHasheousState(state);
     return state;
   }
 

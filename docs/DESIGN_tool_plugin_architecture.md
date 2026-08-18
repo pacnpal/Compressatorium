@@ -1417,6 +1417,17 @@ This is a payload field, not a schema change.
   are browsed or a rescan runs. Dropped rather than left queued because nothing
   but a finishing job drains the set, so holding them would mean waiting on an
   unrelated job that may never come.
+
+  A job that *crashed* is treated the same way, and for a sharper reason. The
+  abandonment guard raises when a hash helper outlives SIGKILL and is still
+  reading unresponsive storage, deliberately stopping so the rest of the
+  library does not strand another process on that volume (issue #268). But
+  `job_success is False` cannot tell that mid-loop crash from a job that ran
+  every path and merely reported failures, so the teardown drained the queue
+  and resumed hashing the same volume seconds later. `job_crashed`, set only by
+  the `except Exception` branch, is the distinction; an ordinary
+  finished-with-failures job still drains, since nothing about it says the next
+  batch cannot run.
 - **A match job fails on its *checkable* files, not its total.** Policy skips
   (over `MATCH_MAX_FILE_SIZE`, not a regular file) are files the job
   deliberately did not check, so they are excluded from the all-failed
@@ -1477,10 +1488,23 @@ This is a payload field, not a schema change.
   recomputed hash is the only thing that separates them:
   `_proves_content_changed()` compares against the stored one, and without it
   the row-two guard protects the badge of a file that has been *replaced*,
-  permanently — the job path never calls `drop_if_content_changed()`, that is
-  the scan's. The outage exit had carried the file-level hash for this reason
+  permanently. The outage exit had carried the file-level hash for this reason
   since round 7; the local-only exit was written without it, so one helper now
   serves both.
+
+  Carrying the evidence is only half of it: **every** consumer of a
+  non-cacheable result runs the pruner. The scan did from the start; the match
+  job did not, so a capped file replaced between DAT imports produced a
+  non-cacheable result the store never saw, was never pruned by a scan that
+  might not run, and kept naming the previous game with nothing left to
+  re-check it. `drop_if_content_changed()` now sits on both paths, and the
+  comparison itself lives in `dat_store.drop_match_if_changed()` — one
+  predicate (`_proves_content_changed()`), one transaction. Reading the row in
+  the route and deleting it in a second call also left a window where a
+  concurrent match job could persist the *replacement* file's correct result in
+  between, and the delete removed that fresh row instead of the one it had
+  compared; the `match` workload token covers hashing, not this cache
+  operation, so the two really can overlap.
 
   Both non-cacheable exits carry it too — a size-capped result never read the
   container, but the embedded hashes it *did* recompute are exactly what proves
@@ -1494,8 +1518,8 @@ This is a payload field, not a schema change.
   comparison keys on the *stored row's own* `match_type` rather than demanding
   `file_sha1`. `dat_store.recomputed_hash_in()` is that lookup, module level
   because both ends of the rule need it: the store's write guard before
-  overwriting a remote hit, and `routes.dat.drop_if_content_changed()` before
-  deleting a row a non-cacheable result left behind. That restriction existed for a real reason — a CHD hit is stored
+  overwriting a remote hit, and `drop_match_if_changed()` before deleting a row
+  a non-cacheable result left behind. That restriction existed for a real reason — a CHD hit is stored
   against its embedded `chd_sha1` while a rescan recomputes the container's
   `file_sha1`, and those differ for a file nobody touched, so comparing them
   deleted valid badges. But it was too blunt: an *exhaustive* tool (Dolphin
@@ -1520,6 +1544,25 @@ This is a payload field, not a schema change.
   both now. The workspace owns the teardown, and the file list also cancels the
   retry timer when its visible set empties — filtering to zero entries does not
   unmount it, so neither the effect's normal path nor `onDestroy` would run.
+
+  Observing the flip is not the same as acting on it. Every policy change —
+  provider toggle, DAT import, delete, finished sync — clears `matches`, and
+  that clear is invisible to the file list's `$effect` by design: `hydrate()`
+  snapshots the map under `untrack` precisely so the effect does not subscribe
+  to the cache it fills. With local DATs present `matchingAvailable` never
+  flips either, so a provider enabled in another tab blanked the badges and
+  nothing re-hydrated them until navigation. `datMatching.policyGeneration`
+  (the reactive `_generation` counter) is the one dependency the effect reads
+  for this, which makes the clear self-healing. It moves only on a real policy
+  change — a `/dat/stats` poll that observes nothing new must not bump it, or
+  it invalidates in-flight match jobs on every tick.
+
+  The toggle itself re-applies its `PUT` response after refreshing stats, so a
+  failed `/dat/stats` cannot bury the state the backend just switched to — but
+  only when that refresh brought nothing back. Unconditionally it did the
+  opposite harm: another tab flipping the provider while the refresh was in
+  flight makes the refresh the newer truth, and re-applying the older response
+  on top of it reported the opposite of the backend for up to a poll interval.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

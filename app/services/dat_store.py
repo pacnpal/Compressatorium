@@ -646,6 +646,34 @@ class DATStore:
         """
         return await run_in_threadpool(self._delete_match_sync, file_path)
 
+    def _drop_match_if_changed_sync(self, file_path: str, match: dict) -> bool:
+        normalized = self._normalize(file_path)
+        with self._session() as session:
+            row = session.get(_db.DATMatch, normalized)
+            if row is None or not self._proves_content_changed(row, match):
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    async def drop_match_if_changed(self, file_path: str, match: dict) -> bool:
+        """Delete ``file_path``'s cached row only if ``match`` disproves it.
+
+        The predicate is :meth:`_proves_content_changed`, the same one the
+        write guard uses -- a recomputed hash in the *stored row's own* domain
+        that contradicts it. Sharing it is the point: "did this file change?"
+        had grown a second, narrower copy in the route layer, and the two
+        answered differently for exhaustive formats.
+
+        Read and delete happen in one session because they are one decision. A
+        background match job can persist the replacement file's correct result
+        between a separate get and delete -- the ``match`` workload token
+        covers hashing, not this cache operation -- and the delete would then
+        remove the fresh row it never compared. Returns True when a row was
+        removed.
+        """
+        return await run_in_threadpool(self._drop_match_if_changed_sync, file_path, match)
+
     def _set_matches_batch_sync(self, matches: dict[str, dict]) -> None:
         if not matches:
             return

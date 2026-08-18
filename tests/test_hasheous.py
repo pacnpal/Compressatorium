@@ -1680,47 +1680,48 @@ async def test_an_outage_does_not_cache_the_single_file_result(
     assert isolated_store.get_match(str(iso)) is None
 
 
+async def _store_hit(store, path, file_hash, match_type, game_name="Old Game"):
+    """Persist a remote hit the pruning tests can try to disprove."""
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": game_name,
+        "match_type": match_type, "file_hash": file_hash, "source": "hasheous",
+    })
+    assert store.get_match(path) is not None
+
+
 @pytest.mark.asyncio
-async def test_an_outage_keeps_a_cached_hit_whose_file_is_unchanged(tmp_path):
+async def test_an_outage_keeps_a_cached_hit_whose_file_is_unchanged(tmp_path, isolated_store):
     """The round-7 rule: an outage says nothing about the file, so keep the row."""
     path = str(tmp_path / "game.chd")
-    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(
-            path, {"error": "hasheous unavailable", "file_hash": "a" * 40}
-        )
-    delete.assert_not_awaited()
+    await _store_hit(isolated_store, path, "a" * 40, "file_sha1")
+    await dat_routes.drop_if_content_changed(
+        path, {"error": "hasheous unavailable", "file_hash": "a" * 40}
+    )
+    assert isolated_store.get_match(path) is not None
 
 
 @pytest.mark.asyncio
-async def test_an_outage_drops_a_cached_hit_whose_file_changed(tmp_path):
+async def test_an_outage_drops_a_cached_hit_whose_file_changed(tmp_path, isolated_store):
     """...but a file that demonstrably changed must not keep its old badge.
 
     Nothing would ever re-check it: cached_result_usable() accepts hits
     unconditionally, so the stale row would name the previous game forever.
     """
     path = str(tmp_path / "game.chd")
-    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(
-            path, {"error": "hasheous unavailable", "file_hash": "b" * 40}
-        )
-    delete.assert_awaited_once_with(path)
+    await _store_hit(isolated_store, path, "a" * 40, "file_sha1")
+    await dat_routes.drop_if_content_changed(
+        path, {"error": "hasheous unavailable", "file_hash": "b" * 40}
+    )
+    assert isolated_store.get_match(path) is None
 
 
 @pytest.mark.asyncio
-async def test_an_unverifiable_outage_result_leaves_the_row_alone(tmp_path):
+async def test_an_unverifiable_outage_result_leaves_the_row_alone(tmp_path, isolated_store):
     """No recomputed hash (size cap, embedded-only) means no proof, so no delete."""
     path = str(tmp_path / "big.chd")
-    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(
-            path, {"error": "hasheous unavailable"}
-        )
-    delete.assert_not_awaited()
+    await _store_hit(isolated_store, path, "a" * 40, "file_sha1")
+    await dat_routes.drop_if_content_changed(path, {"error": "hasheous unavailable"})
+    assert isolated_store.get_match(path) is not None
 
 
 @pytest.mark.asyncio
@@ -1761,7 +1762,7 @@ async def test_the_outage_result_carries_the_recomputed_hash(
 
 
 @pytest.mark.asyncio
-async def test_an_outage_keeps_a_chd_hit_matched_on_an_embedded_hash(tmp_path):
+async def test_an_outage_keeps_a_chd_hit_matched_on_an_embedded_hash(tmp_path, isolated_store):
     """A CHD hit stores the *embedded* hash; the rescan recomputes the container.
 
     Those are different hash domains and differ for a perfectly unchanged file,
@@ -1770,14 +1771,11 @@ async def test_an_outage_keeps_a_chd_hit_matched_on_an_embedded_hash(tmp_path):
     to prevent, now aimed at hits specifically.
     """
     path = str(tmp_path / "game.chd")
-    stored = {"file_hash": "a" * 40, "match_type": "chd_sha1", "matched": True}
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(
-            path,
-            {"error": "hasheous unavailable", "file_hash": "b" * 40},
-        )
-    delete.assert_not_awaited()
+    await _store_hit(isolated_store, path, "a" * 40, "chd_sha1")
+    await dat_routes.drop_if_content_changed(
+        path, {"error": "hasheous unavailable", "file_hash": "b" * 40},
+    )
+    assert isolated_store.get_match(path) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -3415,7 +3413,7 @@ async def test_a_chd_container_hash_still_cannot_disprove_an_embedded_hit(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_an_outage_rescan_prunes_a_replaced_rvz(tmp_path):
+async def test_an_outage_rescan_prunes_a_replaced_rvz(tmp_path, isolated_store):
     """The scan's pruner compares in the row's own domain too.
 
     It demanded a stored ``file_sha1``, which an exhaustive format never has --
@@ -3425,70 +3423,54 @@ async def test_an_outage_rescan_prunes_a_replaced_rvz(tmp_path):
     """
     from services.dat_store import CANDIDATE_HASHES_KEY
 
-    path = "/vol/game.rvz"
-    stored = {
-        "matched": True, "game_name": "Old Game",
-        "match_type": "dolphin_disc_sha1", "file_hash": "a" * 40,
-    }
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(path, {
-            "error": dat_routes.HASHEOUS_ERROR,
-            CANDIDATE_HASHES_KEY: [("b" * 40, "dolphin_disc_sha1")],
-        })
-    delete.assert_awaited_once_with(path)
+    path = str(tmp_path / "game.rvz")
+    await _store_hit(isolated_store, path, "a" * 40, "dolphin_disc_sha1", "Old Game")
+    await dat_routes.drop_if_content_changed(path, {
+        "error": dat_routes.HASHEOUS_ERROR,
+        CANDIDATE_HASHES_KEY: [("b" * 40, "dolphin_disc_sha1")],
+    })
+    assert isolated_store.get_match(path) is None
 
 
 @pytest.mark.asyncio
-async def test_an_outage_rescan_keeps_an_unchanged_rvz(tmp_path):
+async def test_an_outage_rescan_keeps_an_unchanged_rvz(tmp_path, isolated_store):
     """...and an identical disc hash is still not proof of anything."""
     from services.dat_store import CANDIDATE_HASHES_KEY
 
-    path = "/vol/game.rvz"
-    stored = {
-        "matched": True, "game_name": "Kept Game",
-        "match_type": "dolphin_disc_sha1", "file_hash": "a" * 40,
-    }
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(path, {
-            "error": dat_routes.HASHEOUS_ERROR,
-            CANDIDATE_HASHES_KEY: [("a" * 40, "dolphin_disc_sha1")],
-        })
-    delete.assert_not_awaited()
+    path = str(tmp_path / "game.rvz")
+    await _store_hit(isolated_store, path, "a" * 40, "dolphin_disc_sha1", "Kept Game")
+    await dat_routes.drop_if_content_changed(path, {
+        "error": dat_routes.HASHEOUS_ERROR,
+        CANDIDATE_HASHES_KEY: [("a" * 40, "dolphin_disc_sha1")],
+    })
+    assert isolated_store.get_match(path) is not None
 
 
 @pytest.mark.asyncio
-async def test_a_container_hash_still_cannot_prune_an_embedded_chd_hit():
+async def test_a_container_hash_still_cannot_prune_an_embedded_chd_hit(tmp_path, isolated_store):
     """The cross-domain refusal the shared helper must keep.
 
     A CHD hit is stored against ``chd_sha1``; a rescan recomputes the container
     ``file_sha1``. Comparing them deletes valid badges, which is the bug the
     original narrow rule existed to prevent.
     """
-    path = "/vol/game.chd"
-    stored = {
-        "matched": True, "game_name": "Kept Game",
-        "match_type": "chd_sha1", "file_hash": "a" * 40,
-    }
-    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await dat_routes.drop_if_content_changed(
-            path, {"error": dat_routes.HASHEOUS_ERROR, "file_hash": "f" * 40},
-        )
-    delete.assert_not_awaited()
+    path = str(tmp_path / "game.chd")
+    await _store_hit(isolated_store, path, "a" * 40, "chd_sha1", "Kept Game")
+    await dat_routes.drop_if_content_changed(
+        path, {"error": dat_routes.HASHEOUS_ERROR, "file_hash": "f" * 40},
+    )
+    assert isolated_store.get_match(path) is not None
 
 
 @pytest.mark.asyncio
 async def test_a_result_with_no_hashes_never_touches_the_store():
     """No evidence means no comparison, and the check runs per file per rescan."""
-    with patch("services.dat_store.dat_store.get_match") as get_match, \
-         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+    with patch("services.dat_store.dat_store.drop_match_if_changed",
+               new=AsyncMock()) as drop:
         await dat_routes.drop_if_content_changed(
             "/vol/big.iso", {"reason": "file too large"},
         )
-    get_match.assert_not_called()
-    delete.assert_not_awaited()
+    drop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3623,15 +3605,15 @@ async def test_a_capped_rescan_keeps_a_hit_it_cannot_disprove(
     monkeypatch.setattr(dat_internal, "_match_single_file", _capped)
     deleted = AsyncMock()
     monkeypatch.setattr(global_dat_store, "delete_match", deleted)
-    # The row it must not lose: same embedded hash, so nothing is disproved.
-    monkeypatch.setattr(
-        global_dat_store, "get_match",
-        lambda _p: {"matched": True, "game_name": "Kept Game",
-                    "match_type": "chd_sha1", "file_hash": "a" * 40},
-    )
+    # Nothing is disproved, so the shared compare-and-delete keeps the row.
+    dropped = AsyncMock(return_value=False)
+    monkeypatch.setattr(global_dat_store, "drop_match_if_changed", dropped)
 
     await scan_phase_stubs._scan_phase_dat_match("job-1", ["/vol/big.chd"], force=True)
 
+    # Through the pruner, never the unconditional delete this branch used.
+    dropped.assert_awaited_once()
+    assert dropped.await_args.args[0] == "/vol/big.chd"
     deleted.assert_not_awaited()
 
 
@@ -3655,14 +3637,211 @@ async def test_a_capped_rescan_still_drops_a_hit_it_can_disprove(
         }
 
     monkeypatch.setattr(dat_internal, "_match_single_file", _capped)
-    deleted = AsyncMock()
-    monkeypatch.setattr(global_dat_store, "delete_match", deleted)
-    monkeypatch.setattr(
-        global_dat_store, "get_match",
-        lambda _p: {"matched": True, "game_name": "Old Game",
-                    "match_type": "chd_sha1", "file_hash": "a" * 40},
-    )
+    dropped = AsyncMock(return_value=True)
+    monkeypatch.setattr(global_dat_store, "drop_match_if_changed", dropped)
 
     await scan_phase_stubs._scan_phase_dat_match("job-1", ["/vol/big.chd"], force=True)
 
-    deleted.assert_awaited_once_with("/vol/big.chd")
+    dropped.assert_awaited_once()
+    assert dropped.await_args.args[0] == "/vol/big.chd"
+    assert dropped.await_args.args[1][CANDIDATE_HASHES_KEY] == [("b" * 40, "chd_sha1")]
+
+
+# ---------------------------------------------------------------------------
+# Thirty-fifth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_local_only_rematch_prunes_a_replaced_capped_file(
+    tmp_path, isolated_store, monkeypatch,
+):
+    """The job path has to act on the evidence round 33 taught it to carry.
+
+    A DAT import triggers a local-only rematch. For a large CHD the result is
+    non-cacheable (``file too large``), so the store never sees it -- and the
+    job path never pruned, which is the scan's job. Nothing in that sequence
+    ever ran, so a replaced oversized file kept the previous game's badge with
+    nothing left to re-check it.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", set())
+
+    path = str(tmp_path / "big.chd")
+    await _store_hit(isolated_store, path, "a" * 40, "chd_sha1")
+
+    async def _capped(p, *, cancel_event=None, local_only=False):
+        return {
+            "path": p, "matched": False, "reason": "file too large",
+            CANDIDATE_HASHES_KEY: [("b" * 40, "chd_sha1")],
+        }, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _capped)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=[path], local_only=True,
+    )
+
+    assert isolated_store.get_match(path) is None, (
+        "the replaced file kept the badge its recomputed hash disproves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_job_result_with_no_evidence_never_touches_the_store(
+    tmp_path, isolated_store, monkeypatch,
+):
+    """The overcorrection guard: pruning runs per file, on proof only.
+
+    A missing file or a stat error recomputes nothing, so there is no claim to
+    disprove -- and this runs for every non-cacheable path in every job.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", set())
+
+    path = str(tmp_path / "gone.chd")
+    await _store_hit(isolated_store, path, "a" * 40, "chd_sha1", "Kept Game")
+
+    async def _gone(p, *, cancel_event=None, local_only=False):
+        return {"path": p, "matched": False}, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _gone)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=[path],
+    )
+
+    assert isolated_store.get_match(path) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_job_does_not_start_the_rematch_it_was_holding(monkeypatch):
+    """A job that raised stopped for a reason; its queue must not resume it.
+
+    The abandonment guard is the case: a hash helper outlived SIGKILL and is
+    still reading unresponsive storage, so the job raises rather than stranding
+    another process on that volume (issue #268). ``job_success`` is False on
+    that path exactly as it is for an ordinary "ran everything, some failed"
+    job, so the teardown drained the deferred set and started hashing the same
+    volume seconds later.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", {"/vol/queued.chd"})
+
+    started: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        started.append(list(paths))
+        return "job-2"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+
+    async def _abandoned(path, *, cancel_event=None, local_only=False):
+        raise RuntimeError("left a process stuck on unresponsive storage")
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _abandoned)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/vol/a.chd"],
+    )
+
+    assert job_manager.jobs[scan_job.id].status.value == "failed"
+    assert started == [], "a crashed job resumed hashing through its deferred queue"
+    assert not dat_routes._deferred_rematch_paths, (
+        "the dropped queue must not linger for an unrelated job to pick up"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_merely_reported_failures_still_hands_over(monkeypatch):
+    """...and the overcorrection guard: only a *crash* withholds the queue.
+
+    A job whose files all failed (Hasheous unreachable, say) still ran to the
+    end and chose to finish. Nothing about it says the next batch cannot run.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+    monkeypatch.setattr(dat_routes, "_deferred_rematch_paths", {"/vol/queued.chd"})
+
+    started: list[list[str]] = []
+
+    async def _schedule(paths, **_kwargs):
+        started.append(list(paths))
+        return "job-2"
+
+    monkeypatch.setattr(dat_routes, "schedule_match_job", _schedule)
+
+    async def _failed(path, *, cancel_event=None, local_only=False):
+        return {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR}, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _failed)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/vol/a.chd"],
+    )
+
+    assert job_manager.jobs[scan_job.id].status.value == "failed"
+    assert started == [["/vol/queued.chd"]]
+
+
+@pytest.mark.asyncio
+async def test_the_pruner_compares_and_deletes_in_one_transaction(
+    tmp_path, isolated_store,
+):
+    """A concurrent write between the read and the delete must survive.
+
+    A match job can persist the *replacement* file's correct result in that
+    window -- the ``match`` workload token covers hashing, not this cache
+    operation -- and the delete then removed the fresh row it never compared.
+    """
+    path = str(tmp_path / "game.chd")
+    await _store_hit(isolated_store, path, "a" * 40, "file_sha1")
+
+    real_get = isolated_store._session
+
+    seen: list[str] = []
+
+    def _tracking_session():
+        seen.append("session")
+        return real_get()
+
+    isolated_store._session = _tracking_session
+    try:
+        await dat_routes.drop_if_content_changed(
+            path, {"error": dat_routes.HASHEOUS_ERROR, "file_hash": "b" * 40},
+        )
+    finally:
+        isolated_store._session = real_get
+
+    assert isolated_store.get_match(path) is None
+    assert len(seen) == 1, (
+        f"compare and delete must share one transaction, opened {len(seen)}"
+    )

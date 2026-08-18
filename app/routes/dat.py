@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from config import settings
 from models import ConversionMode
 from services import hasheous
-from services.dat_store import CANDIDATE_HASHES_KEY, dat_store, recomputed_hash_in
+from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
 from services.file_hasher import compute_file_sha1
 from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
@@ -986,6 +986,10 @@ async def _run_match_job(
     # Tri-state: True = success, False = failure, None = cancelled.
     job_success: bool | None = False
     job_error: str | None = None
+    # Set only by the `except Exception` branch. `job_success is False` cannot
+    # tell a mid-loop crash from a job that ran every path and reported
+    # failures, and only the first must withhold the deferred rematch.
+    job_crashed = False
 
     # Set when the job is cancelled; forwarded into expensive embedded-hash
     # hooks (e.g. dolphin-tool verify) so the in-flight file aborts promptly
@@ -1035,6 +1039,15 @@ async def _run_match_job(
                     logger.exception("Failed to cache match for %s", normalized_path)
                     errors += 1
             else:
+                # A non-cacheable result is not written, but it is not
+                # evidence-free either: a capped CHD's embedded hashes are
+                # read even when its container is not, and a DAT-change
+                # rematch is exactly when a replaced file needs its old badge
+                # retired. The scan has always pruned on that evidence; this
+                # path never did, so an oversized replaced file kept naming
+                # the previous game with nothing left to re-check it. Deletes
+                # only on proof in the row's own hash domain.
+                await drop_if_content_changed(normalized_path, result)
                 # Non-cacheable outcomes split into errors (something went
                 # wrong, see _hash_one_for_job) vs skips (policy: file
                 # too large, not a regular file). `result.get("error")`
@@ -1098,6 +1111,14 @@ async def _run_match_job(
         job_success = None
     except Exception as exc:
         logger.exception("DAT match job %s failed", job_id)
+        # Fatal, as opposed to "finished with failures": the loop stopped
+        # early and did not choose to. The abandonment guard is the case that
+        # matters -- a hash helper outlived SIGKILL and is still reading
+        # unresponsive storage, so the job raises to stop stranding more
+        # processes (issue #268). Handing its queue straight to a successor
+        # resumed hashing on that same volume seconds later, which is the one
+        # thing the guard exists to prevent.
+        job_crashed = True
         # Include counters so the final-status line tells the operator
         # how far the job got before the mid-loop failure.  Without
         # this, the user only sees the raw exception string and loses
@@ -1118,12 +1139,14 @@ async def _run_match_job(
         async with _get_match_job_lock():
             if _active_match_job_id == job_id:
                 _active_match_job_id = None
-        # A cancelled job must not hand its queue to a successor: see
-        # _discard_deferred_rematch. `job_success is None` is set only by the
-        # ExternalJobCancelled branch, so it is the cancellation signal here --
-        # job_manager.is_cancelled() is not, since a cancelled job can be
-        # reaped from the registry before this runs.
-        if job_success is None:
+        # A cancelled or crashed job must not hand its queue to a successor:
+        # see _discard_deferred_rematch. `job_success is None` is set only by
+        # the ExternalJobCancelled branch, so it is the cancellation signal
+        # here -- job_manager.is_cancelled() is not, since a cancelled job can
+        # be reaped from the registry before this runs. `job_crashed` is the
+        # other stop-now signal; an ordinary "ran everything, some failed" job
+        # still drains, since nothing about it says the next batch would fail.
+        if job_success is None or job_crashed:
             _discard_deferred_rematch(job_id)
         else:
             await _drain_deferred_rematch()
@@ -1524,34 +1547,27 @@ async def drop_if_content_changed(path: str, result: dict) -> None:
     a rescan recomputes the *container* ``file_sha1``. Those are different hash
     domains and differ for a perfectly unchanged file.
 
-    ``recomputed_hash_in`` is the shared answer to "what did this result
-    recompute in the row's own domain", used here and by the store's write
-    guard. Keying on the stored row's ``match_type`` rather than demanding
-    ``file_sha1`` is what lets an exhaustive format be pruned at all: a
-    replaced RVZ carries a fresh ``dolphin_disc_sha1`` and never a
-    ``file_sha1``, so the narrower rule left it wearing the previous game's
-    badge through an outage rescan.
+    The comparison itself lives in the store, as ``drop_match_if_changed``:
+    it is the same question the write guard answers, keyed on the stored row's
+    ``match_type`` rather than demanding ``file_sha1`` (which is what lets an
+    exhaustive format be pruned at all -- a replaced RVZ carries a fresh
+    ``dolphin_disc_sha1`` and never a ``file_sha1``). Reading the row here and
+    deleting it in a second call left a window where a concurrent match job's
+    correct result for the *replacement* file could land in between and be
+    deleted instead, so compare and delete now share one transaction.
+
+    Every consumer of a non-cacheable result funnels through here -- the
+    metadata scan and the match job both -- because "the recompute proves this
+    row is stale" is one rule and it was previously applied in only one of the
+    two places.
     """
     # No recomputed hash of any kind means no claim can be disproved -- and
     # this runs per file on every forced rescan, so it returns before touching
     # the store rather than after.
     if not result.get(CANDIDATE_HASHES_KEY) and not result.get("file_hash"):
         return
-    cached = await run_in_threadpool(dat_store.get_match, path)
-    if not cached:
-        return
-    stored_type = cached.get("match_type")
-    old_hash = cached.get("file_hash")
-    if not stored_type or not old_hash:
-        # Nothing to compare against: no claim can be disproved.
-        return
-    new_hash = recomputed_hash_in(result, stored_type)
-    if new_hash and new_hash != old_hash:
-        logger.info(
-            "%s changed since its cached match (%s -> %s); dropping the stale row",
-            path, old_hash, new_hash,
-        )
-        await dat_store.delete_match(path)
+    if await dat_store.drop_match_if_changed(path, result):
+        logger.info("%s changed since its cached match; dropped the stale row", path)
 
 
 async def _match_single_file(

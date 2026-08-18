@@ -190,6 +190,32 @@
   out — the check ran once it had already been disclosed. Local DATs are now
   re-consulted between requests as well.
 
+- **A replaced file over the size cap no longer keeps the previous game's
+  badge.** Matching a file bigger than `MATCH_MAX_FILE_SIZE` skips its whole-file
+  hash, so the result is never cached — but for something like a large CHD the
+  *embedded* hashes are still read, and those are enough to prove the file on
+  disk is not the one the badge names. The metadata scan had always acted on
+  that; the background match job, which is what a DAT import or sync triggers,
+  had not, so an oversized file you replaced went on showing the old game with
+  nothing left to correct it. Both paths now retire a badge their own recomputed
+  hash contradicts — and only then: a size cap on its own is not evidence, and
+  a match recorded against one kind of hash is never compared against another.
+
+- **A match job that hit stuck storage no longer resumes on it.** When a hash
+  helper survives being killed and keeps reading an unresponsive volume, the job
+  stops on purpose rather than stranding more processes there. If a DAT import
+  had queued a re-match behind it, that queue was handed straight to a
+  replacement job, which started reading the same volume seconds later. A job
+  that stops this way now drops the queue, exactly as a cancelled one does; a
+  job that merely finished with failures still hands it over.
+
+- **A Hasheous toggle in another tab no longer takes a page reload to show
+  up.** Two halves of the same gap: turning the fallback on elsewhere cleared
+  this tab's badges without re-fetching them, so a folder sat blank until you
+  navigated away and back; and toggling it *here* re-applied its own answer
+  after refreshing, which could overwrite a newer state another tab had just
+  set — leaving the panel and the backend disagreeing for up to a minute.
+
 - **Cancelling a match job no longer starts another one.** If a DAT import or
   sync had queued a re-match behind the running job, cancelling it kicked that
   re-match off from the cancelled job's own teardown — and because **Cancel

@@ -218,6 +218,14 @@
       // HASH badge vanish on the next render. hydrateAndMatch() reads the cache
       // first and returns before creating any job when matching is off, so the
       // gate belongs there, not around the read.
+      // Tracked deliberately. A provider flip in another tab -- or a DAT
+      // import, delete or finished sync -- clears the match cache, and this
+      // effect would otherwise never notice: hydrate() snapshots the map
+      // under untrack precisely so it does not subscribe to the cache it
+      // fills, and with local DATs present `matchingAvailable` does not flip
+      // either. Reading the policy generation re-runs the hydration that
+      // repopulates what the clear dropped.
+      const _policyGeneration = datMatching.policyGeneration;
       const matchableExts = registry.allFilterableExts();
       const matchExtSet = new Set(matchableExts.map((e) => e.toLowerCase()));
       const filePaths = entries
