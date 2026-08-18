@@ -917,7 +917,7 @@ def _accepts_source(tool, spec, path: str) -> bool:
     the secondary members of a split Wii U dump visible but non-convertible,
     since only `game_part1.wud` drives the set).
     """
-    if InputKind.DIRECTORY in spec.input_kinds:
+    if registry.mode_input_kind(spec.mode) is InputKind.DIRECTORY:
         return tool.accepts_directory(path)
     if spec.input_extensions and match_extension(path, spec.input_extensions) is None:
         return False
@@ -1144,8 +1144,25 @@ def _inspect_candidate(rom: dict, rule: dict, tool, spec, remembered: dict | Non
     # moved or deleted outside RomM still lists a local_path, and queueing it
     # spends a worker slot to fail in the tool. Same stat call either way, so
     # asking here costs nothing the resolve did not already pay for.
-    if not os.path.exists(resolved):
-        return {**miss, "skip": "missing", "path": path}
+    #
+    # And what is there has to be the *kind* the mode consumes. The check
+    # above is a declaration check -- extensions and the tool's predicate --
+    # so a directory whose name carries an accepted extension passes it, and
+    # plain existence would then let it through. The manual batch route stats
+    # for a regular file; automation must too, because here nothing is
+    # watching: an `overwrite` rule authorises the job, `_clear_existing_output`
+    # removes the previous artifact, and only then does the converter fail on
+    # a directory it cannot open.
+    wants_directory = (
+        registry.mode_input_kind(rule["mode"]) is InputKind.DIRECTORY
+    )
+    present = os.path.isdir(resolved) if wants_directory else os.path.isfile(resolved)
+    if not present:
+        # Nothing there at all is "gone from disk"; something of the wrong kind
+        # is the target format refusing it, which is what the operator needs to
+        # read to understand why.
+        reason = "missing" if not os.path.exists(resolved) else "unconvertible"
+        return {**miss, "skip": reason, "path": path}
     destination, decision = resolve_destination(
         tool, path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
     )

@@ -3227,6 +3227,42 @@ def test_cancelling_a_plan_cannot_retire_the_row_that_superseded_it(
     assert romm_repin.count_pending() == 0
 
 
+def test_an_identity_swap_retires_a_claim_its_holder_never_released(
+    sqlite_db, tmp_path: Path,
+) -> None:
+    """A stale claim is re-issued later, so leaving one behind is not neutral.
+
+    Pointing at a different RomM instance (or library root) retires the rows
+    that hold the old instance's provider ids. A row whose holder died
+    mid-write is `settling`, not `pending` — and both `pending_rows` and
+    `claim` deliberately hand a stale claim back out — so one left behind here
+    is picked up 15 minutes later and stamps the old library's identity onto
+    whatever the new one matches its digest to. Which is the one outcome this
+    cleanup exists to prevent.
+    """
+    from services import romm_repin
+
+    kept = romm_repin.record(
+        {"id": 5, "igdb_id": 42}, str(tmp_path / "A.rvz"), {"igdb_id": 42},
+    )
+    claimed = romm_repin.record(
+        {"id": 6, "igdb_id": 43}, str(tmp_path / "B.rvz"), {"igdb_id": 43},
+    )
+    assert romm_repin.claim(claimed) is True
+    assert romm_repin.count_pending() == 2
+
+    assert romm_repin.retire_all_pending("The RomM instance changed") == 2
+    assert romm_repin.count_pending() == 0
+
+    # Neither comes back, however long the claim has been outstanding.
+    with patch.object(
+        romm_repin, "_iso_seconds_ago", return_value="2999-01-01T00:00:00Z",
+    ):
+        assert romm_repin.pending_rows(10) == []
+        assert romm_repin.claim(claimed) is False
+        assert romm_repin.claim(kept) is False
+
+
 def test_releasing_a_superseded_claim_retires_it_instead_of_restoring_it(
     sqlite_db, tmp_path: Path,
 ) -> None:
@@ -3648,6 +3684,62 @@ async def test_sweep_refuses_a_catalog_entry_whose_file_is_gone(
 
     assert result["queued"] == 0, result
     assert result["skipped_missing"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_refuses_a_directory_where_the_mode_takes_a_file(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Existing is not the same as being the kind of thing the mode consumes.
+
+    The declaration check ahead of this is extensions and the tool's own
+    predicate, so a directory whose *name* carries an accepted extension
+    passes it — and plain `exists()` then let it into the queue. Nothing is
+    watching an unattended sweep: an `overwrite` rule authorises the job,
+    `_clear_existing_output` removes the previous artifact, and only then does
+    the converter fail on a directory it cannot open.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    # A *directory* named like a disc image, which is what RomM lists.
+    (lib / "Game.iso").mkdir()
+    # And the output an overwrite rule would clear before failing.
+    (lib / "Game.rvz").write_bytes(b"\0" * 16)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0, result
+    # Refused by the target format, not reported as gone from disk: it is
+    # right there, it is just not a file.
+    assert result["skipped_unconvertible"] == 1, result
+    assert result["skipped_missing"] == 0, result
+    # And the existing output is untouched, because nothing was ever queued.
+    assert (lib / "Game.rvz").exists()
+
+    # The directory mode's own source is still accepted, or the check would
+    # have closed the PS3 folder path along with the bug.
+    assert (
+        registry.mode_input_kind("folder_to_iso") is romm_auto.InputKind.DIRECTORY
+    )
+    assert registry.mode_input_kind("dolphin_rvz") is romm_auto.InputKind.FILE
 
 
 @pytest.mark.asyncio

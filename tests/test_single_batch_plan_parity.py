@@ -748,3 +748,44 @@ async def test_destination_canonicalisation_never_runs_on_the_event_loop(
     assert [job.output_path for job in jobs] == ["/dead-mount/game.chd"]
     # The loop kept running while the mount did not answer.
     assert ticks > 0
+
+
+@pytest.mark.asyncio
+async def test_a_job_queued_during_another_preflight_still_claims_its_output(
+    tmp_path, monkeypatch,
+) -> None:
+    """The pre-flight map is older than any job queued after it was built.
+
+    Canonicalisation moved off the event loop, which means it now happens
+    *before* `_create_lock` is taken. Two submissions can both pre-resolve and
+    then queue one after the other, and the second's map cannot contain the
+    first's job — so a lexical fallback for that job would miss that a
+    symlinked spelling and the real path name the same file. With overwrite
+    plus delete-on-verify, both sources are deleted for one surviving output.
+    """
+    from services import job_manager as jm
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setattr(jm.concurrency_manager, "reserve_ticket", lambda key: 0)
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    mode = ConversionMode.CREATECD
+    # The first submission spells its source through the symlink, the second
+    # through the real directory. Both resolve to one `game.chd`.
+    first = [{"file_path": str(link / "game.iso")}]
+    second = [{"file_path": str(real / "game.iso")}]
+
+    # Both pre-flights complete before either takes the lock.
+    keys_first = await manager._reservation_keys(first, mode)
+    keys_second = await manager._reservation_keys(second, mode)
+
+    manager._reject_claimed_destinations_locked(first, mode, keys_first)
+    manager._queue_job_locked(
+        file_path=str(link / "game.iso"), mode=mode, resolved=keys_first,
+    )
+
+    with pytest.raises(OutputClaimedError):
+        manager._reject_claimed_destinations_locked(second, mode, keys_second)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from models import InputKind
 from utils.path_utils import match_extension
 
 if TYPE_CHECKING:
@@ -63,6 +64,21 @@ class ToolRegistry:
         """
         spec = self.spec(mode)
         return spec.supports_delete_on_verify or spec.supports_verify
+
+    def mode_input_kind(self, mode: str) -> InputKind:
+        """The kind of thing this mode takes: one file, or one directory.
+
+        The single answer to "what is a source here", asked by the queue (which
+        carries it end-to-end so the pipeline skips the file-only assumptions),
+        by the automation sweep's declaration check, and by the sweep's
+        existence check -- which has to confirm what is on disk is that kind,
+        not merely that something is there.
+        """
+        return (
+            InputKind.DIRECTORY
+            if InputKind.DIRECTORY in self.spec(mode).input_kinds
+            else InputKind.FILE
+        )
 
     def default_compression(self, mode: str) -> str | None:
         """The codec to send when a level is set and the codec is "tool default".

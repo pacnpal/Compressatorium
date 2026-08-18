@@ -1403,6 +1403,16 @@ bound, instead of taking the process with it.
 Calling `_canonical_path` without one is the blocking form, and it is only
 correct off the event loop.
 
+Moving the resolution ahead of the lock opens one gap the map alone cannot
+close: two submissions can both pre-resolve before either takes the lock, so
+the second's map cannot contain a job the first queues in between. Falling back
+to lexical for that job would miss that a symlinked spelling and the real path
+name one file — and with overwrite plus delete-on-verify, both sources are
+deleted for one surviving output. So `_queue_job_locked` records the key it
+claimed the destination under in **`_output_keys[job_id]`**, and
+`_active_output_map` prefers it over the (possibly stale) map. The entry is
+dropped when the job leaves the queue; only live jobs are consulted.
+
 #### One destination, one source (`output_conflicts.collapse_to_winners`)
 
 Two inputs can resolve to the same output — a `.cue` beside its `.bin`, two
@@ -1444,6 +1454,12 @@ Restoring the claim to `pending` then violates
 `release`, replacing the real error with a 500 and stranding the claim until it
 ages out — so `release()` retires a superseded claim instead, and returns
 whether the row went back to `pending`.
+
+`retire_all_pending()` (the identity swap) covers `settling` as well as
+`pending` for the same reason `claim` re-issues a stale one: a claim whose
+holder died mid-write comes back after `_CLAIM_STALE_SECONDS`, and a row left
+behind by the swap would then apply the *old* instance's provider ids to
+whatever the new one matches its digest to.
 
 **"Has this rule already converted this source?"** `skip` is idempotent from the
 destination alone, but the other two policies are not: `overwrite` resolves an
@@ -1625,6 +1641,23 @@ nothing and inherits: recompressing a finished `.chd` is media-agnostic.
 The rule for a new tool: declare `platform_slugs` on the *mode* whenever two of
 a tool's modes would be wrong for each other's platforms, and let the tool-level
 set be the union.
+
+#### What counts as a source (`registry.mode_input_kind`)
+
+`ModeSpec.input_kinds` is a set, and "does this mode take a file or a
+directory" was re-derived from it at each seam. **`mode_input_kind(mode)`** is
+the one answer, used by the queue (which carries it end-to-end so the pipeline
+skips the file-only assumptions), by the sweep's declaration check, and by the
+sweep's existence check.
+
+That last one matters because existing is not the same as being the right kind.
+The declaration check is extensions and the tool's predicate, so a directory
+whose *name* carries an accepted extension passes it, and a plain
+`os.path.exists()` then let it into the queue. The manual batch route stats for
+a regular file; automation has to as well, because nothing is watching an
+unattended sweep — an `overwrite` rule authorises the job,
+`_clear_existing_output` removes the previous artifact, and only then does the
+converter fail on a directory it cannot open.
 
 #### How a job ended, after the queue forgets (`add_terminal_listener`)
 

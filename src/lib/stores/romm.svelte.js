@@ -250,6 +250,24 @@ class RommStore {
   }
 
   /**
+   * Abandon whatever platform load is in flight, writing nothing.
+   *
+   * For leaving the RomM view. The load's tail selects a platform, which
+   * calls `fileBrowser.enterRomm()` — so a request still outstanding when the
+   * view unmounts would repopulate the browser with catalog rows *after* the
+   * cleanup put it back on the ordinary listing, and the workspace would open
+   * showing a directory heading above RomM entries. The request itself cannot
+   * be recalled; superseding its ticket is what makes its answer inert.
+   */
+  cancelPlatformLoad() {
+    this.#platformsTicket += 1;
+    // The abandoned load's `finally` will not clear this — it no longer holds
+    // the newest ticket — and leaving it set would make every later unforced
+    // load bail as "one is already running".
+    this.platformsLoading = false;
+  }
+
+  /**
    * True when the selected platform is one nothing installed can convert.
    *
    * `tool_ids`/`mode_ids` absent means "no opinion" (unknown slug, older

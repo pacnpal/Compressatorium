@@ -164,3 +164,55 @@ def test_an_unforced_platform_load_still_defers_to_the_one_in_flight(tmp_path):
     instance for one screen.
     """
     assert _run(tmp_path, _UNFORCED_LOAD)["requests"] == 1
+
+
+_ABANDONED_LOAD = """
+const store = new RommStore();
+const load = store.loadPlatforms();
+await tick();
+
+// The view unmounts while the request is outstanding.
+store.cancelPlatformLoad();
+fileBrowser.rommPlatformId = null;   // what exitRomm() leaves behind
+
+// ...and only now does RomM answer.
+__calls[0].resolve([{ id: 9, name: 'New', tool_ids: null, mode_ids: null }]);
+await load;
+await tick();
+// Sampled here, before anything legitimate re-enters: this is the value the
+// workspace would open with.
+const entered_after_cancel = fileBrowser.rommPlatformId;
+
+// A later visit must still be able to load.
+const again = store.loadPlatforms();
+await tick();
+__calls[1]?.resolve([{ id: 9, name: 'New', tool_ids: null, mode_ids: null }]);
+await again;
+
+process.stdout.write(JSON.stringify({
+  entered_after_cancel,
+  requests: __calls.length,
+  entered_after_revisit: fileBrowser.rommPlatformId,
+  platforms: store.platforms.map((p) => p.name),
+}));
+"""
+
+
+def test_an_abandoned_platform_load_cannot_re_enter_romm_mode(tmp_path):
+    """Leaving the RomM view has to invalidate the load still in flight.
+
+    A load ends by selecting a platform, which calls `enterRomm()`. The view's
+    cleanup restores the ordinary directory listing — and the outstanding
+    request then put the catalog straight back into the browser, so the
+    workspace opened showing RomM rows under a directory heading. The view's
+    own `alive` flag cannot cover it: the side effect happens inside the store.
+    """
+    data = _run(tmp_path, _ABANDONED_LOAD)
+
+    # Nothing re-entered RomM mode on the abandoned load's behalf.
+    assert data["entered_after_cancel"] is None, data
+    # The next deliberate visit still works — the cancel must not leave the
+    # store wedged as "a load is already running".
+    assert data["requests"] == 2, data
+    assert data["entered_after_revisit"] == 9, data
+    assert data["platforms"] == ["New"], data

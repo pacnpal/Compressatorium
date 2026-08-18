@@ -216,6 +216,16 @@ class JobManager:
         # it runs (a cancel notification or history prune silently dropped).
         self._background_tasks: Set[asyncio.Task] = set()
         self._delete_plans: Dict[str, Dict[str, object]] = {}
+        # job id -> the canonical key its output was reserved under. Recorded
+        # at queue time because the reservation's pre-flight map is built
+        # *before* `_create_lock` is taken (see `_reservation_keys`): two
+        # submissions can both pre-resolve, and the second's map cannot contain
+        # a job the first queues in between. Without the key kept here the
+        # second would fall back to the first job's lexical path, and two
+        # spellings of one file -- a symlinked directory and its target --
+        # would each be accepted. Dropped when the job leaves the queue; only
+        # live jobs are ever consulted.
+        self._output_keys: Dict[str, str] = {}
         # Jobs currently inside the verify phase, mapped to the monotonic clock
         # reading when that phase began. Verification emits no progress and can
         # legitimately run for many minutes, so the stalled-job warning reports
@@ -327,12 +337,7 @@ class JobManager:
         # registry spec (every conversion mode is registered; external jobs
         # bypass this path), so FILE/DIRECTORY can't drift via a typo.
         try:
-            mode_spec = registry.spec(mode.value)
-            input_kind = (
-                InputKind.DIRECTORY
-                if InputKind.DIRECTORY in mode_spec.input_kinds
-                else InputKind.FILE
-            )
+            input_kind = registry.mode_input_kind(mode.value)
         except KeyError:
             input_kind = InputKind.FILE
 
@@ -354,6 +359,9 @@ class JobManager:
         )
 
         self.jobs[job_id] = job
+        # The key this destination is claimed under, for the reservation that
+        # runs after this one. See `_output_keys`.
+        self._output_keys[job_id] = _canonical_path(output_path, resolved)
         if delete_on_verify and delete_snapshot:
             self._delete_plans[job_id] = delete_snapshot
         ticket = concurrency_manager.reserve_ticket(job_id)
@@ -684,9 +692,14 @@ class JobManager:
             if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 continue
             if job.output_path:
-                active.setdefault(
-                    _canonical_path(job.output_path, resolved), job.id,
-                )
+                # The key the job was queued under, when it has one: the
+                # pre-flight map in *resolved* is older than any job queued
+                # since it was built, and falling back to lexical for those
+                # would miss an alias of a path already claimed.
+                key = self._output_keys.get(job.id)
+                if key is None:
+                    key = _canonical_path(job.output_path, resolved)
+                active.setdefault(key, job.id)
         return active
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
@@ -1646,6 +1659,7 @@ class JobManager:
             self._archive_job_for_lookup(job)
             self._cancelled.discard(job_id)
             self._delete_plans.pop(job_id, None)
+            self._output_keys.pop(job_id, None)
             if job_id not in self._cancel_events:
                 concurrency_manager.release(job_id)
             if job_id not in self._cancel_events:
@@ -3063,6 +3077,7 @@ class JobManager:
             concurrency_manager.release(job_id)
 
             self._delete_plans.pop(job_id, None)
+            self._output_keys.pop(job_id, None)
             if job_id in self._cancel_events:
                 del self._cancel_events[job_id]
             self._last_progress_at.pop(job_id, None)

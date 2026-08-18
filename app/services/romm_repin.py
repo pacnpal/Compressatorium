@@ -292,7 +292,7 @@ def cancel(row_ids: list[int]) -> int:
 
 
 def retire_all_pending(detail: str) -> int:
-    """Retire every pending row. Returns how many were retired.
+    """Retire every outstanding row. Returns how many were retired.
 
     For when the rows stop meaning anything: pointing Compressatorium at a
     different RomM instance (or a different library root) leaves rows holding
@@ -302,13 +302,22 @@ def retire_all_pending(detail: str) -> int:
     onto another's game. There is no way to re-home them, so they are retired
     with the reason.
 
+    Outstanding includes ``settling``, not just ``pending``. A claim outlives
+    its holder when the process dies mid-write, and both `pending_rows` and
+    `claim` deliberately hand a stale one back out again -- so a row left
+    behind here would be re-claimed after `_CLAIM_STALE_SECONDS` and apply the
+    *old* instance's provider ids to whatever the new one matches its digest
+    to, which is the exact outcome this function exists to prevent. A claim
+    held by a pass running right now is not a concern: the callers serialise
+    against the settler before swapping identity.
+
     Retire, never delete, like :func:`cancel`: the row is the record of what
     was planned, and only *pending* rows are constrained by the unique index.
     """
     with _session() as session:
         retired = (
             session.query(_db.RommRepin)
-            .filter(_db.RommRepin.state == "pending")
+            .filter(_db.RommRepin.state.in_(("pending", SETTLING)))
             .update(
                 {
                     "state": "abandoned",

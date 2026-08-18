@@ -485,6 +485,34 @@
   Convert panel then narrowed to, against a server nobody was pointed at any
   more.
 
+- **Two submissions racing each other can no longer both claim one file
+  through different spellings of its path.** The queue resolves each
+  destination before taking its lock now (so a dead mount cannot freeze the
+  app), which left a gap: a job queued between one submission's resolution and
+  the next was compared by its literal path, so a library reached through a
+  symlink and the same library reached directly looked like two different
+  destinations. With Overwrite plus *delete the source after verifying*, that
+  deleted both sources for one surviving file. Each job now carries the key its
+  destination was claimed under.
+- **An automatic rule no longer queues a folder to a format that takes a
+  file.** A RomM record can resolve to a directory, and a directory whose name
+  ends in an accepted extension passed the format check — so an Overwrite rule
+  would authorise the job, delete the previous output, and only then fail in
+  the converter. The sweep now confirms what is on disk is the kind the format
+  actually consumes, and says the format cannot take it rather than claiming
+  the file is gone.
+- **Switching RomM instances retires a re-match row whose write was
+  interrupted.** Rows still waiting were retired, but one that a previous run
+  had claimed and never finished was left behind — and claims are deliberately
+  re-issued after fifteen minutes, so it would come back and apply the old
+  instance's identity to whatever the new one matched its digest to. Exactly
+  what retiring those rows exists to prevent.
+- **Leaving the RomM library while it is still loading no longer drops the
+  catalog into the ordinary file browser.** The platform request outlives the
+  screen, and its last step selects a platform — which re-entered RomM mode
+  after the view had already restored the normal directory listing, so the
+  workspace opened showing catalog rows under a folder heading.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

@@ -213,6 +213,12 @@
     // the workspace would open showing RomM rows under a directory heading.
     return () => {
       alive = false;
+      // Before exitRomm, not after: a platform load still in flight ends by
+      // selecting a platform, which re-enters RomM mode — so leaving without
+      // abandoning it puts the catalog straight back into the browser the
+      // line below just restored. `alive` cannot cover that; the side effect
+      // happens inside the store, not after the await here.
+      romm.cancelPlatformLoad();
       fileBrowser.exitRomm();
     };
   });
