@@ -317,24 +317,30 @@ async def lookup(sha1: str) -> dict | None:
             f"skipped: unavailable, retrying in {remaining:.0f}s"
         )
 
+    # Everything that can decide "this server is not answering properly" lives
+    # inside the one try, so it all opens the cooldown. Validation used to sit
+    # after it: a proxy returning `{}` for every hash was then re-requested
+    # once per file, recreating exactly the hours-long outage the breaker
+    # exists to prevent.
     try:
         data = await run_in_threadpool(_fetch_json, _lookup_url(normalized))
+        record = None
+        if data is not None:
+            record = _normalize(data)
+            if not _is_identified(record):
+                # A 200 with no game identity is not a hit. Hasheous answers an
+                # unknown hash with 404, so this is something else answering
+                # for it -- a proxy error envelope, a self-host returning `{}`.
+                # Caching it would record an authoritative-looking match with
+                # no game attached.
+                raise HasheousUnavailable("response carried no game identity")
     except HasheousUnavailable:
         _begin_cooldown()
         raise
 
+    # A clean 404 counts as healthy: the server answered, it just doesn't know
+    # this hash.
     _clear_cooldown()
-    if data is None:
-        return None
-
-    record = _normalize(data)
-    if not _is_identified(record):
-        # A 200 that carries no game identity is not a hit. Hasheous answers an
-        # unknown hash with 404, so this is something else answering for it --
-        # a proxy error envelope, a self-host returning `{}`. Recording it
-        # would cache an authoritative-looking match with no game attached, so
-        # treat it as a service failure (non-cacheable) rather than a result.
-        raise HasheousUnavailable("response carried no game identity")
     return record
 
 

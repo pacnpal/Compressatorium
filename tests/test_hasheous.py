@@ -840,3 +840,209 @@ def test_remote_stamp_is_the_url_not_a_flag(monkeypatch):
 
     monkeypatch.setattr(settings, "hasheous_enabled", False)
     assert dat_routes.remote_stamp() is None
+
+
+# ---------------------------------------------------------------------------
+# Third review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_identityless_200_opens_the_cooldown(hasheous_on):
+    """The breaker has to cover validation failures, not just transport ones.
+
+    A proxy answering every hash with `{}` would otherwise be re-requested once
+    per file -- recreating the hours-long outage the cooldown exists to stop.
+    """
+    calls = []
+
+    def _empty(url):
+        calls.append(url)
+        return {}
+
+    with patch.object(hasheous, "_fetch_json", _empty):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            await hasheous.lookup(SAMPLE_SHA1)
+        for _ in range(5):
+            with pytest.raises(hasheous.HasheousUnavailable):
+                await hasheous.lookup(SAMPLE_SHA1)
+
+    assert len(calls) == 1
+    assert hasheous._cooldown_remaining() > 0
+
+
+@pytest.mark.asyncio
+async def test_a_404_still_counts_as_healthy(hasheous_on):
+    """A miss means the server answered; it must not open the breaker."""
+    hasheous._begin_cooldown()
+    hasheous._clear_cooldown()
+
+    with patch.object(hasheous, "_fetch_json", return_value=None):
+        assert await hasheous.lookup(SAMPLE_SHA1) is None
+
+    assert hasheous._cooldown_remaining() == 0
+
+
+@pytest.mark.asyncio
+async def test_toggle_is_persisted_before_it_is_applied(monkeypatch):
+    """A failed write must not leave the process quietly sending hashes.
+
+    Applying first would enable remote lookups for the running process while
+    the endpoint returned an error and the UI still showed the switch off.
+    """
+    monkeypatch.setattr(settings, "hasheous_enabled", False)
+
+    async def _boom(_key, _value):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(dat_routes.preferences_store, "put", _boom)
+
+    with pytest.raises(RuntimeError, match="locked"):
+        await dat_routes.put_hasheous_settings(
+            dat_routes.HasheousSettingsRequest(enabled=True),
+        )
+
+    assert hasheous.enabled() is False
+    assert hasheous.override() is None
+
+
+@pytest.mark.asyncio
+async def test_file_level_sha1_is_checked_locally_before_any_remote_call(
+    hasheous_on, monkeypatch,
+):
+    """The non-exhaustive (CHD) case of "all local before any remote".
+
+    A CHD reports header + data SHA1s, but its *container* bytes may be what
+    the local DAT indexes. Sending the embedded hashes out before checking that
+    container SHA1 locally both discloses them needlessly and lets a remote
+    outage mask the local hit.
+    """
+    header, data, container = "a" * 40, "b" * 40, "c" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = False
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1"), (data, "chd_data_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=container),
+    )
+
+    async def _local(sha1):
+        if sha1 != container:
+            return None
+        return {
+            "dat_id": "d1", "dat_name": "Local DAT", "game_name": "G",
+            "rom_name": "g.chd", "source": "dat",
+        }
+
+    monkeypatch.setattr(dat_routes, "_local_dat_record", _local)
+    remote = AsyncMock(side_effect=hasheous.HasheousUnavailable("down"))
+    monkeypatch.setattr(hasheous, "lookup", remote)
+
+    result = await dat_routes._match_single_file("/g.chd")
+
+    assert result["matched"] is True
+    assert result["source"] == "dat"
+    assert result["match_type"] == "file_sha1"
+    # The embedded hashes were never disclosed, and the outage never mattered.
+    remote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_pass_covers_embedded_and_file_level_together(
+    hasheous_on, monkeypatch,
+):
+    """Once everything misses locally, one remote pass sees the whole set."""
+    header, container = "a" * 40, "c" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = False
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=container),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+
+    seen = []
+
+    async def _remote(sha1):
+        seen.append(sha1)
+        return None
+
+    monkeypatch.setattr(hasheous, "lookup", _remote)
+
+    result = await dat_routes._match_single_file("/g.chd")
+
+    assert result["matched"] is False
+    assert seen == [header, container]
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_tool_never_reads_the_whole_file(hasheous_on, monkeypatch):
+    """Dolphin's disc SHA1 is definitive, so no file-level fallback."""
+    disc = "d" * 40
+
+    class _Dolphin:
+        embedded_hash_is_exhaustive = True
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(disc, "dolphin_disc_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Dolphin())
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    hashed = AsyncMock(return_value="e" * 40)
+    monkeypatch.setattr(dat_routes, "compute_file_sha1", hashed)
+
+    seen = []
+
+    async def _remote(sha1):
+        seen.append(sha1)
+        return None
+
+    monkeypatch.setattr(hasheous, "lookup", _remote)
+
+    result = await dat_routes._match_single_file("/g.rvz")
+
+    assert result["matched"] is False
+    assert seen == [disc]
+    hashed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_size_capped_file_still_gets_its_embedded_hashes_checked(
+    hasheous_on, monkeypatch,
+):
+    """The cap skips reading the file, not the hashes already in hand."""
+    header = "a" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = False
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(dat_routes.settings, "match_max_file_size", 1024)
+    monkeypatch.setattr(dat_routes.os.path, "getsize", lambda _p: 99_999)
+    hashed = AsyncMock(return_value="e" * 40)
+    monkeypatch.setattr(dat_routes, "compute_file_sha1", hashed)
+    remote = AsyncMock(return_value=None)
+    monkeypatch.setattr(hasheous, "lookup", remote)
+
+    result = await dat_routes._match_single_file("/big.chd")
+
+    assert result["reason"] == "file too large"  # non-cacheable, as before
+    remote.assert_awaited_once_with(header)
+    hashed.assert_not_awaited()

@@ -1197,27 +1197,37 @@ identity fields the source carries — so `_lookup_sha1_match` builds the
 result dict once and splats the record into it. Adding a field to a remote match
 means adding a key to that record, not touching the builder.
 
-#### Candidate ordering: all local, then all remote
+#### Candidate ordering: every local lookup before any remote one
 
-`_lookup_match(file_path, candidates)` takes the **whole** candidate list rather
-than being called once per hash. A tool can report several content hashes for one
-file — `ChdmanTool.embedded_hashes` returns the header SHA1 *and* the data SHA1 —
-and the two loops inside it are not interchangeable with one fused loop:
+This rule has to hold across the *whole* of `_match_single_file`, not just
+within one helper, and it took three passes to get right — so the shape is
+deliberate.
 
-```python
-for sha1, mt in candidates:          # every candidate, local only
-    ...
-if hasheous.enabled():
-    for sha1, mt in candidates:      # then, and only then, remote
-        ...
-```
+The lookup is split into `_local_lookup_match` and `_remote_lookup_match`, with
+`_lookup_match` as the local-then-remote composition. `_match_single_file` calls
+the halves directly, because its candidates do not all exist at the same time:
 
-Interleaving (remote-checking candidate 1 before local-checking candidate 2) has
-two failure modes. It discloses a hash the local DATs could have identified on
-their own, and a remote timeout on the first candidate raises before the second —
-the one that *would* have matched locally — is ever tried. Keeping the passes
-separate is what makes "local always wins" true at the candidate-set level and
-not just per hash.
+1. `_try_embedded_hash_match` gets the tool's embedded hashes (a CHD reports a
+   header SHA1 *and* a data SHA1) and checks them **locally only**.
+2. Unless the tool's hashes are exhaustive, the file-level SHA1 is computed —
+   expensive, hence lazy and size-capped — and checked **locally**.
+3. Only once every one of those has missed does the **complete** candidate set
+   go to Hasheous, in a single remote pass.
+
+Two orderings that look reasonable are both wrong, and each was a real bug here:
+
+- *Remote-checking candidate 1 before local-checking candidate 2.* Discloses a
+  hash the local DATs could have identified, and a remote timeout on the first
+  raises before the second — the one that would have matched — is tried.
+- *Letting the embedded-hash helper go remote before the caller has hashed the
+  file.* Same failure, one level up: for a non-exhaustive tool like CHD the
+  container's own bytes may be exactly what the local DAT indexes, so the
+  embedded hashes must not leave the machine until that has been checked.
+
+`_try_embedded_hash_match` is therefore local-only by contract, and returns its
+candidates so the caller can carry them into the single remote pass. A
+size-capped file still gets a remote pass over whatever embedded candidates it
+did produce, and keeps its non-cacheable `reason` if that misses.
 
 #### Cache entries are scoped to the sources that produced them
 
@@ -1244,7 +1254,17 @@ This is a payload field, not a schema change.
   module-level cooldown during which `lookup` raises immediately without a
   request. Files still come back non-cacheable — just without paying
   `hasheous_timeout` each. A 1,000-file scan against a dead endpoint would
-  otherwise burn over four hours rediscovering the same fact.
+  otherwise burn over four hours rediscovering the same fact. **Everything that
+  can judge the server unhealthy sits inside the one `try`** — transport errors
+  *and* response validation — because a proxy returning an identity-less `200`
+  for every hash is exactly as much of an outage as a timeout, and validating
+  after the guarded call left that case re-requesting once per file. A clean
+  404 is the one non-failure: the server answered, so it clears the cooldown.
+- **The toggle persists before it applies.** `PUT /api/dat/hasheous` writes the
+  preference first and only then flips the in-process override. The other order
+  meant a failed write (locked SQLite, full disk) left the process sending
+  hashes remotely while the endpoint reported failure and the UI still showed
+  the switch off — a privacy-relevant lie, not just a stale display.
 - **`dat_id` is always `None` on a remote hit.** It is a FK into the local `dats`
   table and a remote match has no row there. `dat_store` already nulls unknown
   values before writing, so this keeps the cached row byte-identical across

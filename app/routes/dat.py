@@ -237,8 +237,12 @@ async def put_hasheous_settings(request: HasheousSettingsRequest):
     they were produced with, and ``cached_result_usable`` re-checks them the
     moment a stronger source becomes available.
     """
-    hasheous.set_enabled_override(request.enabled)
+    # Persist BEFORE applying. If the write fails (SQLite locked, disk full)
+    # the request errors out having changed nothing -- whereas applying first
+    # would leave the process sending hashes remotely while the endpoint
+    # reported failure and the UI still showed the switch off.
     await preferences_store.put(HASHEOUS_PREF_KEY, {"enabled": request.enabled})
+    hasheous.set_enabled_override(request.enabled)
     logger.info(
         "Hasheous fallback %s via Web UI",
         "enabled" if hasheous.enabled() else "disabled",
@@ -1016,41 +1020,60 @@ def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> d
     }
 
 
-async def _lookup_match(
+async def _local_lookup_match(
     file_path: str, candidates: list[tuple[str, str]],
 ) -> dict | None:
-    """Resolve the first of ``candidates`` that any source knows.
+    """First of ``candidates`` the imported DATs know, or ``None``.
 
-    ``candidates`` is a list of ``(sha1, match_type)``. A tool can report
-    several content hashes for one file -- a CHD carries both a header SHA1 and
-    a data SHA1 -- and the file-level fallback supplies exactly one.
-
-    **Every** candidate is tried against the imported DATs before *any* of them
-    is sent to Hasheous. Interleaving the two (remote-checking candidate 1
-    before local-checking candidate 2) would both disclose a hash the local DATs
-    could have identified on their own, and let a remote timeout mask an
-    available local hit.
-
-    Returns ``None`` when nothing knows any candidate. Propagates
-    :class:`HasheousUnavailable` -- a transient remote failure is *not* a miss,
-    and the caller turns it into a non-cacheable error.
+    ``candidates`` is a list of ``(sha1, match_type)``: a tool can report
+    several content hashes for one file (a CHD carries a header SHA1 and a data
+    SHA1) and the file-level fallback supplies one more.
     """
     for sha1, match_type in candidates:
         record = await _local_dat_record(sha1)
         if record is not None:
             return _match_result(file_path, sha1, match_type, record)
-
-    if hasheous.enabled():
-        for sha1, match_type in candidates:
-            # ponytail: unbounded concurrency. Each call is bounded by
-            # hasheous_timeout, the bulk match job is already single-flight, and
-            # the client short-circuits while the service is down; add a
-            # workload_limiter lane if a large scan ever gets rate-limited.
-            record = await hasheous.lookup(sha1)
-            if record is not None:
-                return _match_result(file_path, sha1, match_type, record)
-
     return None
+
+
+async def _remote_lookup_match(
+    file_path: str, candidates: list[tuple[str, str]],
+) -> dict | None:
+    """First of ``candidates`` Hasheous knows, or ``None`` when it's disabled.
+
+    Propagates :class:`HasheousUnavailable` -- a transient remote failure is
+    *not* a miss, and the caller turns it into a non-cacheable error.
+    """
+    if not hasheous.enabled():
+        return None
+    for sha1, match_type in candidates:
+        # ponytail: unbounded concurrency. Each call is bounded by
+        # hasheous_timeout, the bulk match job is already single-flight, and
+        # the client short-circuits while the service is down; add a
+        # workload_limiter lane if a large scan ever gets rate-limited.
+        record = await hasheous.lookup(sha1)
+        if record is not None:
+            return _match_result(file_path, sha1, match_type, record)
+    return None
+
+
+async def _lookup_match(
+    file_path: str, candidates: list[tuple[str, str]],
+) -> dict | None:
+    """Local sources first, then remote, over the whole candidate set.
+
+    The two passes are kept separate and in this order deliberately.
+    Interleaving them -- remote-checking candidate 1 before local-checking
+    candidate 2 -- would both disclose a hash the local DATs could have
+    identified on their own, and let a remote timeout mask an available local
+    hit. ``_match_single_file`` calls the halves directly so it can slot its
+    (expensive, lazily computed) file-level SHA1 into the local pass before any
+    candidate goes out.
+    """
+    return (
+        await _local_lookup_match(file_path, candidates)
+        or await _remote_lookup_match(file_path, candidates)
+    )
 
 
 def remote_stamp() -> str | None:
@@ -1117,19 +1140,20 @@ async def _match_single_file(
 
     # Per-tool embedded-hash fast path (already cached / cheap where the tool
     # can manage it, e.g. CHD header hashes from the metadata store).
+    #
+    # The whole body below is ordered around one rule: **every** local lookup
+    # happens before **any** remote one. Candidates accumulate as they become
+    # available -- the tool's embedded hashes first, then the file-level SHA1
+    # -- each is checked against the DATs as it appears, and only once all of
+    # them have missed locally does the complete set go out to Hasheous.
+    candidates: list[tuple[str, str]] = []
+    exhaustive = False
     tool = registry.tool_for_verify(file_path)
     if tool is not None:
         try:
-            match, had_candidates = await _try_embedded_hash_match(
+            match, candidates = await _try_embedded_hash_match(
                 file_path, tool, cancel_event=cancel_event,
             )
-        except HasheousUnavailable as e:
-            # Remote lookup failed mid-flight. Same rule as the abandoned-hash
-            # case: a transient failure must NOT be cached as "unmatched", or a
-            # single network blip permanently marks every in-flight file as not
-            # in any DAT.
-            logger.warning("Hasheous unavailable for %s: %s", file_path, e)
-            return {**base_result, "error": "hasheous unavailable"}
         except EmbeddedHashUnavailable as e:
             # The tool couldn't derive its content hash (e.g. dolphin-tool
             # verify failed). For these formats the file-level SHA1 of the
@@ -1139,63 +1163,92 @@ async def _match_single_file(
             return {**base_result, "error": "embedded hash unavailable"}
         if match:
             return match
-        if had_candidates and tool.embedded_hash_is_exhaustive:
-            # The tool's content hashes are exhaustive (e.g. Dolphin's disc
-            # SHA1): a miss is definitive and the container's file-level SHA1
-            # can never match the DAT, so record a (cacheable) unmatched result
-            # without re-reading the whole file. Tools whose own container
-            # bytes may be DAT-indexed (e.g. CHD) deliberately fall through to
-            # the file-level SHA1 below.
-            return base_result
+        # The tool's content hashes are exhaustive (e.g. Dolphin's disc SHA1):
+        # the container's file-level SHA1 can never match a DAT, so it is not
+        # worth reading the whole file for. Tools whose own container bytes may
+        # be DAT-indexed (e.g. CHD) still fall through to it below.
+        exhaustive = bool(candidates) and tool.embedded_hash_is_exhaustive
 
-    # Defense-in-depth: respect the operator-configured size cap so
-    # browsing a folder of 8 GB Wii ISOs doesn't stampede the hasher.
-    size_cap = max(0, int(getattr(settings, "match_max_file_size", 0) or 0))
-    if size_cap > 0:
-        try:
-            size_bytes = await run_in_threadpool(os.path.getsize, file_path)
-        except OSError:
-            size_bytes = 0
-        if size_bytes > size_cap:
-            return {
+    size_capped: dict | None = None
+    if not exhaustive:
+        # Defense-in-depth: respect the operator-configured size cap so
+        # browsing a folder of 8 GB Wii ISOs doesn't stampede the hasher.
+        size_cap = max(0, int(getattr(settings, "match_max_file_size", 0) or 0))
+        size_bytes = 0
+        if size_cap > 0:
+            try:
+                size_bytes = await run_in_threadpool(os.path.getsize, file_path)
+            except OSError:
+                size_bytes = 0
+
+        if size_cap > 0 and size_bytes > size_cap:
+            # Remember it rather than returning now: any embedded candidates
+            # this file did produce still deserve their remote pass.
+            size_capped = {
                 **base_result,
                 "reason": "file too large",
                 "file_size": size_bytes,
             }
+        else:
+            # File-level SHA1 (works for any format). Gate under the "match"
+            # workload lane so ``MAX_MATCH_CONCURRENCY`` bounds how many full-
+            # file hashes run at once when a directory of uncached files is
+            # browsed.
+            try:
+                async with await workload_limiter.acquire("match"):
+                    file_sha1 = await compute_file_sha1(file_path)
+            except OSError:
+                logger.warning("Failed to hash %s", file_path, exc_info=True)
+                return {**base_result, "error": "Unable to process file"}
 
-    # File-level SHA1 (works for any format). Gate under the "match"
-    # workload lane so ``MAX_MATCH_CONCURRENCY`` bounds how many full-
-    # file hashes run at once when a directory of uncached files is
-    # browsed.
-    try:
-        async with await workload_limiter.acquire("match"):
-            file_sha1 = await compute_file_sha1(file_path)
-    except OSError:
-        logger.warning("Failed to hash %s", file_path, exc_info=True)
-        return {**base_result, "error": "Unable to process file"}
+            # Check it locally BEFORE anything goes remote. For a CHD whose
+            # container bytes are the hash the local DAT actually holds, the
+            # old order sent the embedded hashes out first -- disclosing them
+            # needlessly, and letting a remote outage mask this local hit.
+            local = await _local_lookup_match(file_path, [(file_sha1, "file_sha1")])
+            if local:
+                return local
+            candidates.append((file_sha1, "file_sha1"))
 
-    try:
-        match = await _lookup_match(file_path, [(file_sha1, "file_sha1")])
-    except HasheousUnavailable as e:
-        logger.warning("Hasheous unavailable for %s: %s", file_path, e)
-        return {**base_result, "error": "hasheous unavailable"}
-    return match or base_result
+    # Nothing local knows any of them. Now, and only now, ask Hasheous.
+    if candidates:
+        try:
+            remote = await _remote_lookup_match(file_path, candidates)
+        except HasheousUnavailable as e:
+            # Same rule as the abandoned-hash case: a transient failure must
+            # NOT be cached as "unmatched", or a single network blip
+            # permanently marks every in-flight file as not in any DAT.
+            logger.warning("Hasheous unavailable for %s: %s", file_path, e)
+            return {**base_result, "error": "hasheous unavailable"}
+        if remote:
+            return remote
+
+    # A size-capped file was never fully checked, so its miss stays
+    # non-cacheable (``reason``) rather than being recorded as unmatched.
+    return size_capped if size_capped is not None else base_result
 
 
 async def _try_embedded_hash_match(
     file_path: str, tool, *, cancel_event: asyncio.Event | None = None,
-) -> tuple[dict | None, bool]:
-    """Try matching ``file_path`` using the hashes ``tool`` reports for it.
+) -> tuple[dict | None, list[tuple[str, str]]]:
+    """Match ``file_path`` **locally** using the hashes ``tool`` reports for it.
 
-    Returns ``(match, had_candidates)``. ``match`` is the DAT hit (or ``None``).
-    ``had_candidates`` is True when the tool produced at least one embedded
-    hash. It is only an *input* to the caller's fallback decision, not the
-    decision itself: the caller skips the file-level SHA1 fallback after a miss
-    only when ``had_candidates`` AND ``tool.embedded_hash_is_exhaustive`` (the
-    container bytes can never be DAT-indexed, e.g. Dolphin RVZ/WIA/GCZ). Tools
-    whose own file SHA1 may be indexed (e.g. CHD) still fall back even though
-    they reported candidates. When ``had_candidates`` is False the tool has no
-    embedded hash and the file-level fallback is always the correct next step.
+    Returns ``(match, candidates)``. ``match`` is the local DAT hit (or
+    ``None``); ``candidates`` is the normalized ``(sha1, match_type)`` list the
+    tool produced, which the caller carries into a single remote pass once
+    every local option -- including its own file-level SHA1 -- has missed.
+
+    Deliberately local-only. Going remote here would send the embedded hashes
+    before the caller has checked the container's file-level SHA1 against the
+    DATs, which for a non-exhaustive tool (CHD) is a hash the local index may
+    well hold.
+
+    ``candidates`` is an *input* to the caller's fallback decision, not the
+    decision itself: the caller skips the file-level SHA1 only when the tool
+    reported candidates AND ``tool.embedded_hash_is_exhaustive`` (the container
+    bytes can never be DAT-indexed, e.g. Dolphin RVZ/WIA/GCZ). Tools whose own
+    file SHA1 may be indexed still fall back even though they reported
+    candidates. With no candidates the file-level fallback is always next.
     """
     try:
         candidates = await tool.embedded_hashes(file_path, cancel_event=cancel_event)
@@ -1210,7 +1263,7 @@ async def _try_embedded_hash_match(
             # SHA1 can never match the DAT, so falling back would cache a false
             # negative. Surface it as non-cacheable instead.
             raise EmbeddedHashUnavailable("embedded hash derivation failed") from exc
-        return None, False
+        return None, []
 
     usable = [
         ((raw_hash or "").strip().lower(), match_type)
@@ -1218,8 +1271,6 @@ async def _try_embedded_hash_match(
         if (raw_hash or "").strip()
     ]
     if not usable:
-        return None, False
+        return None, []
 
-    # One call with the whole candidate set, so all of them are checked
-    # locally before any is sent remotely.
-    return await _lookup_match(file_path, usable), True
+    return await _local_lookup_match(file_path, usable), usable

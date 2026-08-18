@@ -351,12 +351,12 @@ async def test_chd_header_match_hit(tmp_path, isolated_dat_store, monkeypatch):
     monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
 
     with patch("services.chd_metadata_store.chd_metadata_store", mock_metadata_store):
-        result, had_candidates = await dat_routes._try_embedded_hash_match(
+        result, candidates = await dat_routes._try_embedded_hash_match(
             chd_path, registry.get("chdman"),
         )
 
     assert result is not None
-    assert had_candidates is True
+    assert candidates
     assert result["matched"] is True
     assert result["match_type"] == "chd_sha1"
     assert result["game_name"] == "Test Game"
@@ -425,12 +425,12 @@ async def test_chd_header_match_no_metadata(tmp_path, isolated_dat_store):
     mock_metadata_store.get_metadata = AsyncMock(return_value=None)
 
     with patch("services.chd_metadata_store.chd_metadata_store", mock_metadata_store):
-        result, had_candidates = await dat_routes._try_embedded_hash_match(
+        result, candidates = await dat_routes._try_embedded_hash_match(
             str(chd), registry.get("chdman"),
         )
 
     assert result is None
-    assert had_candidates is False  # -> caller falls back to file-level SHA1
+    assert not candidates  # -> caller falls back to file-level SHA1
 
 
 @pytest.mark.asyncio
@@ -450,10 +450,10 @@ async def test_dolphin_disc_hash_match_hit(tmp_path, isolated_dat_store, monkeyp
         dolphin._service, "disc_hashes", AsyncMock(return_value=[target_sha1]),
     )
 
-    result, had_candidates = await dat_routes._try_embedded_hash_match(str(rvz), dolphin)
+    result, candidates = await dat_routes._try_embedded_hash_match(str(rvz), dolphin)
 
     assert result is not None
-    assert had_candidates is True
+    assert candidates
     assert result["matched"] is True
     assert result["match_type"] == "dolphin_disc_sha1"
     assert result["file_hash"] == target_sha1
@@ -1592,11 +1592,11 @@ async def test_try_embedded_hash_match_non_exhaustive_tool_falls_back(tmp_path):
         async def embedded_hashes(self, path, *, cancel_event=None):
             raise RuntimeError("boom")
 
-    result, had_candidates = await dat_routes._try_embedded_hash_match(
+    result, candidates = await dat_routes._try_embedded_hash_match(
         str(tmp_path / "x.chd"), _NonExhaustiveBoom(),
     )
     assert result is None
-    assert had_candidates is False
+    assert not candidates
 
 
 @pytest.mark.asyncio
