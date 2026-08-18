@@ -290,12 +290,22 @@ class DATMatchingStore {
       this._autoRetries += 1;
     }
     this._lastJobPaths = uncached;
+    const generation = this._generation;
     try {
       await this.startMatchJob(uncached);
       // Mark attempts only AFTER the backend accepted the job. A 409
       // (another match job already active) would otherwise strand the
       // paths permanently, and any other failure should also leave
       // them eligible for the next hydration to retry.
+      //
+      // ...and only while the verdict still belongs to the current policy.
+      // startMatchJob() drops a stale response's results, but returning
+      // normally is not the same as succeeding: every bump of _generation is
+      // paired with a _resetAttempts() whose whole purpose is to make these
+      // paths eligible again, and stamping them here wrote the suppression
+      // straight back into the freshly cleared map -- for the full 90s
+      // window, with no terminal job event coming to shake it loose.
+      if (generation !== this._generation) return;
       for (const p of uncached) this._attemptedPaths[p] = now;
     } catch (_e) {
       // non-fatal, the file list still renders without badges. The

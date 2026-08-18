@@ -2656,3 +2656,211 @@ def test_a_failure_still_opens_the_cooldown_normally(hasheous_on, monkeypatch):
     with pytest.raises(hasheous.HasheousUnavailable):
         asyncio.run(hasheous.lookup("b" * 40))
     assert hasheous._cooldown_remaining() > 0, "the breaker stopped tripping"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-eighth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_one_skipped_file_cannot_hide_a_total_outage(monkeypatch):
+    """Skips are not survivors, so they must not sit in the failure denominator.
+
+    A batch of remotely-unreachable files plus a single oversized ISO made
+    ``errors == total`` false, so a complete provider outage was downgraded to
+    a green "complete" carrying a generic error count -- the exact misreading
+    the all-failed branch exists to prevent.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    async def _outage_plus_one_skip(path, *, cancel_event=None):
+        if path == "/big.iso":
+            # A policy skip: over the size cap, no error, nothing cacheable.
+            return {"path": path, "matched": False, "reason": "too large"}, False
+        return (
+            {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR},
+            False,
+        )
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _outage_plus_one_skip)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/a.chd", "/b.chd", "/big.iso"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "failed", (
+        "one skipped file turned a total outage into a green job"
+    )
+    assert "all 2 file(s) failed" in final.message, (
+        "the skipped file was counted as a survivor"
+    )
+    assert "Hasheous is unreachable" in final.message
+
+
+@pytest.mark.asyncio
+async def test_a_skip_alone_is_still_a_completed_job(monkeypatch):
+    """...but a batch of nothing *but* skips has not failed at all.
+
+    Excluding skips from the denominator must not make an empty checkable set
+    divide into a failure: nothing was attempted, so nothing went wrong.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    async def _all_skips(path, *, cancel_event=None):
+        return {"path": path, "matched": False, "reason": "too large"}, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", _all_skips)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/big1.iso", "/big2.iso"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "completed"
+    assert "2 skipped" in final.message
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_miss_is_not_written_over_a_dat_that_just_landed(tmp_path):
+    """The write-boundary guard covers misses, not only hits.
+
+    A clean remote miss is cacheable and its ``checked_remote`` stamp stays
+    valid, so a DAT import committing between the route's last local pass and
+    the write left the fresh local match hidden until the *next* import
+    happened to invalidate the row.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import CANDIDATE_HASHES_KEY, DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    await store.import_dat(SAMPLE_DAT_XML)
+
+    known_sha1 = "aabbccddaabbccddaabbccddaabbccddaabbccdd"
+    assert store.lookup_sha1(known_sha1) is not None, "fixture DAT changed"
+
+    path = "/vol/late.chd"
+    miss = {
+        "path": path, "matched": False, "checked_remote": "https://hasheous.org",
+        CANDIDATE_HASHES_KEY: [known_sha1],
+    }
+    await store.set_match(path, dict(miss))
+    assert store.get_match(path) is None, (
+        "a stamped miss was cached over a DAT that had already landed"
+    )
+
+    await store.set_matches_batch({path: dict(miss)})
+    assert store.get_match(path) is None, "the batch writer bypassed the guard"
+
+
+@pytest.mark.asyncio
+async def test_a_remote_hit_yields_to_a_dat_covering_another_candidate(tmp_path):
+    """A CHD sends up to three hashes; the guard has to check all of them.
+
+    Examining only the hash that happened to match remotely left the case where
+    the DAT landing mid-flight knows a *different* candidate -- a local
+    identity exists, and the remote answer would have outranked it for good.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import CANDIDATE_HASHES_KEY, DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    await store.import_dat(SAMPLE_DAT_XML)
+
+    known_sha1 = "aabbccddaabbccddaabbccddaabbccddaabbccdd"
+    unknown_sha1 = "f" * 40
+    assert store.lookup_sha1(unknown_sha1) is None
+
+    path = "/vol/late.chd"
+    hit = {
+        "path": path, "matched": True, "game_name": "Remote Name",
+        "match_type": "chd_sha1", "file_hash": unknown_sha1, "source": "hasheous",
+        # The header hash matched remotely; the DAT that landed knows the data
+        # hash instead.
+        CANDIDATE_HASHES_KEY: [unknown_sha1, known_sha1],
+    }
+    await store.set_match(path, dict(hit))
+    assert store.get_match(path) is None, (
+        "a remote hit was cached while the local index covered another candidate"
+    )
+
+    await store.set_matches_batch({path: dict(hit)})
+    assert store.get_match(path) is None, "the batch writer bypassed the guard"
+
+
+@pytest.mark.asyncio
+async def test_the_candidate_list_is_a_check_input_not_a_cached_field(tmp_path):
+    """It is revalidated at the write boundary, then dropped.
+
+    Persisting it would ship the file's other hashes back to the UI on every
+    lookup and bloat the payload with something no consumer reads.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY, DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.chd"
+    await store.set_match(path, {
+        "path": path, "matched": False, "checked_remote": "https://hasheous.org",
+        CANDIDATE_HASHES_KEY: ["a" * 40, "b" * 40],
+    })
+
+    cached = store.get_match(path)
+    assert cached is not None, "an unrelated candidate set blocked the write"
+    assert CANDIDATE_HASHES_KEY not in cached
+
+
+@pytest.mark.asyncio
+async def test_the_route_hands_its_candidates_to_the_write_boundary(
+    hasheous_on, monkeypatch,
+):
+    """The guard is only as good as what the route attaches to the verdict.
+
+    Both cacheable remote exits -- the stamped miss and the hit -- carry the
+    complete candidate set, so the store can re-check every one of them inside
+    the writing transaction.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY
+
+    header, data = "a" * 40, "b" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = True
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1"), (data, "chd_data_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+
+    # Every candidate misses remotely: the stamped-miss exit.
+    monkeypatch.setattr(hasheous, "lookup", AsyncMock(return_value=None))
+    miss = await dat_routes._match_single_file("/vol/game.chd")
+    assert miss["matched"] is False
+    assert miss[CANDIDATE_HASHES_KEY] == [header, data]
+
+    # The first candidate hits: the remote-hit exit still carries both.
+    async def _hit(sha1):
+        return {"game_name": "Remote Name", "source": "hasheous"} if sha1 == header else None
+
+    monkeypatch.setattr(hasheous, "lookup", _hit)
+    hit = await dat_routes._match_single_file("/vol/game.chd")
+    assert hit["matched"] is True
+    assert hit[CANDIDATE_HASHES_KEY] == [header, data]

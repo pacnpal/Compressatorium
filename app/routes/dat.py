@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from config import settings
 from models import ConversionMode
 from services import hasheous
-from services.dat_store import dat_store
+from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
 from services.file_hasher import compute_file_sha1
 from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
@@ -945,11 +945,20 @@ async def _run_match_job(
             if job_manager.is_cancelled(job_id):
                 raise ExternalJobCancelled()
 
-        # If every single file errored, something structural is wrong
-        # (volume unmounted, DB down, etc.).  Flip the job to failure so
-        # the user sees a red signal rather than a misleading "complete,
-        # 0 matched" that looks like a DAT-coverage gap.
-        if total > 0 and errors == total:
+        # If every file the job could actually process errored, something
+        # structural is wrong (volume unmounted, DB down, Hasheous
+        # unreachable).  Flip the job to failure so the user sees a red
+        # signal rather than a misleading "complete, 0 matched" that looks
+        # like a DAT-coverage gap.
+        #
+        # Skips are excluded from the denominator, not counted as survivors:
+        # they are files the job deliberately did not check (over the size
+        # cap, not a regular file), so a single oversized ISO in the batch
+        # made `errors == total` false and downgraded a total outage to a
+        # green "complete" carrying a generic error count -- exactly the
+        # misread this branch exists to prevent.
+        checkable = total - skips
+        if checkable > 0 and errors == checkable:
             job_success = False
             if hasheous_errors == errors:
                 # Say what actually broke. The files and the volume are fine;
@@ -1157,6 +1166,19 @@ def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> d
         "file_hash": sha1,
         **record,
     }
+
+
+def _carrying_candidates(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """Tag a verdict with the hashes the cache write must re-validate it against.
+
+    The local-first decision and the cache write are separate operations, and a
+    DAT import can commit between them (see
+    ``dat_store.DATStore._local_index_now_covers``, which reads this inside the
+    writing transaction). Attached to *both* remote exits -- the hit and the
+    stamped miss -- because both are cacheable and both would otherwise outrank
+    a local identity that landed while the lookup was in flight.
+    """
+    return {**result, CANDIDATE_HASHES_KEY: [sha1 for sha1, _kind in candidates]}
 
 
 async def _local_lookup_match(
@@ -1446,6 +1468,7 @@ async def _match_single_file(
             remote, consulted = await _remote_lookup_match(
                 file_path, candidates, cancel_event=cancel_event,
             )
+            base_result = _carrying_candidates(base_result, candidates)
             base_result["checked_remote"] = consulted
         except HasheousUnavailable as e:
             # Same rule as the abandoned-hash case: a transient failure must
@@ -1466,7 +1489,7 @@ async def _match_single_file(
                 error_result["file_hash"] = file_level
             return error_result
         if remote:
-            return remote
+            return _carrying_candidates(remote, candidates)
 
     # A size-capped file was never fully checked, so its miss stays
     # non-cacheable (``reason``) rather than being recorded as unmatched.

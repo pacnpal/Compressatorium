@@ -1350,11 +1350,25 @@ This is a payload field, not a schema change.
   re-checking the local index — before the remote pass, and again over the whole
   candidate set before a remote answer is accepted. The third is closed in
   `dat_store._local_index_now_covers()`, which re-checks inside the writing
-  transaction and skips caching a remote hit the local index has since learned
-  (leaving the path uncached, so the next match resolves it locally). What
-  remains is the transaction boundary itself: an import committing between that
-  read and the write's commit leaves a remote hit, which invalidation preserves
-  by design.
+  transaction and skips the write when the local index has since learned any of
+  the candidates (leaving the path uncached, so the next match resolves it
+  locally). What remains is the transaction boundary itself: an import
+  committing between that read and the write's commit leaves a remote hit,
+  which invalidation preserves by design.
+
+  That third guard covers **every verdict the remote source took part in, over
+  the whole candidate set** — not just the hit, and not just the hash that
+  matched. A stamped *miss* is cacheable too, and its `checked_remote` stamp
+  stays valid, so restricting the guard to hits let a fresh local match stay
+  hidden until the next import happened to invalidate the row; and a CHD offers
+  up to three hashes, so the DAT that landed mid-flight may know a candidate
+  other than the one that hit. The route attaches the candidate SHA1s under
+  `dat_store.CANDIDATE_HASHES_KEY` (`_carrying_candidates()`, on both cacheable
+  remote exits); the store revalidates them and strips the key in
+  `_persistable_payload()`, so it never reaches a persisted row. It is a hash
+  re-check rather than a DAT-index generation on purpose: a generation would
+  skip the write on any unrelated import and send the file straight back out to
+  the remote source, which is the same re-disclosure cost rejected just below.
 
   That last one is deliberately *not* chased. Closing it read-side means
   stamping remote hits with the DAT-set generation and rejecting stale ones,
@@ -1365,6 +1379,14 @@ This is a payload field, not a schema change.
   a DAT badge would do: same game, self-correcting on the next rescan. Closing it
   write-side means serialising matches against imports, i.e. holding a lock
   across a network call.
+- **A match job fails on its *checkable* files, not its total.** Policy skips
+  (over `MATCH_MAX_FILE_SIZE`, not a regular file) are files the job
+  deliberately did not check, so they are excluded from the all-failed
+  denominator instead of counting as survivors. With `errors == total` a single
+  oversized ISO in the batch downgraded a complete Hasheous outage to a green
+  "complete" carrying a generic error count — exactly the misread that branch
+  exists to prevent. A batch of nothing but skips still completes: nothing was
+  attempted, so nothing went wrong.
 - **A DAT change re-matches through one helper.** `rematch_after_dat_change()`
   is shared by the manual upload (`import_dat`) and the MAMERedump sync; both
   want "recompute what already had a verdict against the new index", and it had

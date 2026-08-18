@@ -26,6 +26,13 @@ from services.dat_parser import parse_dat
 
 logger = get_logger("dat_store")
 
+#: Transient key on a match dict: the candidate SHA1s the verdict was reached
+#: against. The route attaches it whenever the remote source took part, the
+#: write boundary revalidates the local index against it (see
+#: ``DATStore._local_index_now_covers``), and it is stripped before the row is
+#: persisted -- it is a check input, not part of the cached record.
+CANDIDATE_HASHES_KEY = "candidate_hashes"
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -460,27 +467,63 @@ class DATStore:
 
     @staticmethod
     def _local_index_now_covers(session, match: dict) -> bool:
-        """True when a remote hit's hash has since been learned locally.
+        """True when the local DATs have since learned any candidate hash.
 
         Read inside the writing transaction, which is the point: the route
         decides local-first, but the decision and the write are separate
         operations, and a DAT import can commit in between -- for a path with
         no prior row the import's rematch snapshot cannot cover it either, so
-        the remote hit would be written *after* invalidation and then served
+        the verdict would be written *after* invalidation and then served
         unconditionally. Checking here closes that window at the boundary where
         the write actually happens.
+
+        Applies to every verdict the remote source took part in, over the whole
+        candidate set:
+
+        * a stamped **miss** needs it as much as a hit. Restricting the guard
+          to hits let a clean remote miss through untouched, and because that
+          row is cacheable and its ``checked_remote`` stamp still matches, the
+          local match that had just landed stayed hidden until the *next* DAT
+          import happened to invalidate it.
+        * a hit needs the **other** candidates checked, not only the one that
+          matched. A CHD offers up to three hashes and the DAT that landed
+          mid-flight may know a different one, in which case a local identity
+          exists and the remote answer would outrank it.
+
+        ``candidate_hashes`` is the transient key the route attaches for
+        exactly this re-check (see :data:`CANDIDATE_HASHES_KEY`); ``file_hash``
+        is folded in so a hit stays covered even if that list is absent.
 
         Skipping the write (rather than rewriting the payload) keeps DAT-record
         shape out of the store: the path is simply left uncached, and the next
         match recomputes it local-first. That costs nothing extra remotely,
-        because this only fires when the local index *does* know the hash.
+        because this only fires when the local index *does* know a hash --
+        which is also why it re-checks hashes rather than comparing a DAT-index
+        generation: a generation would skip the write on any unrelated import
+        and send the file back out to the remote source for nothing.
         """
-        if not match.get("matched") or match.get("source") != "hasheous":
+        if not (match.get("checked_remote") or match.get("source") == "hasheous"):
             return False
-        sha1 = match.get("file_hash")
-        if not sha1:
-            return False
-        return session.get(_db.DATHash, (sha1, "sha1")) is not None
+        hashes = list(match.get(CANDIDATE_HASHES_KEY) or ())
+        file_hash = match.get("file_hash")
+        if file_hash and file_hash not in hashes:
+            hashes.append(file_hash)
+        return any(
+            session.get(_db.DATHash, (sha1, "sha1")) is not None
+            for sha1 in hashes if sha1
+        )
+
+    @staticmethod
+    def _persistable_payload(match: dict) -> dict:
+        """The cached payload: the match minus the transient check inputs.
+
+        ``candidate_hashes`` exists to be revalidated at the write boundary,
+        not to be served back to the UI, so it is dropped in the one place
+        both writers build their payload.
+        """
+        payload = dict(match)
+        payload.pop(CANDIDATE_HASHES_KEY, None)
+        return payload
 
     def _upsert_match_sync(self, file_path: str, match: dict) -> None:
         normalized = self._normalize(file_path)
@@ -496,7 +539,7 @@ class DATStore:
                 # A DAT covering this hash landed while the match was running.
                 # Leave the path uncached so the next one resolves it locally.
                 return
-            payload = dict(match)
+            payload = self._persistable_payload(match)
             existing = session.get(_db.DATMatch, normalized)
             if self._would_downgrade_remote_hit(existing, match):
                 # The post-sync rematch re-runs every previously-matched path.
@@ -586,7 +629,7 @@ class DATStore:
                 if self._local_index_now_covers(session, match):
                     # Same rule as _upsert_match_sync.
                     continue
-                payload = dict(match)
+                payload = self._persistable_payload(match)
                 existing = existing_matches.get(normalized)
                 if self._would_downgrade_remote_hit(existing, match):
                     # Same rule as _upsert_match_sync. This path updated rows

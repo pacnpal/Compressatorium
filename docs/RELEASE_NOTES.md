@@ -72,7 +72,10 @@
   time could pin a lookup — and the scan job around it — without ever raising.
   One deadline-aware connection now owns the socket from the first packet, so
   connect, the proxy tunnel, the TLS handshake, headers and body all spend the
-  same budget.
+  same budget. Two things stay outside it and are documented rather than
+  implied: name resolution, which runs before any socket exists, and a peer
+  trickling TLS *handshake* records, which would mean leaving `urllib` to bound
+  properly.
 
 - **A DAT that was deleted mid-match no longer haunts the cache.** When a DAT
   went away between a file being matched and the result being written, the
@@ -90,9 +93,26 @@
   the MAMERedump sync go through the same code for this.
 
 - **A newly imported DAT wins over a lookup that was already in flight.** The
-  local index is checked once more before a remote answer is accepted, so an
-  import committing during the request is not left behind a remote result that
-  nothing would have recomputed.
+  local index is checked once more before a remote answer is accepted, and once
+  again inside the transaction that writes the result — over every hash the file
+  offered, for a recorded "no match" as much as for a hit. An import committing
+  during the request is not left behind a remote verdict that nothing would have
+  recomputed, whether that verdict was a Hasheous hit on one hash, a hit while
+  the new DAT knows a *different* hash of the same file, or a cached miss.
+
+- **A match job that hit a total Hasheous outage no longer reports success
+  because one file was skipped.** Files skipped on policy (over the size cap,
+  not a regular file) were counted as survivors, so a single oversized ISO in
+  the batch turned "every file we could check failed" into a green *complete*
+  with a generic error count — instead of the red "Hasheous is unreachable,
+  your files are fine, re-run it later" the outage deserves.
+
+- **Turning Hasheous on no longer leaves the files that were mid-check waiting
+  90 seconds.** A match request already in flight when you flipped the toggle
+  had its results correctly discarded, but the paths were still marked as
+  recently attempted — writing the suppression straight back into the retry
+  guard the toggle had just cleared, with no job event coming to shake it
+  loose. Those files now re-match immediately, as the toggle intends.
 
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
