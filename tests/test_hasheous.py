@@ -2123,3 +2123,96 @@ async def test_a_failed_rematch_schedule_does_not_fail_the_import(
 
     result = await dat_routes.import_dat(file=_make_upload_file(SAMPLE_DAT_XML))
     assert result["name"] == "Test Redump DAT"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-first review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_changed_file_loses_its_remote_badge(tmp_path):
+    """The round-19 guard refused every unconsulted miss, including honest ones.
+
+    With Hasheous off, replacing a file and running a forced scan produces an
+    unmatched local result with no `checked_remote` -- which the guard rejected
+    unconditionally, so the old hit kept naming the replaced file forever.
+    """
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.iso"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Old Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    # The file was replaced: same path, different content, no remote consulted.
+    await store.set_match(path, {
+        "path": path, "matched": False, "file_hash": "b" * 40, "checked_remote": None,
+    })
+
+    assert store.get_match(path)["matched"] is False, (
+        "a replaced file kept its stale remote badge"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_file_keeps_its_remote_badge(tmp_path):
+    """...but an identical hash is not proof of anything, so the hit stays."""
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.iso"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Old Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+    await store.set_match(path, {
+        "path": path, "matched": False, "file_hash": "a" * 40, "checked_remote": None,
+    })
+
+    assert store.get_match(path)["matched"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_chd_hit_is_not_judged_by_the_container_hash(tmp_path):
+    """A CHD hit is stored against its embedded hash; the rescan computes the
+    container's. Comparing across domains would call every unchanged CHD
+    'changed' -- the same mistake round 13 fixed in the scan path."""
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "CHD Game",
+        "match_type": "chd_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+    await store.set_match(path, {
+        "path": path, "matched": False, "file_hash": "b" * 40, "checked_remote": None,
+    })
+
+    assert store.get_match(path)["matched"] is True, (
+        "an unchanged CHD lost its badge to a cross-domain hash comparison"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_batch_writer_honours_the_same_guard(tmp_path):
+    """_set_matches_batch_sync updated rows unconditionally."""
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.iso"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    await store.set_matches_batch({
+        path: {"path": path, "matched": False, "checked_remote": None},
+    })
+
+    assert store.get_match(path)["matched"] is True, (
+        "a batch write erased a remote hit the single-path writer would refuse"
+    )

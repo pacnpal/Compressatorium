@@ -393,16 +393,37 @@ class DATStore:
 
     @staticmethod
     def _would_downgrade_remote_hit(existing, match: dict) -> bool:
-        """True when writing *match* would replace a remote hit with a non-answer."""
+        """True when writing *match* would replace a remote hit with a non-answer.
+
+        "Non-answer" is the operative word: an unmatched result only supersedes
+        a remote hit if it actually knows better. That means either the remote
+        source was consulted this time (``checked_remote``), or the recompute
+        can *prove* the file changed underneath the cached row.
+
+        The proof compares like with like. A CHD hit is stored against its
+        embedded hash (``chd_sha1``), while a rescan recomputes the container
+        ``file_sha1`` -- different domains that differ for an unchanged file,
+        so only a stored ``file_sha1`` match can be compared. Without this the
+        guard kept a stale badge on a replaced file forever, since cached hits
+        are always accepted on read.
+        """
         if existing is None or not existing.matched:
             return False
         if (existing.payload or {}).get("source") != "hasheous":
             return False
         if match.get("matched"):
             return False
-        # An unmatched verdict only supersedes a remote hit if the remote
-        # source was actually asked this time.
-        return not match.get("checked_remote")
+        if match.get("checked_remote"):
+            return False
+        return not DATStore._proves_content_changed(existing, match)
+
+    @staticmethod
+    def _proves_content_changed(existing, match: dict) -> bool:
+        """True only when the recomputed hash demonstrably contradicts the row."""
+        new_hash = match.get("file_hash")
+        if not new_hash or existing.match_type != "file_sha1":
+            return False
+        return bool(existing.file_hash) and existing.file_hash != new_hash
 
     def _invalidate_dat_derived_matches(self, session) -> None:
         """Drop the part of the match cache the local DATs are responsible for.
@@ -523,6 +544,13 @@ class DATStore:
                     dat_id = None
                 payload = dict(match)
                 existing = existing_matches.get(normalized)
+                if self._would_downgrade_remote_hit(existing, match):
+                    # Same rule as _upsert_match_sync. This path updated rows
+                    # unconditionally, so a concurrent batch match could still
+                    # erase a remote hit the single-path writer would refuse to
+                    # touch -- and the guard's comment claimed the batch route
+                    # wrote through it, which was simply untrue.
+                    continue
                 if existing is not None:
                     existing.matched = bool(match.get("matched", False))
                     existing.dat_id = dat_id
