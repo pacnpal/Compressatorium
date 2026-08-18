@@ -1,6 +1,27 @@
 # Release Notes
 
-## 4.4.2 (unreleased)
+## 4.5.0-beta-1 (2026-08-18)
+
+Compressatorium and [RomM](https://romm.app) look at the same files and know
+different things about them. RomM owns the platform, the game name and the DAT
+match; Compressatorium owns the conversion; neither could use the other. This
+release connects them: browse your library by platform and convert it in the
+ordinary workspace, or leave per-platform rules to do it on a schedule — and the
+metadata survives the conversion.
+
+The payoff is a distinction the filesystem cannot make. A bare `.iso` is a PS2
+disc or a GameCube disc and the extension will never tell you which, so today you
+resolve it by picking a tool tab. RomM's platform resolves it instead: the same
+file is offered Dolphin RVZ on GameCube and CHD/CSO on PS2. No ROM crosses the
+network — the catalog comes over RomM's API, the files are read from disk, and a
+remote RomM works by mounting its library over NFS/SMB/rclone.
+
+Tagged as a pre-release for two reasons. The scheduler has been exercised through
+forced runs and previews rather than across days of real unattended operation;
+and a rule that converts a library and deletes the sources once they verify has
+earned a beta's worth of scrutiny before it becomes the default advice. Start
+with **Preview**, which shows exactly what a sweep would queue without queueing
+it or moving the schedule clock. Sections are newest-first.
 
 ### Added
 
@@ -781,6 +802,17 @@
   walk had no deadline while the sweep held its lock — so one unresponsive
   share blocked previews, manual runs, rule edits and settings saves behind it.
 
+## 4.4.3 (2026-08-17)
+
+Nothing waits forever. Every long operation that could previously block without
+limit — a library scan, a DAT match, a CHD metadata read, a conversion, and the
+verification that follows it — now carries a deadline, reports real progress
+instead of a spinning clock, and can be cancelled. The shared cause is that a
+read on a volume that has stopped answering cannot be interrupted, only
+abandoned: what matters is whose thread it takes and how much waits behind it.
+
+### Fixed
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped
@@ -923,6 +955,8 @@
   used to skip the verify phase outright, to avoid calling a legitimately long
   checksum stalled — which meant a job genuinely stuck *in* verify logged
   nothing. It now gets its own line, timed from when verification started.
+
+## 4.4.2 (2026-08-16)
 
 The counting half of the fix 4.4.1 started. 4.4.1 stopped a deep queue from
 *deleting* your job history; this one stops the retention cap from *lying* about
