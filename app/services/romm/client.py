@@ -400,10 +400,10 @@ class RommClient:
 
         When ``library_root`` points directly at the ROM content (no ``roms/``
         subdirectory on disk), the ``roms/`` prefix in ``full_path`` causes every
-        path to miss.  The method therefore tries both the original relative path
-        and, when it starts with ``roms/``, the stripped variant — returning
-        whichever exists on disk, or the first contained candidate when neither
-        does (so diagnostics can report the attempted path).
+        path to miss.  The decision is made at the directory level — if
+        ``<root>/roms/`` does not exist as a directory, the prefix is stripped —
+        so a single stale file cannot cause a per-file fallback to an unrelated
+        same-named file under a different layout.
 
         Returns None when the record has no usable path, or when the path tries
         to escape the library root.  The escape check is a trust boundary: the
@@ -426,34 +426,28 @@ class RommClient:
         root_abs = os.path.realpath(root)
 
         # RomM's full_path always starts with "roms/" (its standard library
-        # layout).  When library_root already points at the content directory
-        # (no roms/ subdirectory on disk), we need the stripped variant.  Try
-        # the original first so existing setups keep working.
-        candidates = [rel]
-        if rel.startswith("roms/"):
-            candidates.append(rel[len("roms/"):])
+        # layout).  When library_root points directly at the content (no
+        # roms/ subdirectory on disk), strip the prefix.  The check is
+        # directory-level so a stale individual file cannot trigger a
+        # per-file fallback to an unrelated same-named file.
+        if rel.startswith("roms/") and not os.path.isdir(
+            os.path.join(root_abs, "roms")
+        ):
+            rel = rel[len("roms/"):]
 
-        first_valid = None
-        for r in candidates:
-            # No lstrip("/"): an absolute value is malformed coming from RomM
-            # (its own validate_path rejects one), and stripping the slash
-            # would silently rehome "/etc/passwd" inside the library instead
-            # of refusing it.  os.path.join lets an absolute component win, so
-            # the containment check below catches it.
-            resolved = os.path.realpath(os.path.join(root_abs, r))
-            # realpath collapses any ".." *and* resolves symlinks before this
-            # compares, so neither a traversing full_path nor a symlink
-            # planted inside the library can point the result outside it.
-            if resolved == root_abs or not resolved.startswith(root_abs + os.sep):
-                if first_valid is None:
-                    logger.warning("romm: rejecting out-of-library path %r", r)
-                continue
-            if first_valid is None:
-                first_valid = resolved
-            if os.path.exists(resolved):
-                return resolved
-
-        return first_valid
+        # No lstrip("/"): an absolute value is malformed coming from RomM
+        # (its own validate_path rejects one), and stripping the slash would
+        # silently rehome "/etc/passwd" inside the library instead of
+        # refusing it.  os.path.join lets an absolute component win, so the
+        # containment check below catches it.
+        candidate = os.path.realpath(os.path.join(root_abs, rel))
+        # realpath collapses any ".." *and* resolves symlinks before this
+        # compares, so neither a traversing full_path nor a symlink planted
+        # inside the library can point the result outside it.
+        if candidate != root_abs and not candidate.startswith(root_abs + os.sep):
+            logger.warning("romm: rejecting out-of-library path %r", rel)
+            return None
+        return candidate
 
 
 def _encode_multipart(fields: dict) -> tuple[bytes, str]:
