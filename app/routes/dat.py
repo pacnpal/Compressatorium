@@ -315,6 +315,12 @@ async def match_file(request: MatchRequest):
     # job and the scan use, so one blip can't record a library as unmatched.
     if not result.get("reason") and not result.get("error"):
         await dat_store.set_match(normalized_path, result)
+    elif request.force:
+        # A caller forcing a rematch usually just rewrote the file. If the
+        # recompute failed we keep the old row (same rule as the scan), but a
+        # recomputed hash that disproves it must not stay authoritative for
+        # every later unforced call.
+        await drop_if_content_changed(normalized_path, result)
     return result
 
 
@@ -1168,6 +1174,39 @@ def cached_result_usable(payload: dict | None) -> bool:
     if stamp is None:
         return True
     return payload.get("checked_remote") == stamp
+
+
+async def drop_if_content_changed(path: str, result: dict) -> None:
+    """Delete a cached match whose file demonstrably changed under it.
+
+    A non-cacheable result (a Hasheous outage, a size-cap skip) deliberately
+    leaves the previous row in place -- deleting on every transient failure was
+    a real data-loss bug. But "unchanged" is a claim, and when the recomputed
+    hash disproves it the stale row would keep naming the previous game with
+    nothing to re-check it, since ``cached_result_usable`` accepts hits
+    unconditionally.
+
+    Acts only on proof, which means comparing like with like: a CHD hit is
+    stored against its *embedded* hash (``chd_sha1`` / ``chd_data_sha1``) while
+    a rescan recomputes the *container* ``file_sha1``. Those are different hash
+    domains and differ for a perfectly unchanged file, so anything but a stored
+    ``file_sha1`` match is left alone rather than treated as changed.
+    """
+    new_hash = result.get("file_hash")
+    if not new_hash:
+        return
+    cached = await run_in_threadpool(dat_store.get_match, path)
+    if not cached or cached.get("match_type") != "file_sha1":
+        # Nothing cached, or cached against a different hash domain: no
+        # comparison is possible, so no claim can be disproved.
+        return
+    old_hash = cached.get("file_hash")
+    if old_hash and old_hash != new_hash:
+        logger.info(
+            "%s changed since its cached match (%s -> %s); dropping the stale row",
+            path, old_hash, new_hash,
+        )
+        await dat_store.delete_match(path)
 
 
 async def _match_single_file(

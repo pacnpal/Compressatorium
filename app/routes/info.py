@@ -153,28 +153,6 @@ async def _acquire_verify_lane_or_429() -> WorkloadToken:
     return token
 
 
-async def _drop_if_content_changed(path: str, result: dict) -> None:
-    """Delete a cached match whose file demonstrably changed under it.
-
-    Only acts on proof: both the recomputed hash and the stored one must be
-    present and differ. Anything else leaves the row alone.
-    """
-    from services.dat_store import dat_store  # lazy, as elsewhere in this module
-
-    new_hash = result.get("file_hash")
-    if not new_hash:
-        return
-    cached = await run_in_threadpool(dat_store.get_match, path)
-    old_hash = (cached or {}).get("file_hash")
-    if old_hash and old_hash != new_hash:
-        logger.info(
-            "Phase 3: %s changed since its cached match (%s -> %s); dropping the "
-            "stale row despite the Hasheous outage",
-            path, old_hash, new_hash,
-        )
-        await dat_store.delete_match(path)
-
-
 async def _scan_phase_dat_match(
     scan_job_id: str,
     all_paths: list[str],
@@ -195,6 +173,7 @@ async def _scan_phase_dat_match(
         HASHEOUS_ERROR,
         _match_single_file,
         cached_result_usable,
+        drop_if_content_changed,
         matching_available,
     )
     from services.dat_store import dat_store
@@ -298,7 +277,7 @@ async def _scan_phase_dat_match(
                     # hits unconditionally. With no recomputed hash (size cap,
                     # embedded-only) we cannot prove staleness, so the row
                     # stays: an unprovable suspicion is not worth the data loss.
-                    await _drop_if_content_changed(path, result)
+                    await drop_if_content_changed(path, result)
                 else:
                     # Non-cacheable recompute where the *file* is the problem
                     # (size cap, hash unavailable): drop any stale prior row so

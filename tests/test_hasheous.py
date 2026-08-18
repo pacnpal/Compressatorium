@@ -1678,18 +1678,13 @@ async def test_an_outage_does_not_cache_the_single_file_result(
 @pytest.mark.asyncio
 async def test_an_outage_keeps_a_cached_hit_whose_file_is_unchanged(tmp_path):
     """The round-7 rule: an outage says nothing about the file, so keep the row."""
-    from app.routes import info as info_routes
-
     path = str(tmp_path / "game.chd")
-    with patch.object(
-        info_routes, "_drop_if_content_changed", wraps=info_routes._drop_if_content_changed
-    ):
-        stored = {"file_hash": "a" * 40, "matched": True}
-        with patch("services.dat_store.dat_store.get_match", return_value=stored), \
-             patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-            await info_routes._drop_if_content_changed(
-                path, {"error": "hasheous unavailable", "file_hash": "a" * 40}
-            )
+    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(
+            path, {"error": "hasheous unavailable", "file_hash": "a" * 40}
+        )
     delete.assert_not_awaited()
 
 
@@ -1700,13 +1695,11 @@ async def test_an_outage_drops_a_cached_hit_whose_file_changed(tmp_path):
     Nothing would ever re-check it: cached_result_usable() accepts hits
     unconditionally, so the stale row would name the previous game forever.
     """
-    from app.routes import info as info_routes
-
     path = str(tmp_path / "game.chd")
-    stored = {"file_hash": "a" * 40, "matched": True}
+    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
     with patch("services.dat_store.dat_store.get_match", return_value=stored), \
          patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await info_routes._drop_if_content_changed(
+        await dat_routes.drop_if_content_changed(
             path, {"error": "hasheous unavailable", "file_hash": "b" * 40}
         )
     delete.assert_awaited_once_with(path)
@@ -1715,13 +1708,11 @@ async def test_an_outage_drops_a_cached_hit_whose_file_changed(tmp_path):
 @pytest.mark.asyncio
 async def test_an_unverifiable_outage_result_leaves_the_row_alone(tmp_path):
     """No recomputed hash (size cap, embedded-only) means no proof, so no delete."""
-    from app.routes import info as info_routes
-
     path = str(tmp_path / "big.chd")
-    stored = {"file_hash": "a" * 40, "matched": True}
+    stored = {"file_hash": "a" * 40, "match_type": "file_sha1", "matched": True}
     with patch("services.dat_store.dat_store.get_match", return_value=stored), \
          patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
-        await info_routes._drop_if_content_changed(
+        await dat_routes.drop_if_content_changed(
             path, {"error": "hasheous unavailable"}
         )
     delete.assert_not_awaited()
@@ -1757,3 +1748,56 @@ async def test_the_outage_result_carries_the_recomputed_hash(
 
     assert result["error"] == dat_routes.HASHEOUS_ERROR
     assert result["file_hash"] == sha1, "outage result dropped the recomputed hash"
+
+
+# ---------------------------------------------------------------------------
+# Thirteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_outage_keeps_a_chd_hit_matched_on_an_embedded_hash(tmp_path):
+    """A CHD hit stores the *embedded* hash; the rescan recomputes the container.
+
+    Those are different hash domains and differ for a perfectly unchanged file,
+    so comparing them treats every such CHD as "changed" and deletes a valid
+    cached hit during an outage -- the exact data loss the preserve rule exists
+    to prevent, now aimed at hits specifically.
+    """
+    path = str(tmp_path / "game.chd")
+    stored = {"file_hash": "a" * 40, "match_type": "chd_sha1", "matched": True}
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(
+            path,
+            {"error": "hasheous unavailable", "file_hash": "b" * 40},
+        )
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_forced_match_drops_a_disproved_row(
+    hasheous_on, tmp_path, isolated_store, monkeypatch
+):
+    """force=True after replacing a file must not leave the old hit authoritative.
+
+    The forced call reports the failure, but every later unforced /dat/match
+    would serve the previous game from cache indefinitely.
+    """
+    iso = tmp_path / "game.iso"
+    iso.write_bytes(b"new content")
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+
+    await isolated_store.set_match(str(iso), {
+        "path": str(iso), "matched": True, "game_name": "Old Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40,
+    })
+
+    async def _outage(path, **kwargs):
+        return {"path": path, "matched": False,
+                "error": dat_routes.HASHEOUS_ERROR, "file_hash": "b" * 40}
+
+    monkeypatch.setattr(dat_routes, "_match_single_file", _outage)
+    await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso), force=True))
+
+    assert isolated_store.get_match(str(iso)) is None, "stale row survived a forced match"
