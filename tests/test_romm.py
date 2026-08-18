@@ -2471,16 +2471,26 @@ def test_catastrophic_filter_patterns_are_refused_at_save_time() -> None:
     `re` cannot be interrupted, and the sweep evaluates filters while holding
     the sweep lock — so previews, manual runs and even editing the rule to
     remove the pattern would all queue behind it, leaving a restart as the only
-    way out. The probe draws its characters from the pattern, because the
-    trigger is pattern-specific: `(x+x+)+y` only blows up on a run of `x`.
+    way out.
+
+    Detected by reading the pattern, never by running it: executing an
+    operator-supplied regex to time it is the thing CodeQL flags, and a timing
+    test would also have to survive the very blow-up it is looking for.
     """
     from services import romm_auto
 
-    for good in (r"\(USA\)", ".*Beta.*", "^Super", r"^.*\(USA\).*(Rev [0-9])?$"):
-        assert romm_auto._backtracks_catastrophically(re.compile(good)) is False, good
+    good = (
+        r"\(USA\)", ".*Beta.*", "^Super", r"^.*\(USA\).*(Rev [0-9])?$",
+        "(USA|Europe)", r"\d{4}", "[a-z]+", "Disc [0-9] of [0-9]",
+        "(?i)final.*fantasy", r"^\(USA\).*\[!\]$", "Pokemon.*(Red|Blue)",
+        r"(?:USA|Japan)", r"Final Fantasy (I{1,3}|IV)",
+    )
+    for pattern in good:
+        assert romm_auto._has_nested_quantifier(pattern) is False, pattern
+        re.compile(pattern)  # and they are all real regexes
 
-    for bad in ("(a+)+$", "(x+x+)+y", "(a|a)+$", r"^(\w+\s?)*$"):
-        assert romm_auto._backtracks_catastrophically(re.compile(bad)) is True, bad
+    for pattern in ("(a+)+$", "(x+x+)+y", "(a|a)+$", r"^(\w+\s?)*$", "(a*)*b"):
+        assert romm_auto._has_nested_quantifier(pattern) is True, pattern
 
     # And the rule that carries one is paused rather than silently unfiltered.
     pattern, invalid = romm_auto._valid_pattern("(a+)+$")

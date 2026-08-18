@@ -1495,18 +1495,25 @@ would come back as *unfiltered*, and the next unattended sweep could queue the
 whole platform with delete-on-verify attached), and then refuses one that
 backtracks. `re` cannot be interrupted, so a pattern like `(a+)+$` would hold
 `_sweep_lock` indefinitely — blocking previews, manual runs, and the very rule
-edit that would remove it. `_backtracks_catastrophically` therefore probes at
-save time, escalating 12 → 16 → 20 characters and stopping at the first
-over-budget length, because the runtime of the thing it is detecting doubles per
-character and measuring it at full length would hang the check itself. The probe
-alphabet comes from the pattern, since the trigger is pattern-specific:
-`(x+x+)+y` only blows up on a run of `x`.
+edit that would remove it.
 
-CodeQL's `py/regex-injection` fires on the compile-then-match flow and is
-suppressed inline with that reasoning. Its only sanitizer is `re.escape`, which
-would make the filter a literal search — the feature, removed. The value is
-configuration at the same trust level as the output directory beside it, and the
-risk the query names is the one bounded above.
+**`_has_nested_quantifier` reads the pattern rather than running it.** The
+obvious implementation times the regex against an adversarial string, and that
+was the first attempt; it is wrong three ways. It has to survive the very
+blow-up it is looking for (the runtime doubles per character, so measuring at
+full length hangs the check). It is load-dependent, so a busy machine rejects
+patterns that are fine. And executing an operator-supplied regex is exactly what
+CodeQL's `py/regex-injection` flags — the query's only sanitizer is `re.escape`,
+which would turn "convert only `(USA)`" into a literal search and delete the
+feature. A structural test avoids all three: it looks for a quantified group
+whose body itself repeats (`(a+)+`, `(\w+\s?)*`) or is an alternation
+(`(a|a)+`), which are the shapes with exponentially many ways to split one
+input. Escapes and character classes are stripped first, so a literal `\+` or a
+`[+|]` class is not mistaken for a quantifier.
+
+It is conservative on purpose — `(USA|Europe)+` is harmless and still refused —
+because being wrong at save time costs one clear message, while being wrong the
+other way wedges the scheduler.
 
 #### Composite modes narrow per mode (`ModeSpec.platform_slugs`)
 

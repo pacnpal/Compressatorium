@@ -124,7 +124,9 @@
   Python's regex engine cannot be interrupted, so a pattern like `(a+)+$` would
   run effectively forever on a long filename while holding the sweep — blocking
   previews, manual runs, and even editing the rule to remove the pattern, with
-  a restart as the only way out.
+  a restart as the only way out. The check reads the pattern rather than running
+  it, so it costs nothing and cannot itself be slowed down by the thing it is
+  looking for.
 - **A metadata snapshot RomM never matches is now given up on** after the
   configured period, like one whose output never appeared. Once the file had
   been hashed it waited forever instead, sitting in the badge and re-querying

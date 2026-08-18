@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -142,28 +141,11 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
         return None, False
     pattern = value.strip()[:_MAX_PATTERN]
     try:
-        # codeql[py/regex-injection]
-        # lgtm[py/regex-injection]
-        #
-        # Accepted, and narrowly. An operator-authored filter *is* a regex --
-        # "convert only (USA)" is the feature, and `re.escape`, the sanitizer
-        # this query wants, would turn it into a literal search and delete it.
-        # The value is configuration typed by whoever administers this
-        # instance, at the same trust level as the output directory beside it,
-        # and it reaches here only through the settings API.
-        #
-        # The risk the query names is ReDoS, and that is bounded rather than
-        # ignored: the pattern is capped at `_MAX_PATTERN` characters, its
-        # runtime is probed below and a catastrophic one is refused at save
-        # time, and the names it runs against are bounded filenames. This
-        # check is what made the flow visible to CodeQL in the first place --
-        # compiling and matching in one place -- so suppressing it here keeps
-        # the mitigation rather than removing it.
-        compiled = re.compile(pattern)
+        re.compile(pattern)
     except re.error:
         logger.warning("romm_auto: refusing invalid filter pattern %r", pattern)
         return None, True
-    if _backtracks_catastrophically(compiled):
+    if _has_nested_quantifier(pattern):
         logger.warning(
             "romm_auto: refusing filter pattern %r, it backtracks too long",
             pattern,
@@ -172,61 +154,93 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
     return pattern, False
 
 
-# One probe match must finish inside this.
-_PATTERN_BUDGET_S = 0.05
-# Probe lengths, ascending. Exponential backtracking doubles per character, so
-# a bad pattern blows the budget at a short length and the walk stops there --
-# which is the whole point: the check must not pay the cost it is looking for.
-# A linear pattern clears every length instantly.
-_PATTERN_PROBE_LENGTHS = (12, 16, 20)
-# Ceiling on distinct probe characters, so the guard stays cheap on a long
-# pattern: worst case is this many alphabets times the lengths above.
-_MAX_PROBE_CHARS = 6
+# Quantifiers that can repeat unboundedly. `?` is excluded: `(a?)?` cannot
+# blow up, because neither level can consume more than once.
+_UNBOUNDED_QUANTIFIERS = "*+{"
 
 
-def _backtracks_catastrophically(compiled: re.Pattern) -> bool:
-    """Whether *compiled* backtracks pathologically on an adversarial name.
+def _has_nested_quantifier(pattern: str) -> bool:
+    """Whether *pattern* has the shape that backtracks exponentially.
 
-    Python's ``re`` cannot be interrupted, so a pattern like ``(a+)+$`` runs
-    effectively forever on a long filename. Moving the match off the event loop
-    is not enough: the sweep awaits it while holding ``_sweep_lock``, so
-    previews, manual runs, and even editing the rule to remove the pattern all
-    queue behind it -- the operator's only way out would be a restart.
+    A quantified group whose body itself repeats -- ``(a+)+``, ``(\\w+\\s?)*``
+    -- or whose body is an alternation, ``(a|a)+``. Those are the shapes where
+    the engine has exponentially many ways to split the same input, and where
+    a filename of a few dozen characters takes longer than the heat death of
+    the sweep.
 
-    So the pattern is rejected where it is *saved*, and the probe escalates
-    rather than testing one long string: the runtime of the very thing being
-    detected doubles per character, so measuring it at full length would hang
-    the check itself. Growing 12 -> 16 -> 20 and stopping at the first
-    over-budget length keeps the whole test in the tens of milliseconds.
+    Read, never run. The obvious way to measure this is to time the pattern
+    against an adversarial string, but executing an operator-supplied regex is
+    precisely what CodeQL's ``py/regex-injection`` flags -- and rightly: the
+    check would then have to survive the very thing it is looking for, and
+    timing is load-dependent, so a busy machine could reject a fine pattern.
+    Inspecting the source costs nothing and is deterministic.
 
-    A heuristic, not a proof -- it says nothing about every possible input --
-    but it catches the shape that causes this, and a pattern that cannot clear
-    20 characters promptly has no business scanning a library.
+    Conservative, and deliberately so. It refuses a little more than it must
+    (``(USA|Europe)+`` is harmless but rejected), and it is a shape test, not a
+    proof. Being wrong here costs one clear message at save time; being wrong
+    the other way wedges the scheduler, because ``re`` cannot be interrupted
+    and the sweep holds ``_sweep_lock`` while it matches.
     """
-    for char in _probe_alphabet(compiled.pattern):
-        for length in _PATTERN_PROBE_LENGTHS:
-            probe = (char * length) + "\x00"
-            started = time.monotonic()
-            try:
-                compiled.search(probe)
-            except (re.error, RecursionError):
+    group_starts: list[int] = []
+    i = 0
+    length = len(pattern)
+    while i < length:
+        char = pattern[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_class(pattern, i)
+            continue
+        if char == "(":
+            group_starts.append(i + 1)
+            i += 1
+            continue
+        if char == ")":
+            body = pattern[group_starts.pop() if group_starts else 0:i]
+            following = pattern[i + 1] if i + 1 < length else ""
+            if following and following in _UNBOUNDED_QUANTIFIERS and (
+                _contains_quantifier(body) or "|" in _strip_atoms(body)
+            ):
                 return True
-            if time.monotonic() - started > _PATTERN_BUDGET_S:
-                return True
+            i += 1
+            continue
+        i += 1
     return False
 
 
-def _probe_alphabet(pattern: str) -> list[str]:
-    """Characters worth building a probe string from, for *pattern*.
+def _skip_class(pattern: str, i: int) -> int:
+    """Index just past the character class starting at *i*."""
+    i += 1
+    while i < len(pattern) and pattern[i] != "]":
+        i += 2 if pattern[i] == "\\" else 1
+    return i + 1
 
-    Taken from the pattern itself, because the trigger is pattern-specific:
-    ``(a+)+$`` only blows up on a run of ``a``, and ``(x+x+)+y`` only on a run
-    of ``x``. Probing a fixed alphabet would clear the second one and let it
-    wedge the sweep. Capped, so a long pattern cannot turn the check into the
-    slow thing it is guarding against.
+
+def _contains_quantifier(body: str) -> bool:
+    """Whether *body* repeats anything, ignoring escapes and classes."""
+    return any(c in _UNBOUNDED_QUANTIFIERS for c in _strip_atoms(body))
+
+
+def _strip_atoms(body: str) -> str:
+    """*body* with escape pairs and character classes removed.
+
+    So a literal ``\\+`` or a ``[+|]`` class cannot be mistaken for a
+    quantifier or an alternation.
     """
-    seen = dict.fromkeys(c for c in pattern if c.isalnum())
-    return list(seen)[:_MAX_PROBE_CHARS] or ["a"]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_class(body, i)
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
 
 def default_rule(mode: str = "") -> dict[str, Any]:
