@@ -109,6 +109,33 @@
   job runner itself only checked whether the mode supports the option at all.
   A Wii U conversion run with verification off could pass the structural check
   and remove the only copy. The runner now asks both questions.
+- **Two conversions can no longer be queued to write the same file.** Callers
+  resolve duplicates before submitting, but that is a prediction made outside
+  the queue's lock — a manual submit and an automation sweep could each settle
+  on the same destination before either job started, and the second would
+  overwrite the first's result. With *delete the source after verifying*, that
+  removed both sources for one surviving output. The queue itself now refuses a
+  destination another live job holds.
+- **A failed or cancelled conversion no longer counts as done.** The rule
+  history treated any change to the destination as success, so a job that died
+  after unlinking the old file — or leaving a partial one — marked that ROM
+  converted forever. It now asks the job how it ended.
+- **A filter pattern that can hang the scheduler is refused when you save it.**
+  Python's regex engine cannot be interrupted, so a pattern like `(a+)+$` would
+  run effectively forever on a long filename while holding the sweep — blocking
+  previews, manual runs, and even editing the rule to remove the pattern, with
+  a restart as the only way out.
+- **A metadata snapshot RomM never matches is now given up on** after the
+  configured period, like one whose output never appeared. Once the file had
+  been hashed it waited forever instead, sitting in the badge and re-querying
+  every pass — which contradicted what the setting says it does.
+- **Reading a RomM platform no longer risks tying up the app** when the library
+  mount stops responding: the catalog scan stats every ROM in the platform, and
+  it now runs off the shared worker pool with the same bounded probe the rest of
+  the integration uses, returning a clear error instead of hanging.
+- **Saving settings that leave RomM unreachable now clears the catalog** instead
+  of leaving the previous instance's rows on screen, still selected and still
+  wired to the Convert button.
 - **A conversion that lands on a different path than planned no longer stamps
   its metadata onto the wrong file.** Planning predicts where the conversion
   will write; if something else takes that path before the batch is accepted,

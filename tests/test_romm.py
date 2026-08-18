@@ -8,9 +8,11 @@ import asyncio
 import io
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +22,7 @@ import pytest
 # are two distinct module objects holding two distinct ``RommClient`` classes.
 # Patching the ``app.``-prefixed one would land on a class the routes never use,
 # and every patch would silently no-op.
+from models import JobStatus
 from routes import romm as romm_routes
 from services import db as _db
 from services import romm as romm_service
@@ -871,6 +874,24 @@ def test_tool_without_platform_opinion_is_never_dropped() -> None:
 # ----------------------------------------------------------------------
 
 
+
+class _FakeJob:
+    """The shape `create_batch_jobs` returns, as much of it as the sweep reads.
+
+    The sweep pairs each queued source with its job id so the converted-history
+    record can later ask that job how it ended -- a plain object() has neither
+    attribute.
+    """
+
+    def __init__(self, file_path: str, job_id: str = "") -> None:
+        self.file_path = file_path
+        self.id = job_id or f"job-{abs(hash(file_path)) % 100000}"
+
+
+def _fake_jobs(paths):
+    return [_FakeJob(p) for p in paths]
+
+
 @pytest.fixture(name="settings_db")
 def _settings_db(sqlite_db):
     """The same database, plus a settings cache reset around the test."""
@@ -1110,7 +1131,7 @@ async def test_sweep_is_idempotent_against_the_filesystem(
 
     async def _fake_batch(paths, mode, **kwargs):
         queued.append(list(paths))
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -1300,7 +1321,7 @@ async def test_sweep_records_repin_rows_for_unsafe_formats(
     }]
 
     async def _fake_batch(paths, mode, **kwargs):
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -1337,7 +1358,7 @@ async def test_sweep_records_nothing_for_dat_safe_formats(
     }]
 
     async def _fake_batch(paths, mode, **kwargs):
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -1374,7 +1395,7 @@ async def test_sweep_supplies_delete_snapshots(settings_db, tmp_path: Path) -> N
 
     async def _fake_batch(paths, mode, **kwargs):
         captured.update(kwargs)
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -2202,7 +2223,7 @@ async def test_rename_rule_converts_each_source_exactly_once(
 
     async def _fake_batch(paths, mode, **kwargs):
         queued.append(list(paths))
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -2257,7 +2278,7 @@ async def test_overwrite_rule_converts_each_source_exactly_once(
 
     async def _fake_batch(paths, mode, **kwargs):
         queued.append(list(paths))
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -2304,7 +2325,7 @@ async def test_forget_converted_lets_a_rule_run_again(
     }]
 
     async def _fake_batch(paths, mode, **kwargs):
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -2375,7 +2396,7 @@ async def test_a_queued_conversion_that_never_ran_is_retried(
     }]
 
     async def _fake_batch(paths, mode, **kwargs):
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -2442,6 +2463,28 @@ def test_redirect_origin_ignores_a_spelled_out_default_port() -> None:
     assert origin_of("https://romm/api") != origin_of("http://romm:80/api")
     assert origin_of("https://romm:8443/api") != origin_of("https://romm:443/api")
     assert origin_of("https://romm/api") != origin_of("https://evil/api")
+
+
+def test_catastrophic_filter_patterns_are_refused_at_save_time() -> None:
+    """A pattern that backtracks must not reach the sweep.
+
+    `re` cannot be interrupted, and the sweep evaluates filters while holding
+    the sweep lock — so previews, manual runs and even editing the rule to
+    remove the pattern would all queue behind it, leaving a restart as the only
+    way out. The probe draws its characters from the pattern, because the
+    trigger is pattern-specific: `(x+x+)+y` only blows up on a run of `x`.
+    """
+    from services import romm_auto
+
+    for good in (r"\(USA\)", ".*Beta.*", "^Super", r"^.*\(USA\).*(Rev [0-9])?$"):
+        assert romm_auto._backtracks_catastrophically(re.compile(good)) is False, good
+
+    for bad in ("(a+)+$", "(x+x+)+y", "(a|a)+$", r"^(\w+\s?)*$"):
+        assert romm_auto._backtracks_catastrophically(re.compile(bad)) is True, bad
+
+    # And the rule that carries one is paused rather than silently unfiltered.
+    pattern, invalid = romm_auto._valid_pattern("(a+)+$")
+    assert pattern is None and invalid is True
 
 
 def test_composite_modes_are_narrowed_per_platform() -> None:
@@ -2517,7 +2560,9 @@ async def test_changing_the_romm_instance_forgets_the_conversion_history(
     await romm_auto.set_rules({"7": {
         "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
     }})
-    await romm_auto._mark_converted("7", [(1, str(tmp_path / "Game.rvz"), "")])
+    await romm_auto._mark_converted(
+        "7", [(1, str(tmp_path / "Game.rvz"), "", None)],
+    )
     assert (await romm_auto.get_state())["7"]["converted"]
 
     await romm_routes.put_romm_settings(
@@ -2582,7 +2627,7 @@ async def test_automation_repin_records_the_pre_conversion_fingerprint(
     async def _fast_batch(paths, mode, **kwargs):
         # The conversion completes before `record()` gets its turn.
         (lib / "Game.rvz").write_bytes(b"brand new output")
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fast_batch), \
@@ -2599,6 +2644,71 @@ async def test_automation_repin_records_the_pre_conversion_fingerprint(
     row = romm_repin.pending_rows(10)[0]
     assert row[6] == before, "recorded the post-conversion state as the pre-image"
     assert row[6] != romm_repin.path_fingerprint(str(lib / "Game.rvz"))
+
+
+@pytest.mark.asyncio
+async def test_a_failed_job_does_not_count_as_converted(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A changed destination is not proof of success.
+
+    A failed or cancelled `overwrite` job can unlink the previous artifact or
+    leave a partial one, which from the outside looks exactly like a fresh
+    output — and the ROM would then be skipped forever. The job's own outcome
+    decides.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    (lib / "Game.rvz").write_bytes(b"previous")
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return _fake_jobs(paths)
+
+    failed = SimpleNamespace(id="job-1", status=JobStatus.FAILED)
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+
+        # The job died after mangling the destination — the fingerprint changed,
+        # but nothing usable was produced.
+        (lib / "Game.rvz").unlink()
+        with patch.object(
+            romm_auto.job_manager, "get_job", return_value=failed,
+        ), patch.object(
+            romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+        ):
+            retried = await romm_auto.sweep(ignore_schedule=True)
+        assert retried["queued"] == 1, retried
+
+        # And a job that completed does stop the rule.
+        done = SimpleNamespace(id="job-1", status=JobStatus.COMPLETED)
+        (lib / "Game.rvz").write_bytes(b"the real output")
+        with patch.object(
+            romm_auto.job_manager, "get_job", return_value=done,
+        ), patch.object(
+            romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+        ):
+            settled = await romm_auto.sweep(ignore_schedule=True)
+        assert settled["queued"] == 0, settled
 
 
 @pytest.mark.asyncio
@@ -2696,7 +2806,7 @@ async def test_sweep_never_sends_two_sources_to_one_destination(
 
     async def _fake_batch(paths, mode, **kwargs):
         queued.append(list(paths))
-        return [object() for _ in paths]
+        return _fake_jobs(paths)
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \

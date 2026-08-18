@@ -157,7 +157,18 @@ class RommStore {
       this.settings = await api.saveRommSettings(patch);
       // Connection details may have changed; re-derive everything downstream.
       await this.loadStatus();
-      if (this.usable) await this.loadPlatforms({ force: true });
+      if (this.usable) {
+        await this.loadPlatforms({ force: true });
+      } else {
+        // Saving an unreachable URL or an unmounted library leaves nothing to
+        // browse, and the previous instance's catalog must not outlive it:
+        // returning to the Library tab would show those rows, still selected
+        // and still wired to the Convert panel, against a connection that no
+        // longer exists. Same cleanup the failed-reload path does.
+        this.platforms = [];
+        this.selectedPlatformId = null;
+        fileBrowser.exitRomm();
+      }
       return this.settings;
     } finally {
       this.settingsSaving = false;

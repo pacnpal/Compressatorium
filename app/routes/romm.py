@@ -295,7 +295,23 @@ async def romm_roms(
     # one (`platform_fs_slug` is the on-disk folder, which the operator may
     # have renamed and which therefore does not identify the system).
     slug = next((r.get("platform_slug") for r in roms if r.get("platform_slug")), None)
-    entries = await run_in_threadpool(_build_entries, roms, slug)
+    # `run_detached`, not the shared threadpool: this stats every ROM in the
+    # platform, and on the NFS/SMB/rclone mounts this integration exists for a
+    # mount that stops answering blocks the whole scan in uninterruptible I/O.
+    # In a shared pool that strands one worker per load, and a few tabs
+    # reloading a large platform would starve unrelated API offloads -- the
+    # same reasoning AGENTS.md applies to whole-file reads.
+    try:
+        entries = await run_detached(_build_entries, roms, slug)
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.warning("romm: listing platform %s timed out", platform_id)
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "The RomM library did not respond while reading this platform. "
+                "Check that its mount is healthy."
+            ),
+        ) from exc
     return DirectoryListing(
         volume="RomM", path=f"romm://platform/{platform_id}", entries=entries,
     )
@@ -492,6 +508,20 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
         if not await run_in_threadpool(is_within_configured_volumes, destination):
             skipped += 1
             continue
+        # A live job already writing here owns the pending row for it, and
+        # recording would supersede that row. This submit is then going to be
+        # rejected anyway -- the queue refuses a destination another job holds
+        # -- and cancelling ours would retire the replacement too, leaving the
+        # conversion that really is queued with no metadata to come back to.
+        #
+        # Not when the caller passed `output_paths`: that is the re-record after
+        # a batch was accepted, so the job holding this destination is the very
+        # one being recorded for.
+        if not payload.output_paths and await run_in_threadpool(
+            _destination_has_pending_job, destination,
+        ):
+            skipped += 1
+            continue
         if await run_in_threadpool(
             romm_repin.record, rom, destination, ids, payload.mode,
         ):
@@ -625,7 +655,9 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
                 romm_repin.settle, row_id, "abandoned", "Output never appeared",
             )
             return _Outcome.ABANDONED
-        return await _match_and_settle(row_id, sha1, ids, output_path)
+        return await _match_and_settle(
+            row_id, sha1, ids, output_path, created_at,
+        )
 
     # Never hash a file a converter is still writing. An output becomes a
     # regular file the moment the tool creates it, so without this the pass
@@ -662,7 +694,7 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
         logger.warning("romm: could not hash %s: %s", output_path, exc)
         return _Outcome.FAILED
 
-    return await _match_and_settle(row_id, sha1, ids, output_path)
+    return await _match_and_settle(row_id, sha1, ids, output_path, created_at)
 
 
 async def _hash_output(output_path: str) -> str | None:
@@ -705,12 +737,26 @@ async def _hash_output(output_path: str) -> str | None:
 
 
 async def _match_and_settle(
-    row_id: int, sha1: str, ids: dict, output_path: str,
+    row_id: int, sha1: str, ids: dict, output_path: str, created_at: str,
 ) -> _Outcome:
     """Ask RomM which ROM this digest is, and stamp the ids onto it."""
     try:
         match = await run_in_threadpool(romm_client.rom_by_sha1, sha1)
         if not match:
+            # RomM may simply not have rescanned yet -- the normal case. But it
+            # may also never index this file at all (scanning disabled for the
+            # extension, a folder it does not watch), and this branch is
+            # reached *after* the digest is cached, so the age check in the
+            # no-digest path above can never retire it. The row would then sit
+            # in the badge forever, costing a by-hash request every pass, while
+            # the settings screen promises it is given up on after
+            # `repin_abandon_days`. Honour that promise here too.
+            if _is_stale(created_at):
+                await run_in_threadpool(
+                    romm_repin.settle, row_id, "abandoned",
+                    "RomM never matched this output; re-pin it by hand",
+                )
+                return _Outcome.ABANDONED
             return _Outcome.WAITING
 
         # Re-check ownership immediately before the outbound write. Hashing the

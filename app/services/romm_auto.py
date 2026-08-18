@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -40,7 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
-from models import ConversionMode
+from models import ConversionMode, JobStatus
 from services import romm_repin, romm_settings
 from services.job_manager import QueueBackpressureError, job_manager
 from services.output_conflicts import (
@@ -141,11 +142,74 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
         return None, False
     pattern = value.strip()[:_MAX_PATTERN]
     try:
-        re.compile(pattern)
+        compiled = re.compile(pattern)
     except re.error:
         logger.warning("romm_auto: refusing invalid filter pattern %r", pattern)
         return None, True
+    if _backtracks_catastrophically(compiled):
+        logger.warning(
+            "romm_auto: refusing filter pattern %r, it backtracks too long",
+            pattern,
+        )
+        return None, True
     return pattern, False
+
+
+# One probe match must finish inside this.
+_PATTERN_BUDGET_S = 0.05
+# Probe lengths, ascending. Exponential backtracking doubles per character, so
+# a bad pattern blows the budget at a short length and the walk stops there --
+# which is the whole point: the check must not pay the cost it is looking for.
+# A linear pattern clears every length instantly.
+_PATTERN_PROBE_LENGTHS = (12, 16, 20)
+# Ceiling on distinct probe characters, so the guard stays cheap on a long
+# pattern: worst case is this many alphabets times the lengths above.
+_MAX_PROBE_CHARS = 6
+
+
+def _backtracks_catastrophically(compiled: re.Pattern) -> bool:
+    """Whether *compiled* backtracks pathologically on an adversarial name.
+
+    Python's ``re`` cannot be interrupted, so a pattern like ``(a+)+$`` runs
+    effectively forever on a long filename. Moving the match off the event loop
+    is not enough: the sweep awaits it while holding ``_sweep_lock``, so
+    previews, manual runs, and even editing the rule to remove the pattern all
+    queue behind it -- the operator's only way out would be a restart.
+
+    So the pattern is rejected where it is *saved*, and the probe escalates
+    rather than testing one long string: the runtime of the very thing being
+    detected doubles per character, so measuring it at full length would hang
+    the check itself. Growing 12 -> 16 -> 20 and stopping at the first
+    over-budget length keeps the whole test in the tens of milliseconds.
+
+    A heuristic, not a proof -- it says nothing about every possible input --
+    but it catches the shape that causes this, and a pattern that cannot clear
+    20 characters promptly has no business scanning a library.
+    """
+    for char in _probe_alphabet(compiled.pattern):
+        for length in _PATTERN_PROBE_LENGTHS:
+            probe = (char * length) + "\x00"
+            started = time.monotonic()
+            try:
+                compiled.search(probe)
+            except (re.error, RecursionError):
+                return True
+            if time.monotonic() - started > _PATTERN_BUDGET_S:
+                return True
+    return False
+
+
+def _probe_alphabet(pattern: str) -> list[str]:
+    """Characters worth building a probe string from, for *pattern*.
+
+    Taken from the pattern itself, because the trigger is pattern-specific:
+    ``(a+)+$`` only blows up on a run of ``a``, and ``(x+x+)+y`` only on a run
+    of ``x``. Probing a fixed alphabet would clear the second one and let it
+    wedge the sweep. Capped, so a long pattern cannot turn the check into the
+    slow thing it is guarding against.
+    """
+    seen = dict.fromkeys(c for c in pattern if c.isalnum())
+    return list(seen)[:_MAX_PROBE_CHARS] or ["a"]
 
 
 def default_rule(mode: str = "") -> dict[str, Any]:
@@ -683,20 +747,42 @@ async def _converted_map(platform_id: str) -> dict:
 def _was_produced(remembered: dict | None) -> bool:
     """Whether the conversion recorded in *remembered* actually happened.
 
+    The job's own outcome first, and the filesystem only as a fallback. A
+    changed destination is not proof of success: a failed or cancelled
+    ``overwrite`` job can unlink the previous artifact or leave a partial one
+    behind, which looks exactly like a fresh output from the outside -- and
+    the ROM would then be skipped by every later sweep until the operator
+    cleared the history by hand.
+
+    The job id is the precise answer while the queue still remembers it, which
+    covers the window that matters: the next sweep is minutes away. Job history
+    is pruned and does not survive a restart, so after that the fingerprint is
+    the best evidence left -- weaker, but it only ever mis-reads a *destroyed*
+    destination, and `Forget history` is the way back from that.
+
     ``pre`` is None for a legacy record that carries no evidence either way;
     those are trusted, since the alternative is reconverting a whole library.
     """
     if not remembered:
         return False
+    job_id = remembered.get("job_id")
+    if job_id:
+        job = job_manager.get_job(job_id)
+        if job is not None:
+            if job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                return True  # in flight; not a candidate either way
+            return job.status == JobStatus.COMPLETED
     if remembered.get("pre") is None:
         return True
     return romm_repin.path_fingerprint(remembered["path"]) != remembered["pre"]
 
 
 async def _mark_converted(platform_id: str, produced: list[tuple]) -> None:
-    """Remember ``(rom_id, destination, pre_fingerprint)`` for each queued ROM."""
-    entries = {str(rid): {"path": dest, "pre": pre} for rid, dest, pre in produced
-               if rid is not None}
+    """Remember ``(rom_id, destination, pre_fingerprint, job_id)`` per queued ROM."""
+    entries = {
+        str(rid): {"path": dest, "pre": pre, "job_id": job_id}
+        for rid, dest, pre, job_id in produced if rid is not None
+    }
     if not entries:
         return
     state = await get_state()
@@ -1106,9 +1192,13 @@ async def _sweep_locked(
                 # `rename` stop here instead of reconverting the same sources
                 # every interval. Only after the queue accepted them.
                 if rule["duplicate_action"] != "skip":
+                    # Paired by source path, not by position: the record is
+                    # only meaningful if it names the job whose outcome decides
+                    # whether this ROM was really converted.
+                    job_by_path = {j.file_path: j.id for j in jobs}
                     await _mark_converted(platform_id, [
                         (rom_by_path[path].get("id"), destinations[path],
-                         pre_by_path[path])
+                         pre_by_path[path], job_by_path.get(path))
                         for path in batch
                     ])
 

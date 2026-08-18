@@ -236,6 +236,22 @@ class JobManager:
                     "Output path matches input; refusing to overwrite source"
                 )
 
+        # No two live jobs may write the same file. Callers resolve duplicates
+        # before submitting, but resolution is a prediction made outside this
+        # lock: a manual submit and an automation sweep can each decide on the
+        # same destination before either job starts and takes its lock, and the
+        # second then overwrites the first's result -- with delete-on-verify,
+        # removing both sources for one surviving output. Checked here because
+        # this is the one place that is both under `_create_lock` and past the
+        # point where the destination is finally known, so it also catches two
+        # specs of a single batch colliding (each job is registered as it is
+        # created, so the second sees the first).
+        claimed_by = self._active_job_writing(output_path)
+        if claimed_by is not None:
+            raise ValueError(
+                f"Another queued job ({claimed_by}) is already writing that output",
+            )
+
         # Carry the mode's input kind end-to-end so the pipeline skips the
         # archive-extract / file-only assumptions for a directory job and the
         # lock manager can protect the whole source subtree. Derived from the
@@ -408,6 +424,20 @@ class JobManager:
             split=split,
             verify_after=verify_after,
         )
+
+    def _active_job_writing(self, output_path: str) -> Optional[str]:
+        """Id of a queued/running job whose output is *output_path*, else None.
+
+        Compares the primary output only. Companions are covered by the
+        conflict probe callers already run, and this has to stay cheap: it is
+        called under ``_create_lock``, once per job being queued.
+        """
+        for job in self.jobs.values():
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            if job.output_path and _paths_collide(job.output_path, output_path):
+                return job.id
+        return None
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
         """Get a job by ID."""
