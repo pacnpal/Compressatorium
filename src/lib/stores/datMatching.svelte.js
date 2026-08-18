@@ -179,10 +179,36 @@ class DATMatchingStore {
     // effect need not re-run) the newly enabled fallback stayed dead until a
     // reload.
     const generation = this._generation;
+    // Snapshot the entries this hydration can invalidate. Overlaying returned
+    // rows is not enough: the server omits a path it no longer has a usable
+    // row for -- one dropped because a rescan proved the file changed, or one
+    // withheld by cached_result_usable() because it predates a now-enabled
+    // lookup source -- and an omitted path used to keep its old entry
+    // indefinitely. That is worse than a stale badge, because
+    // hydrateAndMatch() treats any key in the map as known: a replaced file
+    // was never re-matched and went on showing the previous file's game until
+    // a reload. Every other invalidation site (import, delete, sync, provider
+    // toggle) clears the whole map; this reconciles the per-path case.
+    // Plain array of pairs, not a Map: this is a throwaway local snapshot with
+    // no lookups, and svelte/prefer-svelte-reactivity flags built-in Maps (the
+    // same reason _attemptedPaths is a plain object).
+    const before = [];
+    for (const path of paths) {
+      if (this.matches.has(path)) before.push([path, this.matches.get(path)]);
+    }
     try {
       const data = await api.getMatchCache(paths);
       if (generation !== this._generation) return;
       const results = data?.results ?? {};
+      // Compare-and-delete against the snapshotted value, not just the key: a
+      // match job can land between the request and this response, and its
+      // result is newer than the answer we are holding. Dropping it would
+      // erase a fresh badge and re-queue a file the backend had just done.
+      for (const [path, previous] of before) {
+        if (!Object.hasOwn(results, path) && this.matches.get(path) === previous) {
+          this.matches.delete(path);
+        }
+      }
       for (const [path, result] of Object.entries(results)) {
         this.matches.set(path, result);
       }
