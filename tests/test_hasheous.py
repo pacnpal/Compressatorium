@@ -8,6 +8,7 @@ No HTTP mocking library is used (the suite has none): the seam is
 import http.client
 import json
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -212,7 +213,7 @@ def test_url_error_raises_unavailable(hasheous_on):
 class _Resp:
     """A minimal stand-in for ``http.client.HTTPResponse``.
 
-    ``read1`` drains and then returns b"" the way a real response does. An
+    ``read`` drains and then returns b"" the way a real response does. An
     earlier version returned the whole payload on every call, which never hit
     EOF -- so tests naming the JSON-parse path actually passed via the
     size-limit path instead.
@@ -1484,7 +1485,9 @@ def test_the_deadline_is_cleared_after_the_request():
 
 
 @pytest.mark.parametrize("mode", ["header", "body"])
-def test_a_dripping_server_cannot_pin_a_lookup(hasheous_on, monkeypatch, tls_cert, mode):
+def test_a_dripping_server_cannot_pin_a_lookup(
+    hasheous_on, monkeypatch, tls_cert, mode, request
+):
     """The end-to-end bound, against a real TLS server that never stops sending.
 
     ``urlopen(timeout=...)`` bounds each socket operation, and every byte that
@@ -1509,6 +1512,17 @@ def test_a_dripping_server_cannot_pin_a_lookup(hasheous_on, monkeypatch, tls_cer
             for _ in range(100000):
                 conn.sendall(b"x")
                 time.sleep(0.3)
+
+    # Hard guard: without the deadline this body drips for 30,000s, and a
+    # hung job is a much worse CI failure than a red one. signal.alarm keeps
+    # that bounded without adding a pytest-timeout dependency (tests run on the
+    # main thread, so the handler fires).
+    def _too_slow(_sig, _frm):
+        raise AssertionError(f"{mode} drip was not bounded -- the deadline regressed")
+
+    signal.signal(signal.SIGALRM, _too_slow)
+    signal.alarm(60)
+    request.addfinalizer(lambda: signal.alarm(0))  # noqa: PT021
 
     port = _tls_serve_once(_drip, tls_cert)
 
@@ -1557,3 +1571,38 @@ def test_a_normal_body_still_reads_whole(hasheous_on, tls_cert):
         data = hasheous._fetch_json(f"https://localhost:{port}/x")
 
     assert data["name"] == "Jumpman Junior"
+
+
+# ---------------------------------------------------------------------------
+# Eleventh review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+def test_the_handshake_also_honours_the_deadline():
+    """The TLS handshake makes zero ``recv_into`` calls.
+
+    Measured: wrapping a socket with a ``recv_into`` override records no calls
+    at all -- the handshake reads through the C layer -- so ``do_handshake``
+    has to apply the deadline itself or connect time is unbounded.
+    """
+    sock = hasheous._DeadlineSSLSocket.__new__(hasheous._DeadlineSSLSocket)
+    with hasheous._deadline_of(-1):
+        with pytest.raises(TimeoutError, match="overall timeout"):
+            sock.do_handshake()
+
+
+def test_the_lookup_url_follows_the_configured_base(monkeypatch):
+    """One base-URL rule, so the request and the cache stamp cannot diverge.
+
+    ``routes.dat.remote_stamp`` stamps cached misses with ``base_url()`` and
+    ``cached_result_usable`` compares against that stamp; a second copy of the
+    normalization in ``_lookup_url`` could drift from it and serve stale misses
+    against a server that was never asked.
+    """
+    monkeypatch.setattr(settings, "hasheous_base_url", "https://self.hosted.example/")
+    sha1 = "a" * 40
+
+    assert hasheous._lookup_url(sha1).startswith(hasheous.base_url())
+    assert hasheous._lookup_url(sha1) == (
+        f"https://self.hosted.example/api/v1/Lookup/ByHash/sha1/{sha1}"
+    )

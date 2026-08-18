@@ -201,7 +201,14 @@
     //      every page change, polluting the unmatched count and
     //      wasting I/O.
     chdMetadata.hydrate(allPaths).catch(() => {});
-    if (datMatching.matchingAvailable) {
+    {
+      // NOT gated on datMatching.matchingAvailable. A library with no DATs
+      // that accumulated Hasheous hits and then turned Hasheous off still has
+      // valid cached matches -- cached_result_usable() keeps hits regardless of
+      // the current provider state -- and gating here made every persisted
+      // HASH badge vanish on the next render. hydrateAndMatch() reads the cache
+      // first and returns before creating any job when matching is off, so the
+      // gate belongs there, not around the read.
       const matchableExts = registry.allFilterableExts();
       const matchExtSet = new Set(matchableExts.map((e) => e.toLowerCase()));
       const filePaths = entries

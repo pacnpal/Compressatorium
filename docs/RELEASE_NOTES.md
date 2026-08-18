@@ -22,9 +22,9 @@
   LaunchBox and SteamGridDB. The badge tooltip shows all of it bar the link
   URLs -- it names which databases list the game, and the URLs themselves are
   stored with the match and returned by the API. These
-  matches get a **HASH** badge to distinguish them from a local **DAT** hit. A
-  fresh install now matches your library immediately, without syncing hundreds
-  of MB of DATs first.
+  matches get a **HASH** badge to distinguish them from a local **DAT** hit.
+  Once you enable it, a fresh install matches your library immediately, without
+  syncing hundreds of MB of DATs first.
 
   It is **off by default and stays off until you turn it on**: a lookup sends
   the SHA1 of your file — and nothing else, no filenames or paths — to a

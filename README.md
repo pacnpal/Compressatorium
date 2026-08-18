@@ -183,7 +183,8 @@ you don't have to force a rescan to pick the feature up.
 Enabling this sends **the SHA1 of your files** (and nothing else — no filenames,
 no paths, no account identifier) to whatever server `COMPRESSATORIUM_HASHEOUS_URL`
 points at. That is why it ships **off**, and why nothing is transmitted at all
-until you set the variable. Requests are HTTPS-only, and a redirect that would
+until you enable it — either with the toggle in the DAT Library or by setting
+the variable. Requests are HTTPS-only, and a redirect that would
 downgrade to plain HTTP is refused rather than followed.
 
 If you'd rather not talk to a third party at all, Hasheous is open source and

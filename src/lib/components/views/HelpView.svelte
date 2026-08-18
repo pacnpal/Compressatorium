@@ -335,8 +335,9 @@
     </p>
     <p>
       Those hits show a <strong>HASH</strong> badge instead of DAT, and their tooltip
-      carries the game name, platform, year, region and which database actually knew the
-      hash. It's off until you turn it on, because a lookup sends your file's SHA1 — and
+      names the DAT the hash came from, then the game name, ROM name, platform, year,
+      region and publisher, plus which metadata databases list the title. It's off until
+      you turn it on, because a lookup sends your file's SHA1 — and
       nothing else, no names or paths — to that service. Your own DATs are always checked
       first, so a library they already cover never makes a network call, and when a file
       offers several hashes all of them are tried locally before any goes out. Turning it

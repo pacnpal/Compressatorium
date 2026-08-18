@@ -14,7 +14,7 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import XIcon from '@lucide/svelte/icons/x';
   import Globe from '@lucide/svelte/icons/globe';
-  import Plug from '@lucide/svelte/icons/plug-zap';
+  import PlugZap from '@lucide/svelte/icons/plug-zap';
 
   const dats = $derived(datMatching.dats);
   const loading = $derived(datMatching.datsLoading);
@@ -25,6 +25,9 @@
   const syncStatus = $derived(datMatching.syncStatus);
 
   const hasheousOn = $derived(Boolean(stats?.hasheous_enabled));
+  // Interpolated straight into prose, so it needs a value before /dat/stats
+  // lands -- otherwise the panel reads "looking up misses at ." while loading.
+  const hasheousUrl = $derived(stats?.hasheous_url || 'the configured Hasheous server');
 
   let fileInputEl;
   let syncPollTimer = null;
@@ -204,7 +207,7 @@
             disabled={testingHasheous}
             onclick={handleTestHasheous}
           >
-            {#snippet icon()}<Plug size={14} />{/snippet}
+            {#snippet icon()}<PlugZap size={14} />{/snippet}
             Test
           </Button>
         {/if}
@@ -222,14 +225,14 @@
 
     <p class="hasheous-detail">
       {#if hasheousOn}
-        On — looking up misses at <code>{stats?.hasheous_url}</code>. Your own
+        On — looking up misses at <code>{hasheousUrl}</code>. Your own
         DATs are always checked first, so a library they already cover makes no
         network calls. These matches show a <strong>HASH</strong> badge, with
         platform, year, region and source DAT in the tooltip.
       {:else}
         Off — nothing is sent anywhere. Turning it on sends each file's SHA1
         (and nothing else, no names or paths) to
-        <code>{stats?.hasheous_url}</code> when your DATs come up empty.
+        <code>{hasheousUrl}</code> when your DATs come up empty.
         Takes effect immediately; no restart needed.
       {/if}
       {#if stats?.hasheous_overridden}
@@ -242,7 +245,9 @@
     {#if hasheousTest}
       <p class="hasheous-test" class:bad={!hasheousTest.ok} role="status">
         {#if hasheousTest.ok}
-          Reachable — responded in {hasheousTest.latency_ms} ms.
+          Reachable{hasheousTest.latency_ms != null
+            ? ` — responded in ${hasheousTest.latency_ms} ms`
+            : ''}.
         {:else}
           Not reachable: {hasheousTest.error}
         {/if}

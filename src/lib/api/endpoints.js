@@ -519,7 +519,12 @@ export const api = {
     );
   },
 
-  /** Probe the configured Hasheous server. Always resolves; check `ok`. */
+  /**
+   * Probe the configured Hasheous server. Resolves `{ ok, latency_ms, error }`
+   * when the backend answers — `ok: false` is a reachability answer, not a
+   * thrown error. Rejects only if the request itself fails (non-2xx, network),
+   * so callers still need a catch.
+   */
   testHasheous() {
     return jsonPost(`${API_BASE}/dat/hasheous/test`, {}, {}, 'Failed to reach Hasheous');
   },

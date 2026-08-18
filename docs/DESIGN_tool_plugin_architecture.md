@@ -1181,12 +1181,19 @@ freshness-gated metadata must call this rather than reintroducing the two-read p
 
 ### 3.3.5.1 Remote hash fallback (`services/hasheous.py`)
 
-Hash matching has two sources, and exactly one place decides between them:
-`routes.dat._lookup_sha1_match`. Every match path already funnels through it —
-`POST /dat/match`, `/dat/match-batch`, the background match job, and
-`info._scan_phase_dat_match` — so the fallback was added there rather than by
-introducing a provider registry. Two sources do not need an interface; a third
-would.
+Hash matching has two sources, and the ordering between them lives in
+`routes.dat._lookup_match`, which runs `_local_lookup_match` and only then
+`_remote_lookup_match`. Every match path — `POST /dat/match`,
+`/dat/match-batch`, the background match job, and `info._scan_phase_dat_match`
+— reaches the sources through those helpers, so the fallback was added there
+rather than by introducing a provider registry. Two sources do not need an
+interface; a third would.
+
+One caller does not go through `_lookup_match`: `_match_single_file` calls
+`_local_lookup_match` and `_remote_lookup_match` directly, because it has to
+check *every* local candidate a file offers (embedded hashes, then the
+file-level SHA1) before any of them may go out remotely. `_match_result`
+builds the record both paths return.
 
 The order is **fixed and local-first**: `_local_dat_record` (the imported DATs)
 and only on a miss, and only when the operator opted in, `hasheous.lookup`. That

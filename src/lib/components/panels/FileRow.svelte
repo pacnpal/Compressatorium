@@ -49,9 +49,10 @@
       lines.push(datMatch.rom_name);
     }
     const links = Array.isArray(datMatch.metadata_links) ? datMatch.metadata_links : [];
-    if (links.length) {
-      lines.push(`Listed on ${links.map((l) => l.source).filter(Boolean).join(', ')}`);
-    }
+    // Gate on the sources, not on links.length: entries without a `source`
+    // would otherwise render a dangling "Listed on ".
+    const sources = links.map((l) => l?.source).filter(Boolean);
+    if (sources.length) lines.push(`Listed on ${sources.join(', ')}`);
     return lines.join('\n');
   });
 

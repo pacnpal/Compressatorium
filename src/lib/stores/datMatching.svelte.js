@@ -48,6 +48,9 @@ class DATMatchingStore {
   _retryTimer = null;
   _retryPaths = null;
   _autoRetries = 0;
+  // The path set the last match job was started for, so a re-run of the same
+  // visible page doesn't count as a new hydration and refill the retry budget.
+  _lastJobPaths = null;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
@@ -181,12 +184,16 @@ class DATMatchingStore {
       if (stillUnknown.length) this._scheduleRetry(paths);
       return;
     }
-    // Only a genuinely new hydration refills the budget. Resetting it here
-    // unconditionally made MAX_AUTO_RETRIES meaningless: a timer-driven pass
-    // finds the window expired, does "real work", and would hand the next
-    // cycle a fresh budget -- looping every 90s for as long as the tab is open
-    // on a path that is never going to become cacheable.
-    if (!fromRetry) this._autoRetries = 0;
+    // Only a genuinely NEW path set refills the budget. `!fromRetry` alone was
+    // not enough: the file list re-runs this on every dat_match completion with
+    // the same visible paths, so a job outliving the 90s attempt window let the
+    // terminal-job pass reset the budget and start another job, and each of
+    // those completions did it again -- MAX_AUTO_RETRIES capped nothing. Keying
+    // on the path set means navigating somewhere new still gets a full budget.
+    if (!fromRetry && !this._samePaths(uncached, this._lastJobPaths)) {
+      this._autoRetries = 0;
+    }
+    this._lastJobPaths = uncached;
     try {
       await this.startMatchJob(uncached);
       // Mark attempts only AFTER the backend accepted the job. A 409
@@ -210,6 +217,7 @@ class DATMatchingStore {
   _resetAttempts() {
     this._attemptedPaths = Object.create(null);
     this._autoRetries = 0;
+    this._lastJobPaths = null;
     if (this._retryTimer) {
       clearTimeout(this._retryTimer);
       this._retryTimer = null;

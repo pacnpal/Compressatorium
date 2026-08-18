@@ -7,7 +7,7 @@ carries platform / publisher / year / region plus links out to IGDB,
 TheGamesDB and RetroAchievements.
 
 It is consulted **only** when the locally imported DATs don't know a hash (see
-``routes.dat._lookup_sha1_match``), and only when the operator opts in, so
+``routes.dat._lookup_match``), and only when the operator opts in, so
 local matching stays instant and fully offline.
 
 Deliberately stdlib-only, mirroring ``services.dat_sync``: the project has no
@@ -193,7 +193,7 @@ class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
 _deadline = threading.local()
 
 
-class _DeadlineSSLSocket(ssl.SSLSocket):
+class _DeadlineSSLSocket(ssl.SSLSocket):  # pylint: disable=abstract-method
     """A TLS socket that enforces one deadline across the whole request.
 
     ``urlopen(timeout=...)`` bounds each *socket operation*, not the request:
@@ -206,15 +206,36 @@ class _DeadlineSSLSocket(ssl.SSLSocket):
     Enforcing it here rather than around the body read is what makes the bound
     real: every byte of the response, status line and headers included, arrives
     through ``recv_into``, so connect, headers and body share one deadline.
+
+    The TLS handshake is the exception: measured, it makes **zero**
+    ``recv_into`` calls, reading through the C layer instead, so
+    ``do_handshake`` has to apply the deadline itself. It sets the remaining
+    budget as the socket timeout, which bounds a peer that stalls or dies
+    mid-handshake. A peer that drips a handshake record at a time, each within
+    the remaining budget, is not fully bounded by this -- doing that properly
+    means leaving urllib. It is called out in the design doc rather than
+    silently implied.
+
+    ``dup()`` is abstract on ``ssl.SSLSocket`` upstream (CPython raises
+    ``NotImplementedError``), hence the pylint waiver: nothing here duplicates
+    the socket, and overriding it would only re-raise the same error.
     """
 
-    def recv_into(self, *args, **kwargs):
+    def do_handshake(self, *args, **kwargs):
+        self._apply_deadline()
+        return super().do_handshake(*args, **kwargs)
+
+    def _apply_deadline(self) -> None:
         end = getattr(_deadline, "at", None)
-        if end is not None:
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("lookup exceeded the overall timeout")
-            self.settimeout(remaining)
+        if end is None:
+            return
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("lookup exceeded the overall timeout")
+        self.settimeout(remaining)
+
+    def recv_into(self, *args, **kwargs):
+        self._apply_deadline()
         return super().recv_into(*args, **kwargs)
 
 
@@ -260,8 +281,10 @@ def _clear_cooldown() -> None:
 
 
 def _lookup_url(sha1: str) -> str:
-    base = str(getattr(settings, "hasheous_base_url", "") or "").rstrip("/")
-    return f"{base}/api/v1/Lookup/ByHash/sha1/{sha1}"
+    # base_url(), not a second copy of the normalization: routes.dat stamps
+    # cached misses with base_url() and cached_result_usable() compares against
+    # that stamp, so the two must not be able to drift.
+    return f"{base_url()}/api/v1/Lookup/ByHash/sha1/{sha1}"
 
 
 def _timeout() -> int:

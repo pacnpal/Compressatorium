@@ -198,7 +198,11 @@ async def _scan_phase_dat_match(
         await job_manager.update_external_job(
             scan_job_id,
             progress=97,
-            message="Phase 3: no DATs imported — skipping DAT match",
+            message=(
+                "Phase 3: DAT store unavailable — skipping DAT match"
+                if not store_ok
+                else "Phase 3: no DATs imported — skipping DAT match"
+            ),
         )
         return 0
 
