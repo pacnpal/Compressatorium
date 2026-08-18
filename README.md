@@ -178,9 +178,13 @@ One exception, if you set `MATCH_MAX_FILE_SIZE`: a file over that cap is never
 read, so its file-level hash cannot be computed or checked locally at all. Such
 a file still gets looked up on whatever hashes it can offer for free (a CHD's
 header and data SHA1s), because the cap means "don't read this file", not
-"don't identify it". If you would rather large files were not looked up
-remotely at all, leave the cap unset and they will be matched locally first
-like everything else.
+"don't identify it". Leaving the cap unset restores the ordinary order for
+those files — their own SHA1 is computed and checked against your DATs before
+anything is sent — but it is **not** a way to keep large files off the network:
+if your DATs don't know the file, its hashes still go to Hasheous like any
+other. There is no size-based opt-out; the controls that actually stop a
+disclosure are turning the fallback off, or pointing
+`COMPRESSATORIUM_HASHEOUS_URL` at your own instance.
 
 Results are cached in the local database, so a file is looked up once, not once
 per browse. If you enable Hasheous *after* files were already recorded as "no

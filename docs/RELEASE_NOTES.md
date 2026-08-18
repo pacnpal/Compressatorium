@@ -112,12 +112,21 @@
   queued re-match and says so in the log; those files keep their current
   verdicts until you browse them or run a rescan.
 
+- **A file replaced after it was identified no longer keeps the old game's
+  badge through a DAT import.** The re-match an import triggers recomputes the
+  file's hash, but wasn't passing it on — and that hash is the only way the
+  cache can tell "your DATs still don't recognise this" apart from "this is a
+  different file now". The first has to keep the existing badge; the second has
+  to drop it. It now keeps them apart.
+
 - **A retry armed for one folder no longer follows you to another.** When a
   Hasheous lookup failed, the badge retry was scheduled for the folder you were
   looking at — but navigating elsewhere left it running, so it could later
   wake up and start hashing files that were no longer on screen. It is now
   retired as soon as you move on, and cancelled outright when the file list
-  closes.
+  closes — which also gives the folder a fresh retry budget, so coming back to
+  a folder whose retries ran out during an outage tries again instead of
+  staying blank until you reload.
 
 - **A match recorded *while* a DAT import was running is no longer left out of
   the follow-up re-match.** The re-match works from a snapshot taken just

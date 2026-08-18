@@ -385,15 +385,24 @@ class DATMatchingStore {
   }
 
   /**
-   * Drop any pending retry outright. Called when the file list goes away:
-   * nothing is visible, so a timer that fires would hydrate and potentially
-   * hash for a view that no longer exists.
+   * Drop any pending retry outright, and hand the next visit a clean slate.
+   * Called when the file list goes away: nothing is visible, so a timer that
+   * fires would hydrate and potentially hash for a view that no longer exists.
+   *
+   * The budget goes with it, and unconditionally -- an early return on "no
+   * timer" would skip exactly the case that needs it. A folder whose budget is
+   * spent has no timer left, so leaving and coming back to it would find
+   * `_lastJobPaths` still holding that same set and `_autoRetries` still at
+   * the cap, and refuse to match. Navigating away and back is a deliberate act
+   * by the operator; it refills the budget for the same reason navigating
+   * somewhere new does.
    */
   cancelRetry() {
-    if (!this._retryTimer) return;
-    clearTimeout(this._retryTimer);
+    if (this._retryTimer) clearTimeout(this._retryTimer);
     this._retryTimer = null;
     this._retryPaths = null;
+    this._autoRetries = 0;
+    this._lastJobPaths = null;
   }
 
   _samePaths(a, b) {

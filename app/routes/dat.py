@@ -1290,6 +1290,26 @@ def _match_result(file_path: str, sha1: str, match_type: str, record: dict) -> d
     }
 
 
+def _carrying_file_hash(result: dict, candidates: list[tuple[str, str]]) -> dict:
+    """Attach the file-level SHA1, when one was computed, to an unmatched result.
+
+    It is the only evidence a later writer has that the file *changed*.
+    ``dat_store._would_downgrade_remote_hit()`` refuses to overwrite a remote
+    hit with an unmatched result unless ``_proves_content_changed()`` can
+    compare the recomputed ``file_sha1`` against the stored one -- so a miss
+    that drops the hash leaves a replaced file wearing the previous game's
+    badge, with nothing left to ever correct it.
+
+    Shared by the two exits that return an unmatched result after computing
+    hashes: a remote outage, and a local-only rematch. Both had the same
+    hazard; only the first had the fix.
+    """
+    file_level = next((h for h, kind in candidates if kind == "file_sha1"), None)
+    if not file_level:
+        return result
+    return {**result, "file_hash": file_level}
+
+
 def _carrying_candidates(result: dict, candidates: list[tuple[str, str]]) -> dict:
     """Tag a verdict with the hashes the cache write must re-validate it against.
 
@@ -1614,7 +1634,17 @@ async def _match_single_file(
             # ``checked_remote`` the store's _would_downgrade_remote_hit()
             # refuses to overwrite an existing remote hit, so a file the new
             # DATs still don't cover simply keeps the badge it had.
-            return size_capped if size_capped is not None else base_result
+            #
+            # ...unless the file itself changed, which is why the recomputed
+            # hash rides along. "The DATs still don't know it" and "this is a
+            # different file now" both arrive here as an unmatched result, and
+            # only the hash tells them apart. Without it a replaced file kept
+            # the previous game's badge and nothing would ever correct it --
+            # the job path never calls drop_if_content_changed(), that is the
+            # scan's.
+            if size_capped is not None:
+                return size_capped
+            return _carrying_file_hash(base_result, candidates)
         try:
             remote, consulted = await _remote_lookup_match(
                 file_path, candidates, cancel_event=cancel_event,
@@ -1632,13 +1662,9 @@ async def _match_single_file(
             # changed" are different facts -- without the hash the scan cannot
             # tell them apart and would keep a badge identifying the file as
             # whatever it used to be.
-            file_level = next(
-                (h for h, kind in candidates if kind == "file_sha1"), None
+            return _carrying_file_hash(
+                {**base_result, "error": HASHEOUS_ERROR}, candidates,
             )
-            error_result = {**base_result, "error": HASHEOUS_ERROR}
-            if file_level:
-                error_result["file_hash"] = file_level
-            return error_result
         if remote:
             return _carrying_candidates(remote, candidates)
 

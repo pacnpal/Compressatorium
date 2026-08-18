@@ -1448,6 +1448,16 @@ This is a payload field, not a schema change.
   burst at sync time. Closing it too means keeping remote-checked misses across
   an invalidation, which would serve a stale negative for any file the new DAT
   does cover — the trade the invalidation exists to avoid.
+
+  The unstamped miss must still **carry the recomputed file-level SHA1**
+  (`_carrying_file_hash()`). "The DATs still don't know it" and "this is a
+  different file now" both reach the store as an unmatched result, and the hash
+  is the only thing that separates them: `_proves_content_changed()` compares it
+  against the stored one, and without it the row-two guard protects the badge of
+  a file that has been *replaced*, permanently — the job path never calls
+  `drop_if_content_changed()`, that is the scan's. The outage exit had carried
+  the hash for this exact reason since round 7; the local-only exit was written
+  without it, so one helper now serves both.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

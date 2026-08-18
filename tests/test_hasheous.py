@@ -3197,3 +3197,99 @@ async def test_a_completed_job_still_hands_over_its_deferred_rematch(monkeypatch
     )
 
     assert started == [["/vol/queued.chd"]]
+
+
+# ---------------------------------------------------------------------------
+# Thirty-first review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_local_only_miss_carries_the_hash_that_proves_a_swap(
+    hasheous_on, monkeypatch,
+):
+    """"Still unknown" and "different file now" both arrive as an unmatched result.
+
+    Only the recomputed file-level hash tells them apart, and the local-only
+    exit dropped it -- so the very guard that protects a remote badge (round 30)
+    would protect it on a file that had been replaced.
+    """
+    container = "c" * 40
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: None)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=container),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+
+    result = await dat_routes._match_single_file("/vol/game.iso", local_only=True)
+
+    assert result["matched"] is False
+    assert result["file_hash"] == container, (
+        "the local-only miss dropped the proof that the file changed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_file_loses_a_remote_badge_it_no_longer_earns(tmp_path):
+    """The end of that chain: the store must be able to act on the hash.
+
+    A cached remote hit plus an unmatched recompute whose file-level hash
+    differs is the one case `_would_downgrade_remote_hit` is meant to let
+    through -- and it can only see it if the hash arrived.
+    """
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/game.iso"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Old Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    # What the fixed local-only rematch produces for a file that was swapped.
+    await store.set_match(path, {
+        "path": path, "matched": False, "checked_remote": None,
+        "file_hash": "b" * 40,
+    })
+    assert store.get_match(path)["matched"] is False, (
+        "a replaced file kept the previous game's badge"
+    )
+
+    # ...and the unchanged file still keeps its badge, which is the whole
+    # point of the guard.
+    other = "/vol/kept.iso"
+    await store.set_match(other, {
+        "path": other, "matched": True, "game_name": "Kept Game",
+        "match_type": "file_sha1", "file_hash": "c" * 40, "source": "hasheous",
+    })
+    await store.set_match(other, {
+        "path": other, "matched": False, "checked_remote": None,
+        "file_hash": "c" * 40,
+    })
+    assert store.get_match(other)["game_name"] == "Kept Game"
+
+
+@pytest.mark.asyncio
+async def test_an_outage_miss_still_carries_its_hash_through_the_shared_helper(
+    hasheous_on, monkeypatch,
+):
+    """The behaviour that was already right must survive being factored out."""
+    container = "c" * 40
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: None)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=container),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        hasheous, "lookup",
+        AsyncMock(side_effect=hasheous.HasheousUnavailable("timed out")),
+    )
+
+    result = await dat_routes._match_single_file("/vol/game.iso")
+
+    assert result["error"] == dat_routes.HASHEOUS_ERROR
+    assert result["file_hash"] == container
