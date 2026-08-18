@@ -3227,6 +3227,111 @@ def test_cancelling_a_plan_cannot_retire_the_row_that_superseded_it(
     assert romm_repin.count_pending() == 0
 
 
+@pytest.mark.asyncio
+async def test_the_identity_comparison_cannot_hang_the_settings_save() -> None:
+    """The dead mount is usually the one being replaced.
+
+    Comparing identity resolves both library roots, and the *old* root is the
+    unresponsive share as often as not — that is why the operator is here
+    changing it. On a pooled worker with no deadline, `realpath` blocks forever
+    while this request holds `_settle_lock` and the sweep pause, so the one
+    request that would have fixed the mount is also the one that wedges every
+    re-pin pass, sweep and rule edit behind it.
+    """
+    import threading
+
+    stuck = threading.Event()
+    real = os.path.realpath
+    loop_thread = threading.get_ident()
+
+    def _realpath(path):
+        assert threading.get_ident() != loop_thread, (
+            f"realpath({path}) ran on the event loop"
+        )
+        if "/dead-mount/" in str(path):
+            stuck.wait(30)
+        return real(path)
+
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        with patch.object(romm_routes.os.path, "realpath", _realpath), \
+                patch.object(romm_routes, "_IDENTITY_PROBE_SECONDS", 0.2):
+            moved = await asyncio.wait_for(
+                romm_routes._identity_moved(
+                    {"url": "http://romm:8080", "library_root": "/dead-mount/old"},
+                    {"url": "http://romm:8080", "library_root": "/dead-mount/new"},
+                ),
+                timeout=5,
+            )
+    finally:
+        stuck.set()
+        ticker.cancel()
+
+    # It answered, from the spellings, and the loop kept running throughout.
+    assert moved is True
+    assert ticks > 0
+
+    # And the safe degradation is "moved": two spellings of one directory cost
+    # a redone conversion history, where the opposite mistake writes one
+    # library's provider ids onto another library's game.
+    with patch.object(romm_routes, "_IDENTITY_PROBE_SECONDS", 0.2):
+        same = await romm_routes._identity_moved(
+            {"url": "http://romm:8080/", "library_root": "/tmp"},
+            {"url": "http://romm:8080", "library_root": "/tmp/"},
+        )
+    assert same is False
+
+
+def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:
+    """A prefix of a regex is usually a valid regex that means something else.
+
+    Cutting `^(Alpha|Beta|...)` mid-alternation can leave something that
+    compiles and matches a different set. An *include* trimmed that way widens
+    the selection; an *exclude* trimmed that way stops protecting the titles
+    the operator meant to skip — unattended, with delete-on-verify possibly
+    attached. Refusing pauses the rule and says so, which is the whole contract
+    of this validator.
+    """
+    from services import romm_auto
+
+    # A bare alternation of literals: every prefix of it is still a valid
+    # regex, which is exactly what makes trimming dangerous rather than noisy.
+    overlong = "|".join(f"Game{i:03d}" for i in range(80))
+    assert len(overlong) > romm_auto._MAX_PATTERN
+    trimmed = overlong[:romm_auto._MAX_PATTERN]
+    re.compile(trimmed)  # the premise: the trimmed form compiles...
+    assert trimmed != overlong
+    # ...and means something else. The cut lands mid-name, leaving a fragment
+    # that matches titles the operator never listed: as an include, that queues
+    # ROMs they excluded; as an exclude, it silently skips ROMs they wanted.
+    assert re.search(overlong, "Game999") is None
+    assert re.search(trimmed, "Game999") is not None
+
+    pattern, invalid = romm_auto._valid_pattern(overlong)
+    assert pattern is None and invalid is True, pattern
+
+    # And the rule carrying it is paused rather than run with a filter nobody
+    # wrote, which is what an invalid pattern means everywhere else here.
+    rule = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "enabled": True, "exclude_pattern": overlong,
+    })
+    assert rule["invalid_pattern"] is True
+    assert rule["exclude_pattern"] is None
+
+    # A pattern at the limit is still accepted: this refuses the overlong ones,
+    # it does not tighten the limit.
+    at_limit = "a" * romm_auto._MAX_PATTERN
+    assert romm_auto._valid_pattern(at_limit) == (at_limit, False)
+
+
 def test_an_identity_swap_retires_a_claim_its_holder_never_released(
     sqlite_db, tmp_path: Path,
 ) -> None:

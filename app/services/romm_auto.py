@@ -149,7 +149,20 @@ def _valid_pattern(value: Any) -> tuple[str | None, bool]:
     """
     if not isinstance(value, str) or not value.strip():
         return None, False
-    pattern = value.strip()[:_MAX_PATTERN]
+    pattern = value.strip()
+    if len(pattern) > _MAX_PATTERN:
+        # Refused, not trimmed. A prefix of a regex is usually still a valid
+        # regex, and it means something else: cutting `^(A|B|C)` mid-alternation
+        # can leave a pattern that compiles and matches a different set. An
+        # *include* that widens queues ROMs the operator excluded; an *exclude*
+        # that narrows stops protecting the titles they meant to skip, with
+        # delete-on-verify possibly attached. Both are the "helpfully widened"
+        # failure this whole validator exists to refuse.
+        logger.warning(
+            "romm_auto: refusing filter pattern of %d characters, the limit is %d",
+            len(pattern), _MAX_PATTERN,
+        )
+        return None, True
     try:
         re.compile(pattern)
     except re.error:

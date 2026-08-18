@@ -513,6 +513,41 @@
   after the view had already restored the normal directory listing, so the
   workspace opened showing catalog rows under a folder heading.
 
+- **Saving a metadata setting no longer commits a half-typed connection
+  edit.** The Metadata card shared its Save button's handler with the
+  Connection card, so it submitted the URL, token and library path too — and a
+  URL or library path that differs from the saved one tells the backend you
+  have moved to a different RomM, which clears the conversion history and
+  retires every pending metadata snapshot. Ticking "re-apply on load" is not a
+  reason to lose those. Neither Save can fire before the saved settings have
+  loaded either, since the fields are empty until then and submitting them
+  reads as a move to nowhere.
+- **Turning automatic conversion on now saves your pending rule edits first**,
+  the way Preview and Run now already did. The scheduler reads the saved
+  rules, so switching the master toggle on with unsaved edits started
+  unattended runs against the *previous* configuration — including a platform
+  you had just switched off, or a delete-after-verify you had just cleared,
+  while the editor showed the safer version.
+- **The metadata promise is no longer made for split conversions.** With
+  splitting on, a PS3 image over 4 GB is written as numbered parts, and RomM
+  matches a ROM on one file's hash — so those genuinely cannot be re-matched
+  automatically, which the backend already knew and said. The warning beside
+  the format now says it too instead of promising a restore that was never
+  coming.
+- **A filter pattern longer than the 500-character limit is refused rather
+  than trimmed.** A cut-off regular expression is usually still a valid one
+  that means something else: an include that widens the selection, or an
+  exclude that stops covering the titles it was written for — running
+  unattended, possibly with delete-after-verify. Overlong patterns now pause
+  the rule and say why, like every other filter this validator refuses.
+- **Changing the RomM connection can no longer hang on the mount you are
+  replacing.** Deciding whether the library actually moved resolves both the
+  old and the new path, and the old one is frequently the share that has
+  stopped responding — which is why you are there. That resolution had no
+  deadline and ran while holding the locks that re-matching, sweeps and rule
+  edits all wait on, so the one request that would have fixed the mount
+  wedged everything else instead.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

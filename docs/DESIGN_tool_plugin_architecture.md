@@ -1461,6 +1461,15 @@ holder died mid-write comes back after `_CLAIM_STALE_SECONDS`, and a row left
 behind by the swap would then apply the *old* instance's provider ids to
 whatever the new one matches its digest to.
 
+Deciding *whether* the identity moved is itself bounded (`_identity_moved`),
+because it resolves both library roots and the old one is the unresponsive
+mount as often as not — that is why the operator is changing it. It runs
+detached under `_IDENTITY_PROBE_SECONDS` and falls back to comparing the
+normalised spellings, while the request holds `_settle_lock` and the sweep
+pause. The fallback errs toward *moved*: two spellings of one directory then
+cost a redone conversion history, where the opposite mistake writes one
+library's provider ids onto another library's game.
+
 **"Has this rule already converted this source?"** `skip` is idempotent from the
 destination alone, but the other two policies are not: `overwrite` resolves an
 occupied destination as queueable, and `rename` always finds a free suffix. Both

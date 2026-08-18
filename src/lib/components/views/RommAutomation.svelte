@@ -252,6 +252,14 @@
   }
 
   async function toggleAuto(enabled) {
+    // Save first, exactly as Preview and Run now do. The scheduler reads the
+    // server's rules, so enabling it with unsaved edits starts unattended runs
+    // against the *previous* configuration — which may still have the platform
+    // enabled, or delete-on-verify on, while the editor shows the safer one
+    // the operator just typed. (Turning it off needs no such care: stopping is
+    // safe whatever is pending, and committing edits nobody saved would be the
+    // surprise.)
+    if (enabled && !(await commitPendingEdits())) return;
     try {
       await romm.saveSettings({ auto_convert: enabled });
       toast.success(enabled ? 'Automatic conversion on' : 'Automatic conversion off');
@@ -735,6 +743,13 @@
                     RomM cannot hash-match <strong>{spec?.outputExt}</strong>, so
                     these ROMs need their metadata re-applied after RomM rescans.
                     Compressatorium saves it first and restores it for you.
+                    {#if spec?.supportsSplit && rule.split}
+                      <strong>Except where splitting kicks in:</strong> past 4 GB
+                      this writes numbered parts instead of one file, and RomM
+                      matches a ROM on a single file's hash — so those need
+                      re-identifying by hand. Anything under 4 GB is restored
+                      normally.
+                    {/if}
                   </p>
                 {/if}
 

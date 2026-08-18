@@ -101,6 +101,9 @@ _CATALOG_SCAN_PER_ROM_S = 0.2
 _CATALOG_SCAN_CEILING_S = 300
 _HASH_TIMEOUT_FLOOR_S = 300
 _HASH_MIN_BYTES_PER_S = 2 * 1024 * 1024
+# How long the identity comparison may spend resolving the two library roots
+# before the save proceeds on their spelling alone. See `_identity_moved`.
+_IDENTITY_PROBE_SECONDS = 20
 
 # One settle pass at a time, process-wide. The view settles on load, so two
 # tabs (or a reload mid-pass) otherwise walk the same cursor and pay the same
@@ -1132,7 +1135,7 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
         # via a symlink -- pointed at the identical instance while looking like
         # a move, and threw away the conversion history and every pending
         # metadata snapshot for nothing.
-        changed = await run_in_threadpool(_identity_changed, before, values)
+        changed = await _identity_moved(before, values)
         cleared = await romm_auto.forget_converted_locked() if changed else 0
         if cleared:
             logger.info(
@@ -1160,10 +1163,13 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
     return romm_settings.public(values)
 
 
-def _identity_changed(before: dict, after: dict) -> bool:
+def _identity_changed(before: dict, after: dict, *, resolve: bool = True) -> bool:
     """Whether the RomM instance or library these settings name really moved.
 
-    Blocking (``realpath`` stats every component), so it runs off the loop.
+    Blocking when *resolve* (``realpath`` stats every component), so it runs
+    off the loop. With ``resolve=False`` it compares normalised spellings and
+    touches nothing -- the answer when the volume will not say; see
+    :func:`_identity_moved`.
     """
     def _url(value: object) -> str:
         return str(value or "").strip().rstrip("/")
@@ -1172,8 +1178,11 @@ def _identity_changed(before: dict, after: dict) -> bool:
         text = str(value or "").strip()
         if not text:
             return ""
+        expanded = os.path.expanduser(text)
+        if not resolve:
+            return os.path.normpath(os.path.abspath(expanded))
         try:
-            return os.path.realpath(os.path.expanduser(text))
+            return os.path.realpath(expanded)
         except (OSError, ValueError):
             return text
 
@@ -1181,6 +1190,36 @@ def _identity_changed(before: dict, after: dict) -> bool:
         _url(before.get("url")) != _url(after.get("url"))
         or _root(before.get("library_root")) != _root(after.get("library_root"))
     )
+
+
+async def _identity_moved(before: dict, after: dict) -> bool:
+    """:func:`_identity_changed`, under a bound and off the event loop.
+
+    The comparison resolves both library roots, and the *old* one is the mount
+    that has just gone unresponsive as often as not -- that is why the operator
+    is here changing it. On a pooled worker with no deadline, `realpath` then
+    blocks forever while this request holds `_settle_lock` and the sweep pause:
+    re-pin passes, sweeps, rule edits and every later settings save wait behind
+    the one request that would have fixed the mount.
+
+    Falling back to the spelling comparison is the safe degradation. Two
+    spellings of one directory then read as a *move*, which retires the pending
+    rows and clears the converted history -- work redone, nothing lost. The
+    opposite mistake writes one library's provider ids onto another library's
+    game.
+    """
+    try:
+        return bool(await asyncio.wait_for(
+            run_detached(_identity_changed, before, after),
+            _IDENTITY_PROBE_SECONDS,
+        ))
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm: resolving the library root did not finish in %ss; comparing "
+            "the paths as written (a volume is not answering)",
+            _IDENTITY_PROBE_SECONDS,
+        )
+        return _identity_changed(before, after, resolve=False)
 
 
 @router.post("/romm/settings/test")

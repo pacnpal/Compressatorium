@@ -50,26 +50,45 @@
     const out = {
       url: url.trim(),
       library_root: libraryRoot.trim(),
-      repin_enabled: repinEnabled,
-      repin_on_load: repinOnLoad,
-      repin_abandon_days: Number(repinAbandonDays) || undefined,
+      ...metadataPatch(),
     };
     if (clearToken) out.clear_token = true;
     else if (token.trim()) out.token = token.trim();
     return out;
   }
 
-  async function handleSave() {
+  /**
+   * The Metadata card's fields, and only those.
+   *
+   * Saving here must never submit the connection buffers. They hold whatever
+   * is half-typed in the other card, and a URL or library root that differs
+   * from the saved one is an *identity change* on the backend: it clears the
+   * conversion history and retires every pending metadata snapshot. Toggling
+   * "re-apply on load" is not a reason to lose those.
+   */
+  function metadataPatch() {
+    return {
+      repin_enabled: repinEnabled,
+      repin_on_load: repinOnLoad,
+      repin_abandon_days: Number(repinAbandonDays) || undefined,
+    };
+  }
+
+  async function save(body, message) {
     try {
-      await romm.saveSettings(patch());
+      await romm.saveSettings(body);
       token = '';
       clearToken = false;
-      toast.success('RomM settings saved');
+      toast.success(message);
       onsaved?.();
     } catch (e) {
       toast.error(e?.message ?? 'Failed to save settings');
     }
   }
+
+  const handleSave = () => save(patch(), 'RomM settings saved');
+  const handleSaveMetadata = () =>
+    save(metadataPatch(), 'Metadata settings saved');
 
   async function handleTest() {
     try {
@@ -160,7 +179,15 @@
       <Button variant="secondary" onclick={handleTest} loading={romm.testing} icon={plugIcon}>
         Test connection
       </Button>
-      <Button onclick={handleSave} loading={romm.settingsSaving} icon={saveIcon}>
+      <!-- Until the saved settings have loaded the buffers are empty, and
+           submitting them would blank the URL and library root -- which the
+           backend reads as a move to a different instance. -->
+      <Button
+        onclick={handleSave}
+        loading={romm.settingsSaving}
+        disabled={!loaded}
+        icon={saveIcon}
+      >
         Save
       </Button>
     </div>
@@ -222,7 +249,12 @@
       </span>
     </label>
     <div class="actions">
-      <Button onclick={handleSave} loading={romm.settingsSaving} icon={saveIcon}>
+      <Button
+        onclick={handleSaveMetadata}
+        loading={romm.settingsSaving}
+        disabled={!loaded}
+        icon={saveIcon}
+      >
         Save
       </Button>
     </div>
