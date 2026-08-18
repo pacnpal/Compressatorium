@@ -4,9 +4,11 @@
 
 ### Added
 
-- **Hasheous integration: match files that aren't in your DATs.** Set
-  `COMPRESSATORIUM_HASHEOUS_ENABLED=true` and any hash the imported DATs don't
-  recognise is looked up at [hasheous.org](https://hasheous.org), which indexes
+- **Hasheous integration: match files that aren't in your DATs.** Press **Turn
+  on** in the DAT Library's Hasheous panel — one click, no restart, no
+  `docker-compose` edit, and the choice is remembered — and any hash the
+  imported DATs don't recognise is looked up at
+  [hasheous.org](https://hasheous.org), which indexes
   **14 preservation databases** — Redump, No-Intro, TOSEC, MAMERedump,
   MAMEArcade, MAMEMess, WHDLoad, RetroAchievements, FBNeo, PureDOSDAT,
   Pleasuredome, TotalDOSCollection, eXo and ScreenScraper. No account and no API
@@ -34,10 +36,15 @@
   as "no match" by the local-only matcher are automatically re-checked against
   the new source, with no forced rescan needed.
 
-  Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you self-host
-  Hasheous (it is open source), and `COMPRESSATORIUM_HASHEOUS_TIMEOUT`
-  (default 15s) bounds each lookup. Lookups are HTTPS-only and a redirect that
-  would downgrade to plain HTTP is refused rather than followed.
+  The panel shows live state and has a **Test** button that reports whether the
+  server is reachable and how fast. `COMPRESSATORIUM_HASHEOUS_ENABLED=true`
+  still works for declarative setups (the toggle overrides it, and the panel
+  says so). Point `COMPRESSATORIUM_HASHEOUS_URL` at your own instance if you
+  self-host Hasheous (it is open source) — previously-unmatched files are
+  automatically re-checked against the new server, since cached verdicts record
+  which one produced them. `COMPRESSATORIUM_HASHEOUS_TIMEOUT` (default 15s)
+  bounds each lookup. Lookups are HTTPS-only and a redirect that would downgrade
+  to plain HTTP is refused rather than followed.
 
   A lookup that fails — timeout, server error, unreachable — is reported as an
   error rather than recorded as "not in any DAT", so one bad minute of network

@@ -325,8 +325,8 @@
       matches feed tools like Hasheous and RomM, so a verified set carries over.
     </p>
     <p>
-      Hasheous also works the other way round. Set
-      <code>COMPRESSATORIUM_HASHEOUS_ENABLED=true</code> and anything your DATs don't
+      Hasheous also works the other way round. Press <strong>Turn on</strong> in the DAT
+      Library's Hasheous panel — one click, no restart — and anything your DATs don't
       recognise gets looked up at hasheous.org, which indexes 14 preservation databases —
       Redump, No-Intro, TOSEC, MAMERedump, MAME arcade and MESS, WHDLoad,
       RetroAchievements, FBNeo and more. No account or API key is needed. Since MAMERedump

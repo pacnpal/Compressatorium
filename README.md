@@ -91,12 +91,23 @@ at once. Turn it on and every hash your imported DATs *don't* recognise is
 looked up there, so your library gets identified without you curating DATs for
 every system you own.
 
+**Setup is one click.** Open **DAT Library** in the web UI and press **Turn on**
+in the Hasheous panel. It takes effect immediately — no restart, no editing
+`docker-compose.yml` — and the choice is saved, so it survives restarts. A
+**Test** button next to it confirms the server is reachable and reports the
+round-trip time.
+
+**No account, no API key, no signup** — the hash-lookup endpoint is public.
+
+If you'd rather set it declaratively (a fresh container that should come up with
+it already on), the environment variable does the same thing:
+
 ```bash
 COMPRESSATORIUM_HASHEOUS_ENABLED=true
 ```
 
-That single variable is the whole setup. **No account, no API key, no signup** —
-the hash-lookup endpoint is public.
+The UI toggle wins over the variable when both are set, and the panel tells you
+when that's the case.
 
 #### What it covers
 
@@ -180,24 +191,40 @@ over four hours re-learning the same fact once per file.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Master switch. Nothing is sent while unset. |
+| `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Starting state of the master switch. The **DAT Library** toggle overrides it and persists. |
 | `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
 | `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Per-request timeout in seconds. This call sits in the file-browse path, so keep it short. |
 
 Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
 accepted as aliases.
 
-The DAT Library page shows the current state — whether the fallback is on, and
-which server it is pointed at.
+The DAT Library page shows the live state — on or off, which server it is
+pointed at, whether the setting came from the toggle or the environment, and a
+**Test** button that reports reachability and latency.
+
+Changing `COMPRESSATORIUM_HASHEOUS_URL` re-checks previously-unmatched files
+against the new server automatically — cached "no match" verdicts record *which*
+server produced them, so pointing at a different instance doesn't leave you with
+stale answers.
 
 #### Scale
 
-Hasheous has **no bulk endpoint** (its API accepts several hashes for *one*
-file, not a batch of files), so the first pass over an uncached library makes one
-request per file. Responses are cached both locally and by Hasheous' CDN, so this
-is a one-time cost per file rather than a per-browse one. If you have a very
-large uncached library, run the background library scan once and let it prime the
-cache rather than browsing folder by folder.
+Hasheous has **no bulk endpoint** — its API accepts several hashes for *one*
+file, not a batch of files — so an uncached library costs at least one request
+per file.
+
+A file that *matches* costs one request. A file that misses can cost more,
+because each of its candidate hashes is tried: a CHD offers a header SHA1 and a
+data SHA1, and since a CHD's own container bytes may also be indexed, a miss on
+both falls back to a file-level SHA1 — **up to three requests, and three hashes
+disclosed, for one unmatched CHD**. Formats with a single hash (ISO, 3DS, Switch,
+CSO) cost one either way. Dolphin RVZ/WIA/GCZ report one exhaustive disc hash, so
+they cost one and never fall back.
+
+Responses are cached both locally and by Hasheous' CDN, so this is a one-time
+cost per file rather than a per-browse one. If you have a large uncached library,
+run the background library scan once and let it prime the cache rather than
+browsing folder by folder.
 
 #### What it deliberately does not do
 

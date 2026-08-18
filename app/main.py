@@ -306,6 +306,12 @@ async def lifespan(app: FastAPI):
         app.state.background_tasks.add(task)
         task.add_done_callback(app.state.background_tasks.discard)
 
+    # Restore the Web UI's Hasheous toggle before anything can match, so the
+    # first request after a restart honours what the operator last chose
+    # rather than briefly reverting to the environment default.
+    from routes.dat import load_hasheous_override
+    await load_hasheous_override()
+
     has_any_dats = await run_in_threadpool(dat_store.has_dats)
     if settings.mameredump_auto_sync and not has_any_dats:
         _spawn_sync_task("MAMEREDUMP_AUTO_SYNC enabled and no DATs loaded")
