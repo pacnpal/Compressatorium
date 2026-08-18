@@ -153,6 +153,28 @@ async def _acquire_verify_lane_or_429() -> WorkloadToken:
     return token
 
 
+async def _drop_if_content_changed(path: str, result: dict) -> None:
+    """Delete a cached match whose file demonstrably changed under it.
+
+    Only acts on proof: both the recomputed hash and the stored one must be
+    present and differ. Anything else leaves the row alone.
+    """
+    from services.dat_store import dat_store  # lazy, as elsewhere in this module
+
+    new_hash = result.get("file_hash")
+    if not new_hash:
+        return
+    cached = await run_in_threadpool(dat_store.get_match, path)
+    old_hash = (cached or {}).get("file_hash")
+    if old_hash and old_hash != new_hash:
+        logger.info(
+            "Phase 3: %s changed since its cached match (%s -> %s); dropping the "
+            "stale row despite the Hasheous outage",
+            path, old_hash, new_hash,
+        )
+        await dat_store.delete_match(path)
+
+
 async def _scan_phase_dat_match(
     scan_job_id: str,
     all_paths: list[str],
@@ -261,13 +283,22 @@ async def _scan_phase_dat_match(
                 if not result.get("reason") and not result.get("error"):
                     await dat_store.set_match(path, result)
                 elif result.get("error") == HASHEOUS_ERROR:
-                    # The remote service is down. That says nothing about this
-                    # file -- a match recorded earlier is still correct, and
-                    # the file hasn't changed. Deleting here would let one
-                    # forced rescan during an outage erase every remote match
-                    # in the library (fast, too, since the breaker makes each
-                    # failure instant) and still finish looking normal.
-                    pass
+                    # The remote service is down, which says nothing about this
+                    # file: deleting here would let one forced rescan during an
+                    # outage erase every remote match in the library (fast, too,
+                    # since the breaker makes each failure instant) and still
+                    # finish looking normal.
+                    #
+                    # But "unchanged" is a claim, not an assumption. When the
+                    # rescan recomputed a file-level hash we can check it: if it
+                    # no longer matches the hash the cached row was built from,
+                    # the file really did change and keeping the row would show
+                    # a badge naming whatever the file used to be -- and nothing
+                    # would re-check it, since cached_result_usable() accepts
+                    # hits unconditionally. With no recomputed hash (size cap,
+                    # embedded-only) we cannot prove staleness, so the row
+                    # stays: an unprovable suspicion is not worth the data loss.
+                    await _drop_if_content_changed(path, result)
                 else:
                     # Non-cacheable recompute where the *file* is the problem
                     # (size cap, hash unavailable): drop any stale prior row so

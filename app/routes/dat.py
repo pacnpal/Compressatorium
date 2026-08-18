@@ -89,6 +89,12 @@ def _get_match_job_lock() -> asyncio.Lock:
 
 class MatchRequest(BaseModel):
     path: str
+    # Opt out of the cache. Default False so a repeated call is served from the
+    # stored result like every other match path -- with Hasheous on, an uncached
+    # single-file route re-hashes the file and re-discloses its SHA1s to a third
+    # party on every request. `force` keeps the old "match it right now"
+    # behaviour available for a caller that just rewrote the file.
+    force: bool = False
 
 
 class MatchBatchRequest(BaseModel):
@@ -286,6 +292,14 @@ async def match_file(request: MatchRequest):
     # verify both come back as "unmatched" (issue #268). 503 rather than a
     # cheerful 200: it is a transient resource condition, and a caller that
     # retries immediately just spawns a second one against the same storage.
+    # Same cache policy as /dat/match-batch, the background job and the scan:
+    # this route was the only match entry point that neither read nor wrote
+    # DATMatch, so an API client polling it paid a full re-hash every time.
+    if not request.force:
+        cached = await run_in_threadpool(dat_store.get_match, normalized_path)
+        if cached_result_usable(cached):
+            return cached
+
     with collect_abandonment() as abandoned:
         result = await _match_single_file(normalized_path)
     if abandoned:
@@ -297,6 +311,10 @@ async def match_file(request: MatchRequest):
                 f"({', '.join(abandoned)}); it is still running."
             ),
         )
+    # Don't cache a transient error or a size-cap skip -- same rule the batch
+    # job and the scan use, so one blip can't record a library as unmatched.
+    if not result.get("reason") and not result.get("error"):
+        await dat_store.set_match(normalized_path, result)
     return result
 
 
@@ -1262,7 +1280,19 @@ async def _match_single_file(
             # NOT be cached as "unmatched", or a single network blip
             # permanently marks every in-flight file as not in any DAT.
             logger.warning("Hasheous unavailable for %s: %s", file_path, e)
-            return {**base_result, "error": HASHEOUS_ERROR}
+            # Carry the file-level hash when one was computed. A forced rescan
+            # keeps an existing cached hit through an outage (deleting it was
+            # a real data-loss bug), but "the service is down" and "this file
+            # changed" are different facts -- without the hash the scan cannot
+            # tell them apart and would keep a badge identifying the file as
+            # whatever it used to be.
+            file_level = next(
+                (h for h, kind in candidates if kind == "file_sha1"), None
+            )
+            error_result = {**base_result, "error": HASHEOUS_ERROR}
+            if file_level:
+                error_result["file_hash"] = file_level
+            return error_result
         if remote:
             return remote
 

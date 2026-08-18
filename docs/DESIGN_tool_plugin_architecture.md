@@ -1200,7 +1200,7 @@ and only on a miss, and only when the operator opted in, `hasheous.lookup`. That
 keeps a covered library fully offline and makes a given hash resolve the same way
 regardless of network weather. Both helpers return the **same record shape** —
 `dat_id` / `dat_name` / `game_name` / `rom_name` / `source`, plus whatever extra
-identity fields the source carries — so `_lookup_sha1_match` builds the
+identity fields the source carries — so `_match_result` builds the
 result dict once and splats the record into it. Adding a field to a remote match
 means adding a key to that record, not touching the builder.
 

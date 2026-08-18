@@ -1606,3 +1606,154 @@ def test_the_lookup_url_follows_the_configured_base(monkeypatch):
     assert hasheous._lookup_url(sha1) == (
         f"https://self.hosted.example/api/v1/Lookup/ByHash/sha1/{sha1}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Twelfth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_store(tmp_path, monkeypatch):
+    """A fresh DATStore for the route under test, as tests/test_dat_routes.py does."""
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    monkeypatch.setattr(dat_routes, "dat_store", store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_single_file_match_is_served_from_cache(
+    hasheous_on, tmp_path, isolated_store, monkeypatch
+):
+    """/dat/match was the only entry point that never touched the cache.
+
+    With Hasheous on that meant a polling API client re-hashed the file and
+    re-disclosed its SHA1 to a third party on every call.
+    """
+    iso = tmp_path / "game.iso"
+    iso.write_bytes(b"content")
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+
+    calls = []
+
+    async def _fake_match(path, **kwargs):
+        calls.append(path)
+        return {"path": path, "matched": True, "game_name": "Cached Game",
+                "file_hash": "a" * 40, "source": "hasheous"}
+
+    monkeypatch.setattr(dat_routes, "_match_single_file", _fake_match)
+
+    first = await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso)))
+    second = await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso)))
+
+    assert first["game_name"] == "Cached Game"
+    assert second["game_name"] == "Cached Game"
+    assert len(calls) == 1, "second call re-matched instead of using the cache"
+
+    # ...and a caller that just rewrote the file can still force a fresh match.
+    await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso), force=True))
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_outage_does_not_cache_the_single_file_result(
+    hasheous_on, tmp_path, isolated_store, monkeypatch
+):
+    """A transient failure must not be written to the cache by this route either."""
+    iso = tmp_path / "game.iso"
+    iso.write_bytes(b"content")
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+
+    async def _fake_match(path, **kwargs):
+        return {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR}
+
+    monkeypatch.setattr(dat_routes, "_match_single_file", _fake_match)
+    await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso)))
+
+    assert isolated_store.get_match(str(iso)) is None
+
+
+@pytest.mark.asyncio
+async def test_an_outage_keeps_a_cached_hit_whose_file_is_unchanged(tmp_path):
+    """The round-7 rule: an outage says nothing about the file, so keep the row."""
+    from app.routes import info as info_routes
+
+    path = str(tmp_path / "game.chd")
+    with patch.object(
+        info_routes, "_drop_if_content_changed", wraps=info_routes._drop_if_content_changed
+    ):
+        stored = {"file_hash": "a" * 40, "matched": True}
+        with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+             patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+            await info_routes._drop_if_content_changed(
+                path, {"error": "hasheous unavailable", "file_hash": "a" * 40}
+            )
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_outage_drops_a_cached_hit_whose_file_changed(tmp_path):
+    """...but a file that demonstrably changed must not keep its old badge.
+
+    Nothing would ever re-check it: cached_result_usable() accepts hits
+    unconditionally, so the stale row would name the previous game forever.
+    """
+    from app.routes import info as info_routes
+
+    path = str(tmp_path / "game.chd")
+    stored = {"file_hash": "a" * 40, "matched": True}
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await info_routes._drop_if_content_changed(
+            path, {"error": "hasheous unavailable", "file_hash": "b" * 40}
+        )
+    delete.assert_awaited_once_with(path)
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_outage_result_leaves_the_row_alone(tmp_path):
+    """No recomputed hash (size cap, embedded-only) means no proof, so no delete."""
+    from app.routes import info as info_routes
+
+    path = str(tmp_path / "big.chd")
+    stored = {"file_hash": "a" * 40, "matched": True}
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await info_routes._drop_if_content_changed(
+            path, {"error": "hasheous unavailable"}
+        )
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_outage_result_carries_the_recomputed_hash(
+    hasheous_on, tmp_path, isolated_store, monkeypatch
+):
+    """_match_single_file must surface the hash the freshness check needs.
+
+    Without it the scan cannot tell "the service is down" from "the file
+    changed", and falls back to keeping a possibly-stale badge.
+    """
+    iso = tmp_path / "game.iso"
+    iso.write_bytes(b"content")
+    sha1 = "c" * 40
+
+    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+    monkeypatch.setattr(dat_routes, "compute_file_sha1", AsyncMock(return_value=sha1))
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: None)
+    monkeypatch.setattr(
+        dat_routes.dat_store, "has_dats", lambda: True,
+    )
+    monkeypatch.setattr(dat_routes.dat_store, "lookup_sha1", lambda _h: None)
+
+    async def _down(_sha1):
+        raise hasheous.HasheousUnavailable("down")
+
+    monkeypatch.setattr(hasheous, "lookup", _down)
+
+    result = await dat_routes._match_single_file(str(iso))
+
+    assert result["error"] == dat_routes.HASHEOUS_ERROR
+    assert result["file_hash"] == sha1, "outage result dropped the recomputed hash"

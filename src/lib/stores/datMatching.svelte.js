@@ -166,8 +166,16 @@ class DATMatchingStore {
    */
   async hydrateAndMatch(paths, { fromRetry = false } = {}) {
     if (!paths?.length) return;
+    // Read BEFORE the first await. $effect tracks only synchronous reads, and
+    // this runs inside the file list's effect -- reading matchingAvailable
+    // after `await this.hydrate()` left the effect unsubscribed from it, so
+    // the false->true flip when /dat/stats resolves never re-ran it. On a
+    // fresh Hasheous-only install that meant nothing matched until the user
+    // navigated or reloaded. (The gate itself has to stay below the hydrate:
+    // cached hits must load even when matching is unavailable.)
+    const canMatch = this.matchingAvailable;
     await this.hydrate(paths);
-    if (!this.matchingAvailable) return;
+    if (!canMatch) return;
     // Drop paths the backend attempted recently: if they came back uncached
     // after a completed dat_match job they were skipped (over
     // MATCH_MAX_FILE_SIZE, unreadable) or failed transiently, and re-spawning
