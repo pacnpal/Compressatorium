@@ -341,7 +341,7 @@ hourly while PS2 converts to CHD overnight, ten at a time, largest first.
 | **Smallest / largest ROM** | Size thresholds in MB. |
 | **Only names matching / Skip names matching** | Regex filters — convert only `(USA)`, skip `(Beta)`. |
 | **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. Mutually exclusive. |
-| **If the output already exists** | Skip it, overwrite it, or write `Game_1.rvz` alongside. |
+| **If the output already exists** | Skip it, overwrite it, or write `Game_1.rvz` alongside. Overwrite and write-alongside also remember what the rule has converted, so each ROM is done once instead of every run — see below. |
 | **Compression / level** | The codec and level for modes that take them — the same registry-driven controls the convert panel uses, so chdman offers its codec chips and Dolphin/NSZ/CSO a codec plus level. |
 | **Split into 4 GB parts** | For FAT32 targets, where the mode supports it. |
 | **Verify each converted file** | Check the output; the source is kept. |
@@ -361,11 +361,28 @@ wrong for the system.
 without moving the schedule clock, so looking never postpones a run. **Run now**
 does it for real.
 
-Sweeps are safe to repeat. A ROM is queued only when its target output is
-genuinely missing, and that comes from the same detector that badges rows in the
-file list — so the filesystem is the state. Running twice, restarting mid-sweep,
-or racing a manual conversion all converge instead of duplicating work. Sweeps also
-stop when the queue is full and resume where they left off.
+Sweeps are safe to repeat. Under **Skip** — the default — a ROM is queued only
+when its target output is genuinely missing, and that comes from the same
+detector that badges rows in the file list, so the filesystem is the state.
+Running twice, restarting mid-sweep, or racing a manual conversion all converge
+instead of duplicating work. Sweeps also stop when the queue is full and resume
+where they left off.
+
+**Overwrite** and **write alongside** are the two policies the filesystem cannot
+answer for: an occupied destination is exactly what they are *for*, so a rule
+using them would otherwise rewrite the same images — or write `Game_1`, `Game_2`,
+`Game_3` — every interval, forever. Each rule therefore remembers which ROMs it
+has converted, and that memory is kept honest for you:
+
+- Retargeting a rule clears it. A rule switched from RVZ to GCZ, or pointed at a
+  new output folder, has not produced that file for anything yet.
+- A **Forget history** button on the platform clears it on demand — for when you
+  restore from a backup, or move outputs aside by hand, and want the rule to run
+  over them again.
+- Preview reads the same history, so what it shows you is what a run would do.
+
+The schedule clock and the conversion history are separate, so forgetting one
+never disturbs the other.
 
 #### Your metadata survives conversion
 
@@ -383,8 +400,14 @@ metadata **before** converting and re-applies it afterwards:
 3. Press **Re-match in RomM** — or leave it to run automatically on page load.
 
 The match uses the converted file's SHA1, so it's exact and survives you renaming
-the file in between. Re-matching is idempotent: already-restored ROMs are skipped,
-and anything RomM hasn't scanned yet just waits for the next attempt.
+or moving the file in between — once the hash has been taken, where the file sits
+stops mattering. Re-matching is idempotent: already-restored ROMs are skipped, and
+anything RomM hasn't scanned yet just waits for the next attempt. A conversion
+that was planned and then never ran is recognised as such rather than re-pinned
+onto whatever it was going to overwrite, and its saved metadata is discarded
+instead of sitting in the pending count. Each pass has a time budget, so an
+unresponsive share costs one pass rather than a hung page; whatever it did not
+reach is picked up on the next one.
 
 #### Settings reference
 

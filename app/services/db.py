@@ -174,6 +174,14 @@ class RommRepin(Base):
     output_sha1 = Column(String, nullable=True)
     # {"igdb_id": 123, "moby_id": ..., ...} -- only the providers that were set.
     metadata_ids = Column(JSON, nullable=False, default=dict)
+    # What was already sitting at ``output_path`` when the row was recorded,
+    # as "size:mtime_ns" -- or "" when the path was free. Only the overwrite
+    # policy ever records a non-empty one, and it is the answer to "has the
+    # conversion actually produced its output yet". Without it, a batch that
+    # was planned but never submitted leaves a row pointing at the *previous*
+    # artifact, and the settle pass hashes that and stamps this ROM's identity
+    # onto whatever RomM knows the old file as.
+    pre_fingerprint = Column(String, nullable=True)
     # "pending" -> "done" | "abandoned"
     state = Column(String, nullable=False, default="pending")
     detail = Column(String, nullable=True)

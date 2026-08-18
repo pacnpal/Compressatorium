@@ -1,0 +1,47 @@
+"""add_romm_repin_pre_fingerprint
+
+Revision ID: 0006
+Revises: 0005
+Create Date: 2026-08-18 00:00:00.000000
+"""
+
+from __future__ import annotations
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '0006'
+down_revision: Union[str, Sequence[str], None] = '0005'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+_COLUMN = 'pre_fingerprint'
+
+
+def upgrade() -> None:
+    # Records what was already at the output path when the re-pin row was
+    # written, so the settle pass can tell "the conversion produced this" from
+    # "this is the file the conversion was going to overwrite".
+    #
+    # Under the overwrite policy the destination is occupied by definition, so
+    # existence alone proves nothing: a batch that was planned and then never
+    # submitted would have its row hash the previous artifact and push this
+    # ROM's provider ids onto whatever RomM identifies that as.
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if 'romm_repin' not in inspector.get_table_names():
+        return
+    if any(col['name'] == _COLUMN for col in inspector.get_columns('romm_repin')):
+        # Already present: a DB built straight from the ORM metadata is stamped
+        # at baseline and then run forward through here, as 0004 anticipates.
+        return
+    op.add_column('romm_repin', sa.Column(_COLUMN, sa.String(), nullable=True))
+
+
+def downgrade() -> None:
+    # Downgrade migrations are not supported in this project — forward-only.
+    raise NotImplementedError("downgrade not supported")

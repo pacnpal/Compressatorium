@@ -92,6 +92,58 @@
 
 ### Fixed
 
+- **A scheduled RomM rule set to Overwrite or Write-alongside no longer
+  reconverts your library on every single run.** Both policies are defined by
+  what they do to an *occupied* destination — Overwrite reuses it, Write-alongside
+  takes the next free `_1`, `_2`, … — so the file on disk could never mean "this
+  one is done", and a rule left running would rewrite the same multi-gigabyte
+  images every interval, or fill the volume with numbered copies. Each rule now
+  remembers which ROMs it has converted, so both policies mean what they say and
+  happen exactly once per ROM. The memory is cleared automatically when you
+  retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
+  anything yet), and there is a **Forget history** button on each platform for
+  when you restore from a backup or move outputs aside by hand.
+- **Two catalog entries for the same file no longer produce two jobs writing to
+  one output.** With Overwrite plus *delete the source after verifying*, that
+  meant two sources deleted for one surviving file. A sweep now claims each
+  destination once.
+- **Automatic conversion no longer queues jobs that were always going to fail.**
+  A saved rule outlives the install it was written against, so a rebuilt
+  container missing a tool would run the rule and fail every job at launch; and
+  RomM's catalog outlives the files it describes, so an entry whose ROM was moved
+  or deleted outside RomM was still queued. Both are now refused before queueing,
+  and the sweep says which platform and why.
+- **Converted metadata is no longer lost when a conversion is planned but never
+  runs.** The metadata snapshot has to be taken before the conversion, while the
+  source is still the file RomM knows about. If the batch was then rejected, the
+  saved row pointed at whatever was already sitting at that path — and with
+  Overwrite the re-matching pass would eventually hash that older file and stamp
+  this ROM's identity onto it. The pass can now tell the file it was going to
+  replace from the one the conversion produced, and a rejected batch discards its
+  rows immediately instead of leaving a week of phantom backlog.
+- **Metadata is no longer thrown away when you rename or move a converted file
+  before RomM rescans it.** RomM matches on the hash, not the path, so a moved
+  output was always still re-pinnable — but the pass gave up on it and eventually
+  retired the row. It now keeps going from the hash it already took. A row whose
+  conversion is still sitting in a long queue is no longer retired either.
+- **Re-matching no longer stalls the request on an unresponsive share, and two
+  browser tabs no longer hash the same files twice.** The pass has a wall-clock
+  budget and a per-file read budget that scales with the file, so a hung mount
+  costs one pass rather than an open request; a second pass while one is running
+  reports that instead of duplicating its work. Nothing is lost either way —
+  whatever was not reached is picked up next time.
+- **The RomM automation editor now enforces chdman's four-codec limit** (the
+  manual Convert panel already did), so a rule cannot be saved in a state that
+  fails every job it queues. The limit now lives on the tool itself, where both
+  pickers read it.
+- **The RomM library summary now counts the format you actually selected.**
+  dolphin-tool produces RVZ, WIA and GCZ, and a stray `.gcz` beside a GameCube
+  ISO reported it as converted while RVZ was selected — so the count and the
+  savings estimate described a different conversion than the button would run.
+- **Filter patterns are evaluated off the event loop.** A pattern like `(a+)+$`
+  can backtrack for minutes on one long filename, and it was being run against
+  every candidate on the loop the whole app shares.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped

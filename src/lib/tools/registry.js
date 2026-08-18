@@ -176,6 +176,11 @@ export const TOOLS = [
       { value: 'avhu',  label: 'avhu',  hint: 'Audio/video Huffman' },
     ],
     compressionStyle: 'multi',  // multi-codec list joined with commas
+    // chdman's `-c` takes at most four codecs. Declared on the tool, not in
+    // whichever picker happens to be on screen: the manual panel and the RomM
+    // automation editor both build codec selections, and a cap only one of
+    // them knows about is a rule the other quietly breaks.
+    maxCodecs: 4,
     modes: [
       { mode: 'createraw', kind: 'create',  label: 'Create Raw', group: 'create',
         outputExt: '.chd', inputExtensions: CHDMAN_SOURCE_EXTS,
@@ -698,6 +703,9 @@ export const registry = {
 
   /** The owning tool for a wire-mode value. */
   toolForMode: (mode) => byMode.get(mode)?.tool,
+
+  /** How many codecs this mode's tool accepts at once (Infinity if unbounded). */
+  maxCodecsFor: (mode) => byMode.get(mode)?.tool?.maxCodecs ?? Infinity,
 
   /** Pick the tool whose verify_extensions match a given file path, or null.
    *  Pure extension match — use `verifyToolForPath` when an entry's backend

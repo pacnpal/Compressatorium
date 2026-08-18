@@ -1358,6 +1358,37 @@ the file like any other locked output; the sweep simply drops the candidate and
 picks it up next time. Both touch the disk (a directory mode's companion lookup
 scans), so call them off the event loop.
 
+### 3.3.9 Re-pin queue and conversion provenance (`services/romm_repin.py`)
+
+Two questions the filesystem cannot answer on its own, both owned here so the
+manual submit (`routes/romm.py`) and the unattended sweep (`services/romm_auto.py`)
+give the same answer.
+
+**"Has the conversion actually produced this output yet?"** A re-pin row is
+written *before* the conversion runs — the source's provider ids are only
+readable while the source is still the file RomM knows about — and under the
+`overwrite` policy the destination is occupied at that moment by definition. So
+`record()` also stores **`pre_fingerprint`** (`"size:mtime_ns"`, or `""` when the
+path was free) and the settle pass treats an unchanged destination as "not yet".
+Without it, a batch that was planned and then rejected leaves a row that hashes
+the *previous* artifact and pushes this ROM's ids onto whatever RomM identifies
+that as. `cancel(paths)` retires such rows immediately rather than waiting out
+`repin_abandon_days`; the fingerprint is what makes leaving them safe until then.
+
+**"Has this rule already converted this source?"** `skip` is idempotent from the
+destination alone, but the other two policies are not: `overwrite` resolves an
+occupied destination as queueable, and `rename` always finds a free suffix. Both
+would therefore reconvert the whole library every interval. The sweep records the
+RomM ids it queued in **`converted_ids`** on the platform's `romm.auto_state`
+entry (bounded by the platform's ROM count) and consults it before the disk hop.
+It is invalidated where it stops being true: `set_rules` drops it for any
+platform whose `OUTPUT_IDENTITY_FIELDS` changed — a rule retargeted from RVZ to
+GCZ is asking for a different file — and `forget_converted()` (exposed as
+`POST /api/romm/rules/forget-converted`, with a per-platform button in the
+automation editor) is the operator's escape hatch after restoring a backup.
+`_record_run` merges into the entry rather than replacing it, or every run would
+forget the history it shares a key with.
+
 ### 3.3.9 Verify without delete (`ConversionJob.verify_after`)
 
 `delete_on_verify` verifies as a *precondition* for deleting the source. A

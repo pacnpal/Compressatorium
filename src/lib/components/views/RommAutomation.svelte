@@ -140,9 +140,18 @@
     return (rule.compression ?? '').split(',').map((c) => c.trim()).filter(Boolean);
   }
 
-  /** Toggle one codec in a multi-codec (chdman) rule. */
+  /** Toggle one codec in a multi-codec (chdman) rule.
+   *
+   * The cap comes from the registry, the same place the manual picker reads
+   * it: chdman takes at most four codecs in `-c`, and a fifth here would save
+   * happily and then fail every job the rule ever queued.
+   */
   function toggleCodec(platformId, rule, value) {
     const current = selectedCodecs(rule);
+    if (!current.includes(value) && current.length >= registry.maxCodecsFor(rule.mode)) {
+      toast.error(`Up to ${registry.maxCodecsFor(rule.mode)} codecs at once.`);
+      return;
+    }
     const next = current.includes(value)
       ? current.filter((c) => c !== value)
       : [...current, value];
@@ -220,6 +229,16 @@
       toast.success(enabled ? 'Automatic conversion on' : 'Automatic conversion off');
     } catch (e) {
       toast.error(e?.message ?? 'Failed to save');
+    }
+  }
+
+  /** Clear one platform's converted-id history (see the store for why). */
+  async function forgetConverted(platformId) {
+    try {
+      await romm.forgetConverted([String(platformId)]);
+      toast.success('Conversion history cleared for this platform');
+    } catch (e) {
+      toast.error(e?.message ?? 'Failed to clear the conversion history');
     }
   }
 
@@ -362,6 +381,10 @@
                         </div>
                         <span class="hint">
                           Leave all off to use {spec?.label ?? 'the tool'}'s default.
+                          {#if Number.isFinite(registry.maxCodecsFor(rule.mode))}
+                            Up to {registry.maxCodecsFor(rule.mode)} at once
+                            ({chosen.length} selected).
+                          {/if}
                         </span>
                       </div>
                     {:else}
@@ -626,6 +649,24 @@
                 {/if}
 
                 <p class="last-run muted">{lastRunLabel(platform.id)}</p>
+
+                {#if rule.duplicate_action !== 'skip'}
+                  {@const remembered = romm.convertedCountFor(platform.id)}
+                  {#if remembered > 0}
+                    <p class="last-run muted forget">
+                      <span>
+                        Remembers {remembered}
+                        {remembered === 1 ? 'ROM' : 'ROMs'} it has already converted, so
+                        {duplicateLabels[rule.duplicate_action] ?? rule.duplicate_action}
+                        happens once per ROM instead of every run.
+                      </span>
+                      <Button
+                        variant="ghost"
+                        onclick={() => forgetConverted(platform.id)}
+                      >Forget history</Button>
+                    </p>
+                  {/if}
+                {/if}
               {:else}
                 <p class="muted">Pick a target format to configure this platform.</p>
               {/if}
@@ -647,6 +688,14 @@
 {#snippet saveIcon()}<Save size={14} />{/snippet}
 
 <style>
+  .forget {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
   .rules-error {
     margin: 0 0 0.75rem;
     padding: 0.6rem 0.8rem;

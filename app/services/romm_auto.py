@@ -29,6 +29,7 @@ operator's disk and CPU for a week on the strength of one checkbox.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -45,7 +46,6 @@ from services.output_conflicts import (
     QUEUE,
     SKIP_EXISTING,
     SKIP_LOCKED,
-    check_output_conflicts,
     resolve_destination,
 )
 from services.preferences_store import preferences_store
@@ -301,7 +301,12 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
         out["verify_after"] = False
     out["split"] = bool(raw.get("split", False))
 
-    out["interval_minutes"] = _clamp("interval_minutes", raw.get("interval_minutes"), 60)
+    # `out[...]` as the fallback, not a literal: `default_rule()` already seeded
+    # these from the effective settings, and re-clamping against 60/25 threw that
+    # away for any stored or API-submitted rule that simply omits the field.
+    out["interval_minutes"] = _clamp(
+        "interval_minutes", raw.get("interval_minutes"), out["interval_minutes"],
+    )
     out["window_start"] = raw.get("window_start") or None
     out["window_end"] = raw.get("window_end") or None
     out["timezone"] = _valid_timezone(raw.get("timezone"))
@@ -310,7 +315,9 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
         parsed = sorted({int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6})
         out["days"] = parsed or list(ALL_DAYS)
 
-    out["max_per_run"] = _clamp("max_per_run", raw.get("max_per_run"), 25)
+    out["max_per_run"] = _clamp(
+        "max_per_run", raw.get("max_per_run"), out["max_per_run"],
+    )
     out["priority"] = _clamp("priority", raw.get("priority"), 0)
     if raw.get("order") in ORDERS:
         out["order"] = raw["order"]
@@ -351,10 +358,69 @@ async def get_rules() -> dict[str, dict]:
     return normalize_rules(await preferences_store.get(RULES_KEY))
 
 
+# The rule fields that decide *what* a conversion produces. Change any of
+# them and the outputs recorded against this platform no longer answer the
+# question "has this rule converted that source" -- so the provenance has to
+# go with them.
+OUTPUT_IDENTITY_FIELDS = (
+    "mode",
+    "output_dir",
+    "compression",
+    "compression_level",
+    "split",
+    "duplicate_action",
+)
+
+
+def _output_identity(rule: dict | None) -> tuple:
+    if not rule:
+        return ()
+    return tuple(rule.get(field) for field in OUTPUT_IDENTITY_FIELDS)
+
+
 async def set_rules(raw: Any) -> dict[str, dict]:
+    """Replace the rule set, forgetting provenance the new rules invalidate.
+
+    Switching a platform from RVZ to GCZ, or pointing it at a new output
+    directory, asks for a different file than the one already produced. Left
+    alone, ``converted_ids`` would report every source as done and the
+    retargeted rule would convert nothing, with no way to say otherwise --
+    so a rule that changes what it produces starts its history over.
+    """
+    previous = await get_rules()
     rules = normalize_rules(raw)
+    stale = [
+        pid for pid in previous
+        if _output_identity(previous[pid]) != _output_identity(rules.get(pid))
+    ]
     await preferences_store.put(RULES_KEY, rules)
+    if stale:
+        await forget_converted(stale)
     return rules
+
+
+async def forget_converted(platform_ids: list[str] | None = None) -> int:
+    """Drop the converted-id history for *platform_ids* (or all of them).
+
+    The operator-facing escape hatch: restoring ROMs from a backup, or moving
+    outputs out of the way by hand, leaves the library in a state only they
+    can see. Returns how many platforms were cleared.
+    """
+    state = await get_state()
+    targets = (
+        [str(p) for p in platform_ids] if platform_ids is not None else list(state)
+    )
+    cleared = 0
+    for pid in targets:
+        entry = state.get(pid)
+        if isinstance(entry, dict) and entry.get("converted_ids"):
+            entry = dict(entry)
+            entry.pop("converted_ids", None)
+            state[pid] = entry
+            cleared += 1
+    if cleared:
+        await preferences_store.put(STATE_KEY, state)
+    return cleared
 
 
 async def get_state() -> dict[str, dict]:
@@ -363,12 +429,21 @@ async def get_state() -> dict[str, dict]:
 
 
 async def _record_run(platform_id: str, summary: dict) -> None:
+    """Stamp the schedule clock, merging into whatever else the entry holds.
+
+    The per-platform entry is shared with ``converted_ids``: replacing it
+    wholesale would forget, on every single run, which sources the rule had
+    already converted -- and that set is the only thing stopping an
+    ``overwrite`` rule from reconverting the library forever.
+    """
     state = await get_state()
-    state[str(platform_id)] = {
+    entry = dict(state.get(str(platform_id)) or {})
+    entry.update({
         "last_run_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "last_queued": summary.get("queued", 0),
         "last_considered": summary.get("considered", 0),
-    }
+    })
+    state[str(platform_id)] = entry
     await preferences_store.put(STATE_KEY, state)
 
 
@@ -519,28 +594,38 @@ def _accepts_source(tool, spec, path: str) -> bool:
     return tool.converts_path(path)
 
 
-def _rename_already_ran(tool, mode: str, path: str, output_dir: str | None) -> bool:
-    """Whether a ``rename`` rule has already converted *path* once.
+async def _converted_ids(platform_id: str) -> set:
+    """RomM ids this rule has already queued a conversion for.
 
-    Rename is the one policy that cannot be idempotent from the base path
-    alone: once a sweep writes an output, the base is occupied, so the next
-    sweep picks ``Game_1``, then ``Game_2``, and a standing schedule reconverts
-    the same ROM forever until the destination fills up.
+    Provenance the filesystem cannot supply. ``skip`` is idempotent from the
+    destination alone, but the other two policies are not:
 
-    The first numbered sibling is the evidence a run happened — a rename writes
-    ``name_1`` before anything higher. Checking it keeps rename meaningful (it
-    still writes alongside a file that was already there) while making it run
-    exactly once per source. `skip` and `overwrite` need none of this: their
-    base-path answer is already stable across sweeps.
+    * ``overwrite`` resolves an existing destination as queueable by
+      definition, so a standing rule reconverts and rewrites the same
+      multi-gigabyte image every interval, forever;
+    * ``rename`` moves to the next free suffix each time, so the same source
+      accumulates ``Game_1``, ``Game_2``, ... until the volume fills.
+
+    Recording the ids keeps both policies meaningful — overwrite really does
+    overwrite what was there, rename really does write alongside it — while
+    doing so exactly once per source. Bounded by the platform's ROM count,
+    which is the same order as the catalog each sweep already holds in memory.
     """
-    try:
-        base = tool.output_path(mode, path, output_dir)
-    except (KeyError, ValueError, OSError):
-        return False
-    candidate = Path(base)
-    first = candidate.parent / f"{candidate.stem}_1{candidate.suffix}"
-    exists, locked = check_output_conflicts(mode, str(first))
-    return exists or locked
+    state = await get_state()
+    stored = state.get(str(platform_id), {}).get("converted_ids")
+    return set(stored) if isinstance(stored, list) else set()
+
+
+async def _mark_converted(platform_id: str, rom_ids: list) -> None:
+    """Add *rom_ids* to this rule's converted set."""
+    if not rom_ids:
+        return
+    state = await get_state()
+    entry = dict(state.get(str(platform_id)) or {})
+    merged = set(entry.get("converted_ids") or []) | {i for i in rom_ids if i is not None}
+    entry["converted_ids"] = sorted(merged)
+    state[str(platform_id)] = entry
+    await preferences_store.put(STATE_KEY, state)
 
 
 def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
@@ -552,11 +637,19 @@ def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
     explicitly supports, a mount that stops answering would otherwise block the
     event loop for the length of the catalog.
 
+    The name filters run here too, and first. They touch no disk, but they
+    evaluate an operator-supplied regex against operator-supplied names, and
+    a pattern like ``(a+)+$`` backtracks for minutes on one long name -- on
+    the event loop that is the whole app, not one sweep. Answering ahead of
+    the path mapping also means a filtered-out ROM still costs no disk work.
+
     ``skip`` is None when the ROM should be queued, otherwise the reason.
     ``resolved`` is still filled in whenever it could be, because the caller
     checks it against the in-flight set before acting on ``skip``.
     """
     miss = {"skip": "unresolvable", "resolved": None, "destination": None, "path": None}
+    if not _passes_filters(rom, rule):
+        return {**miss, "skip": "filtered"}
     path = romm_client.local_path(rom)
     if not path or not is_within_configured_volumes(path):
         return miss
@@ -565,16 +658,26 @@ def _inspect_candidate(rom: dict, rule: dict, tool, spec) -> dict:
     resolved = _resolve_source(path)
     if resolved is None:
         return miss
-    if rule["duplicate_action"] == "rename" and _rename_already_ran(
-        tool, rule["mode"], path, rule["output_dir"],
-    ):
-        return {
-            "skip": SKIP_EXISTING, "resolved": resolved,
-            "destination": None, "path": path,
-        }
+    # RomM's catalog outlives the files it describes: an entry whose ROM was
+    # moved or deleted outside RomM still lists a local_path, and queueing it
+    # spends a worker slot to fail in the tool. Same stat call either way, so
+    # asking here costs nothing the resolve did not already pay for.
+    if not os.path.exists(resolved):
+        return {**miss, "skip": "missing", "path": path}
     destination, decision = resolve_destination(
         tool, path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
     )
+    # The rule's output_dir is validated when the rule is saved, but that is
+    # not the only way a destination is chosen: with no output_dir the tool
+    # derives one from the source, and a mode can place it beside the source
+    # rather than inside it (makeps3iso writes the ISO next to the decrypted
+    # folder). Check what was actually resolved -- but only when the candidate
+    # is going to be queued, or this would mask the policy's own answer (a
+    # skipped destination is reported as None).
+    if decision == QUEUE and (
+        not destination or not is_within_configured_volumes(destination)
+    ):
+        return {**miss, "skip": "outside_volumes", "path": path}
     return {
         "path": path,
         "skip": None if decision == QUEUE else decision,
@@ -647,6 +750,7 @@ async def _sweep_locked(
         "skipped_active": 0,
         "skipped_filtered": 0,
         "skipped_unconvertible": 0,
+        "skipped_missing": 0,
         "platforms": [],
         "errors": [],
         "stopped_reason": None,
@@ -668,6 +772,12 @@ async def _sweep_locked(
     # a capped sweep resumes where the last one stopped.
     ordered = sorted(rules, key=lambda pid: (rules[pid]["priority"], int(pid)))
     active_paths = await run_in_threadpool(_active_source_paths)
+    # Destinations already claimed this sweep. Two sources can resolve to the
+    # same output -- a PS3 folder and its sibling ISO, or two entries RomM
+    # lists for one file -- and under `overwrite` both resolve as queueable,
+    # so without this the second job overwrites the first's output and, with
+    # delete_on_verify, both sources are deleted for one surviving file.
+    claimed_destinations: set[str] = set()
 
     for platform_id in ordered:
         if result["queued"] >= cap:
@@ -692,6 +802,20 @@ async def _sweep_locked(
             spec = registry.spec(rule["mode"])
             tool = registry.for_mode(rule["mode"])
         except KeyError:
+            continue
+
+        # A rule outlives the install it was written against: the editor only
+        # offers ready tools, but a saved rule keeps firing after its binary
+        # is removed or a container is rebuilt without it, and every job it
+        # queues fails at launch. Ask before queueing, and say so.
+        if not await tool.is_ready():
+            logger.warning(
+                "romm_auto: %s is not installed, skipping platform %s",
+                spec.tool_id, platform_id,
+            )
+            result["errors"].append(
+                {"platform_id": int(platform_id), "error": "tool_not_ready"},
+            )
             continue
 
         # Belt and braces on the destination: `normalize_rule` refuses an
@@ -741,6 +865,15 @@ async def _sweep_locked(
             bool(cfg.get("repin_enabled", True))
             and romm_repin.mode_needs_repin(spec.output_ext)
         )
+        # Only the destructive policies need provenance: `skip` is already
+        # idempotent from the destination alone, and consulting the set there
+        # would refuse to reconvert an output the operator deliberately
+        # deleted.
+        converted = (
+            await _converted_ids(platform_id)
+            if rule["duplicate_action"] != "skip"
+            else set()
+        )
         batch: list[str] = []
         rom_by_path: dict[str, dict] = {}
         destinations: dict[str, str] = {}
@@ -751,8 +884,11 @@ async def _sweep_locked(
             if len(batch) >= per_platform_cap:
                 break
             considered += 1
-            if not _passes_filters(rom, rule):
-                result["skipped_filtered"] += 1
+            # Already converted by this rule. Checked before the disk hop: it
+            # is the cheapest gate there is, and on a fully converted library
+            # it is the one that answers for every candidate.
+            if rom.get("id") in converted:
+                result["skipped_existing"] += 1
                 continue
             # One hop to a worker thread for every disk-touching check on this
             # candidate — the local-path mapping and volume check included,
@@ -761,9 +897,18 @@ async def _sweep_locked(
                 _inspect_candidate, rom, rule, tool, spec,
             )
             path = decision["path"]
+            if decision["skip"] == "filtered":
+                result["skipped_filtered"] += 1
+                continue
             if decision["skip"] == "unresolvable":
                 continue
             if decision["skip"] == "unconvertible":
+                result["skipped_unconvertible"] += 1
+                continue
+            if decision["skip"] == "missing":
+                result["skipped_missing"] += 1
+                continue
+            if decision["skip"] == "outside_volumes":
                 result["skipped_unconvertible"] += 1
                 continue
             if decision["resolved"] in active_paths:
@@ -775,6 +920,10 @@ async def _sweep_locked(
             if decision["skip"] == SKIP_LOCKED:
                 result["skipped_active"] += 1
                 continue
+            if decision["destination"] in claimed_destinations:
+                result["skipped_active"] += 1
+                continue
+            claimed_destinations.add(decision["destination"])
             batch.append(path)
             rom_by_path[path] = rom
             destinations[path] = decision["destination"]
@@ -851,6 +1000,15 @@ async def _sweep_locked(
                             repin_count += 1
                 summary["repins_recorded"] = repin_count
                 result["repins_recorded"] += repin_count
+
+                # Record what this rule has now converted, so `overwrite` and
+                # `rename` stop here instead of reconverting the same sources
+                # every interval. Only after the queue accepted them.
+                if rule["duplicate_action"] != "skip":
+                    await _mark_converted(
+                        platform_id,
+                        [rom_by_path[path].get("id") for path in batch],
+                    )
 
                 # Claim them immediately so a later platform in the same sweep
                 # cannot queue the same source twice. Already resolved during

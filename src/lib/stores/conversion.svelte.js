@@ -333,7 +333,11 @@ class ConversionStore {
    * then fail at runtime. Removing a codec from an existing 4-long
    * selection still works.
    */
-  CHDMAN_MAX_CODECS = 4;
+  get CHDMAN_MAX_CODECS() {
+    // The registry owns the cap (chdman declares `maxCodecs`), so the manual
+    // picker and the RomM automation editor enforce the same number.
+    return registry.maxCodecsFor(this.mode);
+  }
 
   toggleCodec(codec) {
     if (codec === 'none') {
@@ -448,6 +452,9 @@ class ConversionStore {
     if (!filePaths?.length) return null;
     this.converting = true;
     this.lastRepinRecorded = 0;
+    // The metadata snapshot is taken before the batch is submitted, so a
+    // rejected batch leaves rows describing conversions that will never run.
+    let recordedPaths = [];
     try {
       if (rommRepin) {
         try {
@@ -463,6 +470,7 @@ class ConversionStore {
           // from here: conversion is imported by fileBrowser, which the RomM
           // store imports, so a static import back would be a cycle.
           this.lastRepinRecorded = planned?.recorded ?? 0;
+          recordedPaths = planned?.recorded_paths ?? [];
         } catch (e) {
           // Best-effort, like the disc-ID tagging hook: losing the metadata
           // snapshot costs a re-match in RomM, while refusing to convert costs
@@ -500,12 +508,20 @@ class ConversionStore {
       } else {
         toast.success(`Queued ${created} job(s)`);
       }
+      recordedPaths = [];
       return result;
     } catch (e) {
       toast.error(e?.message ?? 'Failed to create jobs');
       throw e;
     } finally {
       this.converting = false;
+      // Nothing was queued, so retire the rows the plan step wrote. They are
+      // harmless if this fails — a row whose output never changes is never
+      // settled and ages out on its own — so it must not mask the real error.
+      if (recordedPaths.length) {
+        api.cancelRommRepin(recordedPaths).catch(() => {});
+        this.lastRepinRecorded = 0;
+      }
     }
   }
 }

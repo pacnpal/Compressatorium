@@ -287,6 +287,26 @@ class RommStore {
     }
   }
 
+  /** How many sources this rule remembers having converted. */
+  convertedCountFor(platformId) {
+    const ids = this.ruleState[String(platformId)]?.converted_ids;
+    return Array.isArray(ids) ? ids.length : 0;
+  }
+
+  /**
+   * Forget the "already converted" history for one platform, or all of them.
+   *
+   * Overwrite and rename rules cannot tell "already done" from the
+   * destination alone, so they remember what they produced. Restore a library
+   * from a backup, or move outputs aside by hand, and that memory is the only
+   * thing standing between the operator and a rerun.
+   */
+  async forgetConverted(platformIds = null) {
+    const data = await api.forgetRommConverted(platformIds);
+    this.ruleState = data?.state ?? this.ruleState;
+    return data?.cleared ?? 0;
+  }
+
   async previewSweep(platformIds = null) {
     this.sweeping = true;
     try {

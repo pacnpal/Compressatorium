@@ -362,8 +362,10 @@ def test_settled_rows_are_not_revisited(repin_db) -> None:
 async def test_repin_leaves_unscanned_rows_pending(repin_db, tmp_path: Path) -> None:
     """RomM not having scanned yet is the normal case, not a failure."""
     output = tmp_path / "Game.rvz"
-    output.write_bytes(b"x" * 8)
+    # Recorded first, then produced -- the order the real flow uses, since the
+    # provider ids are only readable while the source is still what RomM knows.
     romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+    output.write_bytes(b"x" * 8)
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
@@ -385,12 +387,139 @@ async def test_repin_leaves_unscanned_rows_pending(repin_db, tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_repin_waits_until_an_overwritten_output_actually_changes(
+    repin_db, tmp_path: Path,
+) -> None:
+    """Under `overwrite` the destination is occupied when the row is written.
+
+    Existence therefore proves nothing. If the batch is never submitted, the
+    file sitting there is still the artifact the conversion was going to
+    replace -- hashing it would push this ROM's provider ids onto whatever
+    RomM identifies the *old* file as.
+    """
+    output = tmp_path / "Game.rvz"
+    output.write_bytes(b"old" * 8)
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+
+    hasher = AsyncMock(return_value="abc123")
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(romm_routes, "run_detached", hasher), \
+            patch.object(
+                romm_routes.romm_client, "rom_by_sha1", return_value={"id": 108},
+            ), \
+            patch.object(romm_routes.romm_client, "update_rom_metadata") as update:
+        waiting = await romm_routes.settle_romm_repins()
+        # Not even hashed: the pass can tell it is looking at the old file.
+        hasher.assert_not_awaited()
+
+        # The conversion lands, replacing what was there.
+        output.write_bytes(b"new" * 32)
+        settled = await romm_routes.settle_romm_repins()
+
+    assert waiting["waiting"] == 1
+    assert waiting["repinned"] == 0
+    update.assert_called_once()
+    assert settled["repinned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repin_cancel_retires_rows_for_a_batch_that_never_ran(
+    repin_db, tmp_path: Path,
+) -> None:
+    """A rejected batch must not leave a week's worth of phantom backlog."""
+    output = tmp_path / "Game.rvz"
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+    assert romm_repin.count_pending() == 1
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)):
+        result = await romm_routes.romm_repin_cancel(
+            romm_routes.RepinCancelRequest(paths=[str(output)]),
+        )
+
+    assert result["cancelled"] == 1
+    assert romm_repin.count_pending() == 0
+    # Retired, not deleted: the history of what was planned survives.
+    assert romm_repin.cancel([str(output)]) == 0
+
+
+@pytest.mark.asyncio
+async def test_repin_settle_refuses_to_run_two_passes_at_once(
+    repin_db, tmp_path: Path,
+) -> None:
+    """Two tabs settling on load must not hash the same outputs twice."""
+    output = tmp_path / "Game.rvz"
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+    output.write_bytes(b"x" * 8)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_hash(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return "abc123"
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(romm_routes, "run_detached", _slow_hash), \
+            patch.object(romm_routes.romm_client, "rom_by_sha1", return_value=None):
+        first = asyncio.create_task(romm_routes.settle_romm_repins())
+        await started.wait()
+        second = await romm_routes.settle_romm_repins()
+        release.set()
+        await first
+
+    assert second["busy"] is True
+    assert second["waiting"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repin_survives_an_output_the_operator_moved(
+    repin_db, tmp_path: Path,
+) -> None:
+    """A cached digest outlives the path it was taken from.
+
+    RomM matches on the hash, so a renamed output is still re-pinnable --
+    abandoning the row there would throw the metadata away for nothing.
+    """
+    output = tmp_path / "Game.rvz"
+    romm_repin.record({"id": 7}, str(output), {"igdb_id": 42})
+    output.write_bytes(b"x" * 8)
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "run_detached", AsyncMock(return_value="abc123"),
+            ), \
+            patch.object(romm_routes.romm_client, "rom_by_sha1", return_value=None):
+        await romm_routes.settle_romm_repins()
+
+    assert romm_repin.pending_rows(10)[0][1] == "abc123"
+
+    # The operator files it away under a different name before RomM scans.
+    output.rename(tmp_path / "Renamed.rvz")
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.romm_client, "rom_by_sha1", return_value={"id": 108},
+            ), \
+            patch.object(romm_routes.romm_client, "update_rom_metadata") as update:
+        result = await romm_routes.settle_romm_repins()
+
+    assert result["repinned"] == 1
+    update.assert_called_once_with(108, {"igdb_id": 42})
+
+
+@pytest.mark.asyncio
 async def test_repin_applies_metadata_once_romm_has_scanned(
     repin_db, tmp_path: Path,
 ) -> None:
     output = tmp_path / "Game.rvz"
-    output.write_bytes(b"x" * 8)
     romm_repin.record({"id": 7}, str(output), {"igdb_id": 42, "ra_id": 5})
+    output.write_bytes(b"x" * 8)
 
     with patch.object(RommClient, "base_url", "http://romm:8080"), \
             patch.object(RommClient, "library_root", str(tmp_path)), \
@@ -1833,7 +1962,9 @@ async def test_rename_rule_converts_each_source_exactly_once(
 
     Once a sweep writes an output the base path is occupied, so the next sweep
     would pick `Game_1`, then `Game_2`, and a scheduled rule would reconvert
-    the same ROM until the destination filled up.
+    the same ROM until the destination filled up. The filesystem cannot answer
+    this on its own -- `rename` means "write alongside", so a free suffix is
+    always available -- which is why the rule records what it has converted.
     """
     from services import romm_auto
 
@@ -1849,8 +1980,14 @@ async def test_rename_rule_converts_each_source_exactly_once(
         "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
         "fs_name": "Game.iso", "platform_slug": "ngc",
     }]
+    queued: list[list[str]] = []
+
+    async def _fake_batch(paths, mode, **kwargs):
+        queued.append(list(paths))
+        return [object() for _ in paths]
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
             patch.object(
                 romm_auto.job_manager, "get_active_job_candidates", return_value=[],
             ), \
@@ -1858,15 +1995,230 @@ async def test_rename_rule_converts_each_source_exactly_once(
         await romm_auto.set_rules({"7": {
             "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "rename",
         }})
-        first = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+        first = await romm_auto.sweep(ignore_schedule=True)
         assert first["queued"] == 1, first
 
-        # That conversion completes.
+        # That conversion completes, taking the next free suffix.
         (lib / "Game_1.rvz").write_bytes(b"\0" * 8)
-        second = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+        second = await romm_auto.sweep(ignore_schedule=True)
+
+        # A preview reads the same history, so what the operator is shown
+        # matches what a run would do.
+        preview = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
 
     assert second["queued"] == 0, second
     assert second["skipped_existing"] == 1
+    assert preview["queued"] == 0, preview
+    assert queued == [[str(lib / "Game.iso")]]
+
+
+@pytest.mark.asyncio
+async def test_overwrite_rule_converts_each_source_exactly_once(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The same guarantee for `overwrite`, which the filesystem cannot give.
+
+    An occupied destination is queueable *by definition* under this policy, so
+    without the recorded history a scheduled rule rewrites the same
+    multi-gigabyte image every interval, forever.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+    queued: list[list[str]] = []
+
+    async def _fake_batch(paths, mode, **kwargs):
+        queued.append(list(paths))
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+        (lib / "Game.rvz").write_bytes(b"\0" * 8)
+        second = await romm_auto.sweep(ignore_schedule=True)
+
+        # Retargeting the rule invalidates that history: the new format has
+        # not been produced for anything yet.
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_gcz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        retargeted = await romm_auto.sweep(ignore_schedule=True)
+
+    assert second["queued"] == 0, second
+    assert second["skipped_existing"] == 1
+    assert retargeted["queued"] == 1, retargeted
+
+
+@pytest.mark.asyncio
+async def test_forget_converted_lets_a_rule_run_again(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The operator's escape hatch: restoring a backup must be recoverable."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 0
+
+        assert await romm_auto.forget_converted(["7"]) == 1
+        assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 1
+
+    # The schedule clock survives forgetting the conversion history: they
+    # share one state entry, and losing "last run" would restart the interval.
+    state = await romm_auto.get_state()
+    assert state["7"].get("last_run_at")
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_a_platform_whose_tool_is_not_installed(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A saved rule outlives its install; queueing would fail every job."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    tool = registry.for_mode("dolphin_rvz")
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(type(tool), "is_ready", AsyncMock(return_value=False)), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0, result
+    assert result["errors"] == [{"platform_id": 7, "error": "tool_not_ready"}]
+
+
+@pytest.mark.asyncio
+async def test_sweep_refuses_a_catalog_entry_whose_file_is_gone(
+    settings_db, tmp_path: Path,
+) -> None:
+    """RomM's catalog outlives the files it describes."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    # Deliberately not created on disk.
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Gone.iso",
+        "fs_name": "Gone.iso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {"mode": "dolphin_rvz", "enabled": True}})
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0, result
+    assert result["skipped_missing"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_sends_two_sources_to_one_destination(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Two catalog rows for one file must not both be queued.
+
+    Under `overwrite` an occupied destination is queueable, so both resolve to
+    the same output -- and with delete_on_verify both sources are deleted for
+    one surviving file.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    link = lib / "Game.link.iso"
+    link.symlink_to(lib / "Game.iso")
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [
+        {"id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+         "fs_name": "Game.iso", "platform_slug": "ngc"},
+        {"id": 2, "name": "Game again", "full_path": "roms/gc/Game.iso",
+         "fs_name": "Game.iso", "platform_slug": "ngc"},
+    ]
+    queued: list[list[str]] = []
+
+    async def _fake_batch(paths, mode, **kwargs):
+        queued.append(list(paths))
+        return [object() for _ in paths]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["queued"] == 1, result
+    assert queued == [[str(lib / "Game.iso")]]
 
 
 def test_directory_modes_use_the_directory_predicate(tmp_path: Path) -> None:

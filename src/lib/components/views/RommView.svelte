@@ -68,8 +68,19 @@
     // "converted" because a CSO sat beside it, even with CHD selected — so the
     // count and the savings estimate described a different conversion than the
     // one the button would run.
+    //
+    // The tool alone is still too coarse: dolphin-tool emits RVZ, WIA and GCZ,
+    // so a stray .gcz beside a GameCube ISO reported it converted while RVZ was
+    // selected. Match the mode's own extension when the mode declares one, and
+    // fall back to the tool for the modes that do not (z3ds and nsz derive
+    // their suffix from the input).
     const activeToolId = conversion.currentTool?.id ?? null;
-    const forActiveTool = (o) => !activeToolId || o.tool_id === activeToolId;
+    const activeExt = (activeMode?.outputExt ?? null)?.toLowerCase() ?? null;
+    const forActiveTool = (o) => {
+      if (activeToolId && o.tool_id !== activeToolId) return false;
+      if (!activeExt) return true;
+      return (o.path ?? '').toLowerCase().endsWith(activeExt);
+    };
     for (const e of entries) {
       const outs = (e.outputs ?? []).filter(forActiveTool);
       const done = outs.some((o) => o.ready);

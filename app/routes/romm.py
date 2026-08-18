@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat as stat_module
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -72,6 +73,21 @@ _SETTLE_CURSOR_KEY = "romm.repin_cursor"
 _MAX_EXAMINE_PER_CALL = 250
 # Rows fetched per query while walking the pending set.
 _SETTLE_PAGE = 50
+# Wall-clock budget for one settle pass. The per-row work is a full-file
+# SHA-1, so on a slow array a full page of them would hold the request open
+# for the better part of an hour. Stopping early costs nothing: every row not
+# reached is still pending, and the cursor means the next call resumes there.
+_MAX_SETTLE_SECONDS = 120
+# Floor on how long one hash may take, and the throughput assumed above it.
+# A multi-gigabyte image on a slow array is legitimately slow, so the budget
+# scales with the file rather than failing big outputs on a fixed timeout.
+_HASH_TIMEOUT_FLOOR_S = 300
+_HASH_MIN_BYTES_PER_S = 2 * 1024 * 1024
+
+# One settle pass at a time, process-wide. The view settles on load, so two
+# tabs (or a reload mid-pass) otherwise walk the same cursor and pay the same
+# multi-gigabyte hashes twice for one row's worth of progress.
+_settle_lock = asyncio.Lock()
 
 
 def _require_configured() -> None:
@@ -361,6 +377,9 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
 
     recorded = 0
     skipped = 0
+    # The destinations actually recorded, returned so the caller can retire
+    # them if the batch it is about to submit is rejected.
+    recorded_paths: list[str] = []
     for path in payload.paths:
         if not is_within_configured_volumes(path):
             skipped += 1
@@ -391,9 +410,35 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
             continue
         if await run_in_threadpool(romm_repin.record, rom, destination, ids):
             recorded += 1
+            recorded_paths.append(destination)
         else:
             skipped += 1
-    return {"recorded": recorded, "skipped": skipped}
+    return {
+        "recorded": recorded, "skipped": skipped, "recorded_paths": recorded_paths,
+    }
+
+
+class RepinCancelRequest(BaseModel):
+    """The output paths a caller recorded and is no longer going to write."""
+
+    paths: list[str]
+
+
+@router.post("/romm/repin/cancel")
+async def romm_repin_cancel(payload: RepinCancelRequest) -> dict:
+    """Retire re-pin rows for conversions that were planned but never submitted.
+
+    ``/romm/repin/plan`` runs before ``POST /api/jobs/batch``, because the
+    provider ids are only readable while the source is still the file RomM
+    knows about. When the batch is then rejected -- backpressure, a validation
+    error -- those rows describe work that will never happen. They are already
+    safe (a row whose output never changes is never settled, and ages out on
+    its own), but leaving them pending for a week would report a backlog that
+    does not exist.
+    """
+    _require_configured()
+    cancelled = await run_in_threadpool(romm_repin.cancel, payload.paths)
+    return {"cancelled": cancelled}
 
 
 class _Outcome(str, Enum):
@@ -438,20 +483,48 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
     exists/lock/hash/match/update/settle chain is a single state machine and
     reads as one.
     """
-    output_path, sha1, _rom_id, ids, created_at, row_id = row
+    output_path, sha1, _rom_id, ids, created_at, row_id, pre_fingerprint = row
 
     try:
         exists = await bounded_path_check(os.path.isfile, output_path)
     except (asyncio.TimeoutError, OSError):
         # Unresponsive volume: treat as "not yet", never as abandoned.
         return _Outcome.WAITING
+    if exists and pre_fingerprint:
+        # Something was already here when the row was recorded -- an overwrite
+        # conversion. Existence therefore proves nothing: until the file
+        # actually changes, what is here is the artifact the conversion was
+        # going to replace, and hashing it would stamp this ROM's provider ids
+        # onto whatever RomM identifies the *old* file as. That happens for
+        # real whenever a batch is planned and then never submitted.
+        try:
+            current = await run_in_threadpool(
+                romm_repin.path_fingerprint, output_path,
+            )
+        except OSError:
+            current = ""
+        if current == pre_fingerprint:
+            exists = False
     if not exists:
-        if not _is_stale(created_at):
-            return _Outcome.WAITING
-        await run_in_threadpool(
-            romm_repin.settle, row_id, "abandoned", "Output never appeared",
-        )
-        return _Outcome.ABANDONED
+        # A cached digest outlives the path it was taken from. Operators do
+        # move and rename outputs after a conversion, and abandoning the row
+        # there would throw away metadata RomM can still be handed -- it
+        # matches on the hash, not on where the file sits. So a row that has
+        # been hashed keeps going even when nothing is at the recorded path.
+        if not sha1:
+            if not _is_stale(created_at):
+                return _Outcome.WAITING
+            # Aged out, but only if nothing is still going to write it: a
+            # queued job that has waited out a long backlog has not failed,
+            # and retiring its row loses the metadata for a conversion that
+            # is about to happen.
+            if await run_in_threadpool(_destination_has_pending_job, output_path):
+                return _Outcome.WAITING
+            await run_in_threadpool(
+                romm_repin.settle, row_id, "abandoned", "Output never appeared",
+            )
+            return _Outcome.ABANDONED
+        return await _match_and_settle(row_id, sha1, ids, output_path)
 
     # Never hash a file a converter is still writing. An output becomes a
     # regular file the moment the tool creates it, so without this the pass
@@ -477,20 +550,60 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
 
     try:
         if not sha1:
-            # Hashing a multi-GB image is heavy disk work: take the same lane
-            # the DAT matcher uses so a re-pin pass cannot compete with a
-            # running conversion for the array.
-            #
-            # `run_detached`, not the shared threadpool: this reads the whole
-            # file, and on a mount that stops answering mid-read the thread
-            # cannot be cancelled. AGENTS.md is explicit that such a read must
-            # never take a pooled worker -- repeated attempts would strand one
-            # each time and starve unrelated API work.
-            async with await workload_limiter.acquire("match"):
-                sha1 = await run_detached(compute_file_sha1_sync, output_path)
+            sha1 = await _hash_output(output_path)
+            if sha1 is None:
+                # Storage stopped answering. Nothing is wrong with the row --
+                # leave it pending and let a later pass try again.
+                return _Outcome.WAITING
             # Cache it: a row may be retried many times before RomM scans.
             await run_in_threadpool(romm_repin.store_sha1, row_id, sha1)
+    except OSError as exc:
+        logger.warning("romm: could not hash %s: %s", output_path, exc)
+        return _Outcome.FAILED
 
+    return await _match_and_settle(row_id, sha1, ids, output_path)
+
+
+async def _hash_output(output_path: str) -> str | None:
+    """SHA-1 of *output_path*, or None if the read did not finish in time.
+
+    Heavy disk work, so it takes the same lane the DAT matcher uses and a
+    re-pin pass cannot compete with a running conversion for the array.
+
+    ``run_detached``, not the shared threadpool: this reads the whole file,
+    and on a mount that stops answering mid-read the thread cannot be
+    cancelled. AGENTS.md is explicit that such a read must never take a pooled
+    worker -- repeated attempts would strand one each time and starve
+    unrelated API work. Detaching is also what makes the timeout safe to
+    apply: abandoning the read costs a thread that was never shared.
+
+    The budget scales with the file. A fixed timeout either fails a legitimate
+    50 GB hash or lets a hung mount hold the pass for hours; assuming a floor
+    throughput does neither.
+    """
+    try:
+        size = os.path.getsize(output_path)
+    except OSError:
+        size = 0
+    timeout = max(_HASH_TIMEOUT_FLOOR_S, size / _HASH_MIN_BYTES_PER_S)
+    try:
+        async with await workload_limiter.acquire("match"):
+            return await asyncio.wait_for(
+                run_detached(compute_file_sha1_sync, output_path), timeout,
+            )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "romm: hashing %s exceeded %.0fs; leaving the row pending",
+            output_path, timeout,
+        )
+        return None
+
+
+async def _match_and_settle(
+    row_id: int, sha1: str, ids: dict, output_path: str,
+) -> _Outcome:
+    """Ask RomM which ROM this digest is, and stamp the ids onto it."""
+    try:
         match = await run_in_threadpool(romm_client.rom_by_sha1, sha1)
         if not match:
             return _Outcome.WAITING
@@ -519,9 +632,6 @@ async def _settle_one_repin(row: tuple) -> _Outcome:
         # burning the rest of the backlog against a sick RomM.
         logger.warning("romm: re-pin failed for %s: %s", output_path, exc)
         return _Outcome.UPSTREAM_ERROR
-    except OSError as exc:
-        logger.warning("romm: could not hash %s: %s", output_path, exc)
-        return _Outcome.FAILED
 
 
 @router.post("/romm/repin")
@@ -536,7 +646,24 @@ async def settle_romm_repins() -> dict:
     happens to a row.
     """
     _require_configured()
+    # Refuse rather than queue behind a pass already running: this endpoint is
+    # called on view load, so waiting would leave a second tab holding a
+    # request open for the length of someone else's backlog, and then do the
+    # whole walk again for rows the first pass had already settled.
+    if _settle_lock.locked():
+        return {
+            "repinned": 0, "waiting": 0, "abandoned": 0, "failed": 0,
+            "busy": True,
+            "pending": await run_in_threadpool(romm_repin.count_pending),
+        }
+    async with _settle_lock:
+        return await _settle_pass()
+
+
+async def _settle_pass() -> dict:
+    """One pass over the pending rows. Always called with ``_settle_lock``."""
     counts = {outcome: 0 for outcome in _Outcome}
+    deadline = time.monotonic() + _MAX_SETTLE_SECONDS
 
     # Walk forward through the pending rows rather than re-reading the oldest
     # page each time: rows that are merely waiting stay pending, and without a
@@ -556,6 +683,10 @@ async def settle_romm_repins() -> dict:
         )
 
     while rows and settled < _MAX_SETTLE_PER_CALL and examined < _MAX_EXAMINE_PER_CALL:
+        if time.monotonic() >= deadline:
+            # Out of time, not out of work. The cursor is stored below, so the
+            # next call picks up exactly here.
+            break
         row = rows.pop(0)
         examined += 1
         cursor = row[5]
@@ -582,6 +713,7 @@ async def settle_romm_repins() -> dict:
         "waiting": counts[_Outcome.WAITING],
         "abandoned": counts[_Outcome.ABANDONED],
         "failed": counts[_Outcome.FAILED] + counts[_Outcome.UPSTREAM_ERROR],
+        "busy": False,
         "pending": await run_in_threadpool(romm_repin.count_pending),
     }
 
@@ -781,6 +913,24 @@ async def put_romm_rules(payload: dict) -> dict:
     """Replace the rule set. Rules naming an unknown mode are dropped."""
     rules = await romm_auto.set_rules(payload.get("rules", payload))
     return {"rules": rules}
+
+
+@router.post("/romm/rules/forget-converted")
+async def forget_romm_converted(payload: dict | None = None) -> dict:
+    """Forget which ROMs the automation has already converted.
+
+    ``overwrite`` and ``rename`` rules remember what they have produced, since
+    neither policy can tell "already done" from the destination alone. Restore
+    a library from backup, or move outputs aside by hand, and that memory is
+    the only thing standing between the operator and a rerun -- so it is
+    clearable, per platform or wholesale.
+    """
+    payload = payload or {}
+    ids = payload.get("platform_ids")
+    cleared = await romm_auto.forget_converted(
+        [str(p) for p in ids] if ids else None,
+    )
+    return {"cleared": cleared, "state": await romm_auto.get_state()}
 
 
 @router.post("/romm/auto-convert/preview")

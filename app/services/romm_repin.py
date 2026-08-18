@@ -110,12 +110,29 @@ def _supersede_pending(session, output_path: str) -> int:
     )
 
 
+def path_fingerprint(path: str) -> str:
+    """``"size:mtime_ns"`` for whatever is at *path*, or ``""`` if nothing is.
+
+    Cheap enough to take on every recorded row (one stat), and precise enough
+    for the only question asked of it: is the file here still the one that was
+    here before the conversion ran? Not a content hash -- it never needs to be,
+    because a converter that rewrites a path always changes both fields, and a
+    false "changed" only costs one hash that then fails to match.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
 def _insert_pending(session, rom: dict, output_path: str, ids: dict) -> None:
     session.add(
         _db.RommRepin(
             source_rom_id=rom.get("id"),
             source_name=rom.get("name") or rom.get("fs_name"),
             output_path=output_path,
+            pre_fingerprint=path_fingerprint(output_path),
             metadata_ids=ids,
             state="pending",
             created_at=utcnow_iso(),
@@ -153,6 +170,40 @@ def record(rom: dict, output_path: str, ids: dict) -> bool:
         return True
 
 
+def cancel(output_paths: list[str]) -> int:
+    """Retire the pending rows for *output_paths*. Returns how many were retired.
+
+    The plan-then-submit pair is two requests, and the second one can fail
+    (backpressure, a validation error, a closed tab). Without this the rows sit
+    pending until they age out, counting against the badge and describing a
+    conversion that is never going to happen.
+
+    Retire, never delete: a settled row is the history of what was planned, and
+    the partial unique index only constrains *pending* rows, so retiring frees
+    the path for the next attempt.
+    """
+    if not output_paths:
+        return 0
+    with _session() as session:
+        retired = (
+            session.query(_db.RommRepin)
+            .filter(
+                _db.RommRepin.output_path.in_(list(output_paths)),
+                _db.RommRepin.state == "pending",
+            )
+            .update(
+                {
+                    "state": "abandoned",
+                    "detail": "The conversion was never submitted",
+                    "settled_at": utcnow_iso(),
+                },
+                synchronize_session=False,
+            )
+        )
+        session.commit()
+        return int(retired)
+
+
 def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
     """A page of pending rows, oldest first, starting after *after_id*.
 
@@ -173,7 +224,7 @@ def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
         # Detach into plain tuples: the session closes before the caller awaits.
         return [
             (r.output_path, r.output_sha1, r.source_rom_id, dict(r.metadata_ids or {}),
-             r.created_at, r.id)
+             r.created_at, r.id, r.pre_fingerprint or "")
             for r in rows
         ]
 

@@ -553,6 +553,16 @@ export const api = {
       'Failed to save RomM rules',
     ),
 
+  // Clears the "already converted by this rule" history that stops overwrite
+  // and rename rules from reconverting the same sources every interval.
+  forgetRommConverted: (platformIds = null) =>
+    jsonPost(
+      `${API_BASE}/romm/rules/forget-converted`,
+      platformIds ? { platform_ids: platformIds } : {},
+      {},
+      'Failed to clear the conversion history',
+    ),
+
   // Shows what a sweep would queue, without queueing it.
   previewRommAutoConvert: (body = {}) =>
     jsonPost(`${API_BASE}/romm/auto-convert/preview`, body, {}, 'Preview failed'),
@@ -566,6 +576,15 @@ export const api = {
       { paths, mode, output_dir: outputDir, duplicate_action: duplicateAction },
       {},
       'Failed to record RomM metadata',
+    ),
+
+  // Retires rows recorded for a batch that was then rejected.
+  cancelRommRepin: (paths) =>
+    jsonPost(
+      `${API_BASE}/romm/repin/cancel`,
+      { paths },
+      {},
+      'Failed to discard the recorded RomM metadata',
     ),
 
   runRommRepin: () =>
