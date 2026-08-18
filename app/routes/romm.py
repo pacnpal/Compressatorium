@@ -27,7 +27,11 @@ from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
 from models import DirectoryListing, FileEntry
 from pydantic import BaseModel
-from routes.files import detect_file_outputs, verifiable_tools
+from routes.files import (
+    detect_directory_outputs,
+    detect_file_outputs,
+    verifiable_tools,
+)
 from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
 from services.job_manager import job_manager
@@ -251,6 +255,11 @@ async def romm_platforms() -> list[dict]:
             # editor offers PS2 chdman/maxcso and GameCube dolphin/nkit
             # instead of every mode for every platform.
             "tool_ids": registry.narrow_to_platform(all_tool_ids, p.get("slug")),
+            # Narrowed per MODE as well, because a tool can be right for the
+            # platform while one of its modes is not: the chain tool has a
+            # GameCube mode and a PS2 mode, so it survives on both and the
+            # tool list alone would offer each mode on the wrong system.
+            "mode_ids": registry.modes_for_platform(p.get("slug")),
         }
         for p in platforms
         if p.get("id") is not None
@@ -304,9 +313,21 @@ def _build_entries(roms: list[dict], platform_slug: str | None) -> list[FileEntr
         except OSError:
             # missing_from_fs, a permissions problem, or a stale record.
             continue
-        if not stat_module.S_ISREG(stat.st_mode):
+        is_dir = stat_module.S_ISDIR(stat.st_mode)
+        if not is_dir and not stat_module.S_ISREG(stat.st_mode):
             continue
-        convertible_by, outputs, _ = detect_file_outputs(path)
+        if is_dir:
+            # A RomM record can resolve to a directory: a decrypted PS3 game
+            # folder is the input unit makeps3iso takes, and the platform
+            # advertises that tool. Dropping it made `folder_to_iso` reachable
+            # from automation but not by hand, for the same records. The
+            # frontend already renders selectable directory rows, so this is
+            # the same registry-driven detection an ordinary listing uses.
+            convertible_by, outputs = detect_directory_outputs(path)
+            verifiable: list[str] = []
+        else:
+            convertible_by, outputs, _ = detect_file_outputs(path)
+            verifiable = verifiable_tools(path)
         # This is what the platform buys us. Extensions alone cannot tell a
         # GameCube .iso from a PS2 .iso, so an unnarrowed list offers chdman and
         # maxcso on a GameCube disc -- conversions that are wrong for the
@@ -323,12 +344,16 @@ def _build_entries(roms: list[dict], platform_slug: str | None) -> list[FileEntr
                 name=name,
                 display_name=rom.get("name") or None,
                 path=path,
-                type="file",
-                size=stat.st_size,
-                extension=os.path.splitext(name)[1].lower() or None,
+                type="directory" if is_dir else "file",
+                # A folder's own inode size is meaningless as a ROM size, and
+                # RomM already knows what the set weighs.
+                size=(rom.get("fs_size_bytes") or None) if is_dir else stat.st_size,
+                extension=None if is_dir else (
+                    os.path.splitext(name)[1].lower() or None
+                ),
                 convertible_by=convertible_by,
                 outputs=outputs,
-                verifiable_by=verifiable_tools(path),
+                verifiable_by=verifiable,
             ),
         )
     # Deterministic ordering, independent of RomM's paging. Sorts on the title
@@ -347,6 +372,9 @@ class RepinPlanRequest(BaseModel):
 
     paths: list[str]
     mode: str
+    # The platform the browser is showing. Turns the catalog lookup into one
+    # request instead of a scan across every platform in the instance.
+    platform_id: int | None = None
     output_dir: str | None = None
     # The policy the batch will apply, so the row is recorded against the path
     # the conversion actually writes rather than the one it would have.
@@ -385,7 +413,9 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
     # One catalog read for the whole batch, indexed by local path, instead of a
     # by-hash lookup per file.
     try:
-        platform_roms = await run_in_threadpool(romm_repin.roms_by_local_path, payload.paths)
+        platform_roms = await run_in_threadpool(
+            romm_repin.roms_by_local_path, payload.paths, payload.platform_id,
+        )
     except RommError as exc:
         raise _romm_call(exc, context="reading the catalog") from exc
 
@@ -848,11 +878,17 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
     layer's dependency runs the other way (``romm_auto`` reads settings), and
     a route is where cross-service consequences belong.
     """
-    before = romm_settings.effective()
-    values = await romm_settings.save(patch.model_dump(exclude_unset=True))
-    identity = ("url", "library_root")
-    if any(before.get(f) != values.get(f) for f in identity):
-        cleared = await romm_auto.forget_converted()
+    # The save itself is inside the pause, not just the cleanup after it. A
+    # sweep resolves each ROM's local path lazily from the *current* library
+    # root, so swapping that root mid-sweep makes it queue whatever unrelated
+    # files sit at the same relative paths in the new library -- and with
+    # delete-on-verify on, delete them.
+    async with romm_auto.paused():
+        before = romm_settings.effective()
+        values = await romm_settings.save(patch.model_dump(exclude_unset=True))
+        identity = ("url", "library_root")
+        changed = any(before.get(f) != values.get(f) for f in identity)
+        cleared = await romm_auto.forget_converted_locked() if changed else 0
         if cleared:
             logger.info(
                 "romm: RomM instance or library changed; cleared the conversion "

@@ -48,6 +48,15 @@ class ModeSpec:
     # Default keeps every existing mode FILE-based (zero behavior change). A
     # directory mode (folder->iso) overrides to {InputKind.DIRECTORY}.
     input_kinds: frozenset[InputKind] = frozenset({InputKind.FILE})
+    # Platforms this MODE serves, when they differ from its tool's. Empty means
+    # "ask the tool", which is right for every single-system tool: chdman's
+    # modes are all as PS2/PSX/Dreamcast as chdman is. It exists for composite
+    # modes, where the tool is a shell and each mode belongs to a different
+    # system -- the chain tool declares no platforms of its own, so without
+    # this its GameCube NKit->RVZ mode was offered on PS2 and its PS2 CSO->CHD
+    # mode on GameCube, and a saved rule would convert a disc to a format for
+    # the wrong console.
+    platform_slugs: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -92,3 +101,8 @@ class ChainSpec:
     # Structural parity with ModeSpec.companion_exts so BaseTool.companion_outputs
     # works for chain modes too (cso_to_chd's single .chd has no companion).
     companion_exts: tuple[str, ...] = ()
+    # Structural parity with ModeSpec.platform_slugs -- and the reason that
+    # field exists. The chain tool is a shell with no platform of its own, so
+    # each composite mode has to name its own system or it is offered on every
+    # one of them.
+    platform_slugs: frozenset[str] = frozenset()

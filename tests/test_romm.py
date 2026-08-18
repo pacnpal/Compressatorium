@@ -424,6 +424,48 @@ async def test_repin_waits_until_an_overwritten_output_actually_changes(
 
 
 @pytest.mark.asyncio
+async def test_repin_plan_reads_only_the_platform_it_was_given(
+    repin_db, tmp_path: Path,
+) -> None:
+    """The rows came from one platform's listing; say so and skip the scan.
+
+    Without it the backend walks every platform's full paginated catalog until
+    each path is found -- hundreds of serialised calls on a large instance
+    before a small batch is even queued.
+    """
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    rom = {"id": 7, "name": "Game", "igdb_id": 42,
+           "full_path": "roms/gc/Game.iso", "fs_name": "Game.iso"}
+
+    asked: list = []
+
+    def _roms(pid):
+        asked.append(pid)
+        return [rom] if pid == 9 else []
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(romm_routes.romm_client, "roms", _roms), \
+            patch.object(
+                romm_routes.romm_client, "platforms",
+                lambda: [{"id": i} for i in range(1, 40)],
+            ), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ):
+        result = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(lib / "Game.iso")], mode="dolphin_rvz", platform_id=9,
+            ),
+        )
+
+    assert result["recorded"] == 1, result
+    assert asked == [9], "walked other platforms despite being told which one"
+
+
+@pytest.mark.asyncio
 async def test_repin_names_a_split_output_instead_of_waiting_it_out(
     repin_db, tmp_path: Path,
 ) -> None:
@@ -2252,6 +2294,90 @@ async def test_a_queued_conversion_that_never_ran_is_retried(
         # Now it lands, and the rule stops.
         (lib / "Game.rvz").write_bytes(b"\0" * 8)
         assert (await romm_auto.sweep(ignore_schedule=True))["queued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_romm_listing_includes_directory_records(tmp_path: Path) -> None:
+    """A PS3 record resolves to a folder, which is makeps3iso's input unit.
+
+    Dropping it made `folder_to_iso` reachable from automation but not by
+    hand, for the very same records, while the platform advertised the tool.
+    """
+    lib = tmp_path / "roms" / "ps3"
+    folder = lib / "MyGame"
+    (folder / "PS3_GAME" / "USRDIR").mkdir(parents=True)
+    (folder / "PS3_GAME" / "PARAM.SFO").write_bytes(b"\0" * 16)
+
+    roms = [{
+        "id": 1, "name": "My Game", "full_path": "roms/ps3/MyGame",
+        "fs_name": "MyGame", "platform_slug": "ps3", "fs_size_bytes": 1234,
+    }]
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ):
+        entries = romm_routes._build_entries(roms, "ps3")
+
+    assert len(entries) == 1, entries
+    assert entries[0].type == "directory"
+    assert entries[0].size == 1234
+    assert "makeps3iso" in (entries[0].convertible_by or [])
+
+
+def test_composite_modes_are_narrowed_per_platform() -> None:
+    """A tool that belongs to no system needs its modes narrowed individually.
+
+    The chain tool has a GameCube mode and a PS2 mode, so a tool-level check
+    keeps it on both -- and then offered each mode on the wrong console.
+    """
+    assert registry.narrow_to_platform(["chain"], "ps2") == ["chain"]
+    assert registry.narrow_to_platform(["chain"], "ngc") == ["chain"]
+
+    assert registry.mode_allows_platform("cso_to_chd", "ps2") is True
+    assert registry.mode_allows_platform("cso_to_chd", "ngc") is False
+    assert registry.mode_allows_platform("nkit_to_rvz", "ngc") is True
+    assert registry.mode_allows_platform("nkit_to_rvz", "ps2") is False
+
+    # A mode with no opinion of its own inherits its tool's.
+    assert registry.mode_allows_platform("createdvd", "ps2") is True
+    assert registry.mode_allows_platform("createdvd", "ngc") is False
+    # An unrecognised slug narrows nothing, matching narrow_to_platform.
+    assert registry.mode_allows_platform("cso_to_chd", "not-a-console") is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_refuses_a_composite_mode_for_the_wrong_platform(
+    settings_db, tmp_path: Path,
+) -> None:
+    """The saved rule is checked against the mode, not its tool."""
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.cso").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.cso",
+        "fs_name": "Game.cso", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {"mode": "cso_to_chd", "enabled": True}})
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0, result
+    assert result["errors"] == [
+        {"platform_id": 7, "error": "tool_wrong_for_platform"},
+    ]
 
 
 @pytest.mark.asyncio

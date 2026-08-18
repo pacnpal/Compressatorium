@@ -1475,6 +1475,22 @@ catalog listing narrows each row's `convertible_by`, and `/romm/platforms`
 returns the narrowed `tool_ids` so the automation editor offers a platform only
 the modes it can actually use.
 
+#### Composite modes narrow per mode (`ModeSpec.platform_slugs`)
+
+Narrowing by tool cannot separate a composite tool's modes. `ChainTool` is a
+shell that belongs to no system: it owns `nkit_to_rvz` (GameCube/Wii) and
+`cso_to_chd` (PS2/PSP), so it legitimately survives `narrow_to_platform` on
+both — and offering *both* modes on *both* is how a GameCube disc gets a rule
+targeting a PS2 format.
+
+**`ModeSpec.platform_slugs`** (default empty, meaning "ask the tool") lets a
+mode name its own systems. `mode_allows_platform(mode, slug)` applies the same
+conservative rules as `narrow_to_platform` one level down, and
+`modes_for_platform(slug)` returns the whole applicable set — served to the
+browser as each platform's `mode_ids` beside its `tool_ids`, so neither the
+automation editor nor the RomM target picker carries a second copy of the
+platform table. The sweep checks the *mode*, not `spec.tool_id`.
+
 #### Extension matching is a suffix match (`utils.path_utils.match_extension`)
 
 Every "does this tool handle this file?" decision goes through one helper:

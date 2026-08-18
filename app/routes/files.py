@@ -145,7 +145,7 @@ def detect_file_outputs(
     return convertible_by, outputs, by_tool
 
 
-def _detect_directory_outputs(
+def detect_directory_outputs(
     item_path: str,
 ) -> tuple[list[str], list[OutputStatus]]:
     """Registry-driven convertibility + output detection for a directory row.
@@ -360,7 +360,7 @@ async def list_files(
                         # browser can badge + select it. A plain folder gets
                         # empty lists and stays navigation-only.
                         dir_convertible_by, dir_outputs = (
-                            _detect_directory_outputs(item_path)
+                            detect_directory_outputs(item_path)
                         )
                         entries.append(
                             FileEntry(
@@ -530,7 +530,7 @@ async def search_files(
                             # jobs). scan_directory alone would leave it invisible
                             # to recursive search. A plain folder still recurses.
                             dir_convertible_by, dir_outputs = (
-                                _detect_directory_outputs(item_path)
+                                detect_directory_outputs(item_path)
                             )
                             if dir_convertible_by:
                                 files.append(

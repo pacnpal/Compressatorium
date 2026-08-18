@@ -38,14 +38,21 @@
   // narrowing the conversion path applies, so the editor cannot offer a
   // GameCube library a PS2-only mode.
   function modeOptionsFor(platform) {
-    const allowed = platform?.tool_ids;
+    const allowedTools = platform?.tool_ids;
+    // Narrowed per mode as well as per tool. A composite tool belongs to no
+    // single system — the chain tool has a GameCube mode and a PS2 mode — so
+    // the tool list keeps it on both and only the mode list can tell them
+    // apart. Both come from the backend registry rather than a second copy of
+    // the platform table here.
+    const allowedModes = platform?.mode_ids;
     const out = [{ value: '', label: 'Off — do not convert this platform' }];
     for (const tool of registry.all()) {
       // No opinion from the backend (unknown slug, older server) keeps every
       // tool, matching narrow_to_platform's conservative contract.
-      if (Array.isArray(allowed) && !allowed.includes(tool.id)) continue;
+      if (Array.isArray(allowedTools) && !allowedTools.includes(tool.id)) continue;
       for (const m of tool.modes ?? []) {
         if (m.kind === 'extract') continue; // automation converts, not unpacks
+        if (Array.isArray(allowedModes) && !allowedModes.includes(m.mode)) continue;
         out.push({ value: m.mode, label: `${tool.label} → ${m.label}` });
       }
     }

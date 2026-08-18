@@ -355,7 +355,9 @@ valid regular expression, stops the rule and explains why in the editor.
 Only formats the platform can actually use are offered: a GameCube rule lists
 dolphin and nkit, a PS2 rule lists chdman and maxcso. That narrowing comes from
 the same registry the file browser uses, so a rule can never name a tool that is
-wrong for the system.
+wrong for the system — and it works per *format*, not just per tool, so the
+two-step conversions (NKit → RVZ, CSO → CHD) each appear only on the console
+they belong to.
 
 **Preview** shows exactly what a sweep would queue, without queueing it — and
 without moving the schedule clock, so looking never postpones a run. **Run now**

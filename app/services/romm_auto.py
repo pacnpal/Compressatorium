@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from datetime import time as dt_time
 from pathlib import Path
@@ -378,6 +379,22 @@ def _output_identity(rule: dict | None) -> tuple:
     return tuple(rule.get(field) for field in OUTPUT_IDENTITY_FIELDS)
 
 
+@asynccontextmanager
+async def paused():
+    """Hold off the sweep for the duration of the block.
+
+    Anything that changes what a sweep *means* -- which RomM it talks to,
+    where the library is mounted, what each rule targets -- has to take this,
+    not just the bookkeeping that follows it. A sweep holds the ROM records it
+    fetched but resolves each one's local path lazily, so swapping the library
+    root underneath a running sweep makes it queue conversions for whatever
+    unrelated files happen to sit at the same relative paths in the new
+    library. With delete-on-verify on, it then deletes them.
+    """
+    async with _sweep_lock:
+        yield
+
+
 async def set_rules(raw: Any) -> dict[str, dict]:
     """Replace the rule set, forgetting provenance the new rules invalidate.
 
@@ -402,7 +419,7 @@ async def set_rules(raw: Any) -> dict[str, dict]:
         ]
         await preferences_store.put(RULES_KEY, rules)
         if stale:
-            await _forget_converted_locked(stale)
+            await forget_converted_locked(stale)
         return rules
 
 
@@ -414,11 +431,11 @@ async def forget_converted(platform_ids: list[str] | None = None) -> int:
     can see. Returns how many platforms were cleared.
     """
     async with _sweep_lock:
-        return await _forget_converted_locked(platform_ids)
+        return await forget_converted_locked(platform_ids)
 
 
-async def _forget_converted_locked(platform_ids: list[str] | None = None) -> int:
-    """The body of :func:`forget_converted`. Called with ``_sweep_lock`` held."""
+async def forget_converted_locked(platform_ids: list[str] | None = None) -> int:
+    """:func:`forget_converted` for a caller already inside :func:`paused`."""
     state = await get_state()
     targets = (
         [str(p) for p in platform_ids] if platform_ids is not None else list(state)
@@ -921,10 +938,14 @@ async def _sweep_locked(
         slug = next(
             (r.get("platform_slug") for r in roms if r.get("platform_slug")), None,
         )
-        if slug and not registry.narrow_to_platform([spec.tool_id], slug):
+        # Per mode, not per tool. A composite tool is a shell that belongs to
+        # no system -- the chain tool has a GameCube mode and a PS2 mode, so it
+        # passes a tool-level check on both, and a rule saved against the wrong
+        # one would convert a disc to a format for the other console.
+        if not registry.mode_allows_platform(rule["mode"], slug):
             logger.info(
-                "romm_auto: %s is not a %s tool, skipping platform %s",
-                spec.tool_id, slug, platform_id,
+                "romm_auto: %s is not a %s mode, skipping platform %s",
+                rule["mode"], slug, platform_id,
             )
             result["errors"].append(
                 {"platform_id": int(platform_id), "error": "tool_wrong_for_platform"},

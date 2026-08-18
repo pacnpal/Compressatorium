@@ -15,6 +15,7 @@
   import { conversion } from '$lib/stores/conversion.svelte.js';
   import { layout } from '$lib/stores/layout.svelte.js';
   import { registry } from '$lib/tools/registry.js';
+  import { ui } from '$lib/stores/ui.svelte.js';
   import { formatSize } from '$lib/api/format.js';
   import FileList from '$lib/components/panels/FileList.svelte';
   import ConvertPanel from '$lib/components/panels/ConvertPanel.svelte';
@@ -35,6 +36,46 @@
 
   const status = $derived(romm.status);
   const entries = $derived(fileBrowser.entries);
+
+  /**
+   * Every target format this platform can actually use.
+   *
+   * Selecting a platform points the workspace at *a* tool the platform allows,
+   * but a platform usually allows several — PS2 takes chdman and maxcso — and
+   * without this the only way to reach the others was to leave RomM for the
+   * sidebar and come back. Narrowed by the backend's own `mode_ids`/`tool_ids`
+   * for this platform, so the list can never offer a format for the wrong
+   * console, and grouped by tool so the choice reads as "what do I want out".
+   */
+  const modeOptions = $derived.by(() => {
+    const platform = romm.platforms.find((p) => p.id === romm.selectedPlatformId);
+    const allowedTools = platform?.tool_ids;
+    const allowedModes = platform?.mode_ids;
+    const out = [];
+    for (const tool of registry.all()) {
+      if (Array.isArray(allowedTools) && !allowedTools.includes(tool.id)) continue;
+      for (const m of tool.modes ?? []) {
+        if (Array.isArray(allowedModes) && !allowedModes.includes(m.mode)) continue;
+        out.push({ value: m.mode, label: `${tool.label} → ${m.label}` });
+      }
+    }
+    return out;
+  });
+
+  /** Switch the workspace to a chosen target format, tool included.
+   *
+   * `setPrimaryTool` resets the mode to that tool's default, so it has to run
+   * first — and it has to run at all, because the Convert panel and the
+   * sidebar both key off the primary tool, not the mode.
+   */
+  function chooseMode(mode) {
+    const tool = registry.toolForMode(mode);
+    if (tool && tool.id !== conversion.primaryTool) {
+      conversion.setPrimaryTool(tool.id);
+      ui.workspaceTool = tool.id;
+    }
+    conversion.setMode(mode);
+  }
 
   const platformOptions = $derived(
     romm.platforms.map((p) => ({
@@ -253,6 +294,14 @@
           />
         {:else}
           <span class="muted">No platforms in RomM.</span>
+        {/if}
+        {#if modeOptions.length > 0}
+          <Select
+            label="Convert to"
+            value={conversion.mode ?? ''}
+            options={modeOptions}
+            onchange={(v) => chooseMode(v)}
+          />
         {/if}
       </div>
 

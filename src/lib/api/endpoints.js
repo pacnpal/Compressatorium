@@ -570,10 +570,18 @@ export const api = {
   // Records the metadata to carry across a conversion. MUST be called before
   // the batch is submitted: the provider ids are read from the RomM record for
   // the source file, which goes stale once that file is converted.
-  planRommRepin: (paths, mode, outputDir = null, duplicateAction = 'skip') =>
+  planRommRepin: (
+    paths, mode, outputDir = null, duplicateAction = 'skip', platformId = null,
+  ) =>
     jsonPost(
       `${API_BASE}/romm/repin/plan`,
-      { paths, mode, output_dir: outputDir, duplicate_action: duplicateAction },
+      {
+        paths,
+        mode,
+        output_dir: outputDir,
+        duplicate_action: duplicateAction,
+        platform_id: platformId,
+      },
       {},
       'Failed to record RomM metadata',
     ),

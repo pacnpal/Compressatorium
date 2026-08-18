@@ -145,6 +145,50 @@ class ToolRegistry:
                 kept.append(tool_id)
         return kept
 
+    def mode_platform_slugs(self, mode: str) -> frozenset[str]:
+        """Platforms this mode serves: its own if declared, else its tool's.
+
+        Most modes inherit -- chdman's modes are as PS2/PSX/Dreamcast as chdman
+        is. A composite mode has to declare, because its tool is a shell that
+        belongs to no system.
+        """
+        spec = self.spec(mode)
+        return spec.platform_slugs or self.for_mode(mode).platform_slugs
+
+    def mode_allows_platform(self, mode: str, slug: str | None) -> bool:
+        """Whether *mode* is applicable to *slug*, on the same terms as
+        :meth:`narrow_to_platform`: conservative, so an unknown slug or a mode
+        with no opinion is always kept."""
+        if not slug:
+            return True
+        key = slug.strip().lower()
+        if not key:
+            return True
+        claimed = self.mode_platform_slugs(mode)
+        if not claimed:
+            return True
+        # Same guard as narrow_to_platform: a slug nothing claims must not
+        # delete every opinionated mode.
+        if not any(
+            key in self.mode_platform_slugs(m.mode) for m in self.mode_specs()
+        ):
+            return True
+        return key in claimed
+
+    def modes_for_platform(self, slug: str | None) -> list[str]:
+        """Every registered mode applicable to *slug*, narrowed per mode.
+
+        The mode-level companion to :meth:`narrow_to_platform`. Narrowing by
+        tool alone cannot separate a composite tool's modes: the chain tool
+        legitimately survives on both PS2 and GameCube, because it has a mode
+        for each -- but offering *both* modes on *both* platforms is how a
+        GameCube disc ends up with a rule targeting a PS2 format.
+        """
+        return [
+            m.mode for m in self.mode_specs()
+            if self.mode_allows_platform(m.mode, slug)
+        ]
+
     def tools_for_directory(self, path: str) -> list[ToolPlugin]:
         """Tools that accept ``path`` (a directory) as their input unit.
 

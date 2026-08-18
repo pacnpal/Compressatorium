@@ -131,6 +131,7 @@
         // Only rows that came from the RomM catalog have RomM metadata to carry
         // across; a normal directory browse has nothing to snapshot.
         rommRepin: fromRomm,
+        rommPlatformId: fileBrowser.rommPlatformId,
       });
       // Surface the follow-up straight away: the "Re-match in RomM" badge is
       // driven by this count, and leaving it stale hides the one action these

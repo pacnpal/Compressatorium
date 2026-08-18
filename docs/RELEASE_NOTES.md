@@ -103,6 +103,26 @@
   retarget the rule (a rule switched from RVZ to GCZ has not produced GCZ for
   anything yet), and there is a **Forget history** button on each platform for
   when you restore from a backup or move outputs aside by hand.
+- **Changing the RomM URL or library path mid-sweep could convert, and with
+  delete-after-verify destroy, the wrong files.** A running sweep resolves each
+  ROM's path from the *current* library root, so swapping that root underneath
+  it made it queue whatever unrelated files happened to sit at the same relative
+  paths in the new library. Saving those settings now waits for the sweep.
+- **PS3 game folders appear in the RomM library.** A RomM record can resolve to
+  a decrypted game directory — the input makeps3iso takes — and the listing
+  dropped it, so *Folder → ISO* was usable from automation but not by hand, for
+  exactly the same records, while the platform advertised the tool.
+- **NKit → RVZ is no longer offered for PS2, nor CSO → CHD for GameCube.** Those
+  two-step conversions belong to a tool that serves no single system, so
+  narrowing by tool kept both on every platform they touched — and a rule saved
+  against the wrong one would produce a format for the other console.
+- **The RomM library has a "Convert to" picker.** A platform usually allows
+  several tools — PS2 takes chdman and maxcso — and the only way to reach the
+  others was to leave RomM for the sidebar and come back.
+- **Queueing a RomM batch no longer scans your whole instance.** The metadata
+  lookup walked every platform's full catalog until it found the selected
+  files, which on a large library is hundreds of requests before the batch is
+  queued. It now asks the platform you are actually looking at.
 - **The re-pin snapshot can no longer capture the finished file as its "before"
   picture.** On an idle queue a fast conversion could complete in the moment
   between the batch being accepted and its metadata row being written, so the

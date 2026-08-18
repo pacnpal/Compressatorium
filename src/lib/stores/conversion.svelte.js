@@ -448,7 +448,10 @@ class ConversionStore {
    *   the provider ids are read from the RomM record for the source file, and
    *   that record is what goes stale once the source is converted or deleted.
    */
-  async submit(filePaths, { duplicateAction = 'skip', rommRepin = false } = {}) {
+  async submit(
+    filePaths,
+    { duplicateAction = 'skip', rommRepin = false, rommPlatformId = null } = {},
+  ) {
     if (!filePaths?.length) return null;
     this.converting = true;
     this.lastRepinRecorded = 0;
@@ -465,8 +468,13 @@ class ConversionStore {
           // to `Game_1.rvz`, so recording the occupied base path would re-pin
           // the OLD file and leave the new one unidentified; under Skip the
           // conflicting sources are never queued at all.
+          // The platform goes with it: the backend would otherwise walk every
+          // platform's full catalog looking for these paths, which on a large
+          // instance is hundreds of serialised requests before a small batch
+          // is even queued. These rows all came from one platform's listing.
           const planned = await api.planRommRepin(
             filePaths, this.mode, this.outputDir || null, duplicateAction,
+            rommPlatformId,
           );
           // Reported back to the caller rather than pushed into the RomM store
           // from here: conversion is imported by fileBrowser, which the RomM

@@ -56,25 +56,43 @@ def metadata_ids(rom: dict) -> dict:
     return {f: rom.get(f) for f in METADATA_ID_FIELDS if rom.get(f)}
 
 
-def roms_by_local_path(paths: list[str]) -> dict[str, dict]:
-    """Index the platforms covering *paths* by resolved local path.
+def roms_by_local_path(
+    paths: list[str], platform_id: int | None = None,
+) -> dict[str, dict]:
+    """Index the ROMs covering *paths* by resolved local path.
 
-    Reads the whole catalog for each platform involved rather than one lookup
-    per file: a batch is normally a single platform, making this one request.
+    One catalog read for the whole batch rather than a lookup per file.
+
+    *platform_id* is the platform the caller is actually browsing, and giving
+    it turns this into a single request. Without it every platform's full
+    paginated catalog is downloaded in turn until each path is found -- and if
+    one selected path has gone stale, *all* of them are, so submitting a
+    handful of ROMs from a large library could mean hundreds of serialised API
+    calls before the batch is even queued. The scan remains the fallback for a
+    caller that genuinely does not know (a path handed in from elsewhere).
     """
     # realpath, to match what `local_path()` returns. Comparing an abspath key
     # against a realpath value made a symlinked library silently miss every
     # lookup, so those ROMs lost their metadata without a word.
     wanted = {os.path.realpath(p) for p in paths}
     index: dict[str, dict] = {}
-    for platform in romm_client.platforms():
-        pid = platform.get("id")
-        if pid is None:
-            continue
+
+    def _absorb(pid: int) -> None:
         for rom in romm_client.roms(pid):
             local = romm_client.local_path(rom)
             if local and local in wanted:
                 index[local] = rom
+
+    if platform_id is not None:
+        _absorb(int(platform_id))
+        if len(index) == len(wanted):
+            return index
+
+    for platform in romm_client.platforms():
+        pid = platform.get("id")
+        if pid is None or pid == platform_id:
+            continue
+        _absorb(pid)
         if len(index) == len(wanted):
             break
     return index
