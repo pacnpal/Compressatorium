@@ -42,9 +42,27 @@ def _find_node() -> str | None:
     return None
 
 
-_SCRIPT_BLOCK = re.compile(
-    r"<script\b[^>]*>(.*?)</\s*script\s*>", re.DOTALL | re.IGNORECASE,
-)
+def _script_body(src: str) -> str | None:
+    """The text between the first `<script ...>` and its `</script ...>`.
+
+    Located by index rather than by regular expression on purpose. A regex tag
+    filter has to enumerate the spellings a tag can take — `<script lang="ts">`,
+    `<SCRIPT>`, `</script\\t\\n foo>` — and the ones it forgets are the ones it
+    silently mismatches. Here that would mean reading an *empty* component and
+    passing. Two case-insensitive searches have no such gaps, and CodeQL flags
+    the regex form (`py/bad-tag-filter`) for exactly this reason.
+    """
+    lowered = src.lower()
+    start = lowered.find("<script")
+    if start == -1:
+        return None
+    opened = src.find(">", start)
+    if opened == -1:
+        return None
+    end = lowered.find("</script", opened)
+    if end == -1:
+        return None
+    return src[opened + 1:end]
 
 
 def _script_of(component: Path) -> str:
@@ -55,15 +73,10 @@ def _script_of(component: Path) -> str:
     prop bag, and `$effect(fn)` runs once — which is what fills the edit
     buffers from the loaded settings.
     """
-    src = component.read_text(encoding="utf-8")
-    # Case-insensitive, attribute- and whitespace-tolerant: a tag filter that
-    # only matches the one spelling it expects is the shape CodeQL flags as a
-    # bad HTML filter, and `<script lang="ts">` or `</SCRIPT >` would silently
-    # make this harness read an empty component and pass.
-    body = _SCRIPT_BLOCK.search(src)
+    body = _script_body(component.read_text(encoding="utf-8"))
     assert body, f"{component.name} has no <script> block"
     kept = [
-        line for line in body.group(1).splitlines()
+        line for line in body.splitlines()
         if not (line.strip().startswith("import ") and line.strip().endswith(";"))
     ]
     text = "\n".join(kept)
