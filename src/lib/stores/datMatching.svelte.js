@@ -9,6 +9,14 @@ import { api } from '$lib/api/endpoints.js';
 // has had a chance to recover, not during the outage.
 const ATTEMPT_RETRY_MS = 90_000;
 
+// How many times a hydration cycle will re-check itself on a timer before
+// giving up until something else (navigation, a finished job, a DAT change)
+// triggers it. Expiring the guard is not enough on its own: nothing reactive
+// changes when the window elapses, so a static page would sit there unmatched.
+// Bounded because a permanently-skipped file (over MATCH_MAX_FILE_SIZE) would
+// otherwise re-spawn a no-op job every interval for as long as the tab is open.
+const MAX_AUTO_RETRIES = 2;
+
 class DATMatchingStore {
   matches = new SvelteMap();
   matchingAvailable = $state(false);
@@ -37,6 +45,8 @@ class DATMatchingStore {
   // the transient ones and costs a permanently-skipped file one cheap no-op
   // job per interval (it re-checks the size cap without hashing).
   _attemptedPaths = Object.create(null);
+  _retryTimer = null;
+  _autoRetries = 0;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
@@ -72,10 +82,30 @@ class DATMatchingStore {
    */
   async setHasheousEnabled(enabled) {
     const state = await api.setHasheousEnabled(enabled);
+    // Apply the authoritative response NOW, before the counters refresh.
+    // That refresh swallows its own errors, so if /dat/stats happened to fail
+    // right after a successful PUT we would report success while the panel
+    // still showed the old state and matchingAvailable stayed stale -- with
+    // the backend already switched over.
+    this._applyHasheousState(state);
     this.matches.clear();
     this._resetAttempts();
     await this.refreshMatchingAvailability();
     return state;
+  }
+
+  /** Merge a /dat/hasheous response into the cached stats. */
+  _applyHasheousState(state) {
+    if (!state) return;
+    this.stats = {
+      ...(this.stats ?? {}),
+      hasheous_enabled: state.enabled,
+      hasheous_url: state.url,
+      hasheous_overridden: state.overridden,
+      hasheous_env_default: state.env_default,
+    };
+    this.matchingAvailable =
+      (this.stats.total_dats ?? 0) > 0 || Boolean(state.enabled);
   }
 
   async testHasheous() {
@@ -134,10 +164,16 @@ class DATMatchingStore {
     // Hasheous outage is non-cacheable by design, and its cooldown is 60s —
     // gets retried once the service recovers, without a page reload.
     const now = Date.now();
-    const uncached = paths.filter(
-      (p) => !this.matches.has(p) && !this._recentlyAttempted(p, now),
-    );
-    if (uncached.length === 0) return;
+    const stillUnknown = paths.filter((p) => !this.matches.has(p));
+    const uncached = stillUnknown.filter((p) => !this._recentlyAttempted(p, now));
+    if (uncached.length === 0) {
+      // Everything left is inside its retry window. Come back when it expires,
+      // otherwise a transient failure (a Hasheous outage) stays on screen as
+      // "no badge" until the user navigates or reloads.
+      if (stillUnknown.length) this._scheduleRetry(paths);
+      return;
+    }
+    this._autoRetries = 0;  // real work to do; this isn't a quiet re-check
     try {
       await this.startMatchJob(uncached);
       // Mark attempts only AFTER the backend accepted the job. A 409
@@ -160,6 +196,28 @@ class DATMatchingStore {
    */
   _resetAttempts() {
     this._attemptedPaths = Object.create(null);
+    this._autoRetries = 0;
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
+  }
+
+  /**
+   * Re-run hydration once the attempt window has expired.
+   *
+   * Only while a remote source is in play: with Hasheous off, a path still
+   * uncached after a completed job is a permanent skip (size cap), not a
+   * transient failure, so retrying it would never produce anything.
+   */
+  _scheduleRetry(paths) {
+    if (!this.stats?.hasheous_enabled) return;
+    if (this._retryTimer || this._autoRetries >= MAX_AUTO_RETRIES) return;
+    this._autoRetries += 1;
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
+      this.hydrateAndMatch(paths).catch(() => {});
+    }, ATTEMPT_RETRY_MS);
   }
 
   /**

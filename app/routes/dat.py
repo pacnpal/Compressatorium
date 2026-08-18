@@ -110,6 +110,12 @@ class HasheousSettingsRequest(BaseModel):
 # for the sibling `layout` / `conversion` keys).
 HASHEOUS_PREF_KEY = "hasheous"
 
+# The ``error`` a per-file result carries when the remote lookup failed. Named
+# rather than repeated as a literal because the batch job reads it back to tell
+# "the network is down" apart from "the volume is gone" -- two very different
+# things to tell an operator.
+HASHEOUS_ERROR = "hasheous unavailable"
+
 
 async def load_hasheous_override() -> None:
     """Restore the persisted Hasheous toggle. Called once at startup.
@@ -746,6 +752,7 @@ async def _run_match_job(
     #            "error" key in these cases). Informational only.
     errors = 0
     skips = 0
+    hasheous_errors = 0  # subset of `errors` caused by the remote lookup
     # Tri-state: True = success, False = failure, None = cancelled.
     job_success: bool | None = False
     job_error: str | None = None
@@ -802,6 +809,8 @@ async def _run_match_job(
                 # is the discriminator that _hash_one_for_job sets.
                 if result.get("error"):
                     errors += 1
+                    if result["error"] == HASHEOUS_ERROR:
+                        hasheous_errors += 1
                 else:
                     skips += 1
 
@@ -824,9 +833,20 @@ async def _run_match_job(
         # 0 matched" that looks like a DAT-coverage gap.
         if total > 0 and errors == total:
             job_success = False
-            job_error = (
-                f"all {errors} file(s) failed, check volume accessibility"
-            )
+            if hasheous_errors == errors:
+                # Say what actually broke. The files and the volume are fine;
+                # pointing the operator at storage would send them debugging
+                # the wrong thing entirely, and this one recovers by itself.
+                job_error = (
+                    f"all {errors} file(s) failed: Hasheous is unreachable. "
+                    "Your files and volume are fine -- nothing was recorded as "
+                    "unmatched, so re-run this once the service is back "
+                    "(or turn the fallback off in the DAT Library)."
+                )
+            else:
+                job_error = (
+                    f"all {errors} file(s) failed, check volume accessibility"
+                )
         else:
             job_success = True
     except ExternalJobCancelled:
@@ -1219,7 +1239,7 @@ async def _match_single_file(
             # NOT be cached as "unmatched", or a single network blip
             # permanently marks every in-flight file as not in any DAT.
             logger.warning("Hasheous unavailable for %s: %s", file_path, e)
-            return {**base_result, "error": "hasheous unavailable"}
+            return {**base_result, "error": HASHEOUS_ERROR}
         if remote:
             return remote
 

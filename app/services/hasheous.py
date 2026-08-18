@@ -240,6 +240,18 @@ def _fetch_json(url: str) -> dict | None:
     return data
 
 
+def _obj(value) -> dict:
+    """A nested field, defensively.
+
+    Hasheous' documented shape nests objects under ``signature``, ``platform``
+    and ``publisher``, but a malformed or hostile 200 can put a string there.
+    Reaching ``.get`` on that raised ``AttributeError``, which is not
+    ``HasheousUnavailable`` -- so it escaped the match path as a 500 and never
+    opened the cooldown, once per file.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def _text(value) -> str | None:
     """Coerce a Hasheous field that may be a string OR a ``{code: name}`` map.
 
@@ -265,9 +277,9 @@ def _normalize(data: dict) -> dict:
     unknown ``dat_id`` values before writing, so this keeps remote rows stable
     across re-runs instead of relying on that guard.
     """
-    signature = data.get("signature") or {}
-    rom = signature.get("rom") or {}
-    game = signature.get("game") or {}
+    signature = _obj(data.get("signature"))
+    rom = _obj(signature.get("rom"))
+    game = _obj(signature.get("game"))
 
     links = [
         {"source": entry.get("source"), "link": entry.get("link")}
@@ -286,9 +298,9 @@ def _normalize(data: dict) -> dict:
         "game_name": _text(data.get("name")) or _text(game.get("name")),
         "rom_name": _text(rom.get("name")),
         "source": "hasheous",
-        "platform": _text((data.get("platform") or {}).get("name")),
+        "platform": _text(_obj(data.get("platform")).get("name")),
         "publisher": (
-            _text((data.get("publisher") or {}).get("name"))
+            _text(_obj(data.get("publisher")).get("name"))
             or _text(game.get("publisher"))
         ),
         "year": _text(game.get("year")),
@@ -326,7 +338,10 @@ async def lookup(sha1: str) -> dict | None:
         data = await run_in_threadpool(_fetch_json, _lookup_url(normalized))
         record = None
         if data is not None:
-            record = _normalize(data)
+            try:
+                record = _normalize(data)
+            except Exception as exc:  # defensive: a shape _obj didn't foresee
+                raise HasheousUnavailable(f"unreadable response: {exc}") from exc
             if not _is_identified(record):
                 # A 200 with no game identity is not a hit. Hasheous answers an
                 # unknown hash with 404, so this is something else answering

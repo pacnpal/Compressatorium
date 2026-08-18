@@ -1046,3 +1046,76 @@ async def test_size_capped_file_still_gets_its_embedded_hashes_checked(
     assert result["reason"] == "file too large"  # non-cacheable, as before
     remote.assert_awaited_once_with(header)
     hashed.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Fourth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    {"signature": "unavailable"},
+    {"platform": "Commodore 64"},
+    {"publisher": "Epyx"},
+    {"signature": {"rom": "nope", "game": "nope"}},
+    {"metadata": "not-a-list"},
+])
+async def test_malformed_nested_fields_do_not_crash_the_match_path(body, hasheous_on):
+    """A 200 with a string where an object belongs used to raise AttributeError.
+
+    That is not HasheousUnavailable, so it escaped as a 500 and skipped the
+    cooldown -- once per file in a bulk match.
+    """
+    with patch.object(hasheous, "_fetch_json", return_value=body):
+        with pytest.raises(hasheous.HasheousUnavailable):
+            await hasheous.lookup(SAMPLE_SHA1)
+
+    assert hasheous._cooldown_remaining() > 0
+
+
+def test_obj_coerces_non_objects():
+    assert hasheous._obj({"a": 1}) == {"a": 1}
+    for bad in ("str", 5, None, [1, 2]):
+        assert hasheous._obj(bad) == {}
+
+
+@pytest.mark.asyncio
+async def test_normalization_crash_becomes_unavailable(hasheous_on, monkeypatch):
+    """Belt and braces for a shape _obj didn't foresee."""
+    def _boom(_data):
+        raise TypeError("something unforeseen")
+
+    monkeypatch.setattr(hasheous, "_normalize", _boom)
+
+    with patch.object(hasheous, "_fetch_json", return_value={"id": 1}):
+        with pytest.raises(hasheous.HasheousUnavailable, match="unreadable"):
+            await hasheous.lookup(SAMPLE_SHA1)
+
+    assert hasheous._cooldown_remaining() > 0
+
+
+def test_hasheous_error_marker_is_shared():
+    """The job reads this back to tell a network outage from a dead volume."""
+    assert dat_routes.HASHEOUS_ERROR == "hasheous unavailable"
+
+
+@pytest.mark.asyncio
+async def test_all_files_failing_on_hasheous_does_not_blame_the_volume(
+    hasheous_on, monkeypatch,
+):
+    """The operator must not be sent to debug storage over a network outage."""
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: False)
+    monkeypatch.setattr(
+        dat_routes, "compute_file_sha1", AsyncMock(return_value=SAMPLE_SHA1),
+    )
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        hasheous, "lookup",
+        AsyncMock(side_effect=hasheous.HasheousUnavailable("timed out")),
+    )
+
+    result = await dat_routes._match_single_file("/x.iso")
+
+    # This exact marker is what the all-failed branch keys off.
+    assert result["error"] == dat_routes.HASHEOUS_ERROR

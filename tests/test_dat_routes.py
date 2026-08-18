@@ -1333,6 +1333,75 @@ async def test_run_match_job_marks_failure_when_all_files_error(
 
 
 @pytest.mark.asyncio
+async def test_run_match_job_names_hasheous_instead_of_blaming_the_volume(
+    tmp_path, isolated_dat_store, monkeypatch,
+):
+    """A remote outage fails every file, but the volume is fine.
+
+    Reporting "check volume accessibility" would send the operator off
+    debugging storage for a network condition that recovers on its own.
+    """
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    async def remote_down(path, *, cancel_event=None):
+        return (
+            {"path": path, "matched": False, "error": dat_routes.HASHEOUS_ERROR},
+            False,
+        )
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", remote_down)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/a", "/b", "/c"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "failed"
+    assert "all 3 file(s) failed" in final.message
+    assert "Hasheous is unreachable" in final.message
+    assert "check volume accessibility" not in final.message
+
+
+@pytest.mark.asyncio
+async def test_run_match_job_mixed_errors_still_blame_the_volume(
+    tmp_path, isolated_dat_store, monkeypatch,
+):
+    """Only an all-Hasheous failure is attributable to Hasheous."""
+    from services.job_manager import job_manager
+
+    scan_job = job_manager.create_external_job(
+        filename="DAT Match",
+        mode=dat_routes.ConversionMode.DAT_MATCH,
+        message="test",
+    )
+    monkeypatch.setattr(dat_routes, "_active_match_job_id", scan_job.id)
+
+    seen = []
+
+    async def mixed(path, *, cancel_event=None):
+        seen.append(path)
+        error = dat_routes.HASHEOUS_ERROR if len(seen) == 1 else "mount offline"
+        return {"path": path, "matched": False, "error": error}, False
+
+    monkeypatch.setattr(dat_routes, "_hash_one_for_job", mixed)
+
+    await dat_routes._run_match_job(
+        job_id=scan_job.id, paths_to_compute=["/a", "/b"],
+    )
+
+    final = job_manager.jobs[scan_job.id]
+    assert final.status.value == "failed"
+    assert "check volume accessibility" in final.message
+
+
+@pytest.mark.asyncio
 async def test_run_match_job_outer_exception_includes_counter_context(
     tmp_path, isolated_dat_store, monkeypatch,
 ):
