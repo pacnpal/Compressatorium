@@ -164,8 +164,9 @@ class DATStore:
 
             # Importing a new DAT invalidates the match cache (a
             # previously-"unmatched" file may now match, or a previously
-            # matched file may now match against a different DAT).
-            session.execute(delete(_db.DATMatch))
+            # matched file may now match against a different DAT) -- except
+            # for remote hits, which the local DATs did not produce.
+            self._invalidate_dat_derived_matches(session)
 
             session.commit()
 
@@ -273,20 +274,7 @@ class DATStore:
                             },
                         )
                         session.execute(stmt)
-            # Importing new DATs invalidates the match cache -- but only the
-            # part of it the DATs are responsible for. A remote (Hasheous) hit
-            # has `dat_id IS NULL` by design and owes nothing to the local DAT
-            # set, so wiping it here permanently discarded a badge that
-            # cached_result_usable() otherwise keeps valid even with the
-            # provider switched off: the recompute would miss locally and cache
-            # "unmatched", and only re-enabling remote disclosure could bring it
-            # back. Unmatched rows still go, since the new DATs may well know
-            # them now.
-            session.execute(
-                delete(_db.DATMatch).where(
-                    or_(_db.DATMatch.dat_id.is_not(None), _db.DATMatch.matched.is_(False))
-                )
-            )
+            self._invalidate_dat_derived_matches(session)
             session.commit()
 
     async def persist(self) -> None:
@@ -403,6 +391,39 @@ class DATStore:
             row = session.get(_db.DATMatch, normalized)
             return dict(row.payload) if row is not None else None
 
+    @staticmethod
+    def _would_downgrade_remote_hit(existing, match: dict) -> bool:
+        """True when writing *match* would replace a remote hit with a non-answer."""
+        if existing is None or not existing.matched:
+            return False
+        if (existing.payload or {}).get("source") != "hasheous":
+            return False
+        if match.get("matched"):
+            return False
+        # An unmatched verdict only supersedes a remote hit if the remote
+        # source was actually asked this time.
+        return not match.get("checked_remote")
+
+    def _invalidate_dat_derived_matches(self, session) -> None:
+        """Drop the part of the match cache the local DATs are responsible for.
+
+        A new/refreshed DAT set can change any verdict it produced, and can
+        turn a previous miss into a hit -- so DAT-derived hits and cached
+        misses both go. A *remote* (Hasheous) hit has ``dat_id IS NULL`` and
+        owes nothing to the local DATs, so it stays: deleting it stranded the
+        badge permanently once the provider was switched off, since the
+        recompute would then miss locally and cache "unmatched".
+
+        Shared by both import paths on purpose. It lived only in
+        ``_persist_sync`` at first, which left ``_import_dat_sync`` (the
+        user-uploaded-DAT path) still wiping everything.
+        """
+        session.execute(
+            delete(_db.DATMatch).where(
+                or_(_db.DATMatch.dat_id.is_not(None), _db.DATMatch.matched.is_(False))
+            )
+        )
+
     def _upsert_match_sync(self, file_path: str, match: dict) -> None:
         normalized = self._normalize(file_path)
         with self._session() as session:
@@ -415,6 +436,21 @@ class DATStore:
                     dat_id = None
             payload = dict(match)
             existing = session.get(_db.DATMatch, normalized)
+            if self._would_downgrade_remote_hit(existing, match):
+                # The post-sync rematch re-runs every previously-matched path.
+                # With Hasheous off, a path whose only identity came from the
+                # remote source misses locally and would be written back as
+                # "unmatched", undoing the preservation above -- so the
+                # selective invalidation alone was not enough end to end.
+                #
+                # Refused here rather than at each caller: the batch route, the
+                # background job and the scan all write through this one place.
+                # A file that genuinely changed is removed by
+                # routes.dat.drop_if_content_changed(), which deletes rather
+                # than downgrading, and a miss recorded while the remote source
+                # *was* consulted carries `checked_remote` and is allowed
+                # through.
+                return
             if existing is not None:
                 existing.matched = bool(match.get("matched", False))
                 existing.dat_id = dat_id

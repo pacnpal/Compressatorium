@@ -1997,3 +1997,73 @@ async def test_a_dat_sync_keeps_remote_hits(tmp_path):
     assert survived["game_name"] == "Remote Game"
     assert store.get_match(local_path) is None, "a DAT-derived hit survived the sync"
     assert store.get_match(miss_path) is None, "a cached miss survived the sync"
+
+
+# ---------------------------------------------------------------------------
+# Nineteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_user_dat_import_keeps_remote_hits(tmp_path):
+    """The other import path was still wiping everything.
+
+    Round 18 fixed `_persist_sync` (the MAMERedump sync path) and left
+    `_import_dat_sync` (a user-uploaded DAT) deleting every row, so the same
+    bug survived via the other door.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    remote_path, miss_path = "/vol/remote.chd", "/vol/miss.iso"
+
+    await store.import_dat(SAMPLE_DAT_XML)
+    await store.set_match(remote_path, {
+        "path": remote_path, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+    await store.set_match(miss_path, {"path": miss_path, "matched": False})
+
+    await store.import_dat(SAMPLE_DAT_XML)  # second import triggers invalidation
+
+    survived = store.get_match(remote_path)
+    assert survived is not None, "a user DAT import destroyed a remote hit"
+    assert survived["game_name"] == "Remote Game"
+    assert store.get_match(miss_path) is None, "a cached miss survived the import"
+
+
+@pytest.mark.asyncio
+async def test_a_local_miss_cannot_overwrite_a_remote_hit(tmp_path):
+    """The post-sync rematch re-runs every previously-matched path.
+
+    With Hasheous off, a path whose identity came only from the remote source
+    misses locally and would be written back as "unmatched" -- undoing the
+    selective invalidation. Preserving the row was not enough end to end.
+    """
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+    path = "/vol/remote.chd"
+    await store.set_match(path, {
+        "path": path, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+
+    # What _match_single_file returns with Hasheous off and no local hit.
+    await store.set_match(path, {"path": path, "matched": False, "checked_remote": None})
+
+    kept = store.get_match(path)
+    assert kept is not None and kept["matched"] is True, (
+        "an unconsulted local miss clobbered a remote hit"
+    )
+    assert kept["game_name"] == "Remote Game"
+
+    # ...but a miss recorded while the remote source WAS consulted supersedes it.
+    await store.set_match(path, {
+        "path": path, "matched": False, "checked_remote": "https://hasheous.org",
+    })
+    assert store.get_match(path)["matched"] is False, (
+        "a genuine remote miss failed to supersede the stale hit"
+    )
