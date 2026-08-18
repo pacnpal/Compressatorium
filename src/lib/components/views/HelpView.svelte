@@ -346,7 +346,9 @@
       A lookup that times out is reported as an error rather than recorded as "no match",
       so a network blip can't permanently mark your library unmatched. Cover art and
       descriptions aren't fetched — those Hasheous endpoints need an API key — but the
-      match links out to IGDB, TheGamesDB and RetroAchievements if you want them. Point
+      tooltip names which databases list the game (IGDB, TheGamesDB, RetroAchievements),
+      and the URLs themselves come back from
+      <code>/api/dat/matches/lookup</code>. Point
       <code>COMPRESSATORIUM_HASHEOUS_URL</code> at your own instance to keep lookups on
       your network.
     </p>

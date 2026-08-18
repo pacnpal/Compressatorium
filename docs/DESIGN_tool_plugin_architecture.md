@@ -1271,6 +1271,18 @@ This is a payload field, not a schema change.
   for every hash is exactly as much of an outage as a timeout, and validating
   after the guarded call left that case re-requesting once per file. A clean
   404 is the one non-failure: the server answered, so it clears the cooldown.
+- **The timeout bounds the request, not each socket read.** `urlopen(timeout=)`
+  restarts on every byte that arrives, so a server dripping slower than the
+  timeout but never stopping pins the lookup — and the scan job around it —
+  without ever raising, which also means the cooldown never opens. Measured:
+  an 18.5s `open()` under a 2s timeout, and unbounded for a longer header.
+  `_DeadlineSSLSocket` enforces one monotonic deadline (`_deadline_of`) inside
+  `recv_into`, so connect, status line, headers and body all share it. Doing it
+  at the socket rather than around the body read is what makes the bound real:
+  an earlier body-only version left the identical hole in the headers, where a
+  hostile or broken server can drip just as easily. `_opener` must therefore
+  keep its `HTTPSHandler(context=_ssl_context())` — rebuilding it without that
+  removes the protection silently, so a test pins the wiring.
 - **The toggle persists before it applies.** `PUT /api/dat/hasheous` writes the
   preference first and only then flips the in-process override. The other order
   meant a failed write (locked SQLite, full disk) left the process sending

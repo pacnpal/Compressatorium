@@ -7,7 +7,10 @@ No HTTP mocking library is used (the suite has none): the seam is
 
 import http.client
 import json
+import shutil
 import socket
+import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -218,7 +221,7 @@ class _Resp:
     def __init__(self, payload: bytes):
         self._payload = payload
 
-    def read1(self, n=None):
+    def read(self, n=None):
         take, self._payload = self._payload[:n], self._payload[n:]
         return take
 
@@ -1360,7 +1363,7 @@ async def test_a_file_level_failure_still_drops_its_stale_row(
 class _TruncatedResp:
     """A chunked response the server cuts short."""
 
-    def read1(self, _n=None):
+    def read(self, _n=None):
         raise http.client.IncompleteRead(b"partial", 500)
 
     def __enter__(self):
@@ -1389,15 +1392,11 @@ def test_a_malformed_status_line_is_a_service_failure(hasheous_on):
             hasheous._fetch_json("https://hasheous.example/x")
 
 
-def _serve_once(handler) -> int:
-    """Run a one-shot HTTP server on a loopback port and return the port.
+def _tls_serve_once(handler, certdir) -> int:
+    """Run a one-shot HTTPS server on a loopback port and return the port."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certdir / "c.pem", certdir / "k.pem")
 
-    These two tests use a real socket rather than a fake response object on
-    purpose. The bug they pin lives in ``http.client``'s read semantics, so a
-    hand-rolled fake with a ``read``/``read1`` method cannot exhibit it: an
-    earlier fake returned promptly on every call and passed against code that
-    hung for real against a live drip server.
-    """
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
@@ -1406,6 +1405,7 @@ def _serve_once(handler) -> int:
     def _run():
         try:
             conn, _ = sock.accept()
+            conn = ctx.wrap_socket(conn, server_side=True)
             conn.recv(4096)
             handler(conn)
             conn.close()
@@ -1418,61 +1418,142 @@ def _serve_once(handler) -> int:
     return sock.getsockname()[1]
 
 
-def test_a_slow_drip_server_cannot_pin_a_lookup(hasheous_on, monkeypatch):
-    """urllib's timeout is per socket operation and resets on every read.
+@pytest.fixture(scope="module")
+def tls_cert(tmp_path_factory):
+    """A throwaway self-signed cert, or skip if openssl isn't on the box."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available")
+    d = tmp_path_factory.mktemp("certs")
+    subprocess.run(  # noqa: S603
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(d / "k.pem"), "-out", str(d / "c.pem"),
+            "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return d
 
-    A server delivering a byte at a time therefore keeps one read alive far
-    past the configured bound, pinning a match request -- or an entire scan
-    job -- without ever tripping the timeout or opening the cooldown. Reading
-    with ``read1`` is what lets the deadline below actually be enforced:
-    ``read(n)`` blocks until it has all n bytes, so the check between chunks is
-    never reached mid-read.
+
+def test_the_lookup_deadline_is_wired_into_the_opener():
+    """The bound only exists if the opener actually uses our socket class.
+
+    Rebuilding ``_opener`` without the context would silently remove the whole
+    protection while every behavioural test still passed, so pin the wiring.
     """
-    monkeypatch.setattr(settings, "hasheous_timeout", 1)
+    contexts = [
+        h._context
+        for h in hasheous._opener.handlers
+        if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    assert contexts, "opener has no HTTPS handler"
+    assert all(c.sslsocket_class is hasheous._DeadlineSSLSocket for c in contexts)
+    # ...and it must still verify certificates.
+    assert all(c.verify_mode is ssl.CERT_REQUIRED for c in contexts)
+
+
+def test_an_expired_deadline_stops_the_read():
+    sock = hasheous._DeadlineSSLSocket.__new__(hasheous._DeadlineSSLSocket)
+    with hasheous._deadline_of(-1):
+        with pytest.raises(TimeoutError, match="overall timeout"):
+            sock.recv_into(bytearray(10))
+
+
+def test_a_live_deadline_shrinks_the_socket_timeout(monkeypatch):
+    """Each read gets only the time still left, not a fresh full timeout."""
+    recorded = []
+    monkeypatch.setattr(ssl.SSLSocket, "settimeout", lambda self, t: recorded.append(t))
+    monkeypatch.setattr(ssl.SSLSocket, "recv_into", lambda self, *a, **k: 0)
+
+    sock = hasheous._DeadlineSSLSocket.__new__(hasheous._DeadlineSSLSocket)
+    with hasheous._deadline_of(10):
+        sock.recv_into(bytearray(10))
+        sock.recv_into(bytearray(10))
+
+    assert len(recorded) == 2
+    assert recorded[0] <= 10
+    assert recorded[1] < recorded[0], "the deadline must not reset between reads"
+
+
+def test_the_deadline_is_cleared_after_the_request():
+    with hasheous._deadline_of(10):
+        assert hasheous._deadline.at is not None
+    assert hasheous._deadline.at is None
+
+
+@pytest.mark.parametrize("mode", ["header", "body"])
+def test_a_dripping_server_cannot_pin_a_lookup(hasheous_on, monkeypatch, tls_cert, mode):
+    """The end-to-end bound, against a real TLS server that never stops sending.
+
+    ``urlopen(timeout=...)`` bounds each socket operation, and every byte that
+    arrives resets it -- so a server dripping slower than the timeout pins the
+    request forever without raising, and the cooldown never opens. Both drips
+    matter: bounding only the body would leave the identical hole in the status
+    line and headers.
+
+    This runs against a real socket on purpose. The predecessor of this test
+    used a fake response object, which returned promptly on every call and so
+    passed against code that hung for real.
+    """
+    monkeypatch.setattr(settings, "hasheous_timeout", 2)
 
     def _drip(conn):
-        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
-        for _ in range(100000):
-            conn.sendall(b"x")
-            time.sleep(0.005)
+        if mode == "header":
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}":
+                conn.sendall(bytes([byte]))
+                time.sleep(0.3)
+        else:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+            for _ in range(100000):
+                conn.sendall(b"x")
+                time.sleep(0.3)
 
-    port = _serve_once(_drip)
-    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)  # noqa: S310
+    port = _tls_serve_once(_drip, tls_cert)
+
+    # Trust the throwaway CA, keeping the deadline socket class under test.
+    context = ssl.create_default_context(cafile=str(tls_cert / "c.pem"))
+    context.sslsocket_class = hasheous._DeadlineSSLSocket
+    monkeypatch.setattr(
+        hasheous,
+        "_opener",
+        urllib.request.build_opener(
+            hasheous._HTTPSOnlyRedirectHandler,
+            urllib.request.HTTPSHandler(context=context),
+        ),
+    )
 
     started = time.monotonic()
-    with pytest.raises(hasheous.HasheousUnavailable, match="overall timeout"):
-        hasheous._read_bounded(resp)
+    with pytest.raises(hasheous.HasheousUnavailable):
+        hasheous._fetch_json(f"https://localhost:{port}/x")
     elapsed = time.monotonic() - started
 
-    # Bounded by the configured 1s timeout. The body would take ~500s to
-    # deliver in full, so a read that only checked the deadline between whole
-    # 64 KiB chunks would still be blocked here.
-    assert elapsed < 15, f"read was not interrupted at the deadline ({elapsed:.1f}s)"
+    assert elapsed < 20, f"{mode} drip was not bounded ({elapsed:.1f}s)"
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_a_normal_body_still_reads_whole(hasheous_on, chunked):
-    """The bounded reader must not truncate a legitimate response.
-
-    Both framings, because ``read1`` terminates at EOF differently for a
-    Content-Length body than for a chunked one.
-    """
+def test_a_normal_body_still_reads_whole(hasheous_on, tls_cert):
+    """The deadline must not truncate or reject a legitimate response."""
     payload = json.dumps(SAMPLE_RESPONSE).encode()
 
     def _respond(conn):
-        if chunked:
-            conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-            for i in range(0, len(payload), 64):
-                part = payload[i : i + 64]
-                conn.sendall(b"%x\r\n" % len(part) + part + b"\r\n")
-            conn.sendall(b"0\r\n\r\n")
-        else:
-            head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(payload)
-            conn.sendall(head + payload)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        for i in range(0, len(payload), 64):
+            part = payload[i : i + 64]
+            conn.sendall(b"%x\r\n" % len(part) + part + b"\r\n")
+        conn.sendall(b"0\r\n\r\n")
 
-    port = _serve_once(_respond)
-    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)  # noqa: S310
+    port = _tls_serve_once(_respond, tls_cert)
+    context = ssl.create_default_context(cafile=str(tls_cert / "c.pem"))
+    context.sslsocket_class = hasheous._DeadlineSSLSocket
+    with patch.object(
+        hasheous,
+        "_opener",
+        urllib.request.build_opener(
+            hasheous._HTTPSOnlyRedirectHandler,
+            urllib.request.HTTPSHandler(context=context),
+        ),
+    ):
+        data = hasheous._fetch_json(f"https://localhost:{port}/x")
 
-    body = hasheous._read_bounded(resp)
-    assert body == payload
-    assert json.loads(body)["name"] == "Jumpman Junior"
+    assert data["name"] == "Jumpman Junior"

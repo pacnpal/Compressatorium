@@ -206,7 +206,7 @@ over four hours re-learning the same fact once per file.
 |---|---|---|
 | `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Starting state of the master switch. The **DAT Library** toggle overrides it and persists. |
 | `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
-| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Per-request timeout in seconds. This call sits in the file-browse path, so keep it short. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, covering connect, headers and body — not per socket read, so a slow-dripping server can't stall a scan. This call sits in the file-browse path, so keep it short. |
 
 Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
 accepted as aliases.
@@ -1502,7 +1502,7 @@ The Web UI communicates with a REST API that can also be used directly. Interact
 | `MATCH_MAX_FILE_SIZE` | `0` | Skip DAT hash-matching for files larger than this many bytes (0 disables the cap). Set e.g. `2147483648` on slow storage to keep 8 GB ISOs from blocking the browse-triggered matcher. |
 | `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Look hashes up at [Hasheous](https://hasheous.org) when the imported DATs don't recognise them. **Off by default**: enabling it sends the SHA1 of your files to a third-party service. Local DATs are always tried first, so a covered library makes no network calls. Legacy alias: `HASHEOUS_ENABLED`. |
 | `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Base URL of the Hasheous server. Hasheous is open source and self-hostable — point this at your own instance to keep lookups on your network. Must be `https`. Legacy alias: `HASHEOUS_URL`. |
-| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Per-request timeout in seconds for Hasheous lookups. This call sits in the file-browse path, so keep it short. Legacy alias: `HASHEOUS_TIMEOUT`. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds for Hasheous lookups, covering connect, headers and body. This call sits in the file-browse path, so keep it short. Legacy alias: `HASHEOUS_TIMEOUT`. |
 | `MAX_JOB_HISTORY` | `500` | Maximum finished jobs (completed + failed + cancelled) to retain in history. Past the cap the oldest are dropped, but the Jobs tab badges still report the true total — the panel says how many of them are still listed. |
 | `COMPRESSATORIUM_TOOL_NICE` | `10` | Nice level for every conversion tool (0-19, higher = lower priority). Legacy alias: `CHD_CHDMAN_NICE`. |
 | `COMPRESSATORIUM_TOOL_IOPRIO_CLASS` | `2` | I/O priority class for every tool (`1` realtime, `2` best-effort, `3` idle). Legacy alias: `CHD_CHDMAN_IOPRIO_CLASS`. |

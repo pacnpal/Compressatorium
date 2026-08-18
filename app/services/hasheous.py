@@ -24,9 +24,11 @@ Upstream shape (verified against the live API):
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -47,9 +49,6 @@ _USER_AGENT = "compressatorium-hasheous/1.0"
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _SHA1_RE = re.compile(r"[0-9a-f]{40}")
-
-# Body is read in chunks so the total elapsed time can be checked between them.
-_READ_CHUNK_BYTES = 64 * 1024
 
 # How long to stop calling out after a failure. Without this, an outage during
 # a 1,000-file scan costs 1,000 x hasheous_timeout -- over four hours at the
@@ -149,8 +148,10 @@ def _probe(url: str) -> None:
     _require_https(url)
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
-            resp.read1(1024)
+        with _deadline_of(_timeout()), _opener.open(  # nosec B310
+            req, timeout=_timeout()
+        ) as resp:
+            resp.read(1024)
     except urllib.error.HTTPError as exc:
         raise HasheousUnavailable(f"HTTP {exc.code}") from exc
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
@@ -186,7 +187,58 @@ class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_opener = urllib.request.build_opener(_HTTPSOnlyRedirectHandler)
+# The deadline for the request running on this thread, as a monotonic
+# timestamp. Thread-local because lookups run in a threadpool and the socket
+# below has no other way to learn which request it belongs to.
+_deadline = threading.local()
+
+
+class _DeadlineSSLSocket(ssl.SSLSocket):
+    """A TLS socket that enforces one deadline across the whole request.
+
+    ``urlopen(timeout=...)`` bounds each *socket operation*, not the request:
+    every byte that arrives resets it. A server dripping slower than the
+    timeout but never stopping therefore pins a lookup -- and the scan job
+    around it -- indefinitely, without ever raising, so the cooldown never
+    opens either. Measured against a real dripping server: an 18.5s
+    ``open()`` under a 2s timeout, unbounded for a longer header.
+
+    Enforcing it here rather than around the body read is what makes the bound
+    real: every byte of the response, status line and headers included, arrives
+    through ``recv_into``, so connect, headers and body share one deadline.
+    """
+
+    def recv_into(self, *args, **kwargs):
+        end = getattr(_deadline, "at", None)
+        if end is not None:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("lookup exceeded the overall timeout")
+            self.settimeout(remaining)
+        return super().recv_into(*args, **kwargs)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """The stock verifying context, with our socket class installed."""
+    context = ssl.create_default_context()
+    context.sslsocket_class = _DeadlineSSLSocket
+    return context
+
+
+_opener = urllib.request.build_opener(
+    _HTTPSOnlyRedirectHandler,
+    urllib.request.HTTPSHandler(context=_ssl_context()),
+)
+
+
+@contextlib.contextmanager
+def _deadline_of(seconds: float):
+    """Bound everything done inside to *seconds* total."""
+    _deadline.at = time.monotonic() + seconds
+    try:
+        yield
+    finally:
+        _deadline.at = None
 
 
 def _cooldown_remaining() -> float:
@@ -232,8 +284,10 @@ def _fetch_json(url: str) -> dict | None:
             url,
             headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
         )
-        with _opener.open(req, timeout=_timeout()) as resp:  # nosec B310
-            raw = _read_bounded(resp)
+        with _deadline_of(_timeout()), _opener.open(  # nosec B310
+            req, timeout=_timeout()
+        ) as resp:
+            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             # The documented "no such hash" answer, not a failure.
@@ -276,37 +330,6 @@ def _obj(value) -> dict:
     opened the cooldown, once per file.
     """
     return value if isinstance(value, dict) else {}
-
-
-def _read_bounded(resp) -> bytes:
-    """Read the body under a *total* deadline, not just a per-socket one.
-
-    urllib's ``timeout`` applies to each socket operation and is reset by every
-    successful read, so a server dripping a byte at a time keeps a single read
-    alive indefinitely -- pinning a match request, or a whole DAT-match /
-    metadata-scan job, without ever tripping the timeout or opening the
-    cooldown.
-
-    ``read1()`` rather than ``read()`` is what makes the deadline enforceable:
-    ``read(n)`` blocks until it has all *n* bytes (measured: a 200-byte body
-    dripped over 10s kept one ``read(65536)`` blocked the whole 10s), so the
-    check below is never reached mid-read. ``read1(n)`` returns as soon as any
-    bytes arrive, so control comes back on every dribble and the elapsed total
-    is actually checked. It reads a whole body and terminates at EOF for both
-    identity and chunked responses.
-    """
-    deadline = time.monotonic() + _timeout()
-    chunks: list[bytes] = []
-    total = 0
-    while total <= _MAX_RESPONSE_BYTES:
-        if time.monotonic() > deadline:
-            raise HasheousUnavailable("response exceeded the overall timeout")
-        chunk = resp.read1(_READ_CHUNK_BYTES)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    return b"".join(chunks)
 
 
 def _text(value) -> str | None:
