@@ -198,6 +198,18 @@
   queued re-match and says so in the log; those files keep their current
   verdicts until you browse them or run a rescan.
 
+- **A replaced file is now recognised whatever hash identified it.** Pruning a
+  stale badge only ever compared plain file checksums, so formats matched on a
+  hash the tool reports — a Dolphin disc hash, a CHD's embedded hashes — kept
+  the old game's name after the file was swapped. Oversized files were in the
+  same position from the other direction: their embedded hashes *were*
+  recomputed, but were being thrown away before anything could use them.
+
+- **Enabling *or disabling* Hasheous in one browser tab now reaches the
+  others.** The previous fix only carried the switch one way: a tab noticed the
+  fallback being turned on, but stopped watching afterwards, so turning it off
+  and on again elsewhere left that tab matching nothing until a reload.
+
 - **Enabling Hasheous in one browser tab now reaches the others.** On a setup
   with no DATs imported, a tab already sitting on the workspace had decided
   nothing could identify files and never asked again — so turning the fallback

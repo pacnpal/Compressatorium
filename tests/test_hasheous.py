@@ -3407,3 +3407,119 @@ async def test_a_chd_container_hash_still_cannot_disprove_an_embedded_hit(tmp_pa
     assert store.get_match(path)["game_name"] == "Kept Game", (
         "a container hash was compared against an embedded one"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thirty-third review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_outage_rescan_prunes_a_replaced_rvz(tmp_path):
+    """The scan's pruner compares in the row's own domain too.
+
+    It demanded a stored ``file_sha1``, which an exhaustive format never has --
+    so a forced rescan during an outage recomputed a fresh
+    ``dolphin_disc_sha1``, held the proof in its hand, and left the previous
+    game's badge in place.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY
+
+    path = "/vol/game.rvz"
+    stored = {
+        "matched": True, "game_name": "Old Game",
+        "match_type": "dolphin_disc_sha1", "file_hash": "a" * 40,
+    }
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(path, {
+            "error": dat_routes.HASHEOUS_ERROR,
+            CANDIDATE_HASHES_KEY: [("b" * 40, "dolphin_disc_sha1")],
+        })
+    delete.assert_awaited_once_with(path)
+
+
+@pytest.mark.asyncio
+async def test_an_outage_rescan_keeps_an_unchanged_rvz(tmp_path):
+    """...and an identical disc hash is still not proof of anything."""
+    from services.dat_store import CANDIDATE_HASHES_KEY
+
+    path = "/vol/game.rvz"
+    stored = {
+        "matched": True, "game_name": "Kept Game",
+        "match_type": "dolphin_disc_sha1", "file_hash": "a" * 40,
+    }
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(path, {
+            "error": dat_routes.HASHEOUS_ERROR,
+            CANDIDATE_HASHES_KEY: [("a" * 40, "dolphin_disc_sha1")],
+        })
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_container_hash_still_cannot_prune_an_embedded_chd_hit():
+    """The cross-domain refusal the shared helper must keep.
+
+    A CHD hit is stored against ``chd_sha1``; a rescan recomputes the container
+    ``file_sha1``. Comparing them deletes valid badges, which is the bug the
+    original narrow rule existed to prevent.
+    """
+    path = "/vol/game.chd"
+    stored = {
+        "matched": True, "game_name": "Kept Game",
+        "match_type": "chd_sha1", "file_hash": "a" * 40,
+    }
+    with patch("services.dat_store.dat_store.get_match", return_value=stored), \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(
+            path, {"error": dat_routes.HASHEOUS_ERROR, "file_hash": "f" * 40},
+        )
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_result_with_no_hashes_never_touches_the_store():
+    """No evidence means no comparison, and the check runs per file per rescan."""
+    with patch("services.dat_store.dat_store.get_match") as get_match, \
+         patch("services.dat_store.dat_store.delete_match", new=AsyncMock()) as delete:
+        await dat_routes.drop_if_content_changed(
+            "/vol/big.iso", {"reason": "file too large"},
+        )
+    get_match.assert_not_called()
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_capped_file_still_carries_the_hashes_it_did_recompute(
+    hasheous_on, monkeypatch,
+):
+    """A size-capped result is non-cacheable, not evidence-free.
+
+    A large CHD's container SHA1 is never read, but its embedded hashes are --
+    and those are exactly what proves a swap to the scan's pruner. The
+    local-only exit returned the bare ``reason`` result and threw them away.
+    """
+    from services.dat_store import CANDIDATE_HASHES_KEY
+
+    header = "a" * 40
+
+    class _Chd:
+        embedded_hash_is_exhaustive = False
+
+        async def embedded_hashes(self, path, *, cancel_event=None):
+            return [(header, "chd_sha1")]
+
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Chd())
+    monkeypatch.setattr(dat_routes, "_local_dat_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(settings, "match_max_file_size", 1)
+    monkeypatch.setattr(dat_routes.os.path, "getsize", lambda _p: 10_000_000_000)
+
+    result = await dat_routes._match_single_file("/vol/big.chd", local_only=True)
+
+    assert result["reason"] == "file too large"
+    assert result[CANDIDATE_HASHES_KEY] == [(header, "chd_sha1")], (
+        "the capped result dropped the embedded hashes it did recompute"
+    )

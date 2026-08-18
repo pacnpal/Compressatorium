@@ -1,6 +1,7 @@
 // DAT matching store, wraps /api/dat endpoints. Caches per-path match
 // results so FileList rows can render badges without per-row fetches.
 
+import { untrack } from 'svelte';
 import { SvelteMap } from 'svelte/reactivity';
 import { api } from '$lib/api/endpoints.js';
 
@@ -17,11 +18,11 @@ const ATTEMPT_RETRY_MS = 90_000;
 // otherwise re-spawn a no-op job every interval for as long as the tab is open.
 const MAX_AUTO_RETRIES = 2;
 
-// How often the workspace re-asks whether anything can answer a hash lookup,
-// while the answer is still "no". Only that state polls (see
-// watchMatchingAvailability), so this is the interval of an install that is
-// not matching anything anyway -- long enough to be free, short enough that
-// enabling Hasheous from another tab takes effect on its own.
+// How often the workspace re-asks which sources can answer a hash lookup, so
+// a provider toggled in another tab (or through the API) reaches this one.
+// Both directions matter, so this runs for as long as the workspace is
+// mounted: one small /dat/stats a minute, against a change that otherwise
+// needs a reload to notice.
 const AVAILABILITY_POLL_MS = 60_000;
 
 class DATMatchingStore {
@@ -88,9 +89,14 @@ class DATMatchingStore {
    * every hydration returned before starting a job, until this tab happened to
    * visit the DAT view or was reloaded.
    *
-   * Polled only while unavailable, and stopped the moment something can
-   * answer: that is the sole state a stale reading changes behaviour in, so a
-   * configured install pays nothing.
+   * Runs for as long as the workspace is mounted, in both directions. An
+   * earlier version stopped itself once something could answer a lookup, on
+   * the reasoning that `matchingAvailable === false` is the only state a stale
+   * reading changes behaviour in. That was wrong: a provider *disabled*
+   * elsewhere makes this tab merge the backend's now-unmatched rows into
+   * `matches`, and stopping meant a later re-enable was never noticed -- those
+   * paths count as known and are never matched again. One transition healed,
+   * the other made permanent.
    *
    * A field plus methods rather than a closure returning its own teardown --
    * the same shape `_retryTimer` already uses, so both of this store's timers
@@ -109,14 +115,9 @@ class DATMatchingStore {
   }
 
   async _recheckAvailability() {
-    if (this.matchingAvailable) {
-      this.stopWatchingAvailability();
-      return;
-    }
-    // Swallowed: a transient /dat/stats failure leaves matchingAvailable
-    // false, which is exactly the state that keeps this polling.
+    // Swallowed: /dat/stats failing is not this poll's problem to report, and
+    // refreshMatchingAvailability() has already recorded what it could.
     await this.refreshMatchingAvailability().catch(() => {});
-    if (this.matchingAvailable) this.stopWatchingAvailability();
   }
 
   async refreshMatchingAvailability() {
@@ -256,10 +257,23 @@ class DATMatchingStore {
     // Plain array of pairs, not a Map: this is a throwaway local snapshot with
     // no lookups, and svelte/prefer-svelte-reactivity flags built-in Maps (the
     // same reason _attemptedPaths is a plain object).
-    const before = [];
-    for (const path of paths) {
-      if (this.matches.has(path)) before.push([path, this.matches.get(path)]);
-    }
+    //
+    // untrack: this reads the reactive map, and hydrate() is entered
+    // synchronously from the file list's $effect -- so without it the effect
+    // subscribes to exactly the entries this function is about to overwrite.
+    // The response installs freshly deserialized objects (new identities even
+    // when logically identical), which invalidates that subscription, re-runs
+    // the effect, and hydrates again: a folder holding any cached match
+    // requested in a loop for as long as it stayed on screen. The effect
+    // already tracks what it means to track -- `datMatchTerminalCount` and
+    // `matchingAvailable` -- and must not also track the cache it is filling.
+    const before = untrack(() => {
+      const snapshot = [];
+      for (const path of paths) {
+        if (this.matches.has(path)) snapshot.push([path, this.matches.get(path)]);
+      }
+      return snapshot;
+    });
     try {
       const data = await api.getMatchCache(paths);
       if (generation !== this._generation) return;

@@ -184,7 +184,15 @@
     // Track explicitly so the effect re-runs on dat_match completion.
     datMatchTerminalCount;
     const allPaths = entries.map((e) => e?.path).filter(Boolean);
-    if (allPaths.length === 0) return;
+    if (allPaths.length === 0) {
+      // Nothing visible, and this component does NOT unmount when a filter or
+      // search empties the list -- so the onDestroy teardown below never runs
+      // and hydrateAndMatch() (which retires a stale timer) is never reached.
+      // A retry armed for the previous view would otherwise fire and start
+      // hashing files nobody is looking at.
+      datMatching.cancelRetry();
+      return;
+    }
     // Hydrate archive-summary badges (member counts, verifiable_by) for the
     // archives on this visible page. Re-runs with this effect on page / sort /
     // filter changes because it reads the same visible `entries`.

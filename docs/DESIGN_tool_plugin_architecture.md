@@ -1475,9 +1475,16 @@ This is a payload field, not a schema change.
   since round 7; the local-only exit was written without it, so one helper now
   serves both.
 
+  Both non-cacheable exits carry it too — a size-capped result never read the
+  container, but the embedded hashes it *did* recompute are exactly what proves
+  a swap to the scan's pruner.
+
   It carries the **whole typed candidate set**, not just `file_sha1`, and the
   comparison keys on the *stored row's own* `match_type` rather than demanding
-  `file_sha1`. That restriction existed for a real reason — a CHD hit is stored
+  `file_sha1`. `dat_store.recomputed_hash_in()` is that lookup, module level
+  because both ends of the rule need it: the store's write guard before
+  overwriting a remote hit, and `routes.dat.drop_if_content_changed()` before
+  deleting a row a non-cacheable result left behind. That restriction existed for a real reason — a CHD hit is stored
   against its embedded `chd_sha1` while a rescan recomputes the container's
   `file_sha1`, and those differ for a file nobody touched, so comparing them
   deleted valid badges. But it was too blunt: an *exhaustive* tool (Dolphin
@@ -1493,10 +1500,15 @@ This is a payload field, not a schema change.
   after mount, so a DAT-less install whose operator enabled Hasheous in a
   second tab sat at `matchingAvailable === false` and started no jobs until
   this tab visited the DAT view or reloaded.
-  `watchMatchingAvailability()` polls it, and *stops itself* the moment
-  something can answer a lookup: that is the only state where a stale reading
-  changes behaviour, so a configured install makes no request at all. The
-  workspace owns the teardown.
+  `watchMatchingAvailability()` polls it for as long as the workspace is
+  mounted. An earlier version stopped once something could answer, on the
+  reasoning that only `matchingAvailable === false` matters — but a provider
+  *disabled* elsewhere makes this tab merge now-unmatched rows into `matches`,
+  and stopping meant a later re-enable was never seen, so those paths stayed
+  "known" forever. One transition healed, the other made permanent; it watches
+  both now. The workspace owns the teardown, and the file list also cancels the
+  retry timer when its visible set empties — filtering to zero entries does not
+  unmount it, so neither the effect's normal path nor `onDestroy` would run.
 - **`matching_available(has_dats)` replaces the bare `has_dats` gates.** Those
   gates predate the remote source and would otherwise short-circuit before it is
   ever reached for an operator who imported no DATs at all. The frontend has the

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from config import settings
 from models import ConversionMode
 from services import hasheous
-from services.dat_store import CANDIDATE_HASHES_KEY, dat_store
+from services.dat_store import CANDIDATE_HASHES_KEY, dat_store, recomputed_hash_in
 from services.file_hasher import compute_file_sha1
 from services.hasheous import HasheousUnavailable
 from services.job_manager import ExternalJobCancelled, job_manager
@@ -1506,19 +1506,31 @@ async def drop_if_content_changed(path: str, result: dict) -> None:
     Acts only on proof, which means comparing like with like: a CHD hit is
     stored against its *embedded* hash (``chd_sha1`` / ``chd_data_sha1``) while
     a rescan recomputes the *container* ``file_sha1``. Those are different hash
-    domains and differ for a perfectly unchanged file, so anything but a stored
-    ``file_sha1`` match is left alone rather than treated as changed.
+    domains and differ for a perfectly unchanged file.
+
+    ``recomputed_hash_in`` is the shared answer to "what did this result
+    recompute in the row's own domain", used here and by the store's write
+    guard. Keying on the stored row's ``match_type`` rather than demanding
+    ``file_sha1`` is what lets an exhaustive format be pruned at all: a
+    replaced RVZ carries a fresh ``dolphin_disc_sha1`` and never a
+    ``file_sha1``, so the narrower rule left it wearing the previous game's
+    badge through an outage rescan.
     """
-    new_hash = result.get("file_hash")
-    if not new_hash:
+    # No recomputed hash of any kind means no claim can be disproved -- and
+    # this runs per file on every forced rescan, so it returns before touching
+    # the store rather than after.
+    if not result.get(CANDIDATE_HASHES_KEY) and not result.get("file_hash"):
         return
     cached = await run_in_threadpool(dat_store.get_match, path)
-    if not cached or cached.get("match_type") != "file_sha1":
-        # Nothing cached, or cached against a different hash domain: no
-        # comparison is possible, so no claim can be disproved.
+    if not cached:
         return
+    stored_type = cached.get("match_type")
     old_hash = cached.get("file_hash")
-    if old_hash and old_hash != new_hash:
+    if not stored_type or not old_hash:
+        # Nothing to compare against: no claim can be disproved.
+        return
+    new_hash = recomputed_hash_in(result, stored_type)
+    if new_hash and new_hash != old_hash:
         logger.info(
             "%s changed since its cached match (%s -> %s); dropping the stale row",
             path, old_hash, new_hash,
@@ -1655,9 +1667,16 @@ async def _match_single_file(
             # the previous game's badge and nothing would ever correct it --
             # the job path never calls drop_if_content_changed(), that is the
             # scan's.
-            if size_capped is not None:
-                return size_capped
-            return _carrying_file_hash(base_result, candidates)
+            # Both exits carry the evidence, the capped one included. Its
+            # result is non-cacheable (``reason``), so the store never sees it
+            # -- but the scan's drop_if_content_changed() does, and for a
+            # large CHD the embedded hashes it *did* recompute are exactly
+            # what proves a swap. Dropping them here left a replaced oversized
+            # file wearing the previous game's badge.
+            return _carrying_file_hash(
+                size_capped if size_capped is not None else base_result,
+                candidates,
+            )
         try:
             remote, consulted = await _remote_lookup_match(
                 file_path, candidates, cancel_event=cancel_event,
@@ -1682,8 +1701,12 @@ async def _match_single_file(
             return _carrying_candidates(remote, candidates)
 
     # A size-capped file was never fully checked, so its miss stays
-    # non-cacheable (``reason``) rather than being recorded as unmatched.
-    return size_capped if size_capped is not None else base_result
+    # non-cacheable (``reason``) rather than being recorded as unmatched -- but
+    # it still carries whatever hashes were recomputed, for the same reason the
+    # local-only exit above does.
+    if size_capped is not None:
+        return _carrying_file_hash(size_capped, candidates) if candidates else size_capped
+    return base_result
 
 
 async def _try_embedded_hash_match(

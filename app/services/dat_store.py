@@ -39,6 +39,30 @@ logger = get_logger("dat_store")
 CANDIDATE_HASHES_KEY = "candidate_hashes"
 
 
+def recomputed_hash_in(match: dict, match_type: str) -> str | None:
+    """The hash *match* recomputed in ``match_type``'s domain, or None.
+
+    Module level, not a method: two callers need it and they are the two ends
+    of the same rule. ``DATStore._proves_content_changed`` uses it before
+    overwriting a remote hit, and ``routes.dat.drop_if_content_changed`` uses
+    it before deleting a row a non-cacheable result left behind. Both are
+    answering "did this file change?", and both have to compare within the
+    domain the row was recorded in -- a CHD stored against its embedded
+    ``chd_sha1`` versus a rescan's container ``file_sha1`` differ for a file
+    nobody touched.
+
+    The typed candidates the route attaches (:data:`CANDIDATE_HASHES_KEY`) are
+    the general answer; the ``file_sha1`` fallback covers a result that carries
+    only the file-level hash with no candidates alongside it.
+    """
+    for sha1, kind in match.get(CANDIDATE_HASHES_KEY) or ():
+        if kind == match_type:
+            return sha1
+    if match_type == "file_sha1":
+        return match.get("file_hash")
+    return None
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -438,23 +462,6 @@ class DATStore:
         return not DATStore._proves_content_changed(existing, match)
 
     @staticmethod
-    def _recomputed_hash_in(match: dict, match_type: str) -> str | None:
-        """The recomputed hash in *match_type*'s domain, or None if there is none.
-
-        The typed candidates the route attached (``CANDIDATE_HASHES_KEY``) are
-        the general answer. The fallback covers the shape a result has when no
-        candidates rode along -- an unmatched result carrying only the
-        file-level hash, which is what the scan's ``drop_if_content_changed()``
-        hands over.
-        """
-        for sha1, kind in match.get(CANDIDATE_HASHES_KEY) or ():
-            if kind == match_type:
-                return sha1
-        if match_type == "file_sha1":
-            return match.get("file_hash")
-        return None
-
-    @staticmethod
     def _proves_content_changed(existing, match: dict) -> bool:
         """True only when a recomputed hash in the row's OWN domain contradicts it.
 
@@ -475,7 +482,7 @@ class DATStore:
         """
         if not existing.file_hash or not existing.match_type:
             return False
-        recomputed = DATStore._recomputed_hash_in(match, existing.match_type)
+        recomputed = recomputed_hash_in(match, existing.match_type)
         return bool(recomputed) and recomputed != existing.file_hash
 
     # A row is a *remote* hit only if it says so. This is the one place the
