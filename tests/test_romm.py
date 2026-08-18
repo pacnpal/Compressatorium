@@ -1444,3 +1444,160 @@ def test_verify_after_is_refused_on_a_mode_that_cannot_verify() -> None:
     extract = romm_auto.normalize_rule({"mode": "extractcd", "verify_after": True})
     assert extract["verify_after"] is False
     assert extract["delete_on_verify"] is False
+
+
+# ----------------------------------------------------------------------
+# third review pass
+# ----------------------------------------------------------------------
+
+
+def test_delete_on_verify_refused_when_the_verify_is_only_structural() -> None:
+    """A mode that *can* verify is not always safely deletable.
+
+    jwud's verify is a structural WUX walk, backed only by JWUDTool's own
+    byte-for-byte pass — which `noverify` turns off. The manual route refuses
+    that combination; an unattended rule must too, or it deletes a 25 GB source
+    on the strength of a geometry check.
+    """
+    from services import romm_auto
+
+    unsafe = romm_auto.normalize_rule({
+        "mode": "jwud_compress", "compression": "noverify", "delete_on_verify": True,
+    })
+    assert unsafe["delete_on_verify"] is False
+    assert unsafe["unsafe_delete_on_verify"] is True
+
+    safe = romm_auto.normalize_rule({
+        "mode": "jwud_compress", "delete_on_verify": True,
+    })
+    assert safe["delete_on_verify"] is True
+    assert safe["unsafe_delete_on_verify"] is False
+
+
+@pytest.mark.asyncio
+async def test_overwrite_never_targets_the_rule_s_own_source(
+    settings_db, tmp_path: Path,
+) -> None:
+    """A conversion must not be authorised to write over its own input.
+
+    RomM rescans what we produce, so a persistent `dolphin_rvz` rule eventually
+    sees the .rvz it made — dolphin accepts .rvz as input and `output_path` maps
+    it straight back onto itself. An `overwrite` rule would then unlink the file
+    before reading it, destroying the only copy once the source ISO was gone.
+    """
+    from services import romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.rvz").write_bytes(b"\0" * 32)
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.rvz",
+        "fs_name": "Game.rvz", "platform_slug": "ngc",
+    }]
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
+        }})
+        result = await romm_auto.sweep(ignore_schedule=True, dry_run=True)
+
+    assert result["queued"] == 0, result
+    assert result["skipped_existing"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rule_defaults_come_from_the_configured_settings(
+    settings_db,
+) -> None:
+    """The documented first-run env defaults must actually reach a new rule."""
+    await settings_db.save({
+        "auto_convert_interval_minutes": 240,
+        "auto_convert_max_per_run": 5,
+        "verify_after_convert": True,
+        "delete_source_after_verify": True,
+    })
+    from services import romm_auto
+
+    fresh = romm_auto.default_rule("dolphin_rvz")
+    assert fresh["interval_minutes"] == 240
+    assert fresh["max_per_run"] == 5
+    assert fresh["verify_after"] is True
+    assert fresh["delete_on_verify"] is True
+
+    # A stored rule that simply omits the field inherits it too, rather than
+    # having it silently forced back off.
+    inherited = romm_auto.normalize_rule({"mode": "dolphin_rvz"})
+    assert inherited["verify_after"] is True
+    assert inherited["delete_on_verify"] is True
+
+    # An explicit False still wins.
+    explicit = romm_auto.normalize_rule({
+        "mode": "dolphin_rvz", "verify_after": False, "delete_on_verify": False,
+    })
+    assert explicit["verify_after"] is False
+    assert explicit["delete_on_verify"] is False
+
+
+@pytest.mark.asyncio
+async def test_abandonment_uses_the_configured_period(settings_db) -> None:
+    """`repin_abandon_days` was documented, persisted, and read by nobody."""
+    from datetime import datetime, timedelta, timezone
+
+    def stamp(days_ago: int) -> str:
+        when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        return when.isoformat().replace("+00:00", "Z")
+
+    await settings_db.save({"repin_abandon_days": 30})
+    assert romm_routes._is_stale(stamp(10)) is False
+    assert romm_routes._is_stale(stamp(31)) is True
+
+    await settings_db.save({"repin_abandon_days": 3})
+    assert romm_routes._is_stale(stamp(10)) is True
+
+
+@pytest.mark.asyncio
+async def test_connection_test_treats_a_cleared_url_as_cleared(
+    settings_db,
+) -> None:
+    """Clearing the URL and pressing Test must not probe the saved one."""
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": "/data/library",
+    })
+    result = await romm_routes.test_romm_connection(
+        romm_routes.RommSettingsPatch(url=""),
+    )
+    assert result["reachable"] is False
+    assert result["error"] == "Set the RomM URL first."
+
+
+def test_re_recording_supersedes_rather_than_mutating(repin_db) -> None:
+    """A settle pass in flight must not settle the row that replaced its own.
+
+    The settler detaches a row id before hashing, which takes minutes for a
+    multi-GB image. Mutating that row meanwhile left the settler marking it
+    done and the re-planned conversion with no pending row at all.
+    """
+    romm_repin.record({"id": 7}, "/vol/Game.rvz", {"igdb_id": 42})
+    first = romm_repin.pending_rows(10)[0][5]
+
+    romm_repin.record({"id": 8}, "/vol/Game.rvz", {"igdb_id": 43})
+    rows = romm_repin.pending_rows(10)
+    # Still exactly one pending row, but it is a *new* one.
+    assert len(rows) == 1
+    second = rows[0][5]
+    assert second != first
+    assert rows[0][3] == {"igdb_id": 43}
+
+    # The in-flight settler finishes against the row it started on: a no-op.
+    romm_repin.settle(first, "done", None, 99)
+    still_pending = romm_repin.pending_rows(10)
+    assert len(still_pending) == 1
+    assert still_pending[0][5] == second

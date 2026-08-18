@@ -342,10 +342,10 @@ hourly while PS2 converts to CHD overnight, ten at a time, largest first.
 | **Only names matching / Skip names matching** | Regex filters — convert only `(USA)`, skip `(Beta)`. |
 | **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. Mutually exclusive. |
 | **If the output already exists** | Skip it, overwrite it, or write `Game_1.rvz` alongside. |
-| **Compression / level** | The codec and level for modes that take them. |
+| **Compression / level** | The codec and level for modes that take them — the same registry-driven controls the convert panel uses, so chdman offers its codec chips and Dolphin/NSZ/CSO a codec plus level. |
 | **Split into 4 GB parts** | For FAT32 targets, where the mode supports it. |
 | **Verify each converted file** | Check the output; the source is kept. |
-| **Delete source after verify** | Offered only for modes that support it. Verifies first. |
+| **Delete source after verify** | Offered only for modes that support it. Verifies first, and is refused outright where the verify is too weak to justify it (a Wii U rule with `noverify`). |
 | **Timezone** | The window and weekday mask are evaluated here — your browser's zone by default, so `22:00` means 22:00 where you are, and DST is handled. |
 
 Only formats the platform can actually use are offered: a GameCube rule lists
@@ -393,6 +393,12 @@ and anything RomM hasn't scanned yet just waits for the next attempt.
 | Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. Off silences both the manual and the automatic path. |
 | Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |
 | Retire unmatched after | 7 days | Give up on a saved re-pin whose output never appeared. |
+
+`ROMM_AUTO_CONVERT_INTERVAL_MINUTES`, `ROMM_AUTO_CONVERT_MAX_PER_RUN`,
+`ROMM_VERIFY_AFTER_CONVERT` and `ROMM_DELETE_SOURCE_AFTER_VERIFY` seed the
+defaults a *new* platform rule starts from, so a deployment can ship a house
+policy without configuring each platform by hand. A rule that sets the field
+explicitly keeps its own value.
 
 Clearing the token in **Settings** clears it for good: a `ROMM_TOKEN` in the
 environment does not silently take over again.

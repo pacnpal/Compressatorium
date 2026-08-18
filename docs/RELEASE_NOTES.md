@@ -41,7 +41,14 @@
 
   The target list is narrowed per platform by the same registry the file browser
   uses, so a GameCube rule offers dolphin and nkit while a PS2 rule offers chdman
-  and maxcso — a rule can never name a tool that is wrong for the system.
+  and maxcso — a rule can never name a tool that is wrong for the system. The
+  compression controls come from the same descriptors the convert panel reads,
+  so each tool offers exactly the codecs and levels it actually supports.
+
+  A rule's defaults come from the configured settings
+  (`ROMM_AUTO_CONVERT_INTERVAL_MINUTES`, `ROMM_VERIFY_AFTER_CONVERT`,
+  `ROMM_DELETE_SOURCE_AFTER_VERIFY` and friends), so a deployment can ship a
+  house policy rather than configuring every platform by hand.
 
   **Preview** shows exactly what a sweep would queue without queueing it, and
   without moving the schedule clock, so looking never postpones a run.

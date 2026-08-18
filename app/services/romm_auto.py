@@ -29,6 +29,7 @@ operator's disk and CPU for a week on the strength of one checkbox.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from datetime import time as dt_time
@@ -48,7 +49,7 @@ from services.output_conflicts import (
 )
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
-from services.tools import registry
+from services.tools import ModeKind, registry
 from utils.delete_plan import build_delete_snapshot
 from utils.path_utils import is_within_configured_volumes
 
@@ -132,7 +133,16 @@ def _valid_pattern(value: Any) -> str | None:
 
 
 def default_rule(mode: str = "") -> dict[str, Any]:
-    """A rule with every field at its default, for the UI to render a new row."""
+    """A rule with every field at its default, for the UI to render a new row.
+
+    The scheduling and verification defaults come from the effective settings,
+    not from constants here, so a deployment that sets
+    ``ROMM_AUTO_CONVERT_INTERVAL_MINUTES``, ``ROMM_VERIFY_AFTER_CONVERT`` or
+    ``ROMM_DELETE_SOURCE_AFTER_VERIFY`` actually gets them. Documented as
+    first-run defaults, they were previously loaded into ``romm_settings`` and
+    then read by nobody.
+    """
+    cfg = romm_settings.effective()
     return {
         "enabled": False,
         "mode": mode,
@@ -140,11 +150,13 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         "compression_level": None,
         "output_dir": None,
         "duplicate_action": "skip",
-        "delete_on_verify": False,
-        "verify_after": False,
+        "delete_on_verify": bool(cfg.get("delete_source_after_verify", False)),
+        "verify_after": bool(cfg.get("verify_after_convert", False)),
         "split": False,
         # scheduling
-        "interval_minutes": 60,
+        "interval_minutes": _clamp(
+            "interval_minutes", cfg.get("auto_convert_interval_minutes"), 60,
+        ),
         "window_start": None,
         "window_end": None,
         "days": list(ALL_DAYS),
@@ -154,7 +166,9 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         # the window stays correct across DST.
         "timezone": "UTC",
         # queueing
-        "max_per_run": 25,
+        "max_per_run": _clamp(
+            "max_per_run", cfg.get("auto_convert_max_per_run"), 25,
+        ),
         "priority": 0,
         "order": "name",
         # selection filters
@@ -167,6 +181,9 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         # Set only when a submitted output_dir was refused, so the editor can
         # say why the rule is not writing where the operator asked.
         "invalid_output_dir": None,
+        # Set when delete-on-verify was refused because this mode + compression
+        # cannot verify strongly enough to justify removing the source.
+        "unsafe_delete_on_verify": False,
     }
 
 
@@ -229,8 +246,30 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
     # output be verified at all", which is the precondition for either switch:
     # deleting needs the check to pass first, verify_after wants only the check.
     if spec is not None and spec.supports_delete_on_verify:
-        out["delete_on_verify"] = bool(raw.get("delete_on_verify", False))
-        out["verify_after"] = bool(raw.get("verify_after", False))
+        # `out[...]` as the fallback, not False: an omitted field must inherit
+        # the configured default rather than silently overriding it.
+        out["delete_on_verify"] = bool(
+            raw.get("delete_on_verify", out["delete_on_verify"]),
+        )
+        out["verify_after"] = bool(raw.get("verify_after", out["verify_after"]))
+        # A mode that *can* be verified is not always safely deletable: jwud's
+        # verify is a structural WUX walk backed only by JWUDTool's own
+        # byte-for-byte pass, which `-noVerify` turns off. The manual route
+        # refuses that combination; automation must too, or an unattended rule
+        # deletes a 25 GB source on the strength of a geometry check.
+        tool = registry.for_mode(out["mode"])
+        if out["delete_on_verify"] and not tool.delete_on_verify_is_safe(
+            out["mode"], out["compression"],
+        ):
+            logger.warning(
+                "romm_auto: refusing delete-on-verify for %s with compression %r",
+                out["mode"], out["compression"],
+            )
+            out["delete_on_verify"] = False
+            out["unsafe_delete_on_verify"] = True
+    else:
+        out["delete_on_verify"] = False
+        out["verify_after"] = False
     out["split"] = bool(raw.get("split", False))
 
     out["interval_minutes"] = _clamp("interval_minutes", raw.get("interval_minutes"), 60)
@@ -411,8 +450,18 @@ SKIP_EXISTING = "skip_existing"
 SKIP_LOCKED = "skip_locked"
 
 
+def _same_file(path_a: str, path_b: str) -> bool:
+    """Whether two paths name the same file once symlinks are resolved."""
+    try:
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
+    except OSError:
+        # Unreadable either way: treat as "same" so the caller refuses rather
+        # than authorises an overwrite it could not rule out.
+        return True
+
+
 def _resolve_destination(
-    path: str, mode: str, output_dir: str | None, duplicate_action: str,
+    tool, path: str, mode: str, output_dir: str | None, duplicate_action: str,
 ) -> tuple[str | None, str]:
     """Where this rule's conversion of *path* should write, and whether to queue.
 
@@ -434,12 +483,25 @@ def _resolve_destination(
     A locked destination is never queued: the next sweep picks it up once the
     lock clears, because the filesystem still reports the ROM unconverted.
     """
-    tool = registry.for_mode(mode)
-    if tool is None:
-        return None, SKIP_EXISTING
+    # *tool* is the one the sweep already resolved for this rule's mode. No
+    # None check: `registry.for_mode` raises KeyError on an unknown mode and
+    # never returns None, and the sweep has already caught that before any
+    # candidate reaches here -- so a guard would be dead code that turned a
+    # misconfigured rule into a silent "already converted".
     try:
         destination = tool.output_path(mode, path, output_dir)
     except (KeyError, ValueError, OSError):
+        return None, SKIP_EXISTING
+
+    # A conversion must never be authorised to write over its own input. RomM
+    # rescans what we produce, so a persistent `dolphin_rvz` rule eventually
+    # sees the .rvz it made: dolphin accepts .rvz as input, output_path maps it
+    # straight back onto itself, and an `overwrite` rule would then unlink the
+    # file before reading it -- destroying the only copy when the source ISO
+    # was already deleted. The manual planner refuses this
+    # (SkipReason.DOLPHIN_SAME_PATH); the sweep must refuse it identically.
+    # Only a COPY mode (chdman .chd -> .chd) rewrites in place on purpose.
+    if registry.spec(mode).kind is not ModeKind.COPY and _same_file(destination, path):
         return None, SKIP_EXISTING
 
     exists, locked = check_output_conflicts(mode, destination)
@@ -500,7 +562,7 @@ def _inspect_candidate(path: str, rule: dict, tool) -> dict:
     if resolved is None:
         return {"skip": "unresolvable", "resolved": None, "destination": None}
     destination, decision = _resolve_destination(
-        path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
+        tool, path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
     )
     return {
         "skip": None if decision == QUEUE else decision,

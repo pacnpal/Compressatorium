@@ -49,8 +49,10 @@ logger = get_logger("romm")
 
 # A pending row whose output never appeared is a conversion that was planned but
 # never ran (the batch submit failed, or the job was cancelled). Left alone it
-# would be retried forever, so retire it once it is clearly not coming.
-_ABANDON_AFTER = timedelta(days=7)
+# would be retried forever, so retire it once it is clearly not coming. How long
+# to wait is the operator's call (`repin_abandon_days`, editable in the app);
+# this is only the fallback for a settings store that has not been primed.
+_ABANDON_AFTER_DAYS_DEFAULT = 7
 
 # Ceiling on rows *settled* in one pass. Each hit costs a full-file SHA-1, so a
 # large backlog is drained over several calls rather than in one request that
@@ -481,13 +483,28 @@ async def settle_romm_repins() -> dict:
 
 
 def _is_stale(created_at: str) -> bool:
+    """Whether a pending re-pin row has waited past the configured period.
+
+    Reads `repin_abandon_days` rather than a constant: a slow array or a long
+    conversion backlog is exactly when an operator raises it, and retiring a row
+    early means that ROM's metadata can never be restored.
+    """
     if not created_at:
         return False
     try:
         created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     except ValueError:
         return False
-    return datetime.now(timezone.utc) - created > _ABANDON_AFTER
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    days = romm_settings.effective().get(
+        "repin_abandon_days", _ABANDON_AFTER_DAYS_DEFAULT,
+    )
+    try:
+        cutoff = timedelta(days=int(days))
+    except (TypeError, ValueError):
+        cutoff = timedelta(days=_ABANDON_AFTER_DAYS_DEFAULT)
+    return datetime.now(timezone.utc) - created > cutoff
 
 
 # ----------------------------------------------------------------------
@@ -546,16 +563,27 @@ async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
     is wrong.
     """
     override = patch.model_dump(exclude_unset=True) if patch else {}
-    url = (override.get("url") or romm_settings.effective().get("url") or "").rstrip("/")
+    saved = romm_settings.effective()
+
+    def _field(name: str) -> str:
+        """The value to probe with: an explicitly submitted one wins, blank included.
+
+        `exclude_unset` distinguishes "not in this form" from "cleared by the
+        operator". Falling back on falsiness reported a working connection for a
+        form that, once saved, would switch the integration off.
+        """
+        if name in override:
+            return str(override[name] or "")
+        return str(saved.get(name) or "")
+
+    url = _field("url").rstrip("/")
     token = override.get("token")
     if not token:
         # `clear_token` means "test with no token at all" -- falling back to
         # the saved one would report success for a configuration the operator
         # is about to save as unauthenticated.
         token = "" if override.get("clear_token") else romm_settings.token()
-    library_root = override.get("library_root") or romm_settings.effective().get(
-        "library_root",
-    )
+    library_root = _field("library_root")
 
     result: dict = {
         "reachable": False,

@@ -13,7 +13,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { toast } from 'svelte-sonner';
   import { romm, DAY_LABELS, ORDER_LABELS } from '$lib/stores/romm.svelte.js';
-  import { registry } from '$lib/tools/registry.js';
+  import { registry, DEFAULT_COMPRESSION_LEVEL_RANGE } from '$lib/tools/registry.js';
   import Button from '$lib/components/ui/Button.svelte';
   import Checkbox from '$lib/components/ui/Checkbox.svelte';
   import Select from '$lib/components/ui/Select.svelte';
@@ -93,6 +93,57 @@
   function specFor(mode) {
     return mode ? registry.specFor(mode) : null;
   }
+
+  function toolFor(mode) {
+    return mode ? registry.toolForMode(mode) : null;
+  }
+
+  // --- conversion options, straight off the registry descriptor ----------
+  //
+  // Same source of truth CompressionPicker reads for the manual panel, so a
+  // new tool declaring `compressionCodecs` / `compressionStyle` in
+  // registry.js appears here with no edit. The rule stores one string, which
+  // is what the job pipeline takes: a comma list for chdman's multi style,
+  // a single codec elsewhere (the level rides separately and the backend
+  // joins them as `codec:level`).
+
+  function codecsFor(mode) {
+    return toolFor(mode)?.compressionCodecs ?? [];
+  }
+
+  function codecStyleFor(mode) {
+    return toolFor(mode)?.compressionStyle ?? 'none';
+  }
+
+  function levelRangeFor(mode) {
+    return toolFor(mode)?.compressionLevelRange ?? DEFAULT_COMPRESSION_LEVEL_RANGE;
+  }
+
+  /** The codecs a rule currently has selected, as a list. */
+  function selectedCodecs(rule) {
+    return (rule.compression ?? '').split(',').map((c) => c.trim()).filter(Boolean);
+  }
+
+  /** Toggle one codec in a multi-codec (chdman) rule. */
+  function toggleCodec(platformId, rule, value) {
+    const current = selectedCodecs(rule);
+    const next = current.includes(value)
+      ? current.filter((c) => c !== value)
+      : [...current, value];
+    update(platformId, { compression: next.join(',') || null });
+  }
+
+  const duplicateLabels = {
+    skip: 'Skip it — leave the existing file alone',
+    overwrite: 'Overwrite it',
+    rename: 'Write alongside it (Game_1.rvz)',
+  };
+
+  const duplicateOptions = $derived(
+    (romm.ruleOptions?.duplicate_actions ?? ['skip', 'overwrite', 'rename']).map(
+      (value) => ({ value, label: duplicateLabels[value] ?? value }),
+    ),
+  );
 
   async function save() {
     try {
@@ -266,6 +317,89 @@
               </div>
 
               {#if rule.mode}
+                {@const codecs = codecsFor(rule.mode)}
+                {@const style = codecStyleFor(rule.mode)}
+                {@const range = levelRangeFor(rule.mode)}
+                {@const chosen = selectedCodecs(rule)}
+
+                <div class="grid">
+                  {#if spec?.supportsCompression && codecs.length > 0}
+                    {#if style === 'multi'}
+                      <div class="field wide">
+                        <span>Compression</span>
+                        <div class="chips" role="group" aria-label="Codec selection">
+                          {#each codecs as codec (codec.value)}
+                            {#if codec.value !== 'none'}
+                              <button
+                                type="button"
+                                class="chip"
+                                class:active={chosen.includes(codec.value)}
+                                aria-pressed={chosen.includes(codec.value)}
+                                title={codec.hint ?? ''}
+                                onclick={() => toggleCodec(platform.id, rule, codec.value)}
+                              >{codec.label}</button>
+                            {/if}
+                          {/each}
+                        </div>
+                        <span class="hint">
+                          Leave all off to use {spec?.label ?? 'the tool'}'s default.
+                        </span>
+                      </div>
+                    {:else}
+                      <label class="field">
+                        <span>Compression</span>
+                        <Select
+                          value={rule.compression ?? ''}
+                          options={[
+                            { value: '', label: 'Tool default' },
+                            ...codecs.map((c) => ({ value: c.value, label: c.label })),
+                          ]}
+                          ariaLabel="Compression codec"
+                          onchange={(v) => update(platform.id, { compression: v || null })}
+                        />
+                      </label>
+                    {/if}
+                  {/if}
+
+                  {#if spec?.supportsCompressionLevel}
+                    <label class="field">
+                      <span>Compression level</span>
+                      <input
+                        type="number" min={range.min} max={range.max}
+                        placeholder={String(range.default)}
+                        value={rule.compression_level ?? ''}
+                        onchange={(e) => update(platform.id, {
+                          compression_level: e.currentTarget.value === ''
+                            ? null
+                            : Number(e.currentTarget.value),
+                        })}
+                      />
+                      <span class="hint">{range.min}–{range.max}. Blank uses {range.default}.</span>
+                    </label>
+                  {/if}
+
+                  <label class="field wide">
+                    <span>If the output already exists</span>
+                    <Select
+                      value={rule.duplicate_action ?? 'skip'}
+                      options={duplicateOptions}
+                      ariaLabel="Existing output policy"
+                      onchange={(v) => update(platform.id, { duplicate_action: v })}
+                    />
+                  </label>
+                </div>
+
+                {#if spec?.supportsSplit}
+                  <div class="toggles">
+                    <Checkbox
+                      checked={rule.split}
+                      label="Split into 4 GB parts (FAT32)"
+                      description="Writes Game.iso.0, Game.iso.1, … so the image fits on FAT32."
+                      onchange={(v) => update(platform.id, { split: v })}
+                    />
+                  </div>
+                {/if}
+
                 <div class="grid">
                   <label class="field">
                     <span>Run every (minutes)</span>
@@ -561,6 +695,25 @@
   }
   .pair { display: flex; align-items: center; gap: var(--space-2); }
   .hint, .muted { color: var(--text-2); font-size: var(--text-sm); }
+
+  /* Codec chips for the multi-codec style (chdman). Mirrors CompressionPicker's
+     affordance so the rule editor and the convert panel read the same way. */
+  .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .chip {
+    padding: 0.25rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-1);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .chip:hover { border-color: var(--accent); }
+  .chip.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-contrast, #fff);
+  }
 
   .days { display: flex; gap: 4px; flex-wrap: wrap; }
   .day {

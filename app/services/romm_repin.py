@@ -75,26 +75,48 @@ def roms_by_local_path(paths: list[str]) -> dict[str, dict]:
     return index
 
 
-def _refresh_pending(session, output_path: str, rom: dict, ids: dict) -> bool:
-    """Update the pending row for *output_path* in place. False when there is none."""
-    existing = (
+def _supersede_pending(session, output_path: str) -> int:
+    """Retire any pending row for *output_path*. Returns how many were retired.
+
+    Deliberately *not* an in-place refresh. A settle pass detaches a row's id,
+    provider ids and timestamp before hashing the output, which for a multi-GB
+    image takes minutes. Mutating that row meanwhile would leave the settler
+    working from its old snapshot and then marking the row done -- so the
+    re-planned conversion silently ends up with no pending row at all and its
+    metadata is never restored.
+
+    Retiring the old row and inserting a fresh one gives the new attempt its own
+    identity. The settler's ``store_sha1``/``settle`` both filter on
+    ``state == "pending"``, so they no-op against the superseded row instead of
+    settling the newcomer.
+    """
+    return (
         session.query(_db.RommRepin)
-        .filter(_db.RommRepin.output_path == output_path)
-        .filter(_db.RommRepin.state == "pending")
-        .one_or_none()
+        .filter(
+            _db.RommRepin.output_path == output_path,
+            _db.RommRepin.state == "pending",
+        )
+        .update(
+            {
+                "state": "abandoned",
+                "detail": "Superseded by a re-planned conversion",
+                "settled_at": utcnow_iso(),
+            },
+        )
     )
-    if existing is None:
-        return False
-    existing.source_rom_id = rom.get("id")
-    existing.metadata_ids = ids
-    # The output is about to be rewritten, so any cached hash is stale.
-    existing.output_sha1 = None
-    # Restart the abandonment clock too. A conversion re-planned long after the
-    # original would otherwise be retired the moment it was re-recorded, and
-    # could never have its metadata restored.
-    existing.created_at = utcnow_iso()
-    session.commit()
-    return True
+
+
+def _insert_pending(session, rom: dict, output_path: str, ids: dict) -> None:
+    session.add(
+        _db.RommRepin(
+            source_rom_id=rom.get("id"),
+            source_name=rom.get("name") or rom.get("fs_name"),
+            output_path=output_path,
+            metadata_ids=ids,
+            state="pending",
+            created_at=utcnow_iso(),
+        ),
+    )
 
 
 def record(rom: dict, output_path: str, ids: dict) -> bool:
@@ -104,30 +126,26 @@ def record(rom: dict, output_path: str, ids: dict) -> bool:
     harmless -- the second submit updates the existing row instead of stacking
     another.
 
-    The read-then-insert is only the fast path. A partial unique index
-    (``ux_romm_repin_pending_output``) is the actual guarantee, so a manual
-    submit racing an automation sweep cannot both pass the check and stack two
-    pending rows for one file. Losing that race is not an error: fall through
-    to updating whichever row won.
+    Re-recording supersedes rather than mutates: the old pending row is retired
+    and a fresh one inserted, so exactly one pending row per output survives
+    (which is what makes re-submitting a batch harmless) while a settle pass
+    already in flight cannot settle the new attempt on the old one's behalf.
+
+    A partial unique index (``ux_romm_repin_pending_output``) is the actual
+    guarantee that only one pending row exists, so a manual submit racing an
+    automation sweep cannot stack two. Losing that race is not an error: retry
+    once, superseding whichever row won.
     """
     with _session() as session:
-        if _refresh_pending(session, output_path, rom, ids):
-            return True
-        session.add(
-            _db.RommRepin(
-                source_rom_id=rom.get("id"),
-                source_name=rom.get("name") or rom.get("fs_name"),
-                output_path=output_path,
-                metadata_ids=ids,
-                state="pending",
-                created_at=utcnow_iso(),
-            ),
-        )
+        _supersede_pending(session, output_path)
+        _insert_pending(session, rom, output_path, ids)
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
-            return _refresh_pending(session, output_path, rom, ids)
+            _supersede_pending(session, output_path)
+            _insert_pending(session, rom, output_path, ids)
+            session.commit()
         return True
 
 
