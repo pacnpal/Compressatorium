@@ -116,10 +116,24 @@ class FileEntry(BaseModel):
     split_parts: int | None = None
 
 
+class RommDiagnostics(BaseModel):
+    total: int = 0
+    resolved: int = 0
+    no_path: int = 0
+    outside_volumes: int = 0
+    not_found: int = 0
+    not_readable: int = 0
+    not_regular: int = 0
+    sample_paths: list[str] = []
+    library_root: str = ""
+    volumes: list[str] = []
+
+
 class DirectoryListing(BaseModel):
     volume: str
     path: str
     entries: list[FileEntry]
+    diagnostics: RommDiagnostics | None = None
 
 
 class Volume(BaseModel):

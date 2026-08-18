@@ -25,7 +25,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from logging_setup import get_logger
-from models import DirectoryListing, FileEntry
+from config import settings
+from models import DirectoryListing, FileEntry, RommDiagnostics
 from pydantic import BaseModel, Field
 from routes.files import (
     detect_directory_outputs,
@@ -384,7 +385,7 @@ async def romm_roms(
         _CATALOG_SCAN_BASE_S + _CATALOG_SCAN_PER_ROM_S * len(roms),
     )
     try:
-        entries = await asyncio.wait_for(
+        entries, diag = await asyncio.wait_for(
             run_detached(_build_entries, roms, slug), budget,
         )
     except (asyncio.TimeoutError, OSError) as exc:
@@ -398,23 +399,54 @@ async def romm_roms(
         ) from exc
     return DirectoryListing(
         volume="RomM", path=f"romm://platform/{platform_id}", entries=entries,
+        diagnostics=diag,
     )
 
 
-def _build_entries(roms: list[dict], platform_slug: str | None) -> list[FileEntry]:
+def _build_entries(
+    roms: list[dict], platform_slug: str | None,
+) -> tuple[list[FileEntry], RommDiagnostics]:
     """Turn RomM records into FileEntry rows. Runs off the event loop."""
     entries: list[FileEntry] = []
+    _MAX_SAMPLES = 5
+    diag = RommDiagnostics(
+        total=len(roms),
+        library_root=romm_client.library_root,
+        volumes=list(settings.volumes),
+    )
     for rom in roms:
         path = romm_client.local_path(rom)
-        if not path or not is_within_configured_volumes(path):
+        if not path:
+            diag.no_path += 1
+            if len(diag.sample_paths) < _MAX_SAMPLES:
+                rel = (rom.get("full_path") or "").strip()
+                if not rel:
+                    fs_p = (rom.get("fs_path") or "").strip()
+                    fs_n = (rom.get("fs_name") or "").strip()
+                    rel = f"{fs_p}/{fs_n}" if fs_p else fs_n
+                if rel:
+                    diag.sample_paths.append(rel)
+            continue
+        if not is_within_configured_volumes(path):
+            diag.outside_volumes += 1
+            if len(diag.sample_paths) < _MAX_SAMPLES:
+                diag.sample_paths.append(path)
             continue
         try:
             stat = os.stat(path)
+        except FileNotFoundError:
+            diag.not_found += 1
+            if len(diag.sample_paths) < _MAX_SAMPLES:
+                diag.sample_paths.append(path)
+            continue
         except OSError:
-            # missing_from_fs, a permissions problem, or a stale record.
+            diag.not_readable += 1
+            if len(diag.sample_paths) < _MAX_SAMPLES:
+                diag.sample_paths.append(path)
             continue
         is_dir = stat_module.S_ISDIR(stat.st_mode)
         if not is_dir and not stat_module.S_ISREG(stat.st_mode):
+            diag.not_regular += 1
             continue
         if is_dir:
             # A RomM record can resolve to a directory: a decrypted PS3 game
@@ -459,7 +491,16 @@ def _build_entries(roms: list[dict], platform_slug: str | None) -> list[FileEntr
     # Deterministic ordering, independent of RomM's paging. Sorts on the title
     # the user actually reads, falling back to the filename.
     entries.sort(key=lambda e: ((e.display_name or e.name).lower(), e.path))
-    return entries
+    diag.resolved = len(entries)
+    dropped = diag.total - diag.resolved
+    if dropped:
+        logger.info(
+            "romm: %d/%d ROMs dropped (no_path=%d outside_volumes=%d "
+            "not_found=%d not_readable=%d not_regular=%d)",
+            dropped, diag.total, diag.no_path, diag.outside_volumes,
+            diag.not_found, diag.not_readable, diag.not_regular,
+        )
+    return entries, diag
 
 
 # ----------------------------------------------------------------------
