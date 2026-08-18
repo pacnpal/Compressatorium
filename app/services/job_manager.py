@@ -63,11 +63,22 @@ def _is_active_conversion(job) -> bool:
     )
 
 
-def _paths_collide(path_a: str, path_b: str) -> bool:
+def _canonical_path(path: str) -> str:
+    """*path* as one comparable key: symlinks resolved, or the path as given.
+
+    Split out from :func:`_paths_collide` so a caller comparing one path
+    against many resolves each of them once instead of per comparison --
+    `realpath` is a blocking stat chain, and the batch reservation runs on the
+    event loop under `_create_lock`.
+    """
     try:
-        return os.path.realpath(path_a) == os.path.realpath(path_b)
+        return os.path.realpath(path)
     except OSError:
-        return False
+        return path
+
+
+def _paths_collide(path_a: str, path_b: str) -> bool:
+    return _canonical_path(path_a) == _canonical_path(path_b)
 
 
 # The statuses a job never leaves. Anything else is still in flight.
@@ -484,7 +495,15 @@ class JobManager:
         one submit resolving to the same path is the same bug arriving twice
         at once.
         """
-        planned: Dict[str, str] = {}
+        # Canonicalise once per path and compare keys. The pairwise version of
+        # this re-resolved every earlier destination for every new one, and
+        # `_active_job_writing` re-resolved every live job's output per spec --
+        # quadratic in the batch size, in blocking `realpath` calls, on the
+        # event loop while `_create_lock` is held. A Select-All submit of a few
+        # thousand files made that millions of stat chains against exactly the
+        # remote mounts this integration exists for.
+        active = self._active_output_map()
+        planned: Dict[str, str] = {}   # canonical destination -> source
         for spec in job_specs:
             file_path = str(spec["file_path"])
             output_dir = spec.get("output_dir")
@@ -495,35 +514,46 @@ class JobManager:
                 output_dir=str(output_dir) if output_dir is not None else None,
                 output_path=str(explicit) if explicit is not None else None,
             )
-            claimed_by = self._active_job_writing(resolved)
+            key = _canonical_path(resolved)
+            claimed_by = active.get(key)
             if claimed_by is not None:
                 raise OutputClaimedError(
                     f"Another queued job ({claimed_by}) is already writing "
                     f"{os.path.basename(resolved)}",
                     claimed_by=claimed_by,
                 )
-            for other, other_path in planned.items():
-                if _paths_collide(other_path, resolved):
-                    raise OutputClaimedError(
-                        "Two files in this batch would write the same output: "
-                        f"{os.path.basename(other)} and "
-                        f"{os.path.basename(file_path)}",
-                    )
-            planned[file_path] = resolved
+            other = planned.get(key)
+            if other is not None:
+                raise OutputClaimedError(
+                    "Two files in this batch would write the same output: "
+                    f"{os.path.basename(other)} and "
+                    f"{os.path.basename(file_path)}",
+                )
+            planned[key] = file_path
+
+    def _active_output_map(self) -> Dict[str, str]:
+        """``{canonical output path: job id}`` for every live job.
+
+        Built once per batch rather than re-derived per spec: each entry costs
+        a `realpath`, which is a blocking stat chain, and this runs under
+        ``_create_lock`` on the event loop. Primary outputs only -- companions
+        are covered by the conflict probe callers already run.
+        """
+        active: Dict[str, str] = {}
+        for job in self.jobs.values():
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            if job.output_path:
+                active.setdefault(_canonical_path(job.output_path), job.id)
+        return active
 
     def _active_job_writing(self, output_path: str) -> Optional[str]:
         """Id of a queued/running job whose output is *output_path*, else None.
 
-        Compares the primary output only. Companions are covered by the
-        conflict probe callers already run, and this has to stay cheap: it is
-        called under ``_create_lock``, once per job being queued.
+        The single-path form of :meth:`_active_output_map`, for the callers that
+        ask about one destination rather than a batch.
         """
-        for job in self.jobs.values():
-            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
-                continue
-            if job.output_path and _paths_collide(job.output_path, output_path):
-                return job.id
-        return None
+        return self._active_output_map().get(_canonical_path(output_path))
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
         """Get a job by ID."""

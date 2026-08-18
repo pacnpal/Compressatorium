@@ -299,6 +299,14 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **Submitting a very large batch no longer slows down as it grows.** The
+  check that stops two jobs writing the same file resolved every path against
+  every other one — fine for ten files, millions of filesystem probes for a
+  few thousand, all of them on the thread that serves the app.
+- **A library reached through a symlink keeps its metadata.** The queue reports
+  each job's source with symlinks resolved while the snapshot was recorded
+  under the path as typed, so the two did not match and a perfectly good
+  snapshot was retired as if the conversion had never been queued.
 - **Two selected ROMs that write the same file keep the right metadata.** The
   batch collapses them into one conversion and keeps one source; the snapshot
   was recorded per source in submission order, so the row ended up holding

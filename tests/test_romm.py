@@ -3124,9 +3124,16 @@ def test_claiming_a_row_is_atomic(sqlite_db, tmp_path: Path) -> None:
     romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
     row_id = romm_repin.pending_rows(10)[0][5]
 
-    assert romm_repin.claim(row_id) is True
-    # A second claimant gets nothing, and neither does a re-plan trying to
-    # supersede a row that is already being applied.
+    # Two passes racing for the same row: exactly one may win. Run them in
+    # threads, because a read-then-write implementation passes a sequential
+    # check and fails this one.
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: romm_repin.claim(row_id), range(8)))
+    assert results.count(True) == 1, results
+
+    # And a re-plan cannot supersede a row that is already being applied.
     assert romm_repin.claim(row_id) is False
     romm_repin.record({"id": 6, "igdb_id": 43}, str(out), {"igdb_id": 43})
     assert romm_repin.claim(row_id) is False
@@ -3272,8 +3279,7 @@ async def test_a_failed_repin_write_still_records_what_was_queued(
     async def _fake_batch(paths, mode, **kwargs):
         return _fake_jobs(paths)
 
-    def _explode(*_args, **_kwargs):
-        raise RuntimeError("database is locked")
+    recorder = MagicMock(side_effect=RuntimeError("database is locked"))
 
     with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
             patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
@@ -3281,18 +3287,34 @@ async def test_a_failed_repin_write_still_records_what_was_queued(
                 romm_auto.job_manager, "get_active_job_candidates", return_value=[],
             ), \
             patch.object(romm_auto, "is_within_configured_volumes", return_value=True), \
-            patch.object(romm_auto.romm_repin, "record", _explode):
+            patch.object(romm_auto.romm_repin, "record", recorder):
         await romm_auto.set_rules({"7": {
             "mode": "dolphin_rvz", "enabled": True, "duplicate_action": "overwrite",
         }})
         first = await romm_auto.sweep(ignore_schedule=True)
 
     assert first["queued"] == 1, first
+    # The failing write really was reached, or this proves nothing.
+    assert recorder.called
     # Not reported as a queue failure — the jobs went in.
     assert first["errors"] == [], first
-    # And the production record exists, so the next sweep leaves it alone.
+    # And the production record exists, so the next sweep leaves it alone —
+    # which is the point: without it the same ROMs are converted twice.
     state = await romm_auto.get_state()
     assert "1" in state["7"]["converted"], state
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True), \
+            patch.object(
+                romm_auto.job_manager, "get_job",
+                return_value=SimpleNamespace(id="x", status=JobStatus.COMPLETED),
+            ):
+        second = await romm_auto.sweep(ignore_schedule=True)
+    assert second["queued"] == 0, second
 
 
 def test_half_a_schedule_window_pauses_the_rule() -> None:

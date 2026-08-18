@@ -20,7 +20,6 @@ opt out of the guarantee the manual path makes.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
 
 from logging_setup import get_logger
 from services import db as _db
@@ -36,6 +35,9 @@ logger = get_logger("romm_repin")
 # owns the columns. Re-exported here because this module writes `created_at`
 # and `settled_at` and its callers read them back.
 utcnow_iso = _db.utcnow_iso
+# Same module, same shape: `settled_at < _iso_seconds_ago(...)` is string
+# arithmetic over these columns, so both sides must be formed identically.
+_iso_seconds_ago = _db.iso_seconds_ago
 
 
 def _session():
@@ -102,13 +104,6 @@ def roms_by_local_path(
         if len(index) == len(wanted):
             break
     return index
-
-
-def _iso_seconds_ago(seconds: int) -> str:
-    """An ISO timestamp *seconds* in the past, in the format rows are stored in."""
-    return (
-        datetime.now(timezone.utc) - timedelta(seconds=seconds)
-    ).isoformat().replace("+00:00", "Z")
 
 
 def _supersede_pending(session, output_path: str) -> int:

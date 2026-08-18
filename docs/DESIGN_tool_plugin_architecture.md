@@ -136,7 +136,8 @@ class ModeSpec:
     input_extensions: frozenset[str]
     supports_compression: bool = False
     supports_compression_level: bool = False   # dolphin rvz/wia only
-    supports_delete_on_verify: bool = False
+    supports_delete_on_verify: bool = False  # may this job delete its source?
+    supports_verify: bool = False            # can its output be checked at all?
     allows_archive_input: bool = False         # opt-in; set True on every mode that can take a member straight from an archive (chdman create + extract, dolphin, z3ds). Only chdman copy (.chd recompress round-trip) leaves it False
 ```
 
@@ -1371,6 +1372,16 @@ The *failure shape* stays a caller concern. `routes/convert.py` keeps a thin
 the file like any other locked output; the sweep simply drops the candidate and
 picks it up next time. Both touch the disk (a directory mode's companion lookup
 scans), so call them off the event loop.
+
+#### Destination reservation is linear (`_canonical_path`)
+
+`JobManager._reject_claimed_destinations_locked` runs on the event loop while
+`_create_lock` is held, so its cost is the cost of accepting a batch. Every
+destination is canonicalised **once** (`_canonical_path`) and compared through a
+dict, and the live-job map is built once per batch (`_active_output_map`) rather
+than re-derived per spec. The pairwise form re-resolved every earlier
+destination for every new one — quadratic in the batch size, in blocking
+`realpath` stat chains, against the remote mounts this integration exists for.
 
 #### One destination, one source (`output_conflicts.collapse_to_winners`)
 

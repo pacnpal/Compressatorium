@@ -13,6 +13,7 @@ skips, and an accepted file resolves to an identical ``output_path`` /
 """
 from __future__ import annotations
 
+import os
 import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -654,3 +655,31 @@ async def test_a_claimed_destination_is_a_conflict_not_a_server_error(
         duplicate_action=DuplicateAction.SKIP, delete_on_verify=False,
     )
     assert single["status"] == 409, single
+
+
+def test_destination_reservation_resolves_each_path_once(monkeypatch) -> None:
+    """The check runs on the event loop while the queue lock is held.
+
+    The pairwise version re-resolved every earlier destination for every new
+    one, and re-resolved every live job's output per spec — quadratic in the
+    batch size, in blocking `realpath` calls, against exactly the remote mounts
+    this integration targets. A Select-All submit made that millions of stats.
+    """
+    from services import job_manager as jm
+
+    calls: list[str] = []
+    real = os.path.realpath
+    monkeypatch.setattr(
+        jm.os.path, "realpath", lambda p: (calls.append(p), real(p))[1],
+    )
+
+    manager = jm.JobManager(max_concurrent=1, max_job_history=10)
+    specs = [
+        {"file_path": f"/vol/game{i}.iso", "output_path": f"/vol/out{i}.chd"}
+        for i in range(60)
+    ]
+    manager._reject_claimed_destinations_locked(specs, ConversionMode.CREATECD)
+
+    # One resolve per destination, not one per pair. The old shape cost
+    # 60 * 59 / 2 = 1770 comparisons, each resolving two paths.
+    assert len(calls) <= len(specs) * 2, len(calls)

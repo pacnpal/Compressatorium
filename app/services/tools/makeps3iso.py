@@ -40,12 +40,12 @@ class MakePs3IsoTool(BaseTool):
             # empty and selection runs through accepts_directory() instead.
             input_extensions=frozenset(),
             supports_compression=False,
-            # No delete-on-verify: deleting a user-curated decrypted folder is
-            # destructive and makeps3iso has no native verify (only the light
-            # PARAM.SFO TITLE_ID readback).
+            # makeps3iso has no verify subcommand: the check is a PARAM.SFO
+            # readback out of the ISO just built. Enough to say the build is
+            # structurally sound, not enough to justify deleting the curated
+            # game folder it came from -- so the mode is verifiable but never
+            # deletable.
             supports_delete_on_verify=False,
-            # The build is checked by reading PARAM.SFO back out of the
-            # ISO; only the *deletion* of the source folder is refused.
             supports_verify=True,
             allows_archive_input=False,
             input_kinds=frozenset({InputKind.DIRECTORY}),

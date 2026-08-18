@@ -198,8 +198,17 @@ def test_default_compression_mirrors_the_frontend_seed(tmp_path):
         # The chain tool has no descriptor of its own: its composite modes are
         # grouped under the descriptors of the tools they start from
         # (`cso_to_chd` under cso, `nkit_to_rvz` under nkit), the same
-        # exception `_TOOL_ID_EXCEPTIONS` records above. Nothing to mirror.
+        # exception `_TOOL_ID_EXCEPTIONS` records above. Nothing to mirror --
+        # but only a tool that declares no default may be missing, or a
+        # renamed descriptor would silently stop being compared.
         fe = frontend.get(tool.id)
+        if fe is None and tool.default_compression is not None:
+            problems.append(
+                f"  {tool.id}: declares default_compression="
+                f"{tool.default_compression!r} but registry.js has no descriptor "
+                "with that id"
+            )
+            continue
         needs_default = any(
             m.supports_compression and m.supports_compression_level
             for m in tool.modes

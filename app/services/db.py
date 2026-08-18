@@ -27,7 +27,7 @@ import json
 from logging_setup import get_logger
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -65,6 +65,18 @@ def utcnow_iso() -> str:
     silently mis-sorts or fails to compare.
     """
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def iso_seconds_ago(seconds: int) -> str:
+    """A timestamp *seconds* in the past, in the same shape as `utcnow_iso`.
+
+    Beside it deliberately: a comparison like ``settled_at < iso_seconds_ago(x)``
+    is string arithmetic over these columns, so the two must be formed the same
+    way or a later change to one silently breaks the other.
+    """
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat().replace("+00:00", "Z")
 
 
 class Base(DeclarativeBase):

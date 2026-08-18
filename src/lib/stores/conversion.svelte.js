@@ -528,13 +528,24 @@ class ConversionStore {
       // this ROM's identity stamped on an unrelated file. So compare against
       // each job's real `output_path`, not just its source.
       const created_jobs = (Array.isArray(result) ? result : []).filter(Boolean);
+      // The queue reports each job's source as the backend resolved it, which
+      // is the symlink-free path; the row was recorded against the path the
+      // browser submitted. For a library reached through a symlinked ancestor
+      // those differ, and matching on the submitted spelling alone would find
+      // no job for a source that was queued — retiring a row the conversion
+      // still needs. A destination that some job is writing means the row is
+      // live whatever the source is spelled like.
       const actualBySource = new Map(
         created_jobs.map((j) => [j.file_path, j.output_path]),
+      );
+      const queuedDestinations = new Set(
+        created_jobs.map((j) => j.output_path).filter(Boolean),
       );
       const misdirected = {};
       for (const [source, planned] of Object.entries(recorded)) {
         const actual = actualBySource.get(source);
-        if (actual && actual !== planned) misdirected[source] = actual;
+        if (!actual) continue;
+        if (actual !== planned) misdirected[source] = actual;
       }
       if (Object.keys(misdirected).length) {
         // Re-record first, retire second. The old row is only wrong once the
@@ -618,7 +629,13 @@ class ConversionStore {
       recorded = Object.fromEntries(
         Object.entries(recorded).filter(
           ([source, destination]) =>
-            !queuedSources.has(source) && !claimed.has(destination),
+            !queuedSources.has(source)
+            && !claimed.has(destination)
+            // ...and not a row whose destination a job is writing under a
+            // source spelled differently (a symlinked ancestor, resolved by
+            // the backend). Retiring that row loses the metadata for a
+            // conversion that is running.
+            && !queuedDestinations.has(destination),
         ),
       );
       // Report only the rows that survive, or the toast would claim metadata
