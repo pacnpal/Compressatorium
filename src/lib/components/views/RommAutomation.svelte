@@ -242,6 +242,25 @@
     }
   }
 
+  /** Why a platform produced nothing, in the operator's terms.
+   *
+   * These reasons exist precisely because the sweep refuses to queue work it
+   * knows will fail, so saying nothing would leave a rule that converts
+   * nothing and never explains itself.
+   */
+  const SWEEP_ERROR_LABELS = {
+    tool_not_ready: 'the tool for this format is not installed here — skipped',
+    tool_wrong_for_platform: 'the saved format is not for this system — skipped',
+    output_dir_outside_volumes:
+      'its output folder is outside the configured volumes — skipped',
+    unreadable: 'RomM could not list this platform',
+    queue_failed: 'the conversion queue rejected this batch',
+  };
+
+  function sweepErrorLabel(code) {
+    return SWEEP_ERROR_LABELS[code] ?? code;
+  }
+
   function lastRunLabel(platformId) {
     const state = romm.lastRunFor(platformId);
     if (!state?.last_run_at) return 'never run';
@@ -283,10 +302,21 @@
         · {r.skipped_existing ?? 0} already converted
         · {r.skipped_filtered ?? 0} filtered out
         {#if r.skipped_active}· {r.skipped_active} already in the queue{/if}
+        {#if r.skipped_missing}· {r.skipped_missing} listed by RomM but gone from disk{/if}
+        {#if r.skipped_unconvertible}
+          · {r.skipped_unconvertible} the target format cannot take
+        {/if}
         {#if r.stopped_reason === 'limit'}· stopped at the per-run limit{/if}
         {#if r.stopped_reason === 'queue_full'}· stopped, queue full{/if}
         {#if r.stopped_reason === 'no_rules'}· no rules configured{/if}
       </span>
+      {#if r.errors?.length}
+        <ul class="sweep-errors">
+          {#each r.errors as e (e.platform_id)}
+            <li>{romm.platformName(e.platform_id)}: {sweepErrorLabel(e.error)}</li>
+          {/each}
+        </ul>
+      {/if}
       {#each r.platforms ?? [] as p (p.platform_id)}
         {#if p.candidates?.length}
           <details class="candidates">
@@ -688,6 +718,13 @@
 {#snippet saveIcon()}<Save size={14} />{/snippet}
 
 <style>
+  .sweep-errors {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    color: var(--warn, #b45309);
+    font-size: 0.85rem;
+  }
+
   .forget {
     display: flex;
     align-items: center;
