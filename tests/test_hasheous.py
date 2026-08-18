@@ -5,6 +5,7 @@ No HTTP mocking library is used (the suite has none): the seam is
 ``tests/test_dat_sync.py`` patches ``sync_service._fetch_json``.
 """
 
+import asyncio
 import http.client
 import json
 import shutil
@@ -1834,3 +1835,68 @@ async def test_a_dat_landing_mid_hash_still_wins_over_the_remote(
     assert result["matched"] is True
     assert result["game_name"] == "Local Game"
     assert result["source"] == "dat"
+
+
+# ---------------------------------------------------------------------------
+# Fifteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_job_stops_the_remote_pass_between_candidates(hasheous_on):
+    """A cancelled scan must not keep disclosing a CHD's remaining hashes.
+
+    The outer job only notices cancellation once _match_single_file returns,
+    so without a check between candidates it kept asking -- and paying a full
+    timeout each -- after the operator hit stop.
+    """
+    cancel = asyncio.Event()
+    asked: list[str] = []
+
+    async def _lookup(sha1):
+        asked.append(sha1)
+        cancel.set()  # cancelled while the first request is in flight
+        return None
+
+    with patch.object(hasheous, "lookup", _lookup):
+        match, consulted = await dat_routes._remote_lookup_match(
+            "/vol/game.chd",
+            [("a" * 40, "chd_sha1"), ("b" * 40, "chd_data_sha1"), ("c" * 40, "file_sha1")],
+            cancel_event=cancel,
+        )
+
+    assert match is None
+    assert len(asked) == 1, f"kept asking after cancellation: {asked}"
+    # An incomplete pass must not be stamped as a completed remote check, or
+    # cached_result_usable() would serve the miss forever.
+    assert consulted is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_toggles_leave_stored_and_live_state_agreeing(monkeypatch):
+    """The persisted value and the live override must not diverge.
+
+    The write runs in a thread pool, so two concurrent toggles can commit in
+    one order and resume in the other. For a privacy control that means a
+    client who just switched the fallback OFF could keep sending hashes.
+    """
+    stored: dict = {}
+
+    async def _slow_put(key, value):
+        # Commit first, then yield. That is the real thread-pool shape: the
+        # write lands, and only afterwards does the coroutine resume to apply
+        # the override. It makes commit order and resume order disagree, which
+        # is exactly the divergence the lock has to prevent.
+        stored[key] = value
+        await asyncio.sleep(0.01 if value["enabled"] else 0)
+
+    monkeypatch.setattr(dat_routes.preferences_store, "put", _slow_put)
+
+    await asyncio.gather(
+        dat_routes.put_hasheous_settings(dat_routes.HasheousSettingsRequest(enabled=True)),
+        dat_routes.put_hasheous_settings(dat_routes.HasheousSettingsRequest(enabled=False)),
+    )
+
+    assert stored[dat_routes.HASHEOUS_PREF_KEY]["enabled"] is hasheous.override(), (
+        "persisted value and live override disagree"
+    )

@@ -110,6 +110,10 @@ class HasheousSettingsRequest(BaseModel):
 # for the sibling `layout` / `conversion` keys).
 HASHEOUS_PREF_KEY = "hasheous"
 
+# Serializes the toggle's persist-then-apply so the stored value and the live
+# override cannot end up disagreeing under concurrent writes.
+_hasheous_toggle_lock = asyncio.Lock()
+
 # The ``error`` a per-file result carries when the remote lookup failed. Named
 # rather than repeated as a literal because the batch job reads it back to tell
 # "the network is down" apart from "the volume is gone" -- two very different
@@ -243,12 +247,17 @@ async def put_hasheous_settings(request: HasheousSettingsRequest):
     they were produced with, and ``cached_result_usable`` re-checks them the
     moment a stronger source becomes available.
     """
-    # Persist BEFORE applying. If the write fails (SQLite locked, disk full)
-    # the request errors out having changed nothing -- whereas applying first
-    # would leave the process sending hashes remotely while the endpoint
-    # reported failure and the UI still showed the switch off.
-    await preferences_store.put(HASHEOUS_PREF_KEY, {"enabled": request.enabled})
-    hasheous.set_enabled_override(request.enabled)
+    # Persist BEFORE applying, and hold a lock across both. The write runs in
+    # a thread pool, so two concurrent toggles can commit in one order and then
+    # resume their coroutines in the other -- leaving the persisted value and
+    # the live override disagreeing. For a privacy control that means a client
+    # who just switched the fallback OFF could keep sending hashes until
+    # restart. Persisting first also means a failed write (SQLite locked, disk
+    # full) errors out having changed nothing, rather than sending hashes
+    # remotely while the endpoint reports failure and the UI shows "off".
+    async with _hasheous_toggle_lock:
+        await preferences_store.put(HASHEOUS_PREF_KEY, {"enabled": request.enabled})
+        hasheous.set_enabled_override(request.enabled)
     logger.info(
         "Hasheous fallback %s via Web UI",
         "enabled" if hasheous.enabled() else "disabled",
@@ -1065,7 +1074,10 @@ async def _local_lookup_match(
 
 
 async def _remote_lookup_match(
-    file_path: str, candidates: list[tuple[str, str]],
+    file_path: str,
+    candidates: list[tuple[str, str]],
+    *,
+    cancel_event: asyncio.Event | None = None,
 ) -> tuple[dict | None, str | None]:
     """Ask Hasheous about ``candidates``. Returns ``(match, consulted)``.
 
@@ -1088,9 +1100,15 @@ async def _remote_lookup_match(
         # switches the fallback off mid-lookup would otherwise still have the
         # remaining candidates go out -- "off means nothing is sent" has to
         # hold for the request after the click, not just the next file.
-        if not hasheous.enabled():
+        if not hasheous.enabled() or (cancel_event and cancel_event.is_set()):
             # Never asked, or stopped part-way: either way this was not a
             # complete remote check, so it must not be stamped as one.
+            #
+            # Cancellation counts for the same reason the toggle does. The
+            # outer job only notices once _match_single_file returns, so
+            # without this a cancelled scan kept sending a CHD's remaining
+            # candidate hashes -- disclosing them after the operator asked it
+            # to stop, and paying a full timeout each on the way out.
             return None, None
         consulted = True
         # ponytail: unbounded concurrency. Each call is bounded by
@@ -1305,7 +1323,9 @@ async def _match_single_file(
         if local:
             return local
         try:
-            remote, consulted = await _remote_lookup_match(file_path, candidates)
+            remote, consulted = await _remote_lookup_match(
+                file_path, candidates, cancel_event=cancel_event,
+            )
             base_result["checked_remote"] = consulted
         except HasheousUnavailable as e:
             # Same rule as the abandoned-hash case: a transient failure must

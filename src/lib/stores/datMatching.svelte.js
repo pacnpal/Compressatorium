@@ -51,15 +51,35 @@ class DATMatchingStore {
   // The path set the last match job was started for, so a re-run of the same
   // visible page doesn't count as a new hydration and refill the retry budget.
   _lastJobPaths = null;
+  // Bumped per /dat/stats request so a slower earlier one can't land last and
+  // overwrite newer, authoritative state.
+  _statsGeneration = 0;
 
   matchFor(path) {
     return this.matches.get(path) ?? null;
   }
 
   async refreshMatchingAvailability() {
+    // App.svelte and DATView both refresh on mount, so one of those can be
+    // in flight when a toggle PUT lands. Its older /dat/stats answer would
+    // otherwise arrive last and overwrite the authoritative state the PUT
+    // just applied -- the panel snaps back to "off" and matchingAvailable
+    // stays false, so browsing schedules nothing until some later refresh.
+    const generation = ++this._statsGeneration;
     try {
       const stats = await api.getDATStats();
+      if (generation !== this._statsGeneration) return this.matchingAvailable;
+      const wasEnabled = this.stats?.hasheous_enabled;
       this.stats = stats;
+      // Another tab (or an API client) can flip the provider under us. The
+      // backend then withholds cached misses that predate the stronger
+      // source, but hydrate() only adds rows and never removes them, so those
+      // paths would sit in `matches` as known-unmatched and never be
+      // scheduled. Same reset setHasheousEnabled() does for a local toggle.
+      if (wasEnabled !== undefined && wasEnabled !== stats?.hasheous_enabled) {
+        this.matches.clear();
+        this._resetAttempts();
+      }
       // /api/dat/stats returns total_dats (legacy UI checked this exact field);
       // `total` / `imported_count` are not part of the response.
       //
@@ -71,6 +91,7 @@ class DATMatchingStore {
         (stats?.total_dats ?? 0) > 0 || Boolean(stats?.hasheous_enabled);
       return this.matchingAvailable;
     } catch (_e) {
+      if (generation !== this._statsGeneration) return this.matchingAvailable;
       this.matchingAvailable = false;
       return false;
     }

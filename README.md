@@ -230,11 +230,13 @@ Hasheous has **no bulk endpoint** — its API accepts several hashes for *one*
 file, not a batch of files — so an uncached library costs at least one request
 per file.
 
-A file that *matches* costs one request. A file that misses can cost more,
-because each of its candidate hashes is tried: a CHD offers a header SHA1 and a
-data SHA1, and since a CHD's own container bytes may also be indexed, a miss on
-both falls back to a file-level SHA1 — **up to three requests, and three hashes
-disclosed, for one unmatched CHD**. Formats with a single hash (ISO, 3DS, Switch,
+A file that matches *on its first candidate* costs one request. Anything else
+costs more, because candidates are tried in order and each one is a request: a
+CHD offers a header SHA1 and a data SHA1, and since a CHD's own container bytes
+may also be indexed, a miss on both falls back to a file-level SHA1 — **up to
+three requests, and three hashes disclosed, for one CHD**. That ceiling applies
+whether the CHD ends up matching on a later candidate or not; a match only stops
+the requests that would have come *after* it. Formats with a single hash (ISO, 3DS, Switch,
 CSO) cost one either way. Dolphin RVZ/WIA/GCZ report one exhaustive disc hash, so
 they cost one and never fall back.
 
