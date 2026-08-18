@@ -311,6 +311,17 @@ class ToolPlugin(Protocol):
         error. Blocking (a small header read) — call it off the event loop.
         """
 
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """The file to verify for a finished job, or None when there is none.
+
+        Usually ``output_path`` itself. It differs where a mode's real product
+        is not at the path the job planned: a split makeps3iso build writes
+        ``<iso>.0``/``.1``/… and no bare ``.iso``, so verifying the planned path
+        checks a file that does not exist and fails a conversion that worked.
+        Asking the tool keeps that per-format knowledge in the plugin instead of
+        the job runner.
+        """
+
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         """Sibling output paths this mode writes beside ``output_path``.
 
@@ -478,6 +489,11 @@ class BaseTool:
         self, input_path: str, output_path: str, mode: str,
     ) -> None:
         return None
+
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """Default: the job's own output path, which is what nearly every mode
+        produces. Overridden where the product can live elsewhere."""
+        return output_path
 
     def companion_outputs(self, output_path: str, mode: str) -> list[str]:
         # Default: derive the sibling paths from the mode's ``companion_exts``

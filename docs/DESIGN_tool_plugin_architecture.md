@@ -198,6 +198,12 @@ class ToolPlugin(Protocol):
     def output_path(self, mode: str, input_path: str, output_dir: str | None = None,
                     *, treat_as_stem: bool = False) -> str: ...
 
+    # The file to verify once a job finishes, or None when the product cannot
+    # be found. Nearly always `output_path`; a split makeps3iso build writes
+    # `<iso>.0`/`.1`/… and no bare `.iso`, so verifying the planned path failed
+    # a conversion that had worked. BaseTool returns `output_path`.
+    def verify_target(self, output_path: str, mode: str) -> str | None: ...
+
     # Whether deleting the source is justified for *this* job's settings, not
     # just whether the mode offers the option (`supports_delete_on_verify`).
     # BaseTool returns True; a tool whose verification can be weakened by a

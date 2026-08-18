@@ -20,11 +20,13 @@ opt out of the guarantee the manual path makes.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 
 from logging_setup import get_logger
 from services import db as _db
 from services.romm import DAT_SAFE_OUTPUT_EXTS, METADATA_ID_FIELDS, romm_client
 from services.tools import registry
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
 logger = get_logger("romm_repin")
@@ -100,6 +102,13 @@ def roms_by_local_path(
         if len(index) == len(wanted):
             break
     return index
+
+
+def _iso_seconds_ago(seconds: int) -> str:
+    """An ISO timestamp *seconds* in the past, in the format rows are stored in."""
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat().replace("+00:00", "Z")
 
 
 def _supersede_pending(session, output_path: str) -> int:
@@ -310,9 +319,22 @@ def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
     would never be examined. The caller walks past them.
     """
     with _session() as session:
+        # Claimed rows come back too, but only once their claim is stale: the
+        # only way one outlives `_CLAIM_STALE_SECONDS` is the process holding it
+        # dying mid-write, and without this that row would sit in `settling`
+        # forever -- invisible to every later pass and never retried.
+        stale_before = _iso_seconds_ago(_CLAIM_STALE_SECONDS)
         rows = (
             session.query(_db.RommRepin)
-            .filter(_db.RommRepin.state == "pending")
+            .filter(
+                or_(
+                    _db.RommRepin.state == "pending",
+                    and_(
+                        _db.RommRepin.state == SETTLING,
+                        _db.RommRepin.settled_at < stale_before,
+                    ),
+                ),
+            )
             .filter(_db.RommRepin.id > after_id)
             .order_by(_db.RommRepin.id)
             .limit(limit)
@@ -343,13 +365,56 @@ def store_sha1(row_id: int, sha1: str) -> None:
         session.commit()
 
 
+# A row being written to RomM right now. Not "pending" (so a re-plan for the
+# same output inserts its own row rather than waiting on this one) and not
+# settled (so the pass can still close it, and a crash mid-write leaves it
+# recoverable rather than done).
+SETTLING = "settling"
+# How long a claim may look unfinished before another pass takes it back. Only
+# reached when the process holding it died mid-write; a live claim is released
+# either way within one outbound request.
+_CLAIM_STALE_SECONDS = 900
+
+
+def claim(row_id: int) -> bool:
+    """Take ownership of a pending row for the outbound write. Atomic.
+
+    The re-check this replaces was a read followed by a write, and the window
+    between them is exactly where a re-plan lands: `record()` supersedes the
+    row, and the pass -- already past its check -- pushes the previous
+    generation's provider ids to RomM anyway. One conditional UPDATE closes it,
+    because whoever flips `pending` to `settling` is the only writer, and a
+    re-plan arriving afterwards gets a row of its own instead of quietly
+    replacing one that is already being applied.
+    """
+    with _session() as session:
+        updated = session.query(_db.RommRepin).filter(
+            _db.RommRepin.id == row_id,
+            _db.RommRepin.state == "pending",
+        ).update({"state": SETTLING, "settled_at": utcnow_iso()})
+        session.commit()
+        return bool(updated)
+
+
+def release(row_id: int) -> bool:
+    """Hand a claimed row back, unsettled. Used when the write did not happen."""
+    with _session() as session:
+        updated = session.query(_db.RommRepin).filter(
+            _db.RommRepin.id == row_id,
+            _db.RommRepin.state == SETTLING,
+        ).update({"state": "pending", "settled_at": None})
+        session.commit()
+        return bool(updated)
+
+
 def settle(
     row_id: int, state: str, detail: str | None = None, new_id: int | None = None,
 ) -> bool:
     """Close out one re-pin row. Keyed by primary key, for the reason above.
 
     Returns whether a row was actually closed, so a caller cannot count a
-    settle that hit a superseded row as a success.
+    settle that hit a superseded row as a success. A row this pass has claimed
+    counts too -- claiming is how it stopped being superseded.
     """
     with _session() as session:
         values: dict = {"state": state, "settled_at": utcnow_iso()}
@@ -359,8 +424,8 @@ def settle(
             values["detail"] = f"Re-pinned to RomM rom {new_id}"
         updated = session.query(_db.RommRepin).filter(
             _db.RommRepin.id == row_id,
-            _db.RommRepin.state == "pending",
-        ).update(values)
+            _db.RommRepin.state.in_(("pending", SETTLING)),
+        ).update(values, synchronize_session=False)
         session.commit()
         return bool(updated)
 

@@ -2607,13 +2607,25 @@ class JobManager:
                     # its own: on a mount that has stopped answering, a Cancel
                     # pressed here must not wait out the probe bound before the
                     # verify that would report it even starts.
+                    # Ask the tool what to verify rather than assuming the
+                    # planned path holds it: a split makeps3iso build writes
+                    # `<iso>.0`/`.1`/… and no bare `.iso`, so verifying
+                    # `output_path` read a file that was never created and
+                    # failed a conversion that had in fact succeeded.
+                    verify_path = await run_in_threadpool(
+                        tool.verify_target, job.output_path, job.mode.value,
+                    )
+                    if not verify_path:
+                        raise RuntimeError(
+                            "Verification could not find the converted output"
+                        )
                     verify_bound = await tool.verify_timeout(
-                        job.output_path, cancel_event=cancel_event,
+                        verify_path, cancel_event=cancel_event,
                     )
                     self._verifying[job_id] = time.monotonic()
                     try:
                         verify_result = await asyncio.wait_for(
-                            tool.verify(job.output_path, cancel_event=cancel_event),
+                            tool.verify(verify_path, cancel_event=cancel_event),
                             timeout=verify_bound or None,
                         )
                     except asyncio.TimeoutError:

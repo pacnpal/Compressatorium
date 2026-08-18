@@ -3024,6 +3024,107 @@ async def test_the_settle_pass_bounds_the_hash_by_its_own_budget() -> None:
     assert seen["timeout"] > romm_routes._HASH_TIMEOUT_FLOOR_S, seen
 
 
+def test_claiming_a_row_is_atomic(sqlite_db, tmp_path: Path) -> None:
+    """Whoever claims the row is the only one that may write to RomM.
+
+    The previous shape was a read (`is_pending`) followed by a write, and the
+    window between them is exactly where a re-plan lands: the row is
+    superseded, and the pass — already past its check — pushes the previous
+    generation's provider ids anyway.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.rvz"
+    romm_repin.record({"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42})
+    row_id = romm_repin.pending_rows(10)[0][5]
+
+    assert romm_repin.claim(row_id) is True
+    # A second claimant gets nothing, and neither does a re-plan trying to
+    # supersede a row that is already being applied.
+    assert romm_repin.claim(row_id) is False
+    romm_repin.record({"id": 6, "igdb_id": 43}, str(out), {"igdb_id": 43})
+    assert romm_repin.claim(row_id) is False
+
+    # The claimed row still settles — claiming is how it stopped being
+    # superseded — and the re-planned row is untouched by that.
+    assert romm_repin.settle(row_id, "done", None, 99) is True
+    fresh = [r for r in romm_repin.pending_rows(10) if r[5] != row_id]
+    assert len(fresh) == 1, fresh
+
+    # And a write that never happened hands the row back rather than parking it.
+    second_id = fresh[0][5]
+    assert romm_repin.claim(second_id) is True
+    assert romm_repin.release(second_id) is True
+    assert romm_repin.claim(second_id) is True
+
+
+def test_a_split_build_is_verified_where_it_actually_landed(tmp_path: Path) -> None:
+    """A `-s` build past 4 GB writes parts, not the planned bare ISO.
+
+    Verifying the path the job planned therefore read a file that was never
+    created, and failed a conversion that had worked — which an overwrite rule
+    then repeated, and failed, on every later sweep.
+    """
+    from services.tools import registry
+
+    tool = registry.for_mode("folder_to_iso")
+    planned = tmp_path / "Game.iso"
+
+    # Split: only the numbered parts exist.
+    (tmp_path / "Game.iso.0").write_bytes(b"a")
+    (tmp_path / "Game.iso.1").write_bytes(b"b")
+    assert tool.verify_target(str(planned), "folder_to_iso") == str(
+        tmp_path / "Game.iso.0",
+    )
+
+    # Unsplit: the planned path is the product, as for every other mode.
+    planned.write_bytes(b"whole")
+    assert tool.verify_target(str(planned), "folder_to_iso") == str(planned)
+
+    # And nothing at all is an honest None rather than a path to a missing file.
+    for leftover in tmp_path.iterdir():
+        leftover.unlink()
+    assert tool.verify_target(str(planned), "folder_to_iso") is None
+
+    # Every other tool keeps the default: what the job planned.
+    chdman = registry.for_mode("createcd")
+    assert chdman.verify_target("/x/Game.chd", "createcd") == "/x/Game.chd"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_destination_leaves_an_overwrite_row_waiting(
+    sqlite_db, tmp_path: Path,
+) -> None:
+    """"The stat did not answer" is not "the file changed".
+
+    Reading a timeout as a change sends the row on to hash whatever is at the
+    destination — under `overwrite` that is the artifact the conversion was
+    going to replace — and stamps this ROM's ids onto it.
+    """
+    from services import romm_repin
+
+    out = tmp_path / "Game.rvz"
+    out.write_bytes(b"the previous artifact")
+    romm_repin.record(
+        {"id": 5, "igdb_id": 42}, str(out), {"igdb_id": 42}, "dolphin_rvz",
+        romm_repin.path_fingerprint(str(out)),
+    )
+    row = romm_repin.pending_rows(10)[0]
+
+    async def _no_answer(func, *args, **kwargs):
+        if func is romm_repin.path_fingerprint:
+            raise asyncio.TimeoutError
+        return func(*args, **kwargs)
+
+    hasher = AsyncMock()
+    with patch.object(romm_routes, "bounded_path_check", _no_answer), \
+            patch.object(romm_routes, "_hash_output", hasher):
+        outcome = await romm_routes._settle_one_repin(row)
+
+    assert outcome is romm_routes._Outcome.WAITING
+    hasher.assert_not_awaited()
+
+
 def test_verify_is_offered_where_deleting_is_refused() -> None:
     """Two capabilities, not one.
 

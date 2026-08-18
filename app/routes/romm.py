@@ -643,9 +643,16 @@ async def _settle_one_repin(row: tuple, deadline: float | None = None) -> _Outco
             # interrupt, because it is only checked between rows.
             current = await bounded_path_check(
                 romm_repin.path_fingerprint, output_path,
-            ) or ""
+            )
         except (asyncio.TimeoutError, OSError):
-            current = ""
+            current = None
+        if not current:
+            # No answer is not "the file changed". Reading it that way would
+            # send a row whose conversion never ran on to hash whatever is at
+            # the destination -- the artifact the overwrite was going to
+            # replace -- and stamp this ROM's ids onto it. A mount that is not
+            # answering means "not yet"; the next pass asks again.
+            return _Outcome.WAITING
         if current == pre_fingerprint:
             exists = False
     if not exists:
@@ -807,19 +814,33 @@ async def _match_and_settle(
                 return _Outcome.ABANDONED
             return _Outcome.WAITING
 
-        # Re-check ownership immediately before the outbound write. Hashing the
-        # output above can take minutes, and a conversion re-planned in that
-        # window supersedes this row -- pushing these ids to RomM afterwards
-        # would stamp the previous generation's identity onto the file the new
-        # conversion just produced.
-        if not await run_in_threadpool(romm_repin.is_pending, row_id):
+        # Claim the row before the outbound write, in one conditional update.
+        # Hashing the output above can take minutes, and a conversion
+        # re-planned in that window supersedes this row -- pushing these ids to
+        # RomM afterwards would stamp the previous generation's identity onto
+        # the file the new conversion just produced. Reading the state and then
+        # writing left exactly that window open; claiming closes it, because
+        # whoever flips the row to `settling` is the only writer, and a re-plan
+        # arriving after that gets its own row instead of silently replacing
+        # one already being applied.
+        if not await run_in_threadpool(romm_repin.claim, row_id):
             logger.info(
                 "romm: re-pin row %s was superseded while hashing; skipping", row_id,
             )
             return _Outcome.FAILED
 
-        await run_in_threadpool(romm_client.update_rom_metadata, match["id"], ids)
-        # Count only what actually settled: losing the row between the re-check
+        try:
+            await run_in_threadpool(
+                romm_client.update_rom_metadata, match["id"], ids,
+            )
+        except BaseException:
+            # Nothing was written, so the claim must not outlive the attempt --
+            # otherwise the row waits out `_CLAIM_STALE_SECONDS` before anyone
+            # retries it. Includes cancellation: the request going away is the
+            # commonest way to get here.
+            await run_in_threadpool(romm_repin.release, row_id)
+            raise
+        # Count only what actually settled: losing the row between the claim
         # and here must not inflate the reported total.
         if await run_in_threadpool(
             romm_repin.settle, row_id, "done", None, match["id"],
@@ -1067,8 +1088,14 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
     async with _settle_lock, romm_auto.paused():
         before = romm_settings.effective()
         values = await romm_settings.save(patch.model_dump(exclude_unset=True))
-        identity = ("url", "library_root")
-        changed = any(before.get(f) != values.get(f) for f in identity)
+        # Compare what the client and the path mapper actually use, not the
+        # spelling: `RommClient` strips a trailing slash from the URL and the
+        # library root is resolved with `realpath`, so saving
+        # `http://romm:8080/` over `http://romm:8080` -- or the same directory
+        # via a symlink -- pointed at the identical instance while looking like
+        # a move, and threw away the conversion history and every pending
+        # metadata snapshot for nothing.
+        changed = await run_in_threadpool(_identity_changed, before, values)
         cleared = await romm_auto.forget_converted_locked() if changed else 0
         if cleared:
             logger.info(
@@ -1094,6 +1121,29 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
                     "previous RomM instance", retired,
                 )
     return romm_settings.public(values)
+
+
+def _identity_changed(before: dict, after: dict) -> bool:
+    """Whether the RomM instance or library these settings name really moved.
+
+    Blocking (``realpath`` stats every component), so it runs off the loop.
+    """
+    def _url(value: object) -> str:
+        return str(value or "").strip().rstrip("/")
+
+    def _root(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return os.path.realpath(os.path.expanduser(text))
+        except (OSError, ValueError):
+            return text
+
+    return (
+        _url(before.get("url")) != _url(after.get("url"))
+        or _root(before.get("library_root")) != _root(after.get("library_root"))
+    )
 
 
 @router.post("/romm/settings/test")

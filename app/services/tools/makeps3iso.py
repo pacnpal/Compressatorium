@@ -133,6 +133,21 @@ class MakePs3IsoTool(BaseTool):
             if part != output_path
         ]
 
+    def verify_target(self, output_path: str, mode: str) -> str | None:
+        """The bare ISO, or the first numbered part when the build split.
+
+        A ``-s`` build past 4 GB writes ``<iso>.0``/``.1``/… and never the bare
+        path the job planned, so verifying `output_path` reads a file that is
+        not there and fails a conversion that actually worked -- and under an
+        overwrite rule the next sweep repeats it. The service's own readback
+        already targets the first part; this is the same answer, given to the
+        job runner.
+        """
+        if os.path.exists(output_path):
+            return output_path
+        parts = self._service.split_parts(output_path)
+        return parts[0] if parts else None
+
     def overwrite_targets(
         self, output_path: str, mode: str,  # noqa: ARG002 - single-mode tool
     ) -> list[str]:

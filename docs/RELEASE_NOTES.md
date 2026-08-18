@@ -299,6 +299,25 @@
   on, so a PS2 disc could be submitted to a GameCube format from a platform that
   allows neither. The reason is named instead, next to the platform it applies
   to.
+- **A PS3 conversion split into parts verifies the parts.** With verification
+  now reachable for that format, the check was still being pointed at the
+  single ISO the job planned — which a `-s` build past 4 GB never writes — so a
+  conversion that had worked was marked failed, and an Overwrite rule repeated
+  it every run. The tool says where its product actually landed.
+- **A destination that cannot be read leaves the re-match row waiting.** The
+  newly bounded check turned a timeout into "the file changed", which would
+  have sent the row on to hash whatever sat at the destination — under
+  Overwrite, the file the conversion was going to replace.
+- **Two re-match passes can no longer write the same ROM's metadata twice
+  over.** Ownership of a row was read and then acted on; a conversion
+  re-planned in between superseded it, and the pass pushed the older ids to
+  RomM anyway. The row is claimed in one atomic step now, and handed back
+  unclaimed if the write does not happen.
+- **Re-typing the same RomM URL with a trailing slash no longer wipes your
+  conversion history.** The identity check compared spellings rather than what
+  the client and the path mapper actually use, so `http://romm:8080/` looked
+  like a different server and `/library/` like a different folder — both
+  clearing the history and retiring every pending snapshot for nothing.
 - **"Verify each converted file" is available for PS3 folder → ISO.** The
   setting was gated on whether the mode could *delete* its source, and that
   conversion deliberately never deletes a curated game folder — so the one
