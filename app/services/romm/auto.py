@@ -468,10 +468,19 @@ def normalize_rule(
     if isinstance(mode, str) and mode:
         try:
             registry.spec(mode)
-            out["mode"] = mode
         except KeyError:
             logger.warning("romm_auto: rule names unknown mode %r", mode)
             return None
+        # Refused here as well as omitted from the editor, because a rules blob
+        # can be written straight into the database. A mode that turns its own
+        # product into a differently named file never terminates under
+        # automation -- see `registry.mode_is_automatable`.
+        if not registry.mode_is_automatable(mode):
+            logger.warning(
+                "romm_auto: rule names mode %r, which cannot run unattended", mode,
+            )
+            return None
+        out["mode"] = mode
     elif mode_required:
         return None
 
@@ -733,6 +742,30 @@ async def _probe(func, *args, default):
             getattr(func, "__name__", func), default,
         )
         return default
+
+
+async def _ready_bounded(tool) -> bool:
+    """Is this tool usable here, without risking the sweep on a dead volume?
+
+    `is_ready()` is async but not therefore safe: NSZ's delegates to a pooled
+    `keys_available()` that walks every configured volume looking for
+    `prod.keys`, and that walk has no deadline. The sweep holds `_sweep_lock`
+    throughout, so an unresponsive mount blocks previews, manual runs, rule
+    edits and settings saves behind it while stranding a shared worker.
+
+    A bound that expires answers *not ready*, which skips the platform with a
+    reason the editor shows -- the same answer a genuinely missing binary gets,
+    and the right one, since a tool whose keys cannot be read cannot convert.
+    """
+    try:
+        return bool(await asyncio.wait_for(tool.is_ready(), _VOLUME_PROBE_SECONDS))
+    except (asyncio.TimeoutError, OSError):
+        logger.warning(
+            "romm_auto: readiness check for %s did not finish in %ss; treating "
+            "it as not ready (a volume is not answering)",
+            getattr(tool, "id", tool), _VOLUME_PROBE_SECONDS,
+        )
+        return False
 
 
 async def _within_volumes_bounded(path: str) -> bool:
@@ -1548,7 +1581,7 @@ async def _sweep_locked(
         # offers ready tools, but a saved rule keeps firing after its binary
         # is removed or a container is rebuilt without it, and every job it
         # queues fails at launch. Ask before queueing, and say so.
-        if not await tool.is_ready():
+        if not await _ready_bounded(tool):
             logger.warning(
                 "romm_auto: %s is not installed, skipping platform %s",
                 spec.tool_id, platform_id,
@@ -1743,6 +1776,23 @@ async def _sweep_locked(
                             "romm_auto: dropping %d source(s) whose delete "
                             "snapshot could not be read", len(unreadable),
                         )
+                    if not batch:
+                        # Every candidate dropped, which is a symptom of the
+                        # volume rather than of the library: queueing nothing
+                        # would otherwise look like a clean run and advance
+                        # this platform's schedule, postponing the whole set
+                        # for a full interval over a transient failure.
+                        logger.warning(
+                            "romm_auto: platform %s had no readable source left "
+                            "to queue", platform_id,
+                        )
+                        summary["snapshot_failed"] = True
+                        result["errors"].append({
+                            "platform_id": int(platform_id),
+                            "error": "sources_unreadable",
+                        })
+                        result["platforms"].append(summary)
+                        continue
 
                 jobs = await job_manager.create_batch_jobs(
                     batch,

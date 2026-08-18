@@ -65,6 +65,44 @@ class ToolRegistry:
         spec = self.spec(mode)
         return spec.supports_delete_on_verify or spec.supports_verify
 
+    def mode_is_automatable(self, mode: str) -> bool:
+        """May an unattended rule run this mode repeatedly over a library?
+
+        About *termination*, not capability: a mode excluded here still works
+        perfectly by hand, and this deliberately does not encode the editor's
+        separate choice not to offer unpacking (extract modes are accepted in
+        a rule and always have been -- they terminate).
+
+        A mode that turns its own product into a *differently named* file does
+        not terminate. CHDMAN's `copy` is the case: a rule over `Game.chd`
+        writes `Game_copy.chd`, RomM rescans and lists it, the same rule
+        accepts it as a source, and the next sweep writes
+        `Game_copy_copy.chd` -- once per sweep, full size each time, until the
+        volume fills. Nothing downstream stops it, because the destination is
+        new every round: the duplicate policy and the converted history both
+        agree it is work that has not been done.
+
+        A mode that maps its own product back onto *itself* is fine --
+        `dolphin_rvz` over a `.rvz` resolves to the same path, which the
+        queue's same-path guard refuses, so it settles instead of multiplying.
+        The question is therefore not "does it accept its own output" but
+        "where would it write it", which the tool answers.
+
+        Derived rather than listed, so a future tool with the same shape is
+        excluded without anyone remembering to add it.
+        """
+        spec = self.spec(mode)
+        output_ext = (spec.output_ext or "").lower()
+        if not output_ext:
+            return True
+        if output_ext not in {ext.lower() for ext in spec.input_extensions}:
+            return True  # cannot re-consume what it makes
+        probe = f"/romm-automation-probe{output_ext}"
+        try:
+            return self.for_mode(mode).output_path(mode, probe) == probe
+        except (KeyError, ValueError, OSError):
+            return False
+
     def mode_input_kind(self, mode: str) -> InputKind:
         """The kind of thing this mode takes: one file, or one directory.
 

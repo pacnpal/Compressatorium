@@ -222,6 +222,42 @@ def test_navigating_into_a_catalog_folder_leaves_the_romm_view():
     )
 
 
+def test_an_action_refuses_when_its_rule_save_was_superseded():
+    """The editor stays live while Preview / Run now / the toggle are saving.
+
+    `saveRules()` deliberately keeps an edit that landed mid-save and leaves it
+    dirty. Returning success anyway ran the action against the *older*
+    server-side snapshot while the editor showed the newer rule — including a
+    platform just switched off, or a delete-after-verify just cleared.
+    """
+    src = _AUTOMATION.read_text(encoding="utf-8")
+    body = re.search(
+        r"async function commitPendingEdits\(\) \{(.*?)\n  \}\n", src, re.DOTALL,
+    )
+    assert body, "commitPendingEdits is no longer where this guard looks"
+    assert "romm.rulesDirty" in body.group(1), (
+        "commitPendingEdits reports success without checking whether the save "
+        "was superseded by an edit made while it was in flight"
+    )
+    # ...and it does not simply proceed: the failure path returns false.
+    assert re.search(r"if \(romm\.rulesDirty\)", body.group(1)), body.group(1)
+    assert "return false;" in body.group(1)
+
+
+def test_automation_offers_neither_unpacking_nor_self_multiplying_modes():
+    """Two exclusions, from two places, and both have to stay.
+
+    `kind === 'extract'` is the editor's own choice (automation converts, it
+    does not unpack). Whether a mode multiplies its own output is the
+    *backend's* answer, because deriving it needs the tool's `output_path`.
+    """
+    src = _AUTOMATION.read_text(encoding="utf-8")
+    assert "m.kind === 'extract'" in src
+    assert "romm.modeIsAutomatable(m.mode)" in src, (
+        "the editor offers modes the backend refuses to run unattended"
+    )
+
+
 def test_the_repin_promise_is_qualified_for_split_builds():
     """A split build has no single file for RomM to hash.
 

@@ -329,7 +329,7 @@ hourly while PS2 converts to CHD overnight, ten at a time, largest first.
 
 | Setting | What it does |
 |---|---|
-| **Convert to** | Target format for this platform. Off means "leave it alone". |
+| **Convert to** | Target format for this platform. Off means "leave it alone". Recompress-in-place targets (CHDMAN's Copy) are not offered here: a rule using one would convert its own output every sweep and never stop. Use it from the Convert panel instead. |
 | **Enabled** | Pause a rule without deleting it. |
 | **Run every** | Minutes between sweeps for this platform (minimum 5). |
 | **Only between** | Time-of-day window. Wraps midnight, so `22:00`–`04:00` works. |

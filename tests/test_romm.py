@@ -3840,6 +3840,120 @@ async def test_a_cancel_spares_the_row_a_queued_job_is_writing(
     assert result["cancelled"] == 1, result
 
 
+def test_a_mode_that_multiplies_its_own_output_is_not_automatable() -> None:
+    """An unattended rule has to terminate.
+
+    CHDMAN `copy` over `Game.chd` writes `Game_copy.chd`; RomM rescans, the
+    same rule accepts that as a source, and the next sweep writes
+    `Game_copy_copy.chd` — full size, once per sweep, until the volume fills.
+    Nothing downstream stops it: the destination is new every round, so the
+    duplicate policy and the converted history both agree it is work not yet
+    done.
+
+    A mode that maps its product onto *itself* is fine — `dolphin_rvz` over a
+    `.rvz` resolves to the same path, which the queue's same-path guard
+    refuses. The question is where it would write, not whether it accepts.
+    """
+    from services.romm import auto as romm_auto
+
+    assert registry.mode_is_automatable("copy") is False
+    assert registry.mode_is_automatable("dolphin_rvz") is True
+    assert registry.mode_is_automatable("createcd") is True
+    # Extract terminates, and rules using it are a deliberate feature; the
+    # editor's choice not to offer them is a separate, UI-side decision.
+    assert registry.mode_is_automatable("extractcd") is True
+    assert [
+        spec.mode for spec in registry.mode_specs()
+        if not registry.mode_is_automatable(spec.mode)
+    ] == ["copy"]
+
+    # Refused in normalization too, for a rules blob written straight into the
+    # database rather than through the editor.
+    assert romm_auto.normalize_rule({"mode": "copy", "enabled": True}) is None
+    assert romm_auto.normalize_rules({"7": {"mode": "copy", "enabled": True}}) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_settings_retry_finishes_a_cleanup_the_first_attempt_owed(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Replaying only at startup is not enough.
+
+    If the save lands and the cleanup fails, retrying the same request finds
+    the new identity already cached, computes no change, and returns success —
+    while the marker still says the previous instance's history and re-pin rows
+    are live against the new one.
+    """
+    from services.romm import repin as romm_repin, settings as romm_settings
+
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path),
+    })
+    romm_repin.record({"id": 5, "igdb_id": 42}, str(tmp_path / "A.rvz"), {"igdb_id": 42})
+
+    # First attempt: identity installed, cleanup owed but not done.
+    await romm_settings.save({"url": "http://elsewhere:8080"}, cleanup_pending=True)
+    assert romm_settings.cleanup_owed() is True
+    assert romm_repin.count_pending() == 1
+
+    # The operator presses Save again with the same values. Nothing "changed"
+    # this time -- and that is exactly the case that used to slip through.
+    with patch.object(RommClient, "base_url", "http://elsewhere:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)):
+        await romm_routes.put_romm_settings(
+            romm_routes.RommSettingsPatch(url="http://elsewhere:8080"),
+        )
+
+    assert romm_repin.count_pending() == 0
+    assert romm_settings.cleanup_owed() is False
+
+
+@pytest.mark.asyncio
+async def test_a_platform_whose_sources_all_dropped_does_not_advance_its_clock(
+    settings_db, tmp_path: Path,
+) -> None:
+    """Queueing nothing because the volume stopped answering is not a clean run.
+
+    With delete-on-verify on, every candidate can lose its delete snapshot and
+    drop out of the batch. `create_batch_jobs([])` then succeeds with no jobs,
+    and recording the run would postpone the whole set for a full interval over
+    a transient failure.
+    """
+    from services.romm import auto as romm_auto
+
+    lib = tmp_path / "library" / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    await settings_db.save({
+        "url": "http://romm:8080", "library_root": str(tmp_path / "library"),
+    })
+    roms = [{
+        "id": 1, "name": "Game", "full_path": "roms/gc/Game.iso",
+        "fs_name": "Game.iso", "platform_slug": "ngc",
+    }]
+
+    async def _fake_batch(paths, mode, **kwargs):
+        assert paths == [], "an unreadable source reached the queue"
+        return []
+
+    with patch.object(romm_routes.romm_client, "roms", return_value=roms), \
+            patch.object(romm_auto.job_manager, "create_batch_jobs", _fake_batch), \
+            patch.object(
+                romm_auto.job_manager, "get_active_job_candidates", return_value=[],
+            ), \
+            patch.object(romm_auto, "is_within_configured_volumes", return_value=True), \
+            patch.object(romm_auto, "build_delete_snapshot", side_effect=OSError):
+        await romm_auto.set_rules({"7": {
+            "mode": "dolphin_rvz", "enabled": True, "delete_on_verify": True,
+        }})
+        result = await romm_auto.sweep(ignore_schedule=True)
+
+    assert result["queued"] == 0, result
+    assert {"platform_id": 7, "error": "sources_unreadable"} in result["errors"], result
+    # The clock did not move, so the next run tries these again immediately.
+    assert not (await romm_auto.get_state()).get("7", {}).get("last_run_at")
+
+
 def test_a_filter_pattern_too_long_to_store_is_refused_not_trimmed() -> None:
     """A prefix of a regex is usually a valid regex that means something else.
 

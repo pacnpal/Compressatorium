@@ -153,6 +153,12 @@ class RommStore {
         tokenSet: data?.token_set === true,
         datSafeOutputExts: data?.dat_safe_output_exts ?? [],
         sizeRatios: data?.size_ratios ?? {},
+        // Which modes may run unattended, from the backend contract. Absent on
+        // an older server, which the editor reads as "no opinion" and falls
+        // back to its own conservative exclusion.
+        automatableModes: Array.isArray(data?.automatable_modes)
+          ? data.automatable_modes
+          : null,
         pendingRepins: data?.pending_repins ?? 0,
         error: data?.error ?? null,
       };
@@ -443,6 +449,22 @@ class RommStore {
     } finally {
       this.rulesSaving = false;
     }
+  }
+
+  /**
+   * May this mode run unattended?
+   *
+   * The backend derives it (a mode that turns its own product into a
+   * differently named file never terminates -- CHDMAN `copy` writes
+   * `Game_copy.chd`, then `Game_copy_copy.chd`, once per sweep until the
+   * volume fills) and serves the list, because the derivation needs the tool's
+   * own `output_path`. Absent -- an older server -- everything is offered, as
+   * it was before: the caller's own `kind === 'extract'` exclusion still
+   * applies either way.
+   */
+  modeIsAutomatable(mode) {
+    const allowed = this.status?.automatableModes;
+    return Array.isArray(allowed) ? allowed.includes(mode) : true;
   }
 
   /** How many sources this rule remembers having produced an output for. */

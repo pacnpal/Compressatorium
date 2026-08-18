@@ -56,6 +56,11 @@
       if (Array.isArray(allowedTools) && !allowedTools.includes(tool.id)) continue;
       for (const m of tool.modes ?? []) {
         if (m.kind === 'extract') continue; // automation converts, not unpacks
+        // ...and a mode that turns its own product into a differently named
+        // file never terminates. That one is the backend's answer, because it
+        // needs the tool's own output_path; the backend refuses such a rule
+        // too, for a blob written straight into the database.
+        if (!romm.modeIsAutomatable(m.mode)) continue;
         if (Array.isArray(allowedModes) && !allowedModes.includes(m.mode)) continue;
         out.push({ value: m.mode, label: `${tool.label} → ${m.label}` });
       }
@@ -221,11 +226,29 @@
     if (!dirty) return true;
     try {
       await romm.saveRules();
-      return true;
     } catch (e) {
       toast.error(e?.message ?? 'Failed to save rules');
       return false;
     }
+    if (romm.rulesDirty) {
+      // The save was superseded: an edit landed while it was in flight, so the
+      // store deliberately kept the newer rule and left it unsaved. Proceeding
+      // would run the action against the *older* server-side snapshot while
+      // the editor shows the newer one -- including a platform just switched
+      // off, or a delete-after-verify just cleared. Save again rather than act
+      // on a configuration nobody is looking at.
+      try {
+        await romm.saveRules();
+      } catch (e) {
+        toast.error(e?.message ?? 'Failed to save rules');
+        return false;
+      }
+      if (romm.rulesDirty) {
+        toast.warning('Your edits are still saving — try that again in a moment');
+        return false;
+      }
+    }
+    return true;
   }
 
   async function preview() {

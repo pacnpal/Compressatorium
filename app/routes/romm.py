@@ -243,6 +243,16 @@ async def romm_status() -> dict:
         # what converting would save. Served rather than duplicated in JS:
         # SIZE_RATIOS is the same table the progress estimator reads.
         "size_ratios": dict(SIZE_RATIOS),
+        # Which modes may run unattended. Served rather than re-derived in JS
+        # because the answer needs the tool's own `output_path` -- a mode that
+        # turns its product into a *differently named* file never terminates
+        # under automation, while one that maps it onto itself is refused by
+        # the queue's same-path guard and settles. See
+        # `registry.mode_is_automatable`.
+        "automatable_modes": sorted(
+            spec.mode for spec in registry.mode_specs()
+            if registry.mode_is_automatable(spec.mode)
+        ),
         "connected": False,
         "version": None,
         "error": None,
@@ -1315,12 +1325,19 @@ async def put_romm_settings(patch: RommSettingsPatch) -> dict:
             },
         }
         changed = await _identity_moved(before, proposed)
+        # ...or a previous attempt already installed an identity and then
+        # failed to clean up after it. Replaying only at startup was not
+        # enough: retrying the same request finds the new identity already
+        # cached, computes `changed == False`, and returns success while the
+        # marker still says the old instance's history and re-pin rows are
+        # live against the new one.
+        owed = changed or romm_settings.cleanup_owed()
         # The new identity and the promise to clean up after it go into one
         # row, so neither half can commit alone: whichever is interrupted, the
         # marker survives and `_run_identity_cleanup` replays the other. Both
         # halves of the cleanup are idempotent, so replaying costs nothing.
         values = await romm_settings.save(submitted, cleanup_pending=changed)
-        cleared = await _run_identity_cleanup() if changed else 0
+        cleared = await _run_identity_cleanup() if owed else 0
         if cleared:
             logger.info(
                 "romm: RomM instance or library changed; cleared the conversion "

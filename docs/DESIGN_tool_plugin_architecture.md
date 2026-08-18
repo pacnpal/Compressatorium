@@ -1487,6 +1487,12 @@ cleanup_pending=True)` writes the marker in the *same row* as the new identity,
 `replay_identity_cleanup()` finishes an interrupted change at startup. Both
 halves of the cleanup are idempotent, so replaying costs nothing.
 
+Startup is not the only replay point: the settings route runs the cleanup when
+`changed` **or** `romm_settings.cleanup_owed()`. Retrying the same save
+otherwise finds the new identity already cached, computes no change, and
+returns success while the marker still says the old instance's records are
+live.
+
 The re-pin **plan** holds neither `_settle_lock` nor the sweep pause, and it
 reads the catalog and then writes rows carrying that catalog's provider ids.
 `romm_settings.identity_generation()` is read before and re-checked after: a
@@ -1684,6 +1690,30 @@ nothing and inherits: recompressing a finished `.chd` is media-agnostic.
 The rule for a new tool: declare `platform_slugs` on the *mode* whenever two of
 a tool's modes would be wrong for each other's platforms, and let the tool-level
 set be the union.
+
+#### What may run unattended (`registry.mode_is_automatable`)
+
+A rule fires repeatedly over a library RomM rescans, so a mode is only
+automatable if that loop **terminates**. The one that does not is CHDMAN's
+`copy`: `Game.chd` becomes `Game_copy.chd`, RomM lists it, the same rule
+accepts it as a source, and the next sweep writes `Game_copy_copy.chd` — full
+size, once per sweep, until the volume fills. Nothing downstream stops it,
+because the destination is new every round: the duplicate policy and the
+converted history both agree it is work not yet done.
+
+The test is not "does it accept its own output" but **where would it write
+it**. `dolphin_rvz` over a `.rvz` resolves to the *same* path, which the
+queue's same-path guard refuses — so it settles rather than multiplying. The
+registry therefore asks the tool: derive the output path for a synthetic source
+carrying the mode's own output extension, and refuse the mode when the answer
+differs from it. Derived, so a future tool of the same shape is excluded
+without anyone remembering.
+
+Enforced in two places, because a rules blob can be written straight into the
+database: `normalize_rule` drops such a rule, and the editor omits the mode
+(served through `/romm/status`'s `automatable_modes`, since the derivation
+needs the tool's `output_path` and cannot be mirrored in JS). Extract modes are
+a *separate*, UI-side exclusion — they terminate, and rules using them work.
 
 #### What counts as a source (`registry.mode_input_kind`)
 

@@ -638,6 +638,34 @@
   thread serving the app, before the deadline meant to cover it, while
   inspecting a job that was merely queued.
 
+- **Copy / Recompress can no longer be set as an automatic rule.** Left running
+  it never stops: `Game.chd` becomes `Game_copy.chd`, RomM scans that, the same
+  rule converts it to `Game_copy_copy.chd`, and so on once per sweep at full
+  size until the volume fills — with nothing to notice it, since each
+  destination really is new. It stays available for conversions you start
+  yourself; only unattended rules refuse it, in the editor and in the backend
+  both, so a hand-edited configuration cannot slip it through.
+- **Retrying a failed connection change now finishes the cleanup it owed.** If
+  the new address saved but clearing the old instance's records did not,
+  pressing Save again saw nothing left to change and reported success — while
+  the previous instance's history and metadata snapshots stayed live against
+  the new one until a restart.
+- **Preview, Run now and the automation switch no longer act on a rule you have
+  since edited.** They save first, and an edit made while that save was in
+  flight is deliberately kept rather than overwritten — but the action then
+  went ahead against the older saved copy, which might still have had the
+  platform enabled or delete-after-verify set.
+- **A platform whose sources all became unreadable no longer waits out its full
+  interval.** With delete-after-verify on, a mount going quiet can drop every
+  candidate from the batch; queueing nothing then looked like a clean run and
+  advanced the schedule, postponing the lot for hours over a transient failure.
+  It now reports the platform's sources as unreadable and leaves the clock
+  alone, so the next run picks them straight back up.
+- **Checking whether a tool is usable can no longer hang a sweep.** Switch
+  conversions look for `prod.keys` by walking every configured volume, and that
+  walk had no deadline while the sweep held its lock — so one unresponsive
+  share blocked previews, manual runs, rule edits and settings saves behind it.
+
 - **The Convert and Jobs panel no longer collapses into a narrow strip on
   mid-width screens.** Between 900 and 1279 CSS pixels wide — the range a 4K
   monitor at 300% display scaling, a laptop at high zoom, or a half-snapped
