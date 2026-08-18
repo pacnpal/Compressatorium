@@ -1343,6 +1343,28 @@ This is a payload field, not a schema change.
   a remote hit. Without it an import landing inside that window left the remote
   answer authoritative for good, since a cached hit is served unconditionally
   afterwards. One indexed lookup, and only on a hit.
+- **Concurrent DAT imports have a boundary, and it is the transaction.** A match
+  runs local-first, but the decision and the write are separate operations, so
+  three windows exist between them: the file hash (seconds), the remote request
+  (seconds), and decide-then-write (milliseconds). The first two are closed by
+  re-checking the local index — before the remote pass, and again over the whole
+  candidate set before a remote answer is accepted. The third is closed in
+  `dat_store._local_index_now_covers()`, which re-checks inside the writing
+  transaction and skips caching a remote hit the local index has since learned
+  (leaving the path uncached, so the next match resolves it locally). What
+  remains is the transaction boundary itself: an import committing between that
+  read and the write's commit leaves a remote hit, which invalidation preserves
+  by design.
+
+  That last one is deliberately *not* chased. Closing it read-side means
+  stamping remote hits with the DAT-set generation and rejecting stale ones,
+  which invalidates every remote hit on every DAT change — the recompute misses
+  locally (the new DAT usually doesn't cover the file that needed Hasheous) and
+  re-queries, re-disclosing thousands of hashes per sync, forever. That is a
+  worse trade than the thing it fixes, whose worst outcome is a HASH badge where
+  a DAT badge would do: same game, self-correcting on the next rescan. Closing it
+  write-side means serialising matches against imports, i.e. holding a lock
+  across a network call.
 - **A DAT change re-matches through one helper.** `rematch_after_dat_change()`
   is shared by the manual upload (`import_dat`) and the MAMERedump sync; both
   want "recompute what already had a verdict against the new index", and it had
