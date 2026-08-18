@@ -383,7 +383,15 @@ class DATMatchingStore {
 
   async startMatchJob(paths) {
     if (!paths?.length) return null;
+    // Same guard as hydrate(): a provider toggle clears the map and bumps the
+    // generation, and the idle response below carries verdicts reached under
+    // the OLD policy. Merging them unconditionally put a local-only miss back
+    // after the clear -- and because that path then counts as known and the
+    // idle response fires no terminal job event, Hasheous was never tried for
+    // it until some later cache reset.
+    const generation = this._generation;
     const response = await api.startMatchJob(paths);
+    if (generation !== this._generation) return response;
     // The endpoint answers {status: "idle", results} and creates NO job when
     // every path was cached between our hydrate() and this call (another
     // client, or a scan, got there first). Dropping that response left the

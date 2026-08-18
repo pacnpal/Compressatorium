@@ -232,7 +232,7 @@ Those files are retried the next time you browse or rescan them.
 |---|---|---|
 | `COMPRESSATORIUM_HASHEOUS_ENABLED` | `false` | Starting state of the master switch. The **DAT Library** toggle overrides it and persists. |
 | `COMPRESSATORIUM_HASHEOUS_URL` | `https://hasheous.org` | Point at your own instance. Must be `https`. |
-| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, covering DNS-to-body: the TCP connect (every address the host resolves to, not one budget each), a proxy `CONNECT` tunnel, the TLS handshake, headers and body. Not per socket read, so a slow-dripping server or proxy can't stall a scan. This call sits in the file-browse path, so keep it short. |
+| `COMPRESSATORIUM_HASHEOUS_TIMEOUT` | `15` | Whole-request timeout in seconds, from the TCP connect to the last byte: every address the host resolves to (one budget between them, not one each), a proxy `CONNECT` tunnel, the TLS handshake, headers and body. Not per socket read, so a slow-dripping server or proxy can't stall a scan. **Name resolution is not included** — `getaddrinfo` runs before any socket exists, so a stalled resolver is bounded by `/etc/resolv.conf` instead (it raises, so the 60s cooldown then opens). This call sits in the file-browse path, so keep it short. |
 
 Legacy short names (`HASHEOUS_ENABLED`, `HASHEOUS_URL`, `HASHEOUS_TIMEOUT`) are
 accepted as aliases.

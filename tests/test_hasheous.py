@@ -2607,3 +2607,52 @@ async def test_a_dat_landing_before_the_write_is_not_overwritten(tmp_path):
         "match_type": "file_sha1", "file_hash": known_sha1, "source": "hasheous",
     }})
     assert store.get_match(path) is None, "the batch writer bypassed the guard"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_failure_cannot_reopen_a_cleared_cooldown(hasheous_on, monkeypatch):
+    """A Test press (or a toggle) outranks a lookup that started before it.
+
+    Both clear the cooldown deliberately. An older in-flight lookup failing
+    afterwards used to reopen it, so the panel said "reachable" while every
+    match short-circuited as unavailable for the next 60 seconds.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    def _slow_failure(url):
+        # Signal that the lookup is in flight, then fail once released.
+        started.set()
+        asyncio.run_coroutine_threadsafe(_wait(), loop).result(timeout=5)
+        raise hasheous.HasheousUnavailable("timed out")
+
+    async def _wait():
+        await release.wait()
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(hasheous, "_fetch_json", _slow_failure)
+
+    lookup = asyncio.create_task(hasheous.lookup("a" * 40))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    # The probe succeeds while that lookup is still out.
+    hasheous._clear_cooldown()
+
+    release.set()
+    with pytest.raises(hasheous.HasheousUnavailable):
+        await lookup
+
+    assert hasheous._cooldown_remaining() == 0, (
+        "a failure that started before the successful probe reopened the cooldown"
+    )
+
+
+def test_a_failure_still_opens_the_cooldown_normally(hasheous_on, monkeypatch):
+    """The ordering guard must not disarm the breaker in the ordinary case."""
+    def _boom(url):
+        raise hasheous.HasheousUnavailable("down")
+
+    monkeypatch.setattr(hasheous, "_fetch_json", _boom)
+    with pytest.raises(hasheous.HasheousUnavailable):
+        asyncio.run(hasheous.lookup("b" * 40))
+    assert hasheous._cooldown_remaining() > 0, "the breaker stopped tripping"

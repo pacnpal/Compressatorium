@@ -82,6 +82,9 @@ _COOLDOWN_SECONDS = 60
 
 _cooldown_lock = threading.Lock()
 _unavailable_until = 0.0  # monotonic deadline; 0 == service presumed up
+# Bumped whenever something *clears* the cooldown (a successful probe, a
+# toggle). A failure carrying an older epoch is stale and must not reopen it.
+_health_generation = 0
 
 
 class HasheousUnavailable(Exception):
@@ -146,13 +149,15 @@ async def health() -> dict:
     """
     url = f"{base_url()}/api/v1/Healthcheck"
     started = time.monotonic()
+    epoch = _health_epoch()
     try:
         await run_in_threadpool(_probe, url)
     except (HasheousUnavailable, ValueError) as exc:
         # A failed probe IS an outage observation, so record it: the next match
         # then fails instantly instead of paying another full timeout to
         # rediscover what the operator just watched the button discover.
-        _begin_cooldown()
+        # Unless a newer verdict landed while this one was in flight.
+        _begin_cooldown(epoch)
         return {"ok": False, "url": url, "error": str(exc)}
 
     # ...and a successful probe clears it. Otherwise the button could report
@@ -193,16 +198,35 @@ def _cooldown_remaining() -> float:
         return max(0.0, _unavailable_until - time.monotonic())
 
 
-def _begin_cooldown() -> None:
+def _health_epoch() -> int:
+    """Token identifying the current health verdict, for ordering observations.
+
+    Requests overlap: a lookup can be in flight while the Test button probes,
+    or while the operator toggles the feature. Both of those *clear* the
+    cooldown deliberately -- "the server answered", "try again" -- and the
+    older lookup then failing would reopen it, leaving the UI reporting the
+    server reachable while every match short-circuits for the next 60 seconds.
+    Callers capture this before their request and hand it back, so a stale
+    failure cannot overwrite a newer success.
+    """
+    with _cooldown_lock:
+        return _health_generation
+
+
+def _begin_cooldown(epoch: int | None = None) -> None:
+    """Open the cooldown, unless a newer verdict has landed since *epoch*."""
     global _unavailable_until  # noqa: PLW0603, intentional module-level state
     with _cooldown_lock:
+        if epoch is not None and epoch != _health_generation:
+            return
         _unavailable_until = time.monotonic() + _COOLDOWN_SECONDS
 
 
 def _clear_cooldown() -> None:
-    global _unavailable_until  # noqa: PLW0603, intentional module-level state
+    global _unavailable_until, _health_generation  # noqa: PLW0603, intentional module-level state
     with _cooldown_lock:
         _unavailable_until = 0.0
+        _health_generation += 1
 
 
 def _lookup_url(sha1: str) -> str:
@@ -362,6 +386,11 @@ async def lookup(sha1: str) -> dict | None:
     # after it: a proxy returning `{}` for every hash was then re-requested
     # once per file, recreating exactly the hours-long outage the breaker
     # exists to prevent.
+    # Captured before the request: a Test button press or a toggle can land
+    # while this lookup is in flight, and both clear the cooldown on purpose.
+    # Reopening it from a failure that started earlier would leave the UI
+    # saying "reachable" while every match short-circuits for 60s.
+    epoch = _health_epoch()
     try:
         data = await run_in_threadpool(_fetch_json, _lookup_url(normalized))
         record = None
@@ -378,7 +407,7 @@ async def lookup(sha1: str) -> dict | None:
                 # no game attached.
                 raise HasheousUnavailable("response carried no game identity")
     except HasheousUnavailable:
-        _begin_cooldown()
+        _begin_cooldown(epoch)
         raise
 
     # A clean 404 counts as healthy: the server answered, it just doesn't know
