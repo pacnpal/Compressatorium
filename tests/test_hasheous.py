@@ -2486,3 +2486,82 @@ async def test_a_scan_reports_that_its_remote_phase_failed(
 
     assert matched == 0
     assert hasheous_errors == 2, "the phase did not count its remote failures"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_library_still_completes_its_scan(scan_phase_stubs):
+    """Every return path has to carry the new (matched, errors) shape.
+
+    The counter changed the signature, and the discovery-found-nothing path
+    kept returning a bare int -- so an empty library failed its whole metadata
+    scan with a TypeError instead of finishing quietly.
+    """
+    assert await scan_phase_stubs._scan_phase_dat_match("job-1", [], force=True) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_dat_import_mid_lookup_wins_on_any_candidate(
+    hasheous_on, monkeypatch,
+):
+    """The post-await recheck covers the whole candidate set, not one hash.
+
+    A CHD sends up to three hashes. Checking only the one that happened to
+    match remotely left the case where the DAT landing mid-flight knows a
+    *later* candidate -- and the all-missed path had no recheck at all, so a
+    miss could be stamped over an index that had just learned the answer.
+    """
+    header, data = "a" * 40, "b" * 40
+    imported: dict[str, dict | None] = {}
+
+    async def _local(hash_value):
+        return imported.get(hash_value)
+
+    async def _remote(hash_value):
+        # The import lands during the first request and covers the *second*
+        # candidate only.
+        imported[data] = {
+            "dat_id": "dat1", "dat_name": "Local.dat", "game_name": "Local Name",
+            "rom_name": "local.bin", "source": "dat",
+        }
+        return {"game_name": "Remote Name", "source": "hasheous"} if hash_value == header else None
+
+    monkeypatch.setattr(dat_routes, "_local_dat_record", _local)
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+
+    match, consulted = await dat_routes._remote_lookup_match(
+        "/vol/game.chd", [(header, "chd_sha1"), (data, "chd_data_sha1")],
+    )
+
+    assert match is not None
+    assert match["game_name"] == "Local Name", (
+        "a remote hit on one candidate hid a local match on another"
+    )
+    assert match["file_hash"] == data
+    assert consulted
+
+
+@pytest.mark.asyncio
+async def test_a_dat_import_mid_lookup_beats_an_all_miss_pass(hasheous_on, monkeypatch):
+    """The exit where nothing matched remotely needs the recheck too."""
+    sha1 = "c" * 40
+    imported: dict[str, dict | None] = {}
+
+    async def _local(hash_value):
+        return imported.get(hash_value)
+
+    async def _remote(hash_value):
+        imported[sha1] = {
+            "dat_id": "dat1", "dat_name": "Local.dat", "game_name": "Local Name",
+            "rom_name": "local.bin", "source": "dat",
+        }
+        return None  # a clean remote miss
+
+    monkeypatch.setattr(dat_routes, "_local_dat_record", _local)
+    monkeypatch.setattr(dat_routes.hasheous, "lookup", _remote)
+
+    match, _ = await dat_routes._remote_lookup_match(
+        "/vol/game.iso", [(sha1, "file_sha1")],
+    )
+
+    assert match is not None, "a miss was stamped over a DAT that had just landed"
+    assert match["game_name"] == "Local Name"

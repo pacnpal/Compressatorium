@@ -179,7 +179,7 @@ async def _scan_phase_dat_match(
     from services.dat_store import dat_store
 
     if not all_paths:
-        return 0
+        return 0, 0
     store_ok = True
     try:
         has_dats = await run_in_threadpool(dat_store.has_dats)

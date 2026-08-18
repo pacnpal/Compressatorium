@@ -1196,6 +1196,7 @@ async def _remote_lookup_match(
     *not* a miss, and the caller turns it into a non-cacheable error.
     """
     consulted = False
+    remote: dict | None = None
     for sha1, match_type in candidates:
         # Re-checked every iteration, not once up front. A CHD sends up to
         # three hashes and each request can take seconds, so an operator who
@@ -1219,21 +1220,25 @@ async def _remote_lookup_match(
         # workload_limiter lane if a large scan ever gets rate-limited.
         record = await hasheous.lookup(sha1)
         if record is not None:
-            # One more local look before accepting it. A DAT import commits in
-            # its own transaction and this await can last seconds, so the index
-            # that missed a moment ago may now hold this very hash -- and a
-            # cached hit is served unconditionally afterwards, so the remote
-            # answer would outrank the local one for good. Local-first has to
-            # hold across the whole call, not just up to the last time we
-            # looked. One indexed lookup, and only on a hit.
-            local = await _local_dat_record(sha1)
-            if local is not None:
-                return (
-                    _match_result(file_path, sha1, match_type, local),
-                    hasheous.base_url(),
-                )
-            return _match_result(file_path, sha1, match_type, record), hasheous.base_url()
-    return None, (hasheous.base_url() if consulted else None)
+            remote = _match_result(file_path, sha1, match_type, record)
+            break
+
+    # One more local pass, over the COMPLETE candidate set, covering every
+    # await above. A DAT import commits in its own transaction and each
+    # request can last seconds, so the index that missed a moment ago may now
+    # hold one of these hashes -- and whatever is written next is served
+    # unconditionally afterwards, so the remote answer (or a stamped miss)
+    # would outrank the local one for good.
+    #
+    # Over the whole set, not just the hash that hit: a CHD sends up to three,
+    # and the DAT that landed mid-flight may know a *later* one. Checking only
+    # the candidate that happened to match remotely left that case open, and
+    # the all-missed path had no re-check at all. Placed here, after the loop,
+    # it is one pass covering both exits instead of a check per await.
+    local = await _local_lookup_match(file_path, candidates)
+    if local is not None:
+        return local, (hasheous.base_url() if consulted else None)
+    return remote, (hasheous.base_url() if consulted else None)
 
 
 async def _lookup_match(
