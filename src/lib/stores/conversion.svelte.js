@@ -452,9 +452,11 @@ class ConversionStore {
     if (!filePaths?.length) return null;
     this.converting = true;
     this.lastRepinRecorded = 0;
-    // The metadata snapshot is taken before the batch is submitted, so a
-    // rejected batch leaves rows describing conversions that will never run.
-    let recordedPaths = [];
+    // The metadata snapshot is taken before the batch is submitted, so any
+    // path the batch does not end up queueing — a rejected submit, or one the
+    // backend filters out during per-file validation — leaves a row describing
+    // a conversion that will never run. Source path -> recorded destination.
+    let recorded = {};
     try {
       if (rommRepin) {
         try {
@@ -470,7 +472,7 @@ class ConversionStore {
           // from here: conversion is imported by fileBrowser, which the RomM
           // store imports, so a static import back would be a cycle.
           this.lastRepinRecorded = planned?.recorded ?? 0;
-          recordedPaths = planned?.recorded_paths ?? [];
+          recorded = planned?.recorded_paths ?? {};
         } catch (e) {
           // Best-effort, like the disc-ID tagging hook: losing the metadata
           // snapshot costs a re-match in RomM, while refusing to convert costs
@@ -508,20 +510,31 @@ class ConversionStore {
       } else {
         toast.success(`Queued ${created} job(s)`);
       }
-      recordedPaths = [];
+      // Narrow `recorded` down to the rows whose source did NOT become a job;
+      // the `finally` block retires exactly those. Anything that did get
+      // queued keeps its row, which is the whole point of having written it.
+      const queuedSources = new Set(
+        (Array.isArray(result) ? result : []).map((job) => job?.file_path),
+      );
+      recorded = Object.fromEntries(
+        Object.entries(recorded).filter(([source]) => !queuedSources.has(source)),
+      );
+      // Report only the rows that survive, or the toast would claim metadata
+      // was saved for conversions that are not happening.
+      this.lastRepinRecorded = Math.max(
+        0, this.lastRepinRecorded - Object.keys(recorded).length,
+      );
       return result;
     } catch (e) {
       toast.error(e?.message ?? 'Failed to create jobs');
       throw e;
     } finally {
       this.converting = false;
-      // Nothing was queued, so retire the rows the plan step wrote. They are
+      // Retire the rows for everything that did not become a job. They are
       // harmless if this fails — a row whose output never changes is never
-      // settled and ages out on its own — so it must not mask the real error.
-      if (recordedPaths.length) {
-        api.cancelRommRepin(recordedPaths).catch(() => {});
-        this.lastRepinRecorded = 0;
-      }
+      // settled and ages out on its own — so it must not mask a real error.
+      const orphaned = Object.values(recorded);
+      if (orphaned.length) api.cancelRommRepin(orphaned).catch(() => {});
     }
   }
 }

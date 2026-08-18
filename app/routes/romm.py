@@ -377,9 +377,11 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
 
     recorded = 0
     skipped = 0
-    # The destinations actually recorded, returned so the caller can retire
-    # them if the batch it is about to submit is rejected.
-    recorded_paths: list[str] = []
+    # Source -> destination for every row written, returned so the caller can
+    # retire the ones its batch does not end up queueing. Keyed by source
+    # because that is what the caller submits and what the created jobs report
+    # back; the destination is what a row is identified by.
+    recorded_paths: dict[str, str] = {}
     for path in payload.paths:
         if not is_within_configured_volumes(path):
             skipped += 1
@@ -410,7 +412,7 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
             continue
         if await run_in_threadpool(romm_repin.record, rom, destination, ids):
             recorded += 1
-            recorded_paths.append(destination)
+            recorded_paths[path] = destination
         else:
             skipped += 1
     return {

@@ -445,6 +445,43 @@ async def test_repin_cancel_retires_rows_for_a_batch_that_never_ran(
 
 
 @pytest.mark.asyncio
+async def test_repin_plan_reports_each_source_s_recorded_destination(
+    repin_db, tmp_path: Path,
+) -> None:
+    """Keyed by source, so the caller can retire what its batch did not queue.
+
+    `create_batch_jobs` legitimately returns fewer jobs than requested, and the
+    paths it dropped must not keep a pending row.
+    """
+    lib = tmp_path / "roms" / "gc"
+    lib.mkdir(parents=True)
+    (lib / "Game.iso").write_bytes(b"\0" * 32)
+    rom = {"id": 7, "name": "Game", "igdb_id": 42}
+
+    with patch.object(RommClient, "base_url", "http://romm:8080"), \
+            patch.object(RommClient, "library_root", str(tmp_path)), \
+            patch.object(
+                romm_routes.romm_repin, "roms_by_local_path",
+                return_value={os.path.realpath(lib / "Game.iso"): rom},
+            ), \
+            patch.object(
+                romm_routes, "is_within_configured_volumes", return_value=True,
+            ):
+        result = await romm_routes.romm_repin_plan(
+            romm_routes.RepinPlanRequest(
+                paths=[str(lib / "Game.iso")], mode="dolphin_rvz",
+            ),
+        )
+
+    assert result["recorded"] == 1
+    assert result["recorded_paths"] == {
+        str(lib / "Game.iso"): str(lib / "Game.rvz"),
+    }
+    assert romm_repin.cancel(list(result["recorded_paths"].values())) == 1
+    assert romm_repin.count_pending() == 0
+
+
+@pytest.mark.asyncio
 async def test_repin_settle_refuses_to_run_two_passes_at_once(
     repin_db, tmp_path: Path,
 ) -> None:
