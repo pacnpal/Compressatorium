@@ -145,6 +145,11 @@ class ConversionJob(BaseModel):
     allow_overwrite: bool = False
     compression: str | None = None
     delete_on_verify: bool = False
+    # Verify the output and keep the source. Independent of delete_on_verify,
+    # which verifies as a precondition for deleting; this asks for the check on
+    # its own, so an unattended conversion can prove its result without the
+    # destructive half.
+    verify_after: bool = False
     # Split the output into ~4 GB parts for FAT32 targets (makeps3iso -s).
     # Only meaningful for the folder->iso directory mode; ignored elsewhere.
     split: bool = False

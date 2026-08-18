@@ -9,6 +9,17 @@ export function buildApiUrl(endpoint, query) {
     url.search = query.toString();
   } else if (typeof query === 'string' && query) {
     url.search = query;
+  } else if (query && typeof query === 'object') {
+    // A plain object used to be dropped on the floor, which turned a missing
+    // required parameter into an HTTP 422 far from the call site. Encode it
+    // instead, skipping null/undefined so an omitted optional stays omitted.
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value === null || value === undefined) continue;
+      if (Array.isArray(value)) for (const v of value) search.append(key, String(v));
+      else search.append(key, String(value));
+    }
+    url.search = search.toString();
   }
   return url.pathname + url.search;
 }

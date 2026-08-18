@@ -28,6 +28,7 @@ file that already holds the rest of the app's state.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from typing import Any
@@ -38,6 +39,14 @@ from services.preferences_store import preferences_store
 logger = get_logger("romm_settings")
 
 SETTINGS_KEY = "romm.settings"
+
+# Persisted alongside the settings: the operator cleared the token *in the app*.
+# Without it, clearing a token on a deployment that also sets ``ROMM_TOKEN``
+# would silently fall straight back to the environment value, so the UI would
+# report the token gone while every request still authenticated with it.
+# (The constant is deliberately not named TOKEN_*: it is a preference key, not
+# a credential, and the secret-scanners read the name.)
+CLEARED_KEY = "token_cleared"
 
 # field -> (env var, default, kind). One table, so a new setting is one row and
 # every layer (env fallback, coercion, serialization) picks it up for free.
@@ -70,7 +79,12 @@ _INT_BOUNDS = {
 
 _cache: dict[str, Any] | None = None
 _token: str | None = None
+_token_cleared = False
 _lock = threading.Lock()
+# Serialises the read-modify-write in save(). Two concurrent saves would
+# otherwise each read the pre-patch row and the later put would drop the
+# earlier one's fields.
+_save_lock = asyncio.Lock()
 
 
 def _coerce(kind: str, value: Any, default: Any, field: str | None = None) -> Any:
@@ -122,21 +136,26 @@ def token() -> str | None:
     with _lock:
         if _token is not None:
             return _token or None
+        if _token_cleared:
+            # Cleared in the app: an env token must not resurrect it.
+            return None
     return os.environ.get("ROMM_TOKEN") or None
 
 
 async def load(*, force: bool = False) -> dict[str, Any]:
     """Prime the cache from the store. Called once at startup."""
-    global _cache, _token
+    global _cache, _token, _token_cleared
     with _lock:
         if _cache is not None and not force:
             return dict(_cache)
     stored = await preferences_store.get(SETTINGS_KEY)
     merged = _merge(stored)
-    stored_token = (stored or {}).get("token") if isinstance(stored, dict) else None
+    row = stored if isinstance(stored, dict) else {}
+    stored_token = row.get("token")
     with _lock:
         _cache = merged
         _token = stored_token if stored_token else None
+        _token_cleared = bool(row.get(CLEARED_KEY))
     return dict(merged)
 
 
@@ -146,30 +165,38 @@ async def save(patch: dict[str, Any]) -> dict[str, Any]:
     Only the fields present in *patch* change, so a form that edits one card
     cannot blank the settings another card owns.
     """
-    global _cache, _token
-    stored = await preferences_store.get(SETTINGS_KEY)
-    stored = dict(stored) if isinstance(stored, dict) else {}
+    global _cache, _token, _token_cleared
+    # Read-modify-write, so it has to be one critical section: concurrent saves
+    # of two different cards would otherwise each read the pre-patch row and the
+    # later put would silently discard the earlier one.
+    async with _save_lock:
+        stored = await preferences_store.get(SETTINGS_KEY)
+        stored = dict(stored) if isinstance(stored, dict) else {}
 
-    for field, (_, default, kind) in _FIELDS.items():
-        if field in patch and patch[field] is not None:
-            stored[field] = _coerce(kind, patch[field], default, field)
+        for field, (_, default, kind) in _FIELDS.items():
+            if field in patch and patch[field] is not None:
+                stored[field] = _coerce(kind, patch[field], default, field)
 
-    # Clearing is an explicit flag rather than a reserved token value: a magic
-    # string in a credential field is both worse to use and indistinguishable
-    # from someone's actual token.
-    if patch.get("clear_token"):
-        stored.pop("token", None)
-    elif isinstance(patch.get("token"), str) and patch["token"].strip():
-        stored["token"] = patch["token"].strip()
-    # An empty or omitted token means "leave the stored one alone", so a form
-    # that cannot display the secret does not blank it just by being submitted.
+        # Clearing is an explicit flag rather than a reserved token value: a
+        # magic string in a credential field is both worse to use and
+        # indistinguishable from someone's actual token.
+        if patch.get("clear_token"):
+            stored.pop("token", None)
+            stored[CLEARED_KEY] = True
+        elif isinstance(patch.get("token"), str) and patch["token"].strip():
+            stored["token"] = patch["token"].strip()
+            stored.pop(CLEARED_KEY, None)
+        # An empty or omitted token means "leave the stored one alone", so a
+        # form that cannot display the secret does not blank it just by being
+        # submitted.
 
-    await preferences_store.put(SETTINGS_KEY, stored)
-    merged = _merge(stored)
-    with _lock:
-        _cache = merged
-        _token = stored.get("token") or None
-    return dict(merged)
+        await preferences_store.put(SETTINGS_KEY, stored)
+        merged = _merge(stored)
+        with _lock:
+            _cache = merged
+            _token = stored.get("token") or None
+            _token_cleared = bool(stored.get(CLEARED_KEY))
+        return dict(merged)
 
 
 def public(values: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -188,7 +215,8 @@ def public(values: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def reset_for_tests() -> None:
     """Drop the cached snapshot (tests re-prime against their own store)."""
-    global _cache, _token
+    global _cache, _token, _token_cleared
     with _lock:
         _cache = None
         _token = None
+        _token_cleared = False

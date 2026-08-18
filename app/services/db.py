@@ -27,6 +27,7 @@ import json
 from logging_setup import get_logger
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,6 +43,7 @@ from sqlalchemy import (
     create_engine,
     event,
     select,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -53,6 +55,11 @@ logger = get_logger("db")
 # ---------------------------------------------------------------------------
 # ORM models
 # ---------------------------------------------------------------------------
+
+
+def _utcnow_iso() -> str:
+    """UTC timestamp in the ``...Z`` form every string date column here uses."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class Base(DeclarativeBase):
@@ -139,6 +146,18 @@ class RommRepin(Base):
     __table_args__ = (
         Index("ix_romm_repin_state", "state"),
         Index("ix_romm_repin_output_path", "output_path"),
+        # At most one *pending* row per output. Partial, because settled rows
+        # are history and the same path is legitimately converted again later.
+        # Enforced in the schema rather than only by a read-then-insert, so two
+        # callers recording the same output concurrently (a manual submit
+        # racing a sweep) cannot both win the check and stack two pending rows
+        # that would each try to re-pin the same file.
+        Index(
+            "ux_romm_repin_pending_output",
+            "output_path",
+            unique=True,
+            sqlite_where=text("state = 'pending'"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -153,7 +172,10 @@ class RommRepin(Base):
     # "pending" -> "done" | "abandoned"
     state = Column(String, nullable=False, default="pending")
     detail = Column(String, nullable=True)
-    created_at = Column(String, nullable=False, default="")
+    # Callable default, not "": the abandonment clock reads this, and an empty
+    # string parses as "no age", so a row inserted without one could never be
+    # retired however long its output failed to appear.
+    created_at = Column(String, nullable=False, default=_utcnow_iso)
     settled_at = Column(String, nullable=True)
 
 

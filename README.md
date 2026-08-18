@@ -340,8 +340,18 @@ hourly while PS2 converts to CHD overnight, ten at a time, largest first.
 | **Output folder** | Blank writes beside the source. |
 | **Smallest / largest ROM** | Size thresholds in MB. |
 | **Only names matching / Skip names matching** | Regex filters — convert only `(USA)`, skip `(Beta)`. |
-| **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. |
-| **Delete source after verify** | Offered only for modes that support it. |
+| **Only identified / unidentified** | Restrict to what RomM has (or hasn't) matched. Mutually exclusive. |
+| **If the output already exists** | Skip it, overwrite it, or write `Game_1.rvz` alongside. |
+| **Compression / level** | The codec and level for modes that take them. |
+| **Split into 4 GB parts** | For FAT32 targets, where the mode supports it. |
+| **Verify each converted file** | Check the output; the source is kept. |
+| **Delete source after verify** | Offered only for modes that support it. Verifies first. |
+| **Timezone** | The window and weekday mask are evaluated here — your browser's zone by default, so `22:00` means 22:00 where you are, and DST is handled. |
+
+Only formats the platform can actually use are offered: a GameCube rule lists
+dolphin and nkit, a PS2 rule lists chdman and maxcso. That narrowing comes from
+the same registry the file browser uses, so a rule can never name a tool that is
+wrong for the system.
 
 **Preview** shows exactly what a sweep would queue, without queueing it — and
 without moving the schedule clock, so looking never postpones a run. **Run now**
@@ -380,8 +390,12 @@ and anything RomM hasn't scanned yet just waits for the next attempt.
 | API token | *(unset)* | Client API token. Saved in `compressatorium.db` and never sent back to the browser — treat that file as holding a secret. |
 | Library path | *(unset)* | Where RomM's library is mounted **in this container**. |
 | Run automatically | off | Master switch for scheduled sweeps. |
-| Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. |
+| Save metadata before converting | on | Snapshot provider IDs for formats RomM can't hash. Off silences both the manual and the automatic path. |
 | Re-apply metadata on page load | on | Settle the queue automatically when you open the view. |
+| Retire unmatched after | 7 days | Give up on a saved re-pin whose output never appeared. |
+
+Clearing the token in **Settings** clears it for good: a `ROMM_TOKEN` in the
+environment does not silently take over again.
 
 The matching environment variables — `ROMM_URL`, `ROMM_TOKEN`,
 `ROMM_LIBRARY_ROOT`, `ROMM_AUTO_CONVERT` and friends — seed these on first run.

@@ -32,18 +32,25 @@
   const expanded = new SvelteSet();
   let dirty = $state(false);
 
-  // Every convertible target the registry knows, grouped by tool. Built from
-  // the registry so a new tool or mode appears here with no change.
-  const modeOptions = $derived.by(() => {
+  // The convertible targets one platform can actually use. Built from the
+  // registry so a new tool or mode appears here with no change, then narrowed
+  // by the tool ids the backend derived for this platform's slug — the same
+  // narrowing the conversion path applies, so the editor cannot offer a
+  // GameCube library a PS2-only mode.
+  function modeOptionsFor(platform) {
+    const allowed = platform?.tool_ids;
     const out = [{ value: '', label: 'Off — do not convert this platform' }];
     for (const tool of registry.all()) {
+      // No opinion from the backend (unknown slug, older server) keeps every
+      // tool, matching narrow_to_platform's conservative contract.
+      if (Array.isArray(allowed) && !allowed.includes(tool.id)) continue;
       for (const m of tool.modes ?? []) {
         if (m.kind === 'extract') continue; // automation converts, not unpacks
         out.push({ value: m.mode, label: `${tool.label} → ${m.label}` });
       }
     }
     return out;
-  });
+  }
 
   function toggle(platformId) {
     if (expanded.has(platformId)) expanded.delete(platformId);
@@ -60,6 +67,19 @@
     if (!rule.mode) romm.removeRule(platformId);
     else romm.setRule(platformId, rule);
     dirty = true;
+  }
+
+  /**
+   * The two identification filters are mutually exclusive.
+   *
+   * The backend collapses "both ticked" to "neither" (it would otherwise mean
+   * "nothing matches"), so leaving both tickable in the editor would show a
+   * state that silently becomes a different one on save. Ticking one clears
+   * the other here instead.
+   */
+  function setIdFilter(platformId, field, value) {
+    const other = field === 'only_matched' ? 'only_unmatched' : 'only_matched';
+    update(platformId, { [field]: value, ...(value ? { [other]: false } : {}) });
   }
 
   function toggleDay(platformId, day) {
@@ -84,7 +104,28 @@
     }
   }
 
+  /**
+   * Persist unsaved edits before a sweep.
+   *
+   * The sweep runs server-side against the *stored* rules, so previewing or
+   * running with a dirty editor would report on rules the operator can no
+   * longer see. Saving first keeps the backend the single source of truth
+   * instead of teaching the sweep endpoints to accept a rule set inline.
+   */
+  async function commitPendingEdits() {
+    if (!dirty) return true;
+    try {
+      await romm.saveRules();
+      dirty = false;
+      return true;
+    } catch (e) {
+      toast.error(e?.message ?? 'Failed to save rules');
+      return false;
+    }
+  }
+
   async function preview() {
+    if (!(await commitPendingEdits())) return;
     try {
       const r = await romm.previewSweep();
       const n = r?.queued ?? 0;
@@ -95,6 +136,7 @@
   }
 
   async function runNow() {
+    if (!(await commitPendingEdits())) return;
     try {
       const r = await romm.runSweep();
       const n = r?.queued ?? 0;
@@ -170,6 +212,12 @@
     </section>
   {/if}
 
+  {#if romm.rulesError}
+    <div class="rules-error" role="alert">
+      Could not load the automation rules: {romm.rulesError}
+    </div>
+  {/if}
+
   {#if romm.rulesLoading}
     <div class="loading"><Spinner /> Loading rules…</div>
   {:else if platforms.length === 0}
@@ -210,7 +258,7 @@
                   <span>Convert to</span>
                   <Select
                     value={rule.mode ?? ''}
-                    options={modeOptions}
+                    options={modeOptionsFor(platform)}
                     ariaLabel="Target format"
                     onchange={(v) => update(platform.id, { mode: v })}
                   />
@@ -368,14 +416,21 @@
                   <Checkbox
                     checked={rule.only_matched}
                     label="Only ROMs RomM has identified"
-                    onchange={(v) => update(platform.id, { only_matched: v })}
+                    onchange={(v) => setIdFilter(platform.id, 'only_matched', v)}
                   />
                   <Checkbox
                     checked={rule.only_unmatched}
                     label="Only ROMs RomM could not identify"
-                    onchange={(v) => update(platform.id, { only_unmatched: v })}
+                    onchange={(v) => setIdFilter(platform.id, 'only_unmatched', v)}
                   />
                   {#if spec?.supportsDeleteOnVerify}
+                    <Checkbox
+                      checked={rule.verify_after || rule.delete_on_verify}
+                      disabled={rule.delete_on_verify}
+                      label="Verify each converted file"
+                      description="Deleting the source already verifies first."
+                      onchange={(v) => update(platform.id, { verify_after: v })}
+                    />
                     <Checkbox
                       checked={rule.delete_on_verify}
                       label="Delete the source after the new file verifies"
@@ -414,6 +469,15 @@
 {#snippet saveIcon()}<Save size={14} />{/snippet}
 
 <style>
+  .rules-error {
+    margin: 0 0 0.75rem;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--danger, #b3261e);
+    border-radius: 6px;
+    color: var(--danger, #b3261e);
+    font-size: 0.9rem;
+  }
+
   .automation { display: grid; gap: var(--space-4); }
   .master {
     display: flex;

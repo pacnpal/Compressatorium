@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from routes.files import detect_file_outputs, verifiable_tools
 from services import romm_auto, romm_repin, romm_settings
 from services.file_hasher import compute_file_sha1_sync
+from services.lock_manager import lock_manager
 from services.romm import (
     DAT_SAFE_OUTPUT_EXTS,
     RommClient,
@@ -34,7 +35,6 @@ from services.romm import (
     RommNotConfigured,
     romm_client,
 )
-from services.lock_manager import lock_manager
 from services.subprocess_runner import (
     SIZE_RATIOS,
     bounded_path_check,
@@ -196,12 +196,18 @@ async def romm_platforms() -> list[dict]:
         platforms = await run_in_threadpool(romm_client.platforms)
     except RommError as exc:
         raise _romm_call(exc, context="listing platforms") from exc
+    all_tool_ids = [t.id for t in registry.all()]
     out = [
         {
             "id": p.get("id"),
             "name": p.get("display_name") or p.get("name") or p.get("slug"),
             "slug": p.get("slug"),
             "rom_count": p.get("rom_count"),
+            # The tools this platform does not rule out, narrowed by the same
+            # registry call the conversion path uses -- so the automation
+            # editor offers PS2 chdman/maxcso and GameCube dolphin/nkit
+            # instead of every mode for every platform.
+            "tool_ids": registry.narrow_to_platform(all_tool_ids, p.get("slug")),
         }
         for p in platforms
         if p.get("id") is not None
@@ -322,6 +328,11 @@ async def romm_repin_plan(payload: RepinPlanRequest) -> dict:
             status_code=400, detail=f"Unknown mode: {payload.mode}",
         ) from exc
 
+    if not romm_settings.effective().get("repin_enabled"):
+        # Re-pinning is switched off, so the automation path records nothing;
+        # the manual path must not quietly disagree with it.
+        return {"recorded": 0, "skipped": len(payload.paths), "reason": "disabled"}
+
     if not romm_repin.mode_needs_repin(spec.output_ext):
         return {"recorded": 0, "skipped": len(payload.paths), "reason": "dat_safe"}
 
@@ -381,7 +392,7 @@ async def settle_romm_repins() -> dict:
     while rows and settled < _MAX_SETTLE_PER_CALL and examined < _MAX_EXAMINE_PER_CALL:
         row = rows.pop(0)
         examined += 1
-        output_path, sha1, rom_id, ids, created_at, row_id = row
+        output_path, sha1, _rom_id, ids, created_at, row_id = row
         cursor = row_id
         if not rows:
             rows = await run_in_threadpool(
@@ -396,8 +407,7 @@ async def settle_romm_repins() -> dict:
         if not exists:
             if _is_stale(created_at):
                 await run_in_threadpool(
-                    romm_repin.settle, rom_id, output_path, "abandoned",
-                    "Output never appeared", None,
+                    romm_repin.settle, row_id, "abandoned", "Output never appeared",
                 )
                 abandoned += 1
                 settled += 1
@@ -435,7 +445,7 @@ async def settle_romm_repins() -> dict:
                 async with await workload_limiter.acquire("match"):
                     sha1 = await run_detached(compute_file_sha1_sync, output_path)
                 # Cache it: a row may be retried many times before RomM scans.
-                await run_in_threadpool(romm_repin.store_sha1, output_path, sha1)
+                await run_in_threadpool(romm_repin.store_sha1, row_id, sha1)
 
             match = await run_in_threadpool(romm_client.rom_by_sha1, sha1)
             if not match:
@@ -445,7 +455,7 @@ async def settle_romm_repins() -> dict:
                 romm_client.update_rom_metadata, match["id"], ids,
             )
             await run_in_threadpool(
-                romm_repin.settle, rom_id, output_path, "done", None, match["id"],
+                romm_repin.settle, row_id, "done", None, match["id"],
             )
             repinned += 1
             settled += 1
@@ -539,7 +549,10 @@ async def test_romm_connection(patch: RommSettingsPatch | None = None) -> dict:
     url = (override.get("url") or romm_settings.effective().get("url") or "").rstrip("/")
     token = override.get("token")
     if not token:
-        token = romm_settings.token()
+        # `clear_token` means "test with no token at all" -- falling back to
+        # the saved one would report success for a configuration the operator
+        # is about to save as unauthenticated.
+        token = "" if override.get("clear_token") else romm_settings.token()
     library_root = override.get("library_root") or romm_settings.effective().get(
         "library_root",
     )

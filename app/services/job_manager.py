@@ -204,6 +204,7 @@ class JobManager:
         filename_override: Optional[str] = None,
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
+        verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
     ) -> ConversionJob:
@@ -262,6 +263,7 @@ class JobManager:
             allow_overwrite=allow_overwrite,
             compression=compression,
             delete_on_verify=delete_on_verify,
+            verify_after=verify_after,
             split=split,
             input_kind=input_kind,
         )
@@ -297,6 +299,7 @@ class JobManager:
         filename_override: Optional[str] = None,
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
+        verify_after: bool = False,
         split: bool = False,
         delete_snapshot: Optional[Dict[str, object]] = None,
     ) -> ConversionJob:
@@ -312,6 +315,7 @@ class JobManager:
                 filename_override=filename_override,
                 compression=compression,
                 delete_on_verify=delete_on_verify,
+                verify_after=verify_after,
                 split=split,
                 delete_snapshot=delete_snapshot,
             )
@@ -325,6 +329,7 @@ class JobManager:
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
         split: bool = False,
+        verify_after: bool = False,
     ) -> List[ConversionJob]:
         """Create multiple jobs atomically under a single backpressure check."""
         if not job_specs:
@@ -352,6 +357,7 @@ class JobManager:
                         ),
                         compression=compression,
                         delete_on_verify=delete_on_verify,
+                        verify_after=verify_after,
                         split=split,
                         delete_snapshot=spec.get("delete_snapshot"),
                     )
@@ -368,23 +374,39 @@ class JobManager:
         compression: Optional[str] = None,
         delete_on_verify: bool = False,
         delete_snapshots: Optional[Dict[str, Dict[str, object]]] = None,
+        split: bool = False,
+        verify_after: bool = False,
+        output_paths: Optional[Dict[str, str]] = None,
+        allow_overwrite: bool = False,
     ) -> List[ConversionJob]:
-        """Create multiple conversion jobs."""
+        """Create multiple conversion jobs.
+
+        ``output_paths`` overrides the derived destination per input, and
+        ``allow_overwrite`` authorises writing over an existing one. Both exist
+        so a caller that has already resolved duplicates (the RomM sweep's
+        rename/overwrite policy) hands the decision down instead of the queue
+        re-deriving a different answer.
+        """
         job_specs: List[Dict[str, object]] = []
         for fp in file_paths:
             snapshot = delete_snapshots.get(fp) if delete_snapshots else None
-            job_specs.append(
-                {
-                    "file_path": fp,
-                    "output_dir": output_dir,
-                    "delete_snapshot": snapshot,
-                }
-            )
+            spec: Dict[str, object] = {
+                "file_path": fp,
+                "output_dir": output_dir,
+                "delete_snapshot": snapshot,
+                "allow_overwrite": allow_overwrite,
+            }
+            override = output_paths.get(fp) if output_paths else None
+            if override:
+                spec["output_path"] = override
+            job_specs.append(spec)
         return await self.create_jobs_atomic(
             job_specs,
             mode,
             compression=compression,
             delete_on_verify=delete_on_verify,
+            split=split,
+            verify_after=verify_after,
         )
 
     def get_job(self, job_id: str) -> Optional[ConversionJob]:
@@ -2357,8 +2379,15 @@ class JobManager:
 
                 verified = False
                 source_deleted = False
-                if job.delete_on_verify:
-                    if not registry.spec(job.mode.value).supports_delete_on_verify:
+                # Two ways to ask for the same verify: delete-on-verify needs it
+                # as a precondition, verify_after wants the check on its own and
+                # keeps the source. One block runs it either way, so a verified
+                # output means the same thing however it was requested.
+                if job.delete_on_verify or job.verify_after:
+                    if (
+                        job.delete_on_verify
+                        and not registry.spec(job.mode.value).supports_delete_on_verify
+                    ):
                         raise RuntimeError(
                             "Delete-on-verify is only supported for "
                             "create/copy/Dolphin/3DS/Switch-compress modes"
@@ -2448,7 +2477,20 @@ class JobManager:
                         produced_meta=produced_meta,
                     )
 
-                    if cancel_event.is_set():
+                    if not job.delete_on_verify:
+                        # verify_after only: the source is kept by design, so
+                        # the job is finished the moment the output checks out.
+                        job.message = "Verification complete."
+                        await self._notify_subscribers(
+                            job_id,
+                            {
+                                "type": "progress",
+                                "job_id": job_id,
+                                "progress": job.progress,
+                                "message": job.message,
+                            },
+                        )
+                    elif cancel_event.is_set():
                         job.message = "Verification complete. Delete skipped (cancelled)."
                         await self._notify_subscribers(
                             job_id,

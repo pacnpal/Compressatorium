@@ -30,19 +30,22 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, time as dt_time, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime, timezone
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi.concurrency import run_in_threadpool
-
 from logging_setup import get_logger
 from models import ConversionMode
-from services import romm_settings
-from services import romm_repin
+from services import romm_repin, romm_settings
 from services.job_manager import QueueBackpressureError, job_manager
-from services.lock_manager import lock_manager
+from services.output_conflicts import (
+    OutputPathLocked,
+    check_output_conflicts,
+    get_unique_output_path,
+)
 from services.preferences_store import preferences_store
 from services.romm import RommError, romm_client
 from services.tools import registry
@@ -161,6 +164,9 @@ def default_rule(mode: str = "") -> dict[str, Any]:
         "exclude_pattern": None,
         "only_unmatched": False,
         "only_matched": False,
+        # Set only when a submitted output_dir was refused, so the editor can
+        # say why the rule is not writing where the operator asked.
+        "invalid_output_dir": None,
     }
 
 
@@ -194,19 +200,37 @@ def normalize_rule(raw: Any, *, mode_required: bool = True) -> dict[str, Any] | 
     # otherwise would be silently dropped at submit time anyway.
     if spec is not None and spec.supports_compression and raw.get("compression"):
         out["compression"] = str(raw["compression"])
-    if spec is not None and spec.supports_compression_level:
-        if raw.get("compression_level") is not None:
-            out["compression_level"] = _clamp(
-                "compression_level", raw["compression_level"], 0,
-            )
+    if (
+        spec is not None
+        and spec.supports_compression_level
+        and raw.get("compression_level") is not None
+    ):
+        out["compression_level"] = _clamp("compression_level", raw["compression_level"], 0)
     if raw.get("output_dir"):
-        out["output_dir"] = str(raw["output_dir"])
+        candidate = str(raw["output_dir"])
+        # The sweep queues through the job manager directly, so it does not get
+        # `/jobs/batch`'s containment check for free. An unvalidated rule could
+        # otherwise point the converter at any writable path in the container.
+        # Refused here, at the edge where the value is accepted, and again in
+        # the sweep before anything is queued.
+        if is_within_configured_volumes(candidate):
+            out["output_dir"] = candidate
+        else:
+            logger.warning(
+                "romm_auto: refusing output_dir outside the configured volumes: %r",
+                candidate,
+            )
+            out["output_dir"] = None
+            out["invalid_output_dir"] = candidate
     if raw.get("duplicate_action") in DUPLICATE_ACTIONS:
         out["duplicate_action"] = raw["duplicate_action"]
     # Both gated on what the mode actually allows, mirroring the manual path.
+    # `supports_delete_on_verify` is the registry's answer to "can this mode's
+    # output be verified at all", which is the precondition for either switch:
+    # deleting needs the check to pass first, verify_after wants only the check.
     if spec is not None and spec.supports_delete_on_verify:
         out["delete_on_verify"] = bool(raw.get("delete_on_verify", False))
-    out["verify_after"] = bool(raw.get("verify_after", False))
+        out["verify_after"] = bool(raw.get("verify_after", False))
     out["split"] = bool(raw.get("split", False))
 
     out["interval_minutes"] = _clamp("interval_minutes", raw.get("interval_minutes"), 60)
@@ -296,16 +320,24 @@ def _in_window(rule: dict, now: datetime) -> bool:
         now = now.astimezone(ZoneInfo(rule.get("timezone") or "UTC"))
     except (ZoneInfoNotFoundError, ValueError, KeyError):
         pass
-    if now.weekday() not in rule["days"]:
-        return False
     start = _parse_hhmm(rule["window_start"])
     end = _parse_hhmm(rule["window_end"])
-    if start is None or end is None:
-        return True
     current = now.time()
+
+    if start is None or end is None:
+        return now.weekday() in rule["days"]
+
     if start <= end:
-        return start <= current <= end
-    return current >= start or current <= end
+        return now.weekday() in rule["days"] and start <= current <= end
+
+    # An overnight window (22:00-04:00) belongs to the day it *started*, so the
+    # 02:00 tail of a Monday window runs on Tuesday morning and a Tuesday-only
+    # rule does not fire at 02:00 Tuesday (that tail began on Monday).
+    if current >= start:
+        return now.weekday() in rule["days"]
+    if current <= end:
+        return (now.weekday() - 1) % 7 in rule["days"]
+    return False
 
 
 def _is_due(rule: dict, state: dict, now: datetime) -> bool:
@@ -320,6 +352,12 @@ def _is_due(rule: dict, state: dict, now: datetime) -> bool:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
     except ValueError:
         return True
+    if last_dt.tzinfo is None:
+        # A hand-edited or pre-tz-aware state row. Subtracting a naive datetime
+        # from an aware one raises TypeError, which would abort the whole sweep
+        # over one stale preference blob -- read it as UTC, which is what this
+        # module has always written.
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
     elapsed_minutes = (now - last_dt).total_seconds() / 60
     return elapsed_minutes >= rule["interval_minutes"]
 
@@ -349,43 +387,126 @@ def _passes_filters(rom: dict, rule: dict) -> bool:
         return False
     if rule["max_size_mb"] and size > rule["max_size_mb"] * 1024 * 1024:
         return False
-    if rule["include_pattern"] and not re.search(rule["include_pattern"], name, re.I):
+    if rule["include_pattern"] and not re.search(rule["include_pattern"], name, re.IGNORECASE):
         return False
-    if rule["exclude_pattern"] and re.search(rule["exclude_pattern"], name, re.I):
+    if rule["exclude_pattern"] and re.search(rule["exclude_pattern"], name, re.IGNORECASE):
         return False
     # RomM reports identification two ways depending on version; treat either
     # as authoritative and fall back to "unknown" rather than filtering blind.
     identified = rom.get("is_identified")
     if identified is None:
-        identified = bool(rom.get("igdb_id") or rom.get("moby_id") or rom.get("ss_id"))
+        # Every provider, not a hand-picked subset: a ROM matched only through
+        # RetroAchievements or Hasheous is still identified, and checking three
+        # of the nine fields made `only_matched` skip it.
+        identified = bool(romm_repin.metadata_ids(rom))
     if rule["only_matched"] and not identified:
         return False
-    if rule["only_unmatched"] and identified:
-        return False
-    return True
+    return not (rule["only_unmatched"] and identified)
 
 
-def _output_exists(path: str, mode: str, output_dir: str | None) -> bool:
-    """True when this rule's output already exists for *path*.
+# What the duplicate policy decided for one candidate. Returned rather than
+# branched on at the call site so the sweep reads as one table lookup.
+QUEUE = "queue"
+SKIP_EXISTING = "skip_existing"
+SKIP_LOCKED = "skip_locked"
 
-    ``detect_output()`` only ever looks *beside the source* -- it takes no
-    output directory -- so a rule with ``output_dir`` set would never find its
-    own output, re-queue the ROM on every sweep, and fail each job on an output
-    collision. Derive the destination through ``tool.output_path()`` instead,
-    the same SSOT the manual conversion path uses.
 
-    ``check_file_status`` answers both halves in one call: a finished output and
-    one a job is writing right now are equally reasons not to queue another.
+def _resolve_destination(
+    path: str, mode: str, output_dir: str | None, duplicate_action: str,
+) -> tuple[str | None, str]:
+    """Where this rule's conversion of *path* should write, and whether to queue.
+
+    Returns ``(destination, decision)``. ``detect_output()`` was the wrong tool
+    for this: it only ever looks *beside the source* -- it takes no output
+    directory -- so a rule with ``output_dir`` set never found its own output,
+    re-queued the ROM on every sweep, and failed each job on a collision.
+    ``tool.output_path()`` derives the real destination instead, the same SSOT
+    the manual path uses.
+
+    The duplicate policy is then applied through the *same* helpers
+    ``/api/jobs`` uses, so ``overwrite`` and ``rename`` mean here exactly what
+    they mean there rather than silently degrading to ``skip``:
+
+    * ``skip`` -- an occupied destination drops the candidate;
+    * ``overwrite`` -- reuses it, unless a job holds it right now;
+    * ``rename`` -- probes ``name_1``, ``name_2``, ... for a free one.
+
+    A locked destination is never queued: the next sweep picks it up once the
+    lock clears, because the filesystem still reports the ROM unconverted.
     """
     tool = registry.for_mode(mode)
     if tool is None:
-        return False
+        return None, SKIP_EXISTING
     try:
         destination = tool.output_path(mode, path, output_dir)
     except (KeyError, ValueError, OSError):
-        return False
-    exists, locked = lock_manager.check_file_status(destination)
-    return exists or locked
+        return None, SKIP_EXISTING
+
+    exists, locked = check_output_conflicts(mode, destination)
+    if not exists:
+        return destination, QUEUE
+    if duplicate_action == "overwrite":
+        return (None, SKIP_LOCKED) if locked else (destination, QUEUE)
+    if duplicate_action == "rename":
+        try:
+            return get_unique_output_path(destination, mode), QUEUE
+        except OutputPathLocked:
+            return None, SKIP_LOCKED
+    return None, SKIP_EXISTING
+
+
+def _resolve_source(path: str) -> str | None:
+    """Absolute, symlink-free source path, or None when it cannot be resolved.
+
+    Its own function so the sweep can push it into a worker thread: resolving a
+    path stats every component, and doing that per ROM on the event loop stalls
+    the whole app for the length of a catalog.
+    """
+    try:
+        return str(Path(path).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError):
+        return None
+
+
+def _compression_arg(rule: dict) -> str | None:
+    """The rule's compression as the job pipeline expects it: ``"codec:level"``.
+
+    The level is not a separate parameter anywhere downstream -- ``/api/jobs``
+    encodes it into the compression string and the tools parse it back out --
+    so sending the codec alone silently dropped the level the operator set.
+    """
+    codec = rule["compression"]
+    level = rule["compression_level"]
+    if not codec:
+        return None
+    return f"{codec}:{level}" if level is not None else codec
+
+
+def _inspect_candidate(path: str, rule: dict, tool) -> dict:
+    """Every disk-touching question about one candidate, answered in one hop.
+
+    Convertibility, path resolution and the duplicate-policy destination all
+    stat the filesystem. Asked separately from the sweep they would each need
+    their own thread hop per ROM; asked here the sweep pays one per candidate.
+
+    ``skip`` is None when the ROM should be queued, otherwise the reason —
+    ``"unconvertible"``, ``"unresolvable"``, or one of the duplicate-policy
+    decisions. ``resolved`` is still filled in whenever it could be, because
+    the caller checks it against the in-flight set before acting on ``skip``.
+    """
+    if not tool.converts_path(path):
+        return {"skip": "unconvertible", "resolved": None, "destination": None}
+    resolved = _resolve_source(path)
+    if resolved is None:
+        return {"skip": "unresolvable", "resolved": None, "destination": None}
+    destination, decision = _resolve_destination(
+        path, rule["mode"], rule["output_dir"], rule["duplicate_action"],
+    )
+    return {
+        "skip": None if decision == QUEUE else decision,
+        "resolved": resolved,
+        "destination": destination,
+    }
 
 
 def _active_source_paths() -> set[str]:
@@ -477,12 +598,42 @@ async def sweep(
         except KeyError:
             continue
 
+        # Belt and braces on the destination: `normalize_rule` refuses an
+        # out-of-volume output_dir at save time, but a rules blob can also be
+        # edited straight in the database.
+        if rule["output_dir"] and not is_within_configured_volumes(rule["output_dir"]):
+            logger.warning(
+                "romm_auto: skipping platform %s, output_dir outside volumes",
+                platform_id,
+            )
+            result["errors"].append(
+                {"platform_id": int(platform_id), "error": "output_dir_outside_volumes"},
+            )
+            continue
+
         try:
             roms = await run_in_threadpool(romm_client.roms, int(platform_id))
         except RommError as exc:
             logger.warning("romm_auto: platform %s unreadable: %s", platform_id, exc)
             result["errors"].append(
                 {"platform_id": int(platform_id), "error": "unreadable"},
+            )
+            continue
+
+        # The editor narrows the target list, but a rule can outlive the tool
+        # set it was written against (or be hand-edited), and `converts_path` is
+        # extension-based -- it cannot tell a GameCube .iso from a PS2 one. Ask
+        # the registry, using the slug RomM stamps on every record.
+        slug = next(
+            (r.get("platform_slug") for r in roms if r.get("platform_slug")), None,
+        )
+        if slug and not registry.narrow_to_platform([spec.tool_id], slug):
+            logger.info(
+                "romm_auto: %s is not a %s tool, skipping platform %s",
+                spec.tool_id, slug, platform_id,
+            )
+            result["errors"].append(
+                {"platform_id": int(platform_id), "error": "tool_wrong_for_platform"},
             )
             continue
 
@@ -496,6 +647,8 @@ async def sweep(
         )
         batch: list[str] = []
         rom_by_path: dict[str, dict] = {}
+        destinations: dict[str, str] = {}
+        resolved_by_path: dict[str, str] = {}
         considered = 0
 
         for rom in sorted(roms, key=_rom_sort_key(rule)):
@@ -508,62 +661,49 @@ async def sweep(
             path = romm_client.local_path(rom)
             if not path or not is_within_configured_volumes(path):
                 continue
-            if not await run_in_threadpool(tool.converts_path, path):
+            # One hop to a worker thread for every disk-touching check on this
+            # candidate: converts_path stats, resolve() stats each component,
+            # and the destination probe scans companions. Done inline they add
+            # up to a stalled event loop for the length of the catalog.
+            decision = await run_in_threadpool(
+                _inspect_candidate, path, rule, tool,
+            )
+            if decision["skip"] == "unconvertible":
                 result["skipped_unconvertible"] += 1
                 continue
-            try:
-                resolved = str(Path(path).expanduser().resolve(strict=False))
-            except (OSError, RuntimeError):
+            if decision["skip"] == "unresolvable":
                 continue
-            if resolved in active_paths:
+            if decision["resolved"] in active_paths:
                 result["skipped_active"] += 1
                 continue
-            if rule["duplicate_action"] == "skip" and await run_in_threadpool(
-                _output_exists, path, rule["mode"], rule["output_dir"],
-            ):
+            if decision["skip"] == SKIP_EXISTING:
                 result["skipped_existing"] += 1
+                continue
+            if decision["skip"] == SKIP_LOCKED:
+                result["skipped_active"] += 1
                 continue
             batch.append(path)
             rom_by_path[path] = rom
+            destinations[path] = decision["destination"]
+            resolved_by_path[path] = decision["resolved"]
 
         result["considered"] += considered
         summary = {
             "platform_id": int(platform_id),
             "mode": rule["mode"],
             "queued": 0,
+            # Always present, so a caller reading a preview does not have to
+            # tell "no re-pins" apart from "this key only exists on real runs".
+            "repins_recorded": 0,
             "considered": considered,
         }
 
         if batch and not dry_run:
             try:
-                # Findings 2 and 3: the manual path does two things before it
-                # queues, and skipping them made automation quietly worse than
-                # converting by hand.
-                #
-                # (a) Snapshot the RomM metadata for formats RomM cannot
-                #     hash-match, or an automatic RVZ sweep destroys exactly the
-                #     metadata the re-pin feature exists to protect. The records
-                #     the sweep is already holding carry the provider ids, so
-                #     this costs no extra catalog fetch.
-                repin_count = 0
-                if repin_needed:
-                    for path in batch:
-                        rom = rom_by_path.get(path)
-                        ids = romm_repin.metadata_ids(rom) if rom else {}
-                        if not ids:
-                            continue
-                        destination = tool.output_path(
-                            rule["mode"], path, rule["output_dir"],
-                        )
-                        if await run_in_threadpool(
-                            romm_repin.record, rom, destination, ids,
-                        ):
-                            repin_count += 1
-
-                # (b) delete-on-verify needs its snapshot up front, or
-                #     `_process_job` refuses to delete ("Delete plan snapshot
-                #     missing") and fails every job after doing the full
-                #     conversion. Same helper the manual path uses.
+                # delete-on-verify needs its snapshot up front, or
+                # `_process_job` refuses to delete ("Delete plan snapshot
+                # missing") and fails every job after doing the full
+                # conversion. Same helper the manual path uses.
                 snapshots = None
                 if rule["delete_on_verify"]:
                     snapshots = {}
@@ -576,19 +716,53 @@ async def sweep(
                     batch,
                     ConversionMode(rule["mode"]),
                     output_dir=rule["output_dir"],
-                    compression=rule["compression"],
+                    compression=_compression_arg(rule),
                     delete_on_verify=rule["delete_on_verify"],
                     delete_snapshots=snapshots,
+                    split=rule["split"],
+                    # delete_on_verify already verifies as a precondition, so
+                    # asking for both would not verify twice -- but a rule that
+                    # only wants the check must still get it.
+                    verify_after=rule["verify_after"],
+                    # The duplicate policy was resolved per candidate above;
+                    # hand the answer down rather than let the queue derive a
+                    # second, possibly different one.
+                    output_paths=destinations,
+                    allow_overwrite=rule["duplicate_action"] == "overwrite",
                 )
-                summary["repins_recorded"] = repin_count
-                result["repins_recorded"] += repin_count
                 summary["queued"] = len(jobs)
                 result["queued"] += len(jobs)
+
+                # Only now, with the jobs actually queued: snapshot the RomM
+                # metadata for formats RomM cannot hash-match, or an automatic
+                # RVZ sweep destroys exactly the metadata the re-pin feature
+                # exists to protect. Recording *before* the queue call would
+                # leave pending rows behind for conversions that never ran, and
+                # those rows re-pin whatever later lands on that path. The
+                # records the sweep already holds carry the provider ids, so
+                # this costs no extra catalog fetch.
+                #
+                # Every path in `batch` is queued or none is: create_jobs_atomic
+                # takes the queue lock once and checks backpressure for the
+                # whole set, so reaching here means the batch went in.
+                repin_count = 0
+                if repin_needed:
+                    for path in batch:
+                        rom = rom_by_path.get(path)
+                        ids = romm_repin.metadata_ids(rom) if rom else {}
+                        if not ids:
+                            continue
+                        if await run_in_threadpool(
+                            romm_repin.record, rom, destinations[path], ids,
+                        ):
+                            repin_count += 1
+                summary["repins_recorded"] = repin_count
+                result["repins_recorded"] += repin_count
+
                 # Claim them immediately so a later platform in the same sweep
-                # cannot queue the same source twice.
-                active_paths.update(
-                    str(Path(p).expanduser().resolve(strict=False)) for p in batch
-                )
+                # cannot queue the same source twice. Already resolved during
+                # selection, so this costs no further disk work.
+                active_paths.update(resolved_by_path.values())
             except QueueBackpressureError:
                 # The queue is full. Stop rather than spin: the next sweep
                 # resumes exactly here, because the filesystem still reports

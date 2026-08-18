@@ -31,9 +31,17 @@
   a library is not homogeneous: GameCube can convert to RVZ hourly while PS2
   converts to CHD overnight, ten at a time, largest first. Each rule sets the
   target format, its own schedule (interval, time-of-day window that may wrap
-  midnight, and a weekday mask), queueing limits (max jobs per run, priority,
-  conversion order), an output folder, and selection filters — size thresholds,
-  name patterns, and whether to include ROMs RomM has or hasn't identified.
+  midnight, and a weekday mask, all evaluated in your own timezone rather than
+  UTC), conversion options (compression codec and level, split output, verify
+  each result, delete the source once it verifies), what to do when the output
+  already exists (skip, overwrite, or write alongside), queueing limits (max
+  jobs per run, priority, conversion order), an output folder, and selection
+  filters — size thresholds, name patterns, and whether to include ROMs RomM has
+  or hasn't identified.
+
+  The target list is narrowed per platform by the same registry the file browser
+  uses, so a GameCube rule offers dolphin and nkit while a PS2 rule offers chdman
+  and maxcso — a rule can never name a tool that is wrong for the system.
 
   **Preview** shows exactly what a sweep would queue without queueing it, and
   without moving the schedule clock, so looking never postpones a run.
@@ -42,7 +50,9 @@
   genuinely missing, judged by the same detector that badges rows in the file
   list. Running twice, restarting mid-sweep, or racing a manual conversion all
   converge instead of duplicating work, and a sweep that hits a full queue stops
-  and resumes where it left off.
+  and resumes where it left off. A rule writing to its own output folder is
+  judged on that folder, and a rule that fails to queue leaves no metadata
+  snapshot behind.
 
 - **Converted ROMs keep their RomM metadata.** RomM identifies a CHD by the SHA1
   embedded in its header and an archive by its largest member, so converting to

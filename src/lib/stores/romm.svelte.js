@@ -45,6 +45,7 @@ class RommStore {
   ruleState = $state({});
   rulesLoading = $state(false);
   rulesSaving = $state(false);
+  rulesError = $state(null);
   sweepResult = $state(null);
   sweeping = $state(false);
 
@@ -81,10 +82,14 @@ class RommStore {
 
   /** True when *modeEntry* produces a format RomM cannot hash-match itself. */
   losesDatMatch(modeEntry) {
-    const ext = modeEntry?.outputExt;
-    // Unknown output extension (input-ext-mapped modes) → don't cry wolf.
-    if (!ext || this.datSafeOutputExts.length === 0) return false;
-    return !this.datSafeOutputExts.includes(ext.toLowerCase());
+    // Mirrors the backend gate (`romm_repin.mode_needs_repin`) exactly: an
+    // extension outside the DAT-safe set loses the match, and that includes
+    // the input-mapped modes whose outputExt is null (Z3DS, NSZ) — their
+    // outputs are .z3ds / .nsz, which RomM cannot hash either. Guessing "safe"
+    // there hid the warning on the two formats that most need it.
+    if (!modeEntry || this.datSafeOutputExts.length === 0) return false;
+    const ext = (modeEntry.outputExt ?? '').toLowerCase();
+    return !this.datSafeOutputExts.includes(ext);
   }
 
   /**
@@ -203,12 +208,18 @@ class RommStore {
 
   async loadRules() {
     this.rulesLoading = true;
+    this.rulesError = null;
     try {
       const data = await api.getRommRules();
       this.rules = data?.rules ?? {};
       this.ruleDefaults = data?.defaults ?? null;
       this.ruleOptions = data?.options ?? this.ruleOptions;
       this.ruleState = data?.state ?? {};
+    } catch (e) {
+      // Surfaced, not swallowed: without this the editor renders an empty rule
+      // set that looks like "nothing is configured" when the request failed.
+      this.rulesError = e?.message ?? 'Failed to load automation rules';
+      throw e;
     } finally {
       this.rulesLoading = false;
     }

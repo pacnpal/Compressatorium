@@ -300,7 +300,9 @@ class RommClient:
         except RommError as exc:
             # RomM answers 404 when nothing matches, which for us just means
             # "not scanned yet" — a normal, expected state, not a failure.
-            if "HTTP 404" in str(exc):
+            # Read the status we recorded, not the message text: a body that
+            # happens to mention "HTTP 404" must not swallow a 500.
+            if exc.status == 404:
                 return None
             raise
         return result if isinstance(result, dict) and result.get("id") else None
@@ -350,15 +352,19 @@ class RommClient:
             if not fs_name:
                 return None
             rel = f"{fs_path}/{fs_name}" if fs_path else fs_name
-        root_abs = os.path.abspath(root)
+        # realpath, not abspath: the library is usually reached through a
+        # container bind mount, and a symlinked component would otherwise make
+        # a contained path look like an escape (or the reverse).
+        root_abs = os.path.realpath(root)
         # No lstrip("/"): an absolute value is malformed coming from RomM (its
         # own validate_path rejects one), and stripping the slash would silently
         # rehome "/etc/passwd" inside the library instead of refusing it.
         # os.path.join lets an absolute component win, so the containment check
         # below catches it.
-        candidate = os.path.abspath(os.path.join(root_abs, rel))
-        # normpath/abspath collapses any ".." before this compares, so a
-        # traversing full_path is rejected rather than resolved.
+        candidate = os.path.realpath(os.path.join(root_abs, rel))
+        # realpath collapses any ".." *and* resolves symlinks before this
+        # compares, so neither a traversing full_path nor a symlink planted
+        # inside the library can point the result outside it.
         if candidate != root_abs and not candidate.startswith(root_abs + os.sep):
             logger.warning("romm: rejecting out-of-library path %r", rel)
             return None
@@ -366,15 +372,26 @@ class RommClient:
 
 
 def _encode_multipart(fields: dict) -> tuple[bytes, str]:
-    """Encode *fields* as multipart/form-data. Text fields only."""
+    """Encode *fields* as multipart/form-data. Text fields only.
+
+    Field names and values are refused if they carry CR, LF or a quote: this
+    encoder writes the header line by string interpolation, so such a character
+    would let a value forge a part boundary or a header of its own. The values
+    originate in a remote RomM record, so the check is a trust boundary, and
+    refusing is right — silently stripping would send altered metadata.
+    """
     # Fixed boundary would risk colliding with field content; derive a random one.
     boundary = "----compressatorium" + os.urandom(16).hex()
     parts: list[bytes] = []
     for key, value in fields.items():
+        name = str(key)
+        text = str(value)
+        if any(c in name for c in '\r\n"') or any(c in text for c in "\r\n"):
+            raise RommError(f"Refusing to send multipart field with control characters: {name!r}")
         parts.append(
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
-            f"{value}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{text}\r\n".encode(),
         )
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"

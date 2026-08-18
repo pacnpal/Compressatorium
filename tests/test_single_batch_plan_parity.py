@@ -27,6 +27,7 @@ from app.models import (
     JobCreateRequest,
 )
 from app.routes import convert as convert_routes
+from services.lock_manager import lock_manager
 
 
 @pytest.fixture(name="parity_env")
@@ -467,7 +468,7 @@ async def test_locked_output_overwrite_agree(parity_env, monkeypatch):
         return False, False
 
     monkeypatch.setattr(
-        convert_routes.lock_manager, "check_file_status", fake_status,
+        lock_manager, "check_file_status", fake_status,
     )
 
     kwargs = {

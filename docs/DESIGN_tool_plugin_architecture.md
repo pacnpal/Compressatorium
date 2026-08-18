@@ -1331,6 +1331,43 @@ than let a badge and a list disagree — `JobsPanel` renders *"Showing the 500
 most recent of 1,153"*, and a distinct empty state for a tab whose jobs have all
 aged out.
 
+### 3.3.8 Output-conflict resolution (`services/output_conflicts.py`)
+
+"Is this mode's output already taken, and what do I do about it?" is asked by
+every path that queues a job — `/api/jobs`, `/api/jobs/batch`, and the RomM
+automation sweep. It is not an HTTP concern, so it does not live in a route:
+both helpers sit in `services/output_conflicts.py` and every caller gets the
+same answer, or `duplicate_action` would mean different things depending on how
+the job was started.
+
+- **`check_output_conflicts(mode, output_path) -> (exists, locked)`** —
+  companion-aware. An `extractcd` `.bin` sidecar or a split `folder_to_iso`
+  build's numbered parts count as occupying the destination, enumerated through
+  the owning tool's `companion_outputs` hook rather than re-derived per caller.
+- **`get_unique_output_path(base_path, mode=None)`** — probes `name_1`,
+  `name_2`, … until the file *and* that mode's companions are all free. Raises
+  **`OutputPathLocked`** when `base_path` sits inside a locked directory subtree:
+  every numbered sibling it would try shares the same held parent, so probing on
+  would spin with no sleep until the dir lock released and then return an
+  arbitrary name.
+
+The *failure shape* stays a caller concern. `routes/convert.py` keeps a thin
+`get_unique_output_path` wrapper that translates `OutputPathLocked` into
+`SkipFile(SkipReason.OUTPUT_LOCKED)`, so the job pipeline defers and requeues
+the file like any other locked output; the sweep simply drops the candidate and
+picks it up next time. Both touch the disk (a directory mode's companion lookup
+scans), so call them off the event loop.
+
+### 3.3.9 Verify without delete (`ConversionJob.verify_after`)
+
+`delete_on_verify` verifies as a *precondition* for deleting the source. A
+caller that wants the check on its own — an unattended sweep proving its output
+before it walks away — sets **`verify_after`** instead. One block in
+`_process_job` runs the verification for either flag, so a verified output means
+the same thing however it was requested, and only `delete_on_verify` reaches the
+delete half. Both are gated on `ModeSpec.supports_delete_on_verify`, the
+registry's answer to "can this mode's output be verified at all".
+
 ### 3.4 `registry.py`
 
 ```python
@@ -1364,6 +1401,27 @@ class ToolRegistry:
     def scannable_extensions(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.output_extensions()) | set(self.verify_extensions())))
 ```
+
+#### Platform narrowing (`narrow_to_platform`, `ToolPlugin.platform_slugs`)
+
+Extension matching decides *convertibility*, which is all a bare filesystem
+listing can know. A library manager knows more: RomM stamps a `platform_slug` on
+every ROM record, and that is the only thing able to tell a GameCube `.iso` from
+a PS2 one.
+
+Each tool declares the platforms it serves as `platform_slugs: frozenset[str]`
+(dolphin: `{"ngc", "gamecube", "wii"}`; maxcso: `{"psp", "ps2"}`; the default is
+an empty set, meaning "no opinion"). `narrow_to_platform(tool_ids, slug)` then
+*removes* candidates the platform contradicts — it never adds any.
+
+It is conservative by construction, because a wrong exclusion is worse than a
+missing one. With no slug, an unrecognised slug, or a slug no tool claims, the
+list is returned untouched; a tool declaring no `platform_slugs` is never
+dropped. So a platform we have never heard of degrades to plain extension-only
+behaviour rather than to an empty list. Both consumers go through it: the RomM
+catalog listing narrows each row's `convertible_by`, and `/romm/platforms`
+returns the narrowed `tool_ids` so the automation editor offers a platform only
+the modes it can actually use.
 
 #### Extension matching is a suffix match (`utils.path_utils.match_extension`)
 

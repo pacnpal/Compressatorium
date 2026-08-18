@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from logging_setup import get_logger
 from services import db as _db
 from services.romm import DAT_SAFE_OUTPUT_EXTS, METADATA_ID_FIELDS, romm_client
+from sqlalchemy.exc import IntegrityError
 
 logger = get_logger("romm_repin")
 
@@ -74,30 +75,43 @@ def roms_by_local_path(paths: list[str]) -> dict[str, dict]:
     return index
 
 
+def _refresh_pending(session, output_path: str, rom: dict, ids: dict) -> bool:
+    """Update the pending row for *output_path* in place. False when there is none."""
+    existing = (
+        session.query(_db.RommRepin)
+        .filter(_db.RommRepin.output_path == output_path)
+        .filter(_db.RommRepin.state == "pending")
+        .one_or_none()
+    )
+    if existing is None:
+        return False
+    existing.source_rom_id = rom.get("id")
+    existing.metadata_ids = ids
+    # The output is about to be rewritten, so any cached hash is stale.
+    existing.output_sha1 = None
+    # Restart the abandonment clock too. A conversion re-planned long after the
+    # original would otherwise be retired the moment it was re-recorded, and
+    # could never have its metadata restored.
+    existing.created_at = utcnow_iso()
+    session.commit()
+    return True
+
+
 def record(rom: dict, output_path: str, ids: dict) -> bool:
     """Insert a pending row unless one already covers this output.
 
     The dedupe on ``output_path`` is what makes re-submitting the same batch
     harmless -- the second submit updates the existing row instead of stacking
     another.
+
+    The read-then-insert is only the fast path. A partial unique index
+    (``ux_romm_repin_pending_output``) is the actual guarantee, so a manual
+    submit racing an automation sweep cannot both pass the check and stack two
+    pending rows for one file. Losing that race is not an error: fall through
+    to updating whichever row won.
     """
     with _session() as session:
-        existing = (
-            session.query(_db.RommRepin)
-            .filter(_db.RommRepin.output_path == output_path)
-            .filter(_db.RommRepin.state == "pending")
-            .one_or_none()
-        )
-        if existing is not None:
-            existing.source_rom_id = rom.get("id")
-            existing.metadata_ids = ids
-            # The output is about to be rewritten, so any cached hash is stale.
-            existing.output_sha1 = None
-            # Restart the abandonment clock too. A conversion re-planned long
-            # after the original would otherwise be retired the moment it was
-            # re-recorded, and could never have its metadata restored.
-            existing.created_at = utcnow_iso()
-            session.commit()
+        if _refresh_pending(session, output_path, rom, ids):
             return True
         session.add(
             _db.RommRepin(
@@ -109,7 +123,11 @@ def record(rom: dict, output_path: str, ids: dict) -> bool:
                 created_at=utcnow_iso(),
             ),
         )
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return _refresh_pending(session, output_path, rom, ids)
         return True
 
 
@@ -138,18 +156,27 @@ def pending_rows(limit: int, *, after_id: int = 0) -> list[tuple]:
         ]
 
 
-def store_sha1(output_path: str, sha1: str) -> None:
+def store_sha1(row_id: int, sha1: str) -> None:
+    """Cache the output's hash on the row the settle pass is working on.
+
+    Keyed by primary key, not by ``output_path``: a row can be settled and the
+    same path re-recorded by a later conversion while a pass is mid-flight, and
+    matching on the path would then stamp the *new* row with the old file's
+    digest -- which, because the hash is cached, that ROM could never recover
+    from.
+    """
     with _session() as session:
         session.query(_db.RommRepin).filter(
-            _db.RommRepin.output_path == output_path,
+            _db.RommRepin.id == row_id,
             _db.RommRepin.state == "pending",
         ).update({"output_sha1": sha1})
         session.commit()
 
 
 def settle(
-    rom_id: int, output_path: str, state: str, detail: str | None, new_id: int | None,
+    row_id: int, state: str, detail: str | None = None, new_id: int | None = None,
 ) -> None:
+    """Close out one re-pin row. Keyed by primary key, for the reason above."""
     with _session() as session:
         values: dict = {"state": state, "settled_at": utcnow_iso()}
         if detail:
@@ -157,7 +184,7 @@ def settle(
         elif new_id is not None:
             values["detail"] = f"Re-pinned to RomM rom {new_id}"
         session.query(_db.RommRepin).filter(
-            _db.RommRepin.output_path == output_path,
+            _db.RommRepin.id == row_id,
             _db.RommRepin.state == "pending",
         ).update(values)
         session.commit()

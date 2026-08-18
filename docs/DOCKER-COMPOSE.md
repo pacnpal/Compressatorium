@@ -123,8 +123,11 @@ mount. Note RomM advises against enabling its own filesystem watcher
 (`ENABLE_RESCAN_ON_FILESYSTEM_CHANGE`) on SMB/rclone mounts; scan from RomM's UI
 instead after converting.
 
-**After converting:** RomM has to rescan before it sees the new files. Either
-enable its filesystem watcher or run a scan from RomM. Then, if you converted to
+**After converting:** RomM has to rescan before it sees the new files. On a local
+bind mount, RomM's filesystem watcher
+(`ENABLE_RESCAN_ON_FILESYSTEM_CHANGE`) picks them up on its own; on an SMB or
+rclone mount, leave the watcher off as RomM advises and run a scan from RomM's UI
+instead. Then, if you converted to
 a format RomM cannot hash-match, press **Re-match in RomM** in the RomM view to
 re-apply the saved metadata (or leave it to run automatically on page load).
 
@@ -211,16 +214,6 @@ Volume behavior:
 | `COMPRESSATORIUM_DB_PATH` | `/config/compressatorium.db` | Unified SQLite database (DAT index, DAT-sync state, match cache, CHD metadata, verification state). On first startup, legacy JSON files are auto-migrated to this DB and renamed to `*.migrated.bak` (never deleted). Custom legacy paths set via `CHD_METADATA_STORE` / `CHD_VERIFICATION_STORE` are honored during migration. |
 | `CHD_METADATA_STORE` | *(deprecated)* | Legacy JSON path; auto-migrated to SQLite on first startup (custom path honored if set) |
 | `CHD_VERIFICATION_STORE` | *(deprecated)* | Legacy JSON path; auto-migrated to SQLite on first startup (custom path honored if set) |
-| `ROMM_URL` | *(unset)* | Base URL of your RomM instance, e.g. `http://romm:8080`. Unset disables the RomM view entirely. |
-| `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. Seeds the first run only. A token entered in **RomM → Settings** is stored in the `preferences` table of `compressatorium.db` (never returned to the browser) and takes precedence over this variable — so back up and permission that file accordingly. |
-| `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
-| `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. Rules are configured in the app (**RomM → Automation**). |
-| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Ceiling on jobs queued by one sweep, across all platforms. |
-| `ROMM_REPIN` | `true` | Save a ROM's metadata before converting to a format RomM cannot hash-match, so it can be restored afterwards. |
-| `ROMM_REPIN_ON_LOAD` | `true` | Re-apply saved metadata automatically when the RomM view loads. |
-
-All of these are editable in **RomM → Settings**; the environment only supplies
-the first-run default.
 | `CHDMAN_MODE` | `createcd` | Conversion mode: `createcd` or `createdvd` (CLI mode) |
 | `CHDMAN_PATH` | `/usr/bin/chdman` | Path to chdman binary |
 | `DOLPHIN_TOOL_PATH` | `/usr/local/bin/dolphin-tool` | Path to dolphin-tool binary |
@@ -256,6 +249,27 @@ the first-run default.
 | `CHD_PROGRESS_TIMEOUT_PER_GIB` | `120` | Additional stall-timeout seconds per GiB of input size |
 | `CHD_PROGRESS_TIMEOUT_CAP` | `7200` | Upper bound for adaptive conversion stall timeout (0 disables cap) |
 | `STATIC_DIR` | `/static` | Path to static web assets |
+
+### RomM
+
+Every one of these is editable in **RomM → Settings** and **RomM → Automation**;
+the environment only supplies the first-run default, and a value saved in the app
+wins from then on. `ROMM_URL` unset *and* nothing saved in the app hides the RomM
+view entirely.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROMM_URL` | *(unset)* | Base URL of your RomM instance, e.g. `http://romm:8080`. |
+| `ROMM_TOKEN` | *(unset)* | RomM **client API token** (`rmm_…`), created under *Administration → Client API Tokens*. Needs `platforms.read` + `roms.read`, plus `roms.write` to re-apply metadata after conversion. A token entered in **RomM → Settings** is stored in the `preferences` table of `compressatorium.db` (never returned to the browser) and takes precedence over this variable — so back up and permission that file accordingly. |
+| `ROMM_LIBRARY_ROOT` | *(unset)* | Where RomM's library folder is mounted **in this container**. Must be inside a configured volume. RomM's ROM paths are resolved relative to it. |
+| `ROMM_AUTO_CONVERT` | `false` | Enable scheduled per-platform conversion sweeps. The rules themselves are configured in the app (**RomM → Automation**). |
+| `ROMM_AUTO_CONVERT_INTERVAL_MINUTES` | `60` | Minutes between sweeps, for platforms whose rule does not set its own interval (minimum 5). |
+| `ROMM_AUTO_CONVERT_MAX_PER_RUN` | `25` | Ceiling on jobs queued by one sweep, across all platforms. |
+| `ROMM_REPIN` | `true` | Save a ROM's metadata before converting to a format RomM cannot hash-match, so it can be restored afterwards. |
+| `ROMM_REPIN_ON_LOAD` | `true` | Re-apply saved metadata automatically when the RomM view loads. |
+| `ROMM_REPIN_ABANDON_DAYS` | `7` | Retire a saved re-pin whose output never appeared after this many days. |
+| `ROMM_VERIFY_AFTER_CONVERT` | `false` | Verify each automatic conversion before its metadata is re-applied. |
+| `ROMM_DELETE_SOURCE_AFTER_VERIFY` | `false` | Delete the source once the new output verifies. Destructive, so off by default. |
 
 ---
 

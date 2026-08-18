@@ -218,43 +218,21 @@ class Settings(BaseSettings):
     # touches the ROM bytes only through the filesystem: RomM's library is
     # mounted as an ordinary Compressatorium volume (locally via the same bind
     # mount, remotely via NFS/SMB/rclone), so no ROM ever crosses the network.
-    # Unset romm_url disables the feature and hides the view.
     #
-    # The credential is deliberately NOT a Settings field. It is read from the
-    # environment inside services.romm, the same choice made for
-    # MAMEREDUMP_GITHUB_TOKEN: a secret on the settings singleton ends up in
-    # every repr()/log line that dumps config.
-    romm_url: str = Field(
-        default="", alias="ROMM_URL",
-        description="Base URL of the RomM instance, e.g. http://romm:8080",
-    )
-    romm_library_root: str = Field(
-        default="", alias="ROMM_LIBRARY_ROOT",
-        description=(
-            "Local mount point of RomM's library directory (the path RomM sees "
-            "as /romm/library). RomM's fs_path/full_path are relative to it."
-        ),
-    )
-    # Unattended conversion. Off by default: it queues real jobs that rewrite
-    # the operator's library, so it must be asked for, not inherited. The
-    # per-platform target formats live in the `romm.rules` preference (editable
-    # from the RomM view) rather than here -- they are user policy, not
-    # deployment config, and env vars cannot express a per-platform map.
-    romm_auto_convert: bool = Field(
-        default=False, alias="ROMM_AUTO_CONVERT",
-        description="Periodically queue conversions for RomM ROMs matching the saved rules",
-    )
-    romm_auto_convert_interval_minutes: int = Field(
-        default=60, alias="ROMM_AUTO_CONVERT_INTERVAL_MINUTES", ge=5,
-        description="Minutes between automatic RomM conversion sweeps (minimum 5)",
-    )
-    romm_auto_convert_max_per_run: int = Field(
-        default=25, alias="ROMM_AUTO_CONVERT_MAX_PER_RUN", ge=1,
-        description=(
-            "Most jobs one automatic sweep may queue. Bounds how much of the "
-            "library a single sweep commits to converting."
-        ),
-    )
+    # None of its settings are Settings fields. They are runtime-editable in
+    # the app (URL, library root, unattended-conversion policy, per-platform
+    # rules), which makes the saved value the authority and the environment
+    # only the first-run default -- a layering `Settings` cannot express, since
+    # it is populated once at import. `services.romm_settings` owns the whole
+    # table: ROMM_URL, ROMM_LIBRARY_ROOT, ROMM_AUTO_CONVERT,
+    # ROMM_AUTO_CONVERT_INTERVAL_MINUTES, ROMM_AUTO_CONVERT_MAX_PER_RUN,
+    # ROMM_REPIN*, ROMM_VERIFY_AFTER_CONVERT, ROMM_DELETE_SOURCE_AFTER_VERIFY.
+    # Duplicating any of them here would create a second source of truth that
+    # nothing reads and that silently drifts from the one that matters.
+    #
+    # The credential is likewise not here, for the additional reason that
+    # applies to MAMEREDUMP_GITHUB_TOKEN: a secret on the settings singleton
+    # ends up in every repr()/log line that dumps config.
 
     # Process-priority and timeout policy shared by EVERY conversion tool's
     # subprocess (chdman, Dolphin, 3DS, Switch) and the shared SubprocessRunner.

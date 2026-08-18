@@ -15,6 +15,7 @@
   import { conversion } from '$lib/stores/conversion.svelte.js';
   import { layout } from '$lib/stores/layout.svelte.js';
   import { registry } from '$lib/tools/registry.js';
+  import { formatSize } from '$lib/api/format.js';
   import FileList from '$lib/components/panels/FileList.svelte';
   import ConvertPanel from '$lib/components/panels/ConvertPanel.svelte';
   import JobsPanel from '$lib/components/panels/JobsPanel.svelte';
@@ -81,15 +82,6 @@
     };
   });
 
-  function formatBytes(n) {
-    if (!n) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let v = n;
-    let i = 0;
-    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
-    return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-  }
-
   onMount(() => {
     (async () => {
       await Promise.all([romm.loadStatus(), romm.loadSettings()]);
@@ -101,7 +93,9 @@
       // here: listing ROMs stats every file, and doing that against a mount
       // that is missing or unresponsive would tie up a worker for nothing.
       if (!romm.usable) return;
-      await Promise.all([romm.loadPlatforms(), romm.loadRules()]);
+      // allSettled: each store records its own error, and one failing must
+      // not skip the other load or the re-pin pass below.
+      await Promise.allSettled([romm.loadPlatforms(), romm.loadRules()]);
       if (romm.pendingRepins > 0 && romm.settings?.repin_on_load !== false) {
         try {
           await romm.runRepin();
@@ -114,6 +108,14 @@
     // the workspace would open showing RomM rows under a directory heading.
     return () => fileBrowser.exitRomm();
   });
+
+  /** Refresh what the new connection settings changed. Errors land in the store. */
+  async function reloadAfterSave() {
+    await Promise.allSettled([
+      romm.loadPlatforms({ force: true }),
+      romm.loadRules(),
+    ]);
+  }
 
   async function handleRepin() {
     try {
@@ -164,7 +166,7 @@
   </nav>
 
   {#if tab === 'settings'}
-    <RommSettings onsaved={() => { if (romm.usable) { romm.loadPlatforms({ force: true }); romm.loadRules(); } }} />
+    <RommSettings onsaved={() => { if (romm.usable) { reloadAfterSave(); } }} />
   {:else if tab === 'automation'}
     <RommAutomation />
   {:else if romm.statusLoading}
@@ -215,11 +217,11 @@
           <span><strong>{summary.converted}</strong> converted</span>
           <span><strong>{summary.pending}</strong> to go</span>
           {#if summary.pendingBytes > 0}
-            <span class="muted">({formatBytes(summary.pendingBytes)} of sources)</span>
+            <span class="muted">({formatSize(summary.pendingBytes)} of sources)</span>
           {/if}
           {#if summary.estimatedSaving}
             <span class="saving">
-              ≈ {formatBytes(summary.estimatedSaving)} could be saved
+              ≈ {formatSize(summary.estimatedSaving)} could be saved
             </span>
           {/if}
         </div>
