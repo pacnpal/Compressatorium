@@ -1624,37 +1624,40 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_repeated_single_file_match_is_served_from_cache(
+async def test_a_single_file_match_always_recomputes(
     hasheous_on, tmp_path, isolated_store, monkeypatch
 ):
-    """/dat/match was the only entry point that never touched the cache.
+    """/dat/match means "match this file now" -- it must never serve a cache.
 
-    With Hasheous on that meant a polling API client re-hashed the file and
-    re-disclosed its SHA1 to a third party on every call.
+    Caching it was tried during review and reverted: DATMatch carries no
+    freshness metadata, so a stored row would identify a replaced file as the
+    game it used to be, for every existing caller, indefinitely.
     """
     iso = tmp_path / "game.iso"
     iso.write_bytes(b"content")
     monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
 
+    # A stale row for this path, as a previous match would have left.
+    await isolated_store.set_match(str(iso), {
+        "path": str(iso), "matched": True, "game_name": "Old Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40,
+    })
+
     calls = []
 
-    async def _fake_match(path, **kwargs):
+    async def _fresh(path, **kwargs):
         calls.append(path)
-        return {"path": path, "matched": True, "game_name": "Cached Game",
-                "file_hash": "a" * 40, "source": "hasheous"}
+        return {"path": path, "matched": True, "game_name": "New Game",
+                "match_type": "file_sha1", "file_hash": "b" * 40}
 
-    monkeypatch.setattr(dat_routes, "_match_single_file", _fake_match)
+    monkeypatch.setattr(dat_routes, "_match_single_file", _fresh)
 
     first = await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso)))
     second = await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso)))
 
-    assert first["game_name"] == "Cached Game"
-    assert second["game_name"] == "Cached Game"
-    assert len(calls) == 1, "second call re-matched instead of using the cache"
-
-    # ...and a caller that just rewrote the file can still force a fresh match.
-    await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso), force=True))
-    assert len(calls) == 2
+    assert first["game_name"] == "New Game", "a stale cached row was served"
+    assert second["game_name"] == "New Game"
+    assert len(calls) == 2, "the route skipped a recompute"
 
 
 @pytest.mark.asyncio
@@ -1775,29 +1778,59 @@ async def test_an_outage_keeps_a_chd_hit_matched_on_an_embedded_hash(tmp_path):
     delete.assert_not_awaited()
 
 
+# ---------------------------------------------------------------------------
+# Fourteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_a_failed_forced_match_drops_a_disproved_row(
+async def test_a_dat_landing_mid_hash_still_wins_over_the_remote(
     hasheous_on, tmp_path, isolated_store, monkeypatch
 ):
-    """force=True after replacing a file must not leave the old hit authoritative.
+    """Candidates are checked as they appear; hashing a file takes minutes.
 
-    The forced call reports the failure, but every later unforced /dat/match
-    would serve the previous game from cache indefinitely.
+    A DAT import or sync landing during that window can make an already-missed
+    embedded hash locally known. Without a final local pass over the complete
+    candidate set, it would be disclosed to Hasheous and a remote hit would win
+    over an available local one.
     """
-    iso = tmp_path / "game.iso"
-    iso.write_bytes(b"new content")
-    monkeypatch.setattr(dat_routes, "is_within_configured_volumes", lambda p: True)
+    chd = tmp_path / "game.chd"
+    chd.write_bytes(b"content")
+    embedded = "e" * 40
+    file_level = "f" * 40
 
-    await isolated_store.set_match(str(iso), {
-        "path": str(iso), "matched": True, "game_name": "Old Game",
-        "match_type": "file_sha1", "file_hash": "a" * 40,
-    })
+    class _Tool:
+        embedded_hash_is_exhaustive = False
 
-    async def _outage(path, **kwargs):
-        return {"path": path, "matched": False,
-                "error": dat_routes.HASHEOUS_ERROR, "file_hash": "b" * 40}
+        async def embedded_hashes(self, _path, **_kw):
+            return [(embedded, "chd_sha1")]
 
-    monkeypatch.setattr(dat_routes, "_match_single_file", _outage)
-    await dat_routes.match_file(dat_routes.MatchRequest(path=str(iso), force=True))
+    monkeypatch.setattr(dat_routes.registry, "tool_for_verify", lambda _p: _Tool())
+    monkeypatch.setattr(dat_routes, "compute_file_sha1", AsyncMock(return_value=file_level))
+    monkeypatch.setattr(dat_routes.dat_store, "has_dats", lambda: True)
 
-    assert isolated_store.get_match(str(iso)) is None, "stale row survived a forced match"
+    # The DAT library gains the embedded hash only after the file hash is in.
+    seen: list[str] = []
+
+    def _lookup(h):
+        seen.append(h)
+        # Nothing known until the file-level hash has been computed...
+        if file_level not in seen:
+            return None
+        # ...after which the import has landed and the embedded hash resolves.
+        if h == embedded:
+            return {"game_name": "Local Game", "dat_name": "Late Import"}
+        return None
+
+    monkeypatch.setattr(dat_routes.dat_store, "lookup_sha1", _lookup)
+
+    async def _never(_sha1):
+        raise AssertionError("went remote despite a local hit being available")
+
+    monkeypatch.setattr(hasheous, "lookup", _never)
+
+    result = await dat_routes._match_single_file(str(chd))
+
+    assert result["matched"] is True
+    assert result["game_name"] == "Local Game"
+    assert result["source"] == "dat"

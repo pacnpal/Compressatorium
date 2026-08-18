@@ -89,12 +89,6 @@ def _get_match_job_lock() -> asyncio.Lock:
 
 class MatchRequest(BaseModel):
     path: str
-    # Opt out of the cache. Default False so a repeated call is served from the
-    # stored result like every other match path -- with Hasheous on, an uncached
-    # single-file route re-hashes the file and re-discloses its SHA1s to a third
-    # party on every request. `force` keeps the old "match it right now"
-    # behaviour available for a caller that just rewrote the file.
-    force: bool = False
 
 
 class MatchBatchRequest(BaseModel):
@@ -292,14 +286,6 @@ async def match_file(request: MatchRequest):
     # verify both come back as "unmatched" (issue #268). 503 rather than a
     # cheerful 200: it is a transient resource condition, and a caller that
     # retries immediately just spawns a second one against the same storage.
-    # Same cache policy as /dat/match-batch, the background job and the scan:
-    # this route was the only match entry point that neither read nor wrote
-    # DATMatch, so an API client polling it paid a full re-hash every time.
-    if not request.force:
-        cached = await run_in_threadpool(dat_store.get_match, normalized_path)
-        if cached_result_usable(cached):
-            return cached
-
     with collect_abandonment() as abandoned:
         result = await _match_single_file(normalized_path)
     if abandoned:
@@ -311,16 +297,14 @@ async def match_file(request: MatchRequest):
                 f"({', '.join(abandoned)}); it is still running."
             ),
         )
-    # Don't cache a transient error or a size-cap skip -- same rule the batch
-    # job and the scan use, so one blip can't record a library as unmatched.
-    if not result.get("reason") and not result.get("error"):
-        await dat_store.set_match(normalized_path, result)
-    elif request.force:
-        # A caller forcing a rematch usually just rewrote the file. If the
-        # recompute failed we keep the old row (same rule as the scan), but a
-        # recomputed hash that disproves it must not stay authoritative for
-        # every later unforced call.
-        await drop_if_content_changed(normalized_path, result)
+    # Deliberately NOT cached, in either direction. This route means "match
+    # this file now", and DATMatch carries no freshness metadata: serving a
+    # stored row would identify a replaced file as the game it used to be, for
+    # every existing caller, indefinitely. Caching it (added in review, then
+    # reverted) traded that correctness for fewer repeat lookups -- the wrong
+    # way round for a route whose whole contract is freshness. The batch route,
+    # the background job and the scan all cache; a client that wants the cached
+    # answer should ask them, or read /dat/matches/lookup.
     return result
 
 
@@ -1311,6 +1295,15 @@ async def _match_single_file(
 
     # Nothing local knows any of them. Now, and only now, ask Hasheous.
     if candidates:
+        # One last local pass over the COMPLETE set first. Candidates are
+        # checked as they appear, and computing a file-level SHA1 can take
+        # minutes -- long enough for a DAT import or MAMERedump sync to land in
+        # between. An embedded hash that missed before that await may be in the
+        # library by now, and disclosing a hash the local DATs can identify is
+        # exactly what the local-first rule exists to prevent.
+        local = await _local_lookup_match(file_path, candidates)
+        if local:
+            return local
         try:
             remote, consulted = await _remote_lookup_match(file_path, candidates)
             base_result["checked_remote"] = consulted

@@ -168,8 +168,11 @@ like everything else.
 
 Results are cached in the local database, so a file is looked up once, not once
 per browse. If you enable Hasheous *after* files were already recorded as "no
-match", those old verdicts are automatically re-checked against the new source —
-you don't have to force a rescan to pick the feature up.
+match", those old verdicts are automatically re-checked against the new source
+as you browse those files — the cached verdict records which source produced it,
+so it stops being accepted the moment a stronger one is available. Re-checking
+is lazy, not a library-wide sweep: a folder you never open keeps its old verdict
+until you open it, or until you run a rescan.
 
 #### Badges
 

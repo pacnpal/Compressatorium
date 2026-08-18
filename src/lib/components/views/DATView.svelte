@@ -230,10 +230,12 @@
         network calls. These matches show a <strong>HASH</strong> badge, with
         platform, year, region and source DAT in the tooltip.
       {:else}
-        Off — nothing is sent anywhere. Turning it on sends each file's SHA1
+        Off — nothing is sent anywhere. Turning it on sends a file's hashes
         (and nothing else, no names or paths) to
-        <code>{hasheousUrl}</code> when your DATs come up empty.
-        Takes effect immediately; no restart needed.
+        <code>{hasheousUrl}</code> when your DATs come up empty — one SHA1 for
+        most formats, up to three for a CHD, which reports a header and a data
+        hash alongside the file's own. Takes effect immediately; no restart
+        needed.
       {/if}
       {#if stats?.hasheous_overridden}
         <span class="hasheous-note">

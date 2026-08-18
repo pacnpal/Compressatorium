@@ -295,7 +295,19 @@ class DATMatchingStore {
 
   async startMatchJob(paths) {
     if (!paths?.length) return null;
-    return api.startMatchJob(paths);
+    const response = await api.startMatchJob(paths);
+    // The endpoint answers {status: "idle", results} and creates NO job when
+    // every path was cached between our hydrate() and this call (another
+    // client, or a scan, got there first). Dropping that response left the
+    // badges missing with no terminal job event to trigger another hydration,
+    // so a static page stayed blank until the user navigated.
+    const results = response?.results;
+    if (results) {
+      for (const [path, match] of Object.entries(results)) {
+        if (match) this.matches.set(path, match);
+      }
+    }
+    return response;
   }
 
   async deleteDAT(datId) {

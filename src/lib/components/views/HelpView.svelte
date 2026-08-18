@@ -341,7 +341,9 @@
       nothing else, no names or paths — to that service. Your own DATs are always checked
       first, so a library they already cover never makes a network call, and when a file
       offers several hashes all of them are tried locally before any goes out. Turning it
-      on later re-checks files already marked "no match", so you don't need a rescan.
+      on later re-checks files already marked "no match" as you browse them — no
+      rescan needed, though a folder you never open keeps its old verdict until
+      you do (or until you run a rescan).
     </p>
     <p>
       A lookup that times out is reported as an error rather than recorded as "no match",

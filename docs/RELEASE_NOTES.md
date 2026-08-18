@@ -35,8 +35,10 @@
   *all* of them are checked locally before *any* is sent remotely.
 
   Enabling it on an existing install works retroactively: files already recorded
-  as "no match" by the local-only matcher are automatically re-checked against
-  the new source, with no forced rescan needed.
+  as "no match" by the local-only matcher are re-checked against the new source
+  as you browse them, with no forced rescan needed. The re-check is lazy rather
+  than a library-wide sweep — a folder you never open keeps its old verdict
+  until you do, or until you rescan.
 
   The panel shows live state and has a **Test** button that reports whether the
   server is reachable and how fast. `COMPRESSATORIUM_HASHEOUS_ENABLED=true`
