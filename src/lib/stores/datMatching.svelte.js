@@ -221,6 +221,15 @@ class DATMatchingStore {
     // on the path set means navigating somewhere new still gets a full budget.
     if (!fromRetry && !this._samePaths(uncached, this._lastJobPaths)) {
       this._autoRetries = 0;
+    } else if (!fromRetry) {
+      // The same visible set again, driven by a terminal job event rather than
+      // by the retry timer. `_autoRetries` is only incremented inside
+      // _scheduleRetry(), so a job that outlives ATTEMPT_RETRY_MS reaches here
+      // with the attempt guard already expired, skips the timer entirely, and
+      // starts another full job -- for as long as the tab stays open. It is a
+      // retry in everything but name, so it consumes the budget like one.
+      if (this._autoRetries >= MAX_AUTO_RETRIES) return;
+      this._autoRetries += 1;
     }
     this._lastJobPaths = uncached;
     try {

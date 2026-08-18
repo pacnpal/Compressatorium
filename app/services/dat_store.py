@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -273,8 +273,20 @@ class DATStore:
                             },
                         )
                         session.execute(stmt)
-            # Importing new DATs invalidates the match cache.
-            session.execute(delete(_db.DATMatch))
+            # Importing new DATs invalidates the match cache -- but only the
+            # part of it the DATs are responsible for. A remote (Hasheous) hit
+            # has `dat_id IS NULL` by design and owes nothing to the local DAT
+            # set, so wiping it here permanently discarded a badge that
+            # cached_result_usable() otherwise keeps valid even with the
+            # provider switched off: the recompute would miss locally and cache
+            # "unmatched", and only re-enabling remote disclosure could bring it
+            # back. Unmatched rows still go, since the new DATs may well know
+            # them now.
+            session.execute(
+                delete(_db.DATMatch).where(
+                    or_(_db.DATMatch.dat_id.is_not(None), _db.DATMatch.matched.is_(False))
+                )
+            )
             session.commit()
 
     async def persist(self) -> None:

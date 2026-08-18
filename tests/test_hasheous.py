@@ -1943,3 +1943,57 @@ async def test_the_batch_routes_serve_cached_hits_with_matching_unavailable(
     assert job["results"][str(iso)]["game_name"] == "Cached Game", (
         "match-batch/job hid a valid cached hit"
     )
+
+
+# ---------------------------------------------------------------------------
+# Eighteenth review round (PR #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_dat_sync_keeps_remote_hits(tmp_path):
+    """A MAMERedump sync invalidates DAT-derived matches, not Hasheous ones.
+
+    A remote hit owes nothing to the local DAT set. Wiping it meant the
+    post-sync recompute missed locally and cached "unmatched", so the badge was
+    gone for good unless the operator re-enabled remote disclosure -- even
+    though cached_result_usable() keeps such hits valid with the provider off.
+
+    The import has to be staged for real: `_persist_sync` returns early when
+    nothing is pending, so seeding rows and calling persist() on an empty
+    staging area exercises none of this.
+    """
+    from tests.test_dat_routes import SAMPLE_DAT_XML
+
+    from services.dat_store import DATStore
+
+    store = DATStore(store_path=str(tmp_path / "dat_store.json"))
+
+    # Phase 1: a committed DAT, so a local hit can carry a real dat_id past the
+    # FK guard in _upsert_match_sync.
+    await store.import_dat_no_persist(SAMPLE_DAT_XML)
+    await store.persist()
+    dat_id = store.list_dats()[0]["id"]
+
+    remote_path, local_path, miss_path = "/vol/remote.chd", "/vol/local.iso", "/vol/miss.iso"
+    await store.set_match(remote_path, {
+        "path": remote_path, "matched": True, "game_name": "Remote Game",
+        "match_type": "file_sha1", "file_hash": "a" * 40, "source": "hasheous",
+    })
+    await store.set_match(local_path, {
+        "path": local_path, "matched": True, "game_name": "Local Game",
+        "dat_id": dat_id, "match_type": "file_sha1", "file_hash": "b" * 40,
+    })
+    await store.set_match(miss_path, {
+        "path": miss_path, "matched": False, "file_hash": "c" * 40,
+    })
+
+    # Phase 2: a second sync, which is what invalidates the match cache.
+    await store.import_dat_no_persist(SAMPLE_DAT_XML)
+    await store.persist()
+
+    survived = store.get_match(remote_path)
+    assert survived is not None, "the sync destroyed a remote hit"
+    assert survived["game_name"] == "Remote Game"
+    assert store.get_match(local_path) is None, "a DAT-derived hit survived the sync"
+    assert store.get_match(miss_path) is None, "a cached miss survived the sync"
