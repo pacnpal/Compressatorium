@@ -223,13 +223,10 @@ RUN apt-get update -o Acquire::Retries=3 && \
       libdeflate0 \
       zlib1g \
       ca-certificates && \
-    # Install dolphin-emu only where available/practical (non-fatal)
-    if [ "$TARGETARCH" = "amd64" ]; then \
-      apt-get install -y --no-install-recommends dolphin-emu || \
-        echo "WARNING: dolphin-emu install failed on amd64; continuing without it"; \
-    else \
-      echo "Skipping dolphin-emu on ${TARGETARCH}"; \
-    fi && \
+    # Install dolphin-emu (packaged for both amd64 and arm64 on trixie; kept
+    # non-fatal in case a future/unsupported TARGETARCH has no build)
+    (apt-get install -y --no-install-recommends dolphin-emu || \
+      echo "WARNING: dolphin-emu install failed on ${TARGETARCH}; continuing without it") && \
     # --- Install pinned mame-tools from snapshot ---
     MAME_DEB="mame-tools_${MAME_TOOLS_VERSION}_${TARGETARCH}.deb" && \
     if [ "$TARGETARCH" = "amd64" ]; then \

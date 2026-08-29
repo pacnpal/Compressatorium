@@ -489,8 +489,9 @@ for the stage list). Pick the one that fits:
 
 - **Distro package** (chdman via `mame-tools`, pinned to a `snapshot.debian.org`
   `.deb` with per-arch SHA256 checks).
-- **Distro package, best-effort** (dolphin-emu, amd64-only, non-fatal). A wrapper
-  script at `/usr/local/bin/dolphin-tool` is created only if the binary exists.
+- **Distro package, best-effort** (dolphin-emu, amd64+arm64, non-fatal). A
+  wrapper script at `/usr/local/bin/dolphin-tool` is created only if the
+  binary exists.
 - **Build from source in the `builder` stage** (z3ds), then copy the artifact
   into the runtime image.
 
